@@ -213,8 +213,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "-o",
         "--output",
-        required=True,
-        help="Path to write the JSON corpus.",
+        default=None,
+        help="Path to write the JSON corpus (required unless --lang is given).",
     )
     parser.add_argument(
         "--min-freq",
@@ -233,10 +233,25 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Read input lines from stdin (for piping from extract_wiki.py).",
     )
+    parser.add_argument(
+        "--lang",
+        type=str,
+        default="",
+        help="Language code (e.g. 'en', 'bg'). Sets default output to "
+        "~/.config/smartkey/corpus_{lang}.json.",
+    )
     args = parser.parse_args(argv)
 
     if not args.stdin and not args.inputs:
         parser.error("either provide INPUT_FILE(s) or use --stdin")
+
+    # Default output path when --lang is given and -o is not explicitly set.
+    if args.output is None:
+        if args.lang:
+            config_dir = Path.home() / ".config" / "smartkey"
+            args.output = str(config_dir / f"corpus_{args.lang}.json")
+        else:
+            parser.error("either provide -o/--output or use --lang")
 
     unigrams: Counter = Counter()
     bigrams: Counter = Counter()

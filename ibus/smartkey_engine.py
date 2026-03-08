@@ -150,8 +150,27 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Corpus loading.
     # -----------------------------------------------------------------------
     def _load_corpus(self) -> None:
-        """Populate the engine with n-gram data from the corpus file."""
-        corpus = _load_json(_CORPUS_FILE)
+        """Populate the engine with n-gram data from corpus files.
+
+        Scans ``~/.config/smartkey/`` for ``corpus_*.json`` (per-language)
+        and the legacy ``corpus.json``, loading all found corpora into the
+        same engine so predictions blend across languages.
+        """
+        corpus_files: list[Path] = []
+
+        # Per-language corpora (corpus_en.json, corpus_bg.json, ...).
+        corpus_files.extend(sorted(_CONFIG_DIR.glob("corpus_*.json")))
+
+        # Legacy single corpus.
+        if _CORPUS_FILE.is_file():
+            corpus_files.append(_CORPUS_FILE)
+
+        for path in corpus_files:
+            self._load_corpus_file(path)
+
+    def _load_corpus_file(self, path: Path) -> None:
+        """Load a single corpus JSON file into the engine."""
+        corpus = _load_json(path)
         if not isinstance(corpus, dict):
             return
 
