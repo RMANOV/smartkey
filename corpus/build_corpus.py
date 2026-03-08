@@ -17,9 +17,94 @@ from collections import Counter
 from pathlib import Path
 
 
+# ---------------------------------------------------------------------------
+# Sentence-aware tokenisation.
+# ---------------------------------------------------------------------------
+
+# Abbreviations that should NOT trigger a sentence split when followed by ".".
+_ABBREVIATIONS = frozenset(
+    "dr mr mrs ms st vs etc jr sr prof gen gov rev vol no"
+    " jan feb mar apr jun jul aug sep oct nov dec"
+    " al approx dept est inc ltd corp univ assn ave blvd".split()
+)
+
+# Matches a potential sentence boundary: .!? followed by whitespace + uppercase.
+_SENT_BOUNDARY = re.compile(r"[.!?]\s+(?=[A-ZА-ЯЁ])")
+
+# Words: sequences of word-chars and apostrophes, but strip outer apostrophes.
+_WORD_RE = re.compile(r"[\w']+", re.UNICODE)
+
+
+def _is_abbreviation(text: str, dot_pos: int) -> bool:
+    """Check whether the period at *dot_pos* belongs to an abbreviation."""
+    if text[dot_pos] != ".":
+        return False
+    # Walk backward to find the preceding word.
+    i = dot_pos - 1
+    while i >= 0 and text[i].isalpha():
+        i -= 1
+    word = text[i + 1 : dot_pos].lower()
+    if not word:
+        return False
+    # Check single-letter abbreviations (U.S., e.g., i.e.) and known list.
+    if len(word) == 1:
+        return True
+    return word in _ABBREVIATIONS
+
+
+def tokenize_sentences(text: str) -> list[str]:
+    """Split *text* into sentences, respecting abbreviations.
+
+    Splits on `.` `!` `?` followed by whitespace + uppercase letter,
+    but not after common abbreviations like ``Dr.`` ``Mr.`` ``vs.``.
+    """
+    if not text or not text.strip():
+        return []
+    # Find all potential split points and filter out abbreviations.
+    splits: list[int] = []
+    for m in _SENT_BOUNDARY.finditer(text):
+        if not _is_abbreviation(text, m.start()):
+            # Split right after the punctuation mark.
+            splits.append(m.start() + 1)
+
+    if not splits:
+        return [text.strip()] if text.strip() else []
+
+    # Build sentences from the split points.
+    result: list[str] = []
+    prev = 0
+    for pos in splits:
+        chunk = text[prev:pos].strip()
+        if chunk:
+            result.append(chunk)
+        prev = pos
+    # Last segment.
+    chunk = text[prev:].strip()
+    if chunk:
+        result.append(chunk)
+    return result
+
+
+def tokenize_words(text: str) -> list[str]:
+    """Split *text* into lowercase word tokens, preserving contractions.
+
+    - Keeps apostrophes *between* letters (``I'm``, ``don't``).
+    - Strips leading/trailing apostrophes.
+    - Handles Cyrillic and Latin naturally via Unicode ``\\w``.
+    """
+    if not text or not text.strip():
+        return []
+    tokens = _WORD_RE.findall(text.lower())
+    # Strip leading/trailing apostrophes from each token.
+    return [t.strip("'") for t in tokens if t.strip("'")]
+
+
 def tokenize(text: str) -> list[str]:
-    """Split text into lowercase word tokens (Unicode-aware)."""
-    return re.findall(r"\b\w+\b", text.lower())
+    """Split text into lowercase word tokens (Unicode-aware).
+
+    Uses the sentence-aware tokenize_words() for better quality.
+    """
+    return tokenize_words(text)
 
 
 def build_ngrams(
