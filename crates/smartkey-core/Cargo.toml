@@ -10,6 +10,7 @@ categories = ["text-processing", "algorithms"]
 
 [dependencies]
 aho-corasick = { workspace = true }
+bitflags = { workspace = true }
 memmap2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
