@@ -1,8 +1,18 @@
 # SmartKey
 
-**Rust-powered predictive keyboard engine with word-by-word smart suggestions, CVM streaming adaptation, and system-wide IBus integration.**
+**Rust-powered predictive keyboard engine with word-by-word smart suggestions, CVM streaming adaptation, and cross-platform input method integration.**
 
 All prediction happens in pure Rust. Zero network. Zero cloud. Sub-microsecond lookups. Your typing patterns never leave your machine.
+
+## Platform Support
+
+| Platform | Framework | Status | Crate |
+|----------|-----------|--------|-------|
+| Linux | IBus | Production | `smartkey-py` (PyO3) |
+| Windows | TSF (Text Services Framework) | In Development | `smartkey-win` |
+| macOS | Input Method Kit | In Development | `smartkey-mac` |
+
+The Rust core (`smartkey-core`) is platform-agnostic — all prediction logic and key event state machine are shared. Each platform crate is a thin adapter (~200-400 LoC) that bridges OS input events to the shared `InputMethodCore`.
 
 ---
 
@@ -43,38 +53,37 @@ Final: α·corpus + β·markov + γ·personal ──── < 10μs total
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    IBus Framework                        │
-│  ┌───────────────┐    ┌──────────────┐    ┌──────────┐  │
-│  │ IBus Daemon   │◄──►│ SmartKey     │◄──►│ UI Panel │  │
-│  │ (system)      │    │ Engine       │    │ (ghost + │  │
-│  │               │    │ (Rust lib)   │    │  popup)  │  │
-│  └───────────────┘    └──────┬───────┘    └──────────┘  │
-│                              │                           │
-│                   ┌──────────┼──────────┐               │
-│                   ▼          ▼          ▼               │
-│            ┌──────────┐ ┌────────┐ ┌────────┐          │
-│            │ Static   │ │ Markov │ │  CVM   │          │
-│            │ N-gram   │ │ Chain  │ │ Stream │          │
-│            │ Corpus   │ │ (ctx)  │ │ Layer  │          │
-│            └──────────┘ └────────┘ └────────┘          │
-│                   │          │          │               │
-│                   ▼          ▼          ▼               │
-│            ┌─────────────────────────────────┐          │
-│            │  Ensemble Scorer + Ranker       │          │
-│            │  (weighted vote → top-5)        │          │
-│            └─────────────────────────────────┘          │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│                  smartkey-core (Apache 2.0)          │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ │
+│  │ NgramTrie│ │ Markov   │ │ CVM      │ │Ensemble│ │
+│  └──────────┘ └──────────┘ └──────────┘ └────────┘ │
+│  ┌────────────────────────────────────────────────┐ │
+│  │ InputMethodCore                                │ │
+│  │  - key event state machine                     │ │
+│  │  - ghost text lifecycle                        │ │
+│  │  - word commit + context tracking              │ │
+│  │  - returns Action list (platform-neutral)      │ │
+│  └────────────────────────────────────────────────┘ │
+└─────────────┬──────────────┬──────────────┬─────────┘
+              │              │              │
+    ┌─────────▼───┐  ┌──────▼──────┐  ┌───▼──────────┐
+    │ smartkey-py  │  │ smartkey-win│  │ smartkey-mac  │
+    │ (PyO3+IBus)  │  │ (TSF/COM)  │  │ (IMK/Swift)  │
+    │ GPL 3.0      │  │ GPL 3.0    │  │ GPL 3.0      │
+    │ Linux        │  │ Windows    │  │ macOS         │
+    └──────────────┘  └────────────┘  └───────────────┘
 ```
 
-**4 layers, each independently testable:**
+**5 layers, each independently testable:**
 
 | Layer | Tech | Responsibility |
 |---|---|---|
-| IBus Integration | Python + GObject | Key events, text commit, kill switch |
-| Prediction Engine | Rust (PyO3) | N-gram lookup, Markov scoring, ensemble |
+| InputMethodCore | Rust | Key dispatch, ghost text lifecycle, context tracking |
+| Platform Adapters | PyO3 / COM / C FFI | Translate OS events ↔ Action list |
+| Prediction Engine | Rust | N-gram lookup, Markov scoring, ensemble |
 | Learning Layer | CVM + SQLite | Personal vocabulary, adaptive memory |
-| UI | GTK4 (IBus Panel) | Ghost text overlay, floating popup |
+| UI | IBus Panel / TSF / IMK | Ghost text overlay, floating popup |
 
 ---
 
@@ -241,13 +250,16 @@ The engine is language-agnostic by design. The character-level trie handles any 
 ## Test Suite
 
 ```
-38 tests across 5 modules:
+54 tests across 8 modules:
 
   cvm       10 tests  (streaming counter, adaptive memory, probabilistic eviction)
   ngram      7 tests  (trie operations, Cyrillic, prefix search, frequency ranking)
   markov     7 tests  (bigram/trigram probability, Katz backoff, candidate ranking)
   prefix     8 tests  (single/multi-prefix matching, Aho-Corasick batch)
   ensemble   6 tests  (prediction pipeline, personal boost, context handling)
+  input     11 tests  (key dispatch, ghost text, kill switch, focus lifecycle)
+  paths      3 tests  (cross-platform config/corpus path resolution)
+  mac        2 tests  (keycode mapping, FFI lifecycle roundtrip)
 ```
 
 ---
@@ -256,18 +268,29 @@ The engine is language-agnostic by design. The character-level trie handles any 
 
 ```
 smartkey/
-├── Cargo.toml                    # Workspace root
+├── Cargo.toml                    # Workspace root (4 crates)
 ├── crates/
-│   ├── smartkey-core/            # Rust prediction engine
+│   ├── smartkey-core/            # Rust prediction engine + state machine
 │   │   └── src/
+│   │       ├── input.rs          # InputMethodCore (cross-platform state machine)
+│   │       ├── paths.rs          # Platform-aware config/corpus paths
 │   │       ├── cvm.rs            # CVM streaming counter
 │   │       ├── ngram.rs          # N-gram trie + prefix search
 │   │       ├── markov.rs         # Markov chain + Katz backoff
 │   │       ├── prefix.rs         # Aho-Corasick prefix matcher
 │   │       └── ensemble.rs       # SmartKeyEngine (ties it all together)
-│   └── smartkey-py/              # PyO3 Python bindings
-├── ibus/                         # IBus engine (Python)
-│   ├── smartkey_engine.py        # IBus.Engine subclass
+│   ├── smartkey-py/              # PyO3 Python bindings (Linux)
+│   ├── smartkey-win/             # Windows TSF adapter
+│   │   └── src/
+│   │       ├── tsf.rs            # ITfTextInputProcessorEx + ITfKeyEventSink
+│   │       ├── display.rs        # Ghost text display attributes
+│   │       ├── config.rs         # Windows paths + COM GUIDs
+│   │       └── register.rs       # COM/TIP registration helper
+│   └── smartkey-mac/             # macOS IMK adapter
+│       ├── src/lib.rs            # C FFI exports for Swift
+│       └── swift/SmartKeyIME/    # Swift IMKInputController
+├── ibus/                         # IBus engine (thin Python adapter)
+│   ├── smartkey_engine.py        # IBus.Engine → InputMethodCore bridge
 │   ├── main.py                   # Daemon entry point
 │   └── smartkey.xml              # Component descriptor
 ├── corpus/                       # Corpus tools
@@ -292,6 +315,16 @@ SmartKey builds on algorithms proven in production across other projects:
 
 ## Roadmap
 
+### Cross-platform
+- [x] **InputMethodCore** — extract platform-agnostic state machine to Rust
+- [x] **Windows TSF scaffold** — COM skeleton with ITfTextInputProcessorEx
+- [x] **macOS IMK scaffold** — C FFI + Swift IMKInputController
+- [ ] Windows TSF full implementation (composition, display attributes)
+- [ ] macOS IMK full implementation (marked text, candidate window)
+- [ ] Windows installer (MSI)
+- [ ] macOS .app bundle + DMG
+
+### Engine
 - [ ] Benchmark suite (Criterion) with latency targets
 - [ ] Memory-mapped binary corpus format (mmap, no JSON parse at startup)
 - [ ] GTK4 popup panel for Alt-hold alternatives
