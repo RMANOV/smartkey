@@ -1,0 +1,28 @@
+SmartKey — Dual License
+
+This project uses a dual licensing model:
+
+1. smartkey-core (crates/smartkey-core/)
+   Licensed under the Apache License, Version 2.0.
+   See LICENSE-APACHE for the full text.
+
+   This covers the core prediction engine: n-gram trie, Markov chain,
+   CVM streaming counter, prefix matcher, and ensemble scorer. You may
+   use smartkey-core in your own projects (mobile keyboards, IDE plugins,
+   WASM apps, etc.) under the permissive Apache 2.0 terms.
+
+2. Everything else (ibus/, corpus/, crates/smartkey-py/, tests/, config/)
+   Licensed under the GNU General Public License v3.0.
+   See LICENSE-GPL for the full text.
+
+   This covers the IBus integration engine, corpus building tools,
+   PyO3 bridge, and all application-level code. Derivative works that
+   include these components must also be distributed under GPL 3.0.
+
+Why dual license?
+- Apache 2.0 for the library maximizes re-use and embedding (patent grant
+  included — important for downstream consumers).
+- GPL 3.0 for the application aligns with the IBus ecosystem and ensures
+  that the full SmartKey input method remains open source.
+
+Copyright 2026 Rosen Manov

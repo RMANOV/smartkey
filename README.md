@@ -304,4 +304,9 @@ SmartKey builds on algorithms proven in production across other projects:
 
 ## License
 
-MIT
+Dual-licensed:
+
+- **`smartkey-core`** (Rust library) — [Apache 2.0](LICENSE-APACHE). Embed it in your own keyboard, IDE plugin, or WASM app.
+- **Everything else** (IBus engine, corpus tools, PyO3 bridge) — [GPL 3.0](LICENSE-GPL). Derivative works must stay open.
+
+See [LICENSE](LICENSE) for details.

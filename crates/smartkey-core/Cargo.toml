@@ -2,6 +2,11 @@
 name = "smartkey-core"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "Rust prediction engine: n-gram trie, Markov chain, CVM streaming counter, ensemble scorer"
+repository = "https://github.com/RMANOV/smartkey"
+keywords = ["predictive-text", "keyboard", "nlp", "markov", "ibus"]
+categories = ["text-processing", "algorithms"]
 
 [dependencies]
 aho-corasick = { workspace = true }
