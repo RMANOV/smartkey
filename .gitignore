@@ -1,0 +1,8 @@
+/target
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+.env
+*.db
+data/
