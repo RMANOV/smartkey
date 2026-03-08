@@ -6,8 +6,11 @@
 // and execute the returned `Action` list.
 
 use std::collections::VecDeque;
+use std::path::Path;
 
+use crate::cvm::CvmSnapshot;
 use crate::ensemble::{Prediction, SmartKeyEngine};
+use crate::paths;
 
 // ======================================================================
 // Key abstraction
@@ -80,6 +83,12 @@ pub struct InputConfig {
     pub max_candidates: usize,
     pub min_prefix_length: usize,
     pub weights: (f64, f64, f64),
+    pub cvm_initial_size: usize,
+    pub cvm_max_size: usize,
+    pub cvm_decay_lambda: f64,
+    pub fuzzy_max_edits: u8,
+    pub fuzzy_discounts: [f64; 3],
+    pub markov_lambdas: [f64; 3],
 }
 
 impl Default for InputConfig {
@@ -90,6 +99,12 @@ impl Default for InputConfig {
             max_candidates: 5,
             min_prefix_length: 2,
             weights: (0.4, 0.4, 0.2),
+            cvm_initial_size: 500,
+            cvm_max_size: 5000,
+            cvm_decay_lambda: 0.001,
+            fuzzy_max_edits: 2,
+            fuzzy_discounts: [1.0, 0.7, 0.4],
+            markov_lambdas: [0.6, 0.3, 0.1],
         }
     }
 }
@@ -128,6 +143,38 @@ impl InputConfig {
                     .unwrap_or(config.weights.2);
                 config.weights = (a, b, c);
             }
+            if let Some(t) = v.get("tuning").and_then(|v| v.as_object()) {
+                if let Some(n) = t.get("cvm_initial_size").and_then(|v| v.as_u64()) {
+                    config.cvm_initial_size = n as usize;
+                }
+                if let Some(n) = t.get("cvm_max_size").and_then(|v| v.as_u64()) {
+                    config.cvm_max_size = n as usize;
+                }
+                if let Some(f) = t.get("cvm_decay_lambda").and_then(|v| v.as_f64()) {
+                    config.cvm_decay_lambda = f;
+                }
+                if let Some(n) = t.get("fuzzy_max_edits").and_then(|v| v.as_u64()) {
+                    config.fuzzy_max_edits = n as u8;
+                }
+                if let Some(arr) = t.get("fuzzy_discounts").and_then(|v| v.as_array()) {
+                    if arr.len() == 3 {
+                        if let (Some(a), Some(b), Some(c)) =
+                            (arr[0].as_f64(), arr[1].as_f64(), arr[2].as_f64())
+                        {
+                            config.fuzzy_discounts = [a, b, c];
+                        }
+                    }
+                }
+                if let Some(arr) = t.get("markov_lambdas").and_then(|v| v.as_array()) {
+                    if arr.len() == 3 {
+                        if let (Some(a), Some(b), Some(c)) =
+                            (arr[0].as_f64(), arr[1].as_f64(), arr[2].as_f64())
+                        {
+                            config.markov_lambdas = [a, b, c];
+                        }
+                    }
+                }
+            }
         }
         config
     }
@@ -155,7 +202,7 @@ impl InputMethodCore {
     pub fn new(config: InputConfig) -> Self {
         let enabled = config.enabled;
         Self {
-            engine: SmartKeyEngine::new(),
+            engine: SmartKeyEngine::from_config(&config),
             config,
             current_word: String::new(),
             ghost: String::new(),
@@ -177,6 +224,34 @@ impl InputMethodCore {
 
     pub fn load_trigram(&mut self, w1: &str, w2: &str, word: &str, count: u32) {
         self.engine.load_trigram(w1, w2, word, count);
+    }
+
+    // -- corpus file loading ---------------------------------------------
+
+    /// Load a corpus file (JSON or bincode) and feed it into the engine.
+    ///
+    /// Auto-detects format by extension (`.bin` = bincode, anything else = JSON).
+    /// On JSON load, writes a `.bin` cache alongside (best-effort, ignores write errors).
+    pub fn load_corpus_file(&mut self, path: &Path) -> Result<(), String> {
+        use crate::corpus::Corpus;
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let corpus = match ext {
+            "bin" => {
+                let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+                Corpus::from_bincode(&bytes)?
+            }
+            _ => {
+                let json_str = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+                let corpus = Corpus::from_json(&json_str)?;
+                // Best-effort: write .bin cache alongside.
+                let bin_path = path.with_extension("bin");
+                let _ = std::fs::write(&bin_path, corpus.to_bincode());
+                corpus
+            }
+        };
+        corpus.load_into_engine(&mut self.engine);
+        Ok(())
     }
 
     // -- key event handling ---------------------------------------------
@@ -321,6 +396,41 @@ impl InputMethodCore {
         &self.current_word
     }
 
+    // -- personal profile persistence -----------------------------------
+
+    /// Save the personal CVM profile to the given path.
+    pub fn save_personal(&self, path: &Path) -> Result<(), String> {
+        let snap = self.engine.export_personal();
+        let json = serde_json::to_string_pretty(&snap).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, json).map_err(|e| e.to_string())
+    }
+
+    /// Load the personal CVM profile from the given path.
+    ///
+    /// Silent no-op if the file does not exist.
+    pub fn load_personal(&mut self, path: &Path) -> Result<(), String> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let snap: CvmSnapshot = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        self.engine.import_personal(&snap);
+        Ok(())
+    }
+
+    /// Save personal profile to the default path (`~/.config/smartkey/personal.json`).
+    pub fn save_personal_default(&self) -> Result<(), String> {
+        self.save_personal(&paths::personal_profile_path())
+    }
+
+    /// Load personal profile from the default path (no-op if missing).
+    pub fn load_personal_default(&mut self) -> Result<(), String> {
+        self.load_personal(&paths::personal_profile_path())
+    }
+
     // -- internal helpers -----------------------------------------------
 
     fn commit_word(&mut self, word: &str) {
@@ -340,7 +450,7 @@ impl InputMethodCore {
     }
 
     fn update_predictions(&mut self) -> Action {
-        if self.current_word.len() < self.config.min_prefix_length {
+        if self.current_word.chars().count() < self.config.min_prefix_length {
             self.ghost.clear();
             self.last_predictions.clear();
             return Action::HideGhost;
@@ -352,7 +462,7 @@ impl InputMethodCore {
                 .predict(&self.current_word, &ctx_refs, self.config.max_candidates);
 
         if let Some(top) = self.last_predictions.first() {
-            let suffix = &top.word[self.current_word.len()..];
+            let suffix = top.word.get(self.current_word.len()..).unwrap_or("");
             if !suffix.is_empty() && self.config.ghost_text {
                 self.ghost = suffix.to_string();
                 return Action::ShowGhost(self.ghost.clone());
@@ -615,5 +725,58 @@ mod tests {
         let config = InputConfig::from_json("not json at all");
         let default = InputConfig::default();
         assert_eq!(config.enabled, default.enabled);
+    }
+
+    #[test]
+    fn test_config_from_json_tuning_overrides() {
+        let json = r#"{
+            "tuning": {
+                "cvm_initial_size": 1000,
+                "cvm_max_size": 10000,
+                "cvm_decay_lambda": 0.05,
+                "fuzzy_max_edits": 1,
+                "fuzzy_discounts": [1.0, 0.5, 0.2],
+                "markov_lambdas": [0.5, 0.3, 0.2]
+            }
+        }"#;
+        let config = InputConfig::from_json(json);
+        assert_eq!(config.cvm_initial_size, 1000);
+        assert_eq!(config.cvm_max_size, 10000);
+        assert!((config.cvm_decay_lambda - 0.05).abs() < 1e-9);
+        assert_eq!(config.fuzzy_max_edits, 1);
+        assert_eq!(config.fuzzy_discounts, [1.0, 0.5, 0.2]);
+        assert_eq!(config.markov_lambdas, [0.5, 0.3, 0.2]);
+    }
+
+    // ── Personal profile persistence tests ─────────────────────────────
+
+    #[test]
+    fn test_personal_save_load_round_trip() {
+        let dir = std::env::temp_dir().join("smartkey_test_profile");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("personal_test.json");
+
+        let mut core = test_core();
+        // Learn some words so CVM has state.
+        for _ in 0..50 {
+            core.engine.learn("persisted");
+        }
+        core.save_personal(&path).expect("save should succeed");
+        assert!(path.is_file(), "profile file should exist");
+
+        let mut core2 = InputMethodCore::new(InputConfig::default());
+        core2.load_personal(&path).expect("load should succeed");
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_personal_load_missing_file_is_noop() {
+        let path = std::path::PathBuf::from("/tmp/smartkey_nonexistent_profile.json");
+        let mut core = test_core();
+        let result = core.load_personal(&path);
+        assert!(result.is_ok(), "loading missing file should be a no-op");
     }
 }

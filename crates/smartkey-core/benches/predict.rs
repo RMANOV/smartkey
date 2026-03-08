@@ -4,7 +4,7 @@
 //! for each scoring component (trie, Markov, CVM).
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use smartkey_core::cvm::CvmCounter;
+use smartkey_core::cvm::{CvmCounter, CvmSnapshot};
 use smartkey_core::markov::MarkovChain;
 use smartkey_core::ngram::NgramTrie;
 use smartkey_core::SmartKeyEngine;
@@ -247,6 +247,57 @@ fn bench_cvm_process_and_score(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark: fuzzy search by corpus size × edit distance × prefix length
+// ---------------------------------------------------------------------------
+
+fn bench_fuzzy_search(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fuzzy_search");
+    for &corpus_size in &[1_000, 10_000] {
+        let trie = build_trie(corpus_size);
+        for &max_edits in &[1u8, 2] {
+            for &prefix_len in &[3usize, 5] {
+                let prefix: String = "word_0005".chars().take(prefix_len).collect();
+                let id = format!("corpus_{corpus_size}/edits_{max_edits}/prefix_{prefix_len}");
+                group.bench_function(&id, |b| {
+                    b.iter(|| {
+                        black_box(trie.fuzzy_search(black_box(&prefix), max_edits, 10));
+                    });
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: CvmSnapshot serialization round-trip
+// ---------------------------------------------------------------------------
+
+fn bench_personal_serialization(c: &mut Criterion) {
+    let mut group = c.benchmark_group("personal_serialization");
+
+    group.bench_function("cvm_snapshot_json_round_trip", |b| {
+        b.iter_batched(
+            || {
+                let mut cvm = CvmCounter::new(256, 1024);
+                for i in 0..200 {
+                    cvm.process(&format!("word_{i:04}"));
+                }
+                cvm.to_snapshot()
+            },
+            |snap| {
+                let json = serde_json::to_string(black_box(&snap)).unwrap();
+                let restored: CvmSnapshot = serde_json::from_str(black_box(&json)).unwrap();
+                black_box(restored);
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
 
@@ -258,5 +309,7 @@ criterion_group!(
     bench_trie_prefix_search,
     bench_markov_score,
     bench_cvm_process_and_score,
+    bench_fuzzy_search,
+    bench_personal_serialization,
 );
 criterion_main!(benches);

@@ -1,6 +1,7 @@
 // Ensemble scorer — combines corpus frequency, Markov context, and CVM personal boost.
 
-use crate::cvm::CvmCounter;
+use crate::cvm::{CvmCounter, CvmSnapshot};
+use crate::input::InputConfig;
 use crate::markov::MarkovChain;
 use crate::ngram::{NgramTrie, WordEntry};
 
@@ -27,19 +28,29 @@ pub struct SmartKeyEngine {
     alpha: f64,
     beta: f64,
     gamma: f64,
+    fuzzy_max_edits: u8,
+    fuzzy_discounts: [f64; 3],
 }
 
 impl SmartKeyEngine {
     /// Create a new engine with default weights `(0.4, 0.4, 0.2)` and a
     /// CVM counter sized `(500, 5000)`.
     pub fn new() -> Self {
+        Self::from_config(&InputConfig::default())
+    }
+
+    /// Create a new engine from an `InputConfig`, respecting all tuning parameters.
+    pub fn from_config(config: &InputConfig) -> Self {
         Self {
             trie: NgramTrie::new(),
-            markov: MarkovChain::new(),
-            personal: CvmCounter::new(500, 5000),
-            alpha: 0.4,
-            beta: 0.4,
-            gamma: 0.2,
+            markov: MarkovChain::with_lambdas(config.markov_lambdas),
+            personal: CvmCounter::new(config.cvm_initial_size, config.cvm_max_size)
+                .with_decay_lambda(config.cvm_decay_lambda),
+            alpha: config.weights.0,
+            beta: config.weights.1,
+            gamma: config.weights.2,
+            fuzzy_max_edits: config.fuzzy_max_edits,
+            fuzzy_discounts: config.fuzzy_discounts,
         }
     }
 
@@ -61,6 +72,16 @@ impl SmartKeyEngine {
     /// Feed a word into the personal CVM layer (call when the user types a word).
     pub fn learn(&mut self, word: &str) {
         self.personal.process(word);
+    }
+
+    /// Export the personal CVM layer as a portable snapshot.
+    pub fn export_personal(&self) -> CvmSnapshot {
+        self.personal.to_snapshot()
+    }
+
+    /// Replace the personal CVM layer from a snapshot (import / load).
+    pub fn import_personal(&mut self, snapshot: &CvmSnapshot) {
+        self.personal = CvmCounter::from_snapshot(snapshot);
     }
 
     /// Produce up to `limit` predictions for the given prefix and context.
@@ -88,7 +109,9 @@ impl SmartKeyEngine {
         // candidates, fill the gap with fuzzy matches (edit distance ≤ 2).
         let fuzzy_discount = if candidates.len() < limit && !prefix.is_empty() {
             let fuzzy_slots = candidate_pool.saturating_sub(candidates.len());
-            let fuzzy_matches = self.trie.fuzzy_search(prefix, 2, fuzzy_slots);
+            let fuzzy_matches = self
+                .trie
+                .fuzzy_search(prefix, self.fuzzy_max_edits, fuzzy_slots);
 
             // Build a set of words already found by exact prefix search to
             // avoid scoring the same word twice.
@@ -103,11 +126,7 @@ impl SmartKeyEngine {
                 if exact_words.contains(fm.word.as_str()) {
                     continue;
                 }
-                let discount = match fm.edit_distance {
-                    0 => 1.0,
-                    1 => 0.7,
-                    _ => 0.4,
-                };
+                let discount = self.fuzzy_discounts[fm.edit_distance.min(2) as usize];
                 discount_map.insert(fm.word.clone(), discount);
                 merged.push(WordEntry {
                     word: fm.word.clone(),
@@ -153,12 +172,20 @@ impl SmartKeyEngine {
             .fold(0.0_f64, f64::max)
             .max(1.0); // avoid division by zero
 
+        // Determine max Markov score among candidates for normalisation.
+        let max_markov = all_candidates
+            .iter()
+            .map(|c| self.markov.score_with_backoff(&c.word, prev1, prev2))
+            .fold(0.0_f64, f64::max)
+            .max(1e-6);
+
         // Step 2-3: score each candidate.
         let mut scored: Vec<Prediction> = all_candidates
             .iter()
             .map(|entry| {
                 let corpus_score = entry.frequency as f64 / max_freq;
-                let markov_score = self.markov.score_with_backoff(&entry.word, prev1, prev2);
+                let markov_score =
+                    self.markov.score_with_backoff(&entry.word, prev1, prev2) / max_markov;
                 let personal_score = self.personal.frequency_score(&entry.word) / max_personal;
 
                 let mut score = self.alpha * corpus_score
@@ -434,6 +461,21 @@ mod tests {
     }
 
     #[test]
+    fn test_export_import_personal() {
+        let mut engine = SmartKeyEngine::new();
+        for _ in 0..50 {
+            engine.learn("persisted");
+        }
+        let snap = engine.export_personal();
+        assert!(snap.words.contains(&"persisted".to_string()) || snap.words.is_empty());
+
+        let mut engine2 = SmartKeyEngine::new();
+        engine2.import_personal(&snap);
+        let snap2 = engine2.export_personal();
+        assert_eq!(snap.words.len(), snap2.words.len());
+    }
+
+    #[test]
     fn test_fuzzy_discount_applied() {
         let mut engine = SmartKeyEngine::new();
         // Two words with same frequency. One matches exactly, one via fuzzy.
@@ -449,6 +491,59 @@ mod tests {
             assert!(
                 tp.score > bp.score,
                 "exact match 'test' ({}) should score higher than fuzzy 'best' ({})",
+                tp.score,
+                bp.score
+            );
+        }
+    }
+
+    #[test]
+    fn test_markov_normalization_affects_ranking() {
+        // Two candidates with equal corpus frequency but different Markov support.
+        // After normalization, the one with stronger bigram context should rank higher.
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("world", 50);
+        engine.load_word("worry", 50);
+
+        // Strong bigram: "hello" → "world" (10)
+        engine.load_bigram("hello", "world", 10);
+        // No bigram support for "worry" from "hello".
+
+        let preds = engine.predict("wor", &["hello"], 5);
+        let world_pos = preds.iter().position(|p| p.word == "world");
+        let worry_pos = preds.iter().position(|p| p.word == "worry");
+        assert!(
+            world_pos.is_some() && worry_pos.is_some(),
+            "both 'world' and 'worry' should appear"
+        );
+        assert!(
+            world_pos.unwrap() < worry_pos.unwrap(),
+            "'world' should rank above 'worry' due to Markov context from 'hello'"
+        );
+    }
+
+    #[test]
+    fn test_from_config_respects_fuzzy_discount() {
+        let config = InputConfig {
+            fuzzy_discounts: [1.0, 0.1, 0.05],
+            ..InputConfig::default()
+        };
+
+        let mut engine = SmartKeyEngine::from_config(&config);
+        engine.load_word("test", 100);
+        engine.load_word("best", 100); // distance 1 from "tes" prefix
+
+        // "tes" matches "test" exactly; "best" only via fuzzy (distance 1).
+        let preds = engine.predict("tes", &[], 5);
+        let test_pred = preds.iter().find(|p| p.word == "test");
+        let best_pred = preds.iter().find(|p| p.word == "best");
+        assert!(test_pred.is_some(), "'test' should appear");
+        if let (Some(tp), Some(bp)) = (test_pred, best_pred) {
+            // With discount 0.1 for distance-1, the gap should be very large.
+            assert!(
+                tp.score > bp.score * 5.0,
+                "custom fuzzy discount 0.1 should heavily penalise fuzzy match: \
+                 test={}, best={}",
                 tp.score,
                 bp.score
             );

@@ -14,11 +14,13 @@ bitflags = { workspace = true }
 memmap2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+bincode = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [[bench]]
 name = "predict"

@@ -3,7 +3,7 @@
 // Provides bigram and trigram language-model probabilities with interpolated
 // backoff: score = λ₁·P₃(trigram) + λ₂·P₂(bigram) + λ₃·P₁(unigram).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Minimum score returned for completely unseen words so that no candidate
 /// is ever assigned a probability of exactly zero.
@@ -17,8 +17,8 @@ pub struct MarkovChain {
     trigrams: HashMap<(String, String), HashMap<String, u32>>,
     /// Total unigram mass (sum of all bigram counts, used for uniform fallback).
     unigram_total: u32,
-    /// Number of distinct words observed.
-    vocab_size: u32,
+    /// Distinct words observed (tracked incrementally).
+    vocab: HashSet<String>,
     /// Interpolation weights: [trigram, bigram, unigram].
     lambda: [f64; 3],
 }
@@ -30,8 +30,19 @@ impl MarkovChain {
             bigrams: HashMap::new(),
             trigrams: HashMap::new(),
             unigram_total: 0,
-            vocab_size: 0,
+            vocab: HashSet::new(),
             lambda: [0.6, 0.3, 0.1],
+        }
+    }
+
+    /// Create a new, empty model with custom interpolation weights.
+    pub fn with_lambdas(lambda: [f64; 3]) -> Self {
+        Self {
+            bigrams: HashMap::new(),
+            trigrams: HashMap::new(),
+            unigram_total: 0,
+            vocab: HashSet::new(),
+            lambda,
         }
     }
 
@@ -49,10 +60,7 @@ impl MarkovChain {
             .or_insert(0);
         *entry += count;
         self.unigram_total += count;
-
-        // Recompute vocab_size as the number of distinct next-words across
-        // all contexts. This is a simple O(n) sweep; fine for training.
-        self.recompute_vocab();
+        self.vocab.insert(word.to_owned());
     }
 
     /// Record `count` observations of the trigram `(w1, w2) → word`.
@@ -112,10 +120,10 @@ impl MarkovChain {
     ///
     /// Falls back to `UNSEEN_FLOOR` when the vocabulary is empty.
     fn unigram_prob(&self) -> f64 {
-        if self.vocab_size == 0 {
+        if self.vocab.is_empty() {
             return UNSEEN_FLOOR;
         }
-        1.0 / self.vocab_size as f64
+        1.0 / self.vocab.len() as f64
     }
 
     // ------------------------------------------------------------------
@@ -171,19 +179,9 @@ impl MarkovChain {
         scored
     }
 
-    // ------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------
-
-    /// Recompute `vocab_size` from the union of all next-words in bigram map.
-    fn recompute_vocab(&mut self) {
-        let mut words: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for followers in self.bigrams.values() {
-            for w in followers.keys() {
-                words.insert(w.as_str());
-            }
-        }
-        self.vocab_size = words.len() as u32;
+    /// Number of distinct words in the vocabulary.
+    pub fn vocab_size(&self) -> usize {
+        self.vocab.len()
     }
 }
 
@@ -261,7 +259,7 @@ mod tests {
         //   P₁ = 1/vocab_size
         let p3 = 0.75;
         let p2 = 4.0 / 5.0;
-        let p1 = 1.0 / m.vocab_size as f64;
+        let p1 = 1.0 / m.vocab_size() as f64;
         let expected = 0.6 * p3 + 0.3 * p2 + 0.1 * p1;
         let score = m.score_with_backoff("rust", Some("love"), Some("i"));
         assert!(
@@ -276,7 +274,7 @@ mod tests {
         // Only bigram context (prev2 = None).
         // Weights are redistributed: w_bi and w_uni absorb λ₁.
         let p_bi = m.bigram_prob("love", "i"); // 0.6
-        let p_uni = 1.0 / m.vocab_size as f64;
+        let p_uni = 1.0 / m.vocab_size() as f64;
         let w_bi = 0.3 + 0.6 * (0.3 / 0.4);
         let w_uni = 0.1 + 0.6 * (0.1 / 0.4);
         let expected = w_bi * p_bi + w_uni * p_uni;
@@ -312,5 +310,28 @@ mod tests {
         assert_eq!(s, UNSEEN_FLOOR);
         let ranked = m.rank_candidates(&["a".into(), "b".into()], None, None);
         assert_eq!(ranked.len(), 2);
+    }
+
+    #[test]
+    fn with_lambdas_uses_custom_weights() {
+        let mut m = MarkovChain::with_lambdas([0.1, 0.2, 0.7]);
+        m.train_bigram("i", "love", 3);
+        m.train_bigram("i", "like", 2);
+        m.train_trigram("i", "love", "rust", 3);
+        m.train_trigram("i", "love", "python", 1);
+        m.train_bigram("love", "rust", 4);
+        m.train_bigram("love", "python", 1);
+
+        // With custom lambdas [0.1, 0.2, 0.7], unigram weight dominates.
+        // Full backoff: 0.1·P₃ + 0.2·P₂ + 0.7·P₁
+        let p3 = 3.0 / 4.0; // trigram P(rust | i, love)
+        let p2 = 4.0 / 5.0; // bigram P(rust | love)
+        let p1 = 1.0 / m.vocab_size() as f64;
+        let expected = 0.1 * p3 + 0.2 * p2 + 0.7 * p1;
+        let score = m.score_with_backoff("rust", Some("love"), Some("i"));
+        assert!(
+            (score - expected).abs() < 1e-9,
+            "expected {expected}, got {score}"
+        );
     }
 }

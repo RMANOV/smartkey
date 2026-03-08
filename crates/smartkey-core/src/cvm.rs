@@ -7,8 +7,9 @@
 //! the user types frequently so the prediction engine can boost them.
 
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default exponential decay rate.
 ///
@@ -184,6 +185,75 @@ impl CvmCounter {
 
     // ── internal ────────────────────────────────────────────────────────
 
+    /// Snapshot the counter state for persistence / export.
+    ///
+    /// Converts `Instant`-based `last_seen` timestamps into portable `age_secs`
+    /// (seconds since each word was last seen at save time).
+    pub fn to_snapshot(&self) -> CvmSnapshot {
+        let now = Instant::now();
+        let saved_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        let words: Vec<String> = self.buffer.iter().cloned().collect();
+        let age_secs: HashMap<String, f64> = self
+            .last_seen
+            .iter()
+            .map(|(word, &ts)| (word.clone(), (now - ts).as_secs_f64()))
+            .collect();
+
+        CvmSnapshot {
+            version: 1,
+            saved_at_unix,
+            capacity: self.capacity,
+            max_capacity: self.max_capacity,
+            round: self.round,
+            decay_lambda: self.decay_lambda,
+            words,
+            age_secs,
+        }
+    }
+
+    /// Reconstruct a counter from a saved snapshot.
+    ///
+    /// Offline time (`now_unix − saved_at_unix`) is added to each word's age
+    /// so that decay resumes correctly.
+    pub fn from_snapshot(snap: &CvmSnapshot) -> Self {
+        let now = Instant::now();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let offline_secs = (now_unix - snap.saved_at_unix).max(0.0);
+
+        let buffer: HashSet<String> = snap.words.iter().cloned().collect();
+        let last_seen: HashMap<String, Instant> = snap
+            .words
+            .iter()
+            .filter_map(|word| {
+                let age_at_save = snap.age_secs.get(word).copied().unwrap_or(0.0);
+                let total_age = (age_at_save + offline_secs).max(0.0);
+                if !total_age.is_finite() {
+                    return None;
+                }
+                now.checked_sub(Duration::from_secs_f64(total_age))
+                    .map(|ts| (word.clone(), ts))
+            })
+            .collect();
+
+        Self {
+            capacity: snap.capacity,
+            max_capacity: snap.max_capacity,
+            buffer,
+            round: snap.round,
+            last_seen,
+            decay_lambda: snap.decay_lambda,
+        }
+    }
+
+    // ── internal ────────────────────────────────────────────────────────
+
     /// Begin a new round: randomly discard ~half the buffer, bump round counter.
     fn start_new_round(&mut self) {
         let mut rng = rand::thread_rng();
@@ -206,6 +276,23 @@ impl CvmCounter {
 
         self.round += 1;
     }
+}
+
+/// Serialisable snapshot of a [`CvmCounter`] for persistence and export.
+///
+/// `words` lists the elements currently in the sample buffer, and `age_secs`
+/// records how many seconds each word had been unseen at save time.  On load,
+/// offline time is added to each age so that decay resumes correctly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CvmSnapshot {
+    pub version: u32,
+    pub saved_at_unix: f64,
+    pub capacity: usize,
+    pub max_capacity: usize,
+    pub round: u32,
+    pub decay_lambda: f64,
+    pub words: Vec<String>,
+    pub age_secs: HashMap<String, f64>,
 }
 
 #[cfg(test)]
@@ -257,7 +344,7 @@ mod tests {
         // We just sanity-check it's in the right order of magnitude.
         let est = c.estimate();
         assert!(
-            est >= 100 && est <= 50_000,
+            (100..=50_000).contains(&est),
             "estimate {est} out of plausible range for 1000 unique elements"
         );
     }
@@ -476,5 +563,76 @@ mod tests {
             c.last_seen.len(),
             "last_seen should have exactly as many entries as the buffer"
         );
+    }
+
+    // ── Snapshot round-trip tests ──────────────────────────────────────
+
+    #[test]
+    fn snapshot_round_trip_preserves_state() {
+        let mut c = CvmCounter::new(64, 256).with_decay_lambda(0.005);
+        for word in &["hello", "world", "rust", "test"] {
+            c.process(word);
+        }
+        let snap = c.to_snapshot();
+        let restored = CvmCounter::from_snapshot(&snap);
+
+        assert_eq!(restored.capacity, c.capacity);
+        assert_eq!(restored.max_capacity, c.max_capacity);
+        assert_eq!(restored.round, c.round);
+        assert!((restored.decay_lambda - c.decay_lambda).abs() < f64::EPSILON);
+        assert_eq!(restored.buffer, c.buffer);
+        // Every surviving word should have a last_seen entry.
+        for word in restored.buffer.iter() {
+            assert!(
+                restored.last_seen.contains_key(word),
+                "restored counter missing last_seen for '{word}'"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_empty_counter() {
+        let c = CvmCounter::new(32, 128);
+        let snap = c.to_snapshot();
+        assert!(snap.words.is_empty());
+        assert!(snap.age_secs.is_empty());
+        assert_eq!(snap.version, 1);
+
+        let restored = CvmCounter::from_snapshot(&snap);
+        assert_eq!(restored.estimate(), 0);
+        assert!(restored.buffer.is_empty());
+    }
+
+    #[test]
+    fn snapshot_json_serialization() {
+        let mut c = CvmCounter::new(64, 256);
+        c.process("serialize_me");
+        let snap = c.to_snapshot();
+
+        let json = serde_json::to_string_pretty(&snap).expect("serialize");
+        let deser: CvmSnapshot = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deser.version, snap.version);
+        assert_eq!(deser.capacity, snap.capacity);
+        assert_eq!(deser.words, snap.words);
+    }
+
+    #[test]
+    fn snapshot_age_increases_after_delay() {
+        let mut c = CvmCounter::new(64, 256);
+        c.process("aging");
+
+        let snap1 = c.to_snapshot();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let snap2 = c.to_snapshot();
+
+        if let (Some(&age1), Some(&age2)) =
+            (snap1.age_secs.get("aging"), snap2.age_secs.get("aging"))
+        {
+            assert!(
+                age2 > age1,
+                "age should increase over time: {age1} → {age2}"
+            );
+        }
     }
 }

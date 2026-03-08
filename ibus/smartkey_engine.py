@@ -8,7 +8,9 @@ Rust ``InputMethodCore`` — this Python layer is a thin IBus adapter.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -82,6 +84,10 @@ except ImportError:
         def focus_gained(self) -> None: ...
         def reset(self) -> list[tuple[str, str]]:
             return []
+        def save_personal(self) -> None: ...
+        def load_personal(self) -> None: ...
+        def export_personal(self, path: str) -> None: ...
+        def import_personal(self, path: str) -> None: ...
         def predictions(self) -> list[tuple[str, float, float]]:
             return []
 
@@ -130,6 +136,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         # Create the Rust core with config.
         self._core = PyInputMethodCore(config_json)
+
+        # Load personal profile (learned words from previous sessions).
+        try:
+            self._core.load_personal()
+        except Exception:
+            logging.debug("smartkey: no personal profile loaded (first run?)")
+
+        # Debounce timer for auto-save on focus-out (60s cooldown).
+        self._last_save: float = 0.0
 
         # Load corpus.
         self._load_corpus()
@@ -224,6 +239,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_focus_out(self) -> None:
         actions = self._core.focus_lost()
         self._execute_actions(actions)
+        # Debounced auto-save: persist personal profile at most once per 60s.
+        now = time.monotonic()
+        if now - self._last_save >= 60.0:
+            try:
+                self._core.save_personal()
+                self._last_save = now
+            except Exception:
+                pass
 
     def do_reset(self) -> None:
         actions = self._core.reset()
@@ -235,3 +258,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_disable(self) -> None:
         actions = self._core.reset()
         self._execute_actions(actions)
+        # Save personal profile on engine disable (session end).
+        try:
+            self._core.save_personal()
+        except Exception:
+            pass

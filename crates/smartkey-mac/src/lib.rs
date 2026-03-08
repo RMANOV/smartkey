@@ -8,7 +8,8 @@
 // insertText, etc.).
 
 use smartkey_core::input::{Action, InputConfig, InputMethodCore, Key, KeyEvent, Modifiers};
-use std::ffi::{c_char, c_uint, CStr, CString};
+use smartkey_core::paths;
+use std::ffi::{c_char, c_int, c_uint, CStr, CString};
 use std::ptr;
 
 /// Opaque handle to an InputMethodCore instance.
@@ -184,6 +185,37 @@ pub unsafe extern "C" fn smartkey_load_bigram(
     let ctx_s = unsafe { CStr::from_ptr(ctx) }.to_str().unwrap_or("");
     let word_s = unsafe { CStr::from_ptr(word) }.to_str().unwrap_or("");
     core.load_bigram(ctx_s, word_s, count);
+}
+
+// ======================================================================
+// Personal profile persistence
+// ======================================================================
+
+/// Save personal profile to the default path. Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `handle` must be a valid pointer from `smartkey_new`.
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_save_personal(handle: SmartKeyHandle) -> c_int {
+    let core = unsafe { &*handle };
+    match core.save_personal(&paths::personal_profile_path()) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Load personal profile from the default path. Returns 0 on success, -1 on error.
+/// No-op (returns 0) if the file does not exist yet.
+///
+/// # Safety
+/// `handle` must be a valid pointer from `smartkey_new`.
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_load_personal(handle: SmartKeyHandle) -> c_int {
+    let core = unsafe { &mut *handle };
+    match core.load_personal(&paths::personal_profile_path()) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
 // ======================================================================

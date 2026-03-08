@@ -1,3 +1,4 @@
+pub mod corpus;
 pub mod cvm;
 pub mod ensemble;
 pub mod input;

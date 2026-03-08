@@ -128,6 +128,13 @@ impl PyInputMethodCore {
         self.inner.load_trigram(w1, w2, word, count);
     }
 
+    /// Load a corpus file (JSON or bincode). Auto-detects format by extension.
+    fn load_corpus_file(&mut self, path: &str) -> PyResult<()> {
+        self.inner
+            .load_corpus_file(std::path::Path::new(path))
+            .map_err(pyo3::exceptions::PyIOError::new_err)
+    }
+
     /// Process a key event. Returns list of `(action_type, payload)` tuples.
     ///
     /// `keyval`: IBus/X11 keysym (e.g. 0xFF09 for Tab).
@@ -161,6 +168,34 @@ impl PyInputMethodCore {
     /// Reset internal state.
     fn reset(&mut self) -> Vec<(String, String)> {
         self.inner.reset().iter().map(action_to_tuple).collect()
+    }
+
+    /// Save personal profile to the default path (~/.config/smartkey/personal.json).
+    fn save_personal(&self) -> PyResult<()> {
+        self.inner
+            .save_personal_default()
+            .map_err(pyo3::exceptions::PyIOError::new_err)
+    }
+
+    /// Load personal profile from the default path (no-op if missing).
+    fn load_personal(&mut self) -> PyResult<()> {
+        self.inner
+            .load_personal_default()
+            .map_err(pyo3::exceptions::PyIOError::new_err)
+    }
+
+    /// Export personal profile to a custom path.
+    fn export_personal(&self, path: &str) -> PyResult<()> {
+        self.inner
+            .save_personal(std::path::Path::new(path))
+            .map_err(pyo3::exceptions::PyIOError::new_err)
+    }
+
+    /// Import personal profile from a custom path.
+    fn import_personal(&mut self, path: &str) -> PyResult<()> {
+        self.inner
+            .load_personal(std::path::Path::new(path))
+            .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
     /// Current predictions as `(word, score, confidence)` tuples.
