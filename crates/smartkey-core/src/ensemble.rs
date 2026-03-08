@@ -2,7 +2,7 @@
 
 use crate::cvm::CvmCounter;
 use crate::markov::MarkovChain;
-use crate::ngram::NgramTrie;
+use crate::ngram::{NgramTrie, WordEntry};
 
 /// A single prediction with its ensemble score and UI confidence.
 #[derive(Debug, Clone)]
@@ -79,14 +79,59 @@ impl SmartKeyEngine {
             return Vec::new();
         }
 
+        let candidate_pool = limit * 3;
+
         // Step 1: candidate generation via trie prefix search.
-        let candidates = self.trie.prefix_search(prefix, limit * 3);
-        if candidates.is_empty() {
+        let candidates = self.trie.prefix_search(prefix, candidate_pool);
+
+        // Step 1b: fuzzy fallback — if exact prefix returned fewer than `limit`
+        // candidates, fill the gap with fuzzy matches (edit distance ≤ 2).
+        let fuzzy_discount = if candidates.len() < limit && !prefix.is_empty() {
+            let fuzzy_slots = candidate_pool.saturating_sub(candidates.len());
+            let fuzzy_matches = self.trie.fuzzy_search(prefix, 2, fuzzy_slots);
+
+            // Build a set of words already found by exact prefix search to
+            // avoid scoring the same word twice.
+            let exact_words: std::collections::HashSet<&str> =
+                candidates.iter().map(|c| c.word.as_str()).collect();
+
+            let mut discount_map: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+
+            let mut merged: Vec<WordEntry> = Vec::new();
+            for fm in &fuzzy_matches {
+                if exact_words.contains(fm.word.as_str()) {
+                    continue;
+                }
+                let discount = match fm.edit_distance {
+                    0 => 1.0,
+                    1 => 0.7,
+                    _ => 0.4,
+                };
+                discount_map.insert(fm.word.clone(), discount);
+                merged.push(WordEntry {
+                    word: fm.word.clone(),
+                    frequency: fm.frequency,
+                });
+            }
+            (merged, discount_map)
+        } else {
+            (Vec::new(), std::collections::HashMap::new())
+        };
+
+        let (fuzzy_candidates, discount_map) = fuzzy_discount;
+
+        // If both exact and fuzzy are empty, nothing to do.
+        if candidates.is_empty() && fuzzy_candidates.is_empty() {
             return Vec::new();
         }
 
-        // Determine the max corpus frequency among candidates for normalisation.
-        let max_freq = candidates
+        // Combine all candidates for scoring.
+        let all_candidates: Vec<&WordEntry> =
+            candidates.iter().chain(fuzzy_candidates.iter()).collect();
+
+        // Determine the max corpus frequency among all candidates for normalisation.
+        let max_freq = all_candidates
             .iter()
             .map(|c| c.frequency)
             .max()
@@ -102,23 +147,28 @@ impl SmartKeyEngine {
         };
 
         // Determine max personal score among candidates for normalisation.
-        let max_personal = candidates
+        let max_personal = all_candidates
             .iter()
             .map(|c| self.personal.frequency_score(&c.word))
             .fold(0.0_f64, f64::max)
             .max(1.0); // avoid division by zero
 
-        // Step 2–3: score each candidate.
-        let mut scored: Vec<Prediction> = candidates
+        // Step 2-3: score each candidate.
+        let mut scored: Vec<Prediction> = all_candidates
             .iter()
             .map(|entry| {
                 let corpus_score = entry.frequency as f64 / max_freq;
                 let markov_score = self.markov.score_with_backoff(&entry.word, prev1, prev2);
                 let personal_score = self.personal.frequency_score(&entry.word) / max_personal;
 
-                let score = self.alpha * corpus_score
+                let mut score = self.alpha * corpus_score
                     + self.beta * markov_score
                     + self.gamma * personal_score;
+
+                // Apply fuzzy discount if this came from fuzzy matching.
+                if let Some(&discount) = discount_map.get(&entry.word) {
+                    score *= discount;
+                }
 
                 Prediction {
                     word: entry.word.clone(),
@@ -301,6 +351,7 @@ mod tests {
     #[test]
     fn test_unknown_prefix_returns_empty() {
         let engine = test_engine();
+        // "zzz" is too far from any word — even fuzzy can't help.
         let preds = engine.predict("zzz", &[], 5);
         assert!(preds.is_empty());
     }
@@ -310,5 +361,97 @@ mod tests {
         let engine = test_engine();
         let preds = engine.predict("hel", &[], 0);
         assert!(preds.is_empty());
+    }
+
+    // ==================================================================
+    // Fuzzy fallback integration tests
+    // ==================================================================
+
+    #[test]
+    fn test_fuzzy_fallback_misspelled_prefix() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("function", 100);
+        engine.load_word("functional", 60);
+        engine.load_word("funnel", 30);
+
+        // "fucn" — transposition of n and c — exact prefix search finds nothing.
+        // Fuzzy fallback should kick in and return "function" / "functional".
+        let preds = engine.predict("fucn", &[], 5);
+        assert!(
+            !preds.is_empty(),
+            "misspelled prefix should produce predictions via fuzzy fallback"
+        );
+        assert!(
+            preds.iter().any(|p| p.word == "function"),
+            "'function' should appear for misspelled prefix 'fucn': got {:?}",
+            preds.iter().map(|p| &p.word).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_fallback_substitution() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("hello", 100);
+        engine.load_word("help", 80);
+
+        // "hallo" — substitution of 'e' → 'a'. Exact prefix "hallo" finds nothing.
+        let preds = engine.predict("hallo", &[], 5);
+        assert!(
+            preds.iter().any(|p| p.word == "hello"),
+            "'hello' should appear for 'hallo': got {:?}",
+            preds.iter().map(|p| &p.word).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_exact_matches_rank_above_fuzzy() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("help", 80);
+        engine.load_word("hello", 100);
+        engine.load_word("held", 40);
+        // "helm" — only "hel" words match exact prefix. But "help" is also
+        // fuzzy-matchable from "helm" (distance 1: m→p substitution).
+        // Let's use a different setup: words starting with "hel" (exact match)
+        // plus words reachable only by fuzzy.
+        engine.load_word("hero", 90);
+
+        // "hel" matches hello, help, held exactly. "hero" is not a prefix match.
+        let preds = engine.predict("hel", &[], 5);
+        // All three exact matches should appear.
+        assert!(preds.iter().any(|p| p.word == "hello"));
+        assert!(preds.iter().any(|p| p.word == "help"));
+        assert!(preds.iter().any(|p| p.word == "held"));
+        // "hero" could appear via fuzzy (distance 1: l→o), but since we already
+        // have 3 exact matches and limit=5, fuzzy also kicks in.
+        // The exact matches should rank higher than fuzzy.
+        let hello_pos = preds.iter().position(|p| p.word == "hello").unwrap();
+        if let Some(hero_pos) = preds.iter().position(|p| p.word == "hero") {
+            assert!(
+                hello_pos < hero_pos,
+                "exact match 'hello' should rank above fuzzy 'hero'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fuzzy_discount_applied() {
+        let mut engine = SmartKeyEngine::new();
+        // Two words with same frequency. One matches exactly, one via fuzzy.
+        engine.load_word("test", 100);
+        engine.load_word("best", 100);
+
+        // "tes" — exact prefix matches "test" only. "best" is distance 1.
+        let preds = engine.predict("tes", &[], 5);
+        let test_pred = preds.iter().find(|p| p.word == "test");
+        let best_pred = preds.iter().find(|p| p.word == "best");
+        assert!(test_pred.is_some(), "'test' should appear");
+        if let (Some(tp), Some(bp)) = (test_pred, best_pred) {
+            assert!(
+                tp.score > bp.score,
+                "exact match 'test' ({}) should score higher than fuzzy 'best' ({})",
+                tp.score,
+                bp.score
+            );
+        }
     }
 }
