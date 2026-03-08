@@ -1,15 +1,14 @@
 """SmartKey IBus engine -- ghost text predictions powered by Rust via PyO3.
 
 This module implements the IBus.Engine subclass that drives SmartKey.
-It handles keystroke events, manages ghost (auxiliary) text, and delegates
-all prediction work to the native ``smartkey_py.PySmartKeyEngine``.
+All key event logic, ghost text lifecycle, and prediction state live in the
+Rust ``InputMethodCore`` — this Python layer is a thin IBus adapter.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from collections import deque
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -45,7 +44,6 @@ except (ValueError, ImportError):
             def new(*_a: object) -> "_FakeIBus.Attribute":
                 return _FakeIBus.Attribute()
 
-        # Key symbol constants used in the engine.
         KEY_Tab = 0xFF09
         KEY_Escape = 0xFF1B
         KEY_Right = 0xFF53
@@ -62,51 +60,45 @@ except (ValueError, ImportError):
 # Rust prediction engine via PyO3.
 # ---------------------------------------------------------------------------
 try:
-    from smartkey_py import PySmartKeyEngine  # type: ignore[import-untyped]
+    from smartkey_py import PyInputMethodCore  # type: ignore[import-untyped]
 
-    _HAS_ENGINE = True
+    _HAS_CORE = True
 except ImportError:
-    _HAS_ENGINE = False
+    _HAS_CORE = False
 
-    class PySmartKeyEngine:  # type: ignore[no-redef]
+    class PyInputMethodCore:  # type: ignore[no-redef]
         """Stub when the native extension is not available."""
 
-        def load_word(self, word: str, frequency: int) -> None: ...
-        def load_bigram(self, context: str, word: str, count: int) -> None: ...
+        def __init__(self, config_json: str | None = None) -> None: ...
+        def load_word(self, word: str, freq: int) -> None: ...
+        def load_bigram(self, ctx: str, word: str, count: int) -> None: ...
         def load_trigram(self, w1: str, w2: str, word: str, count: int) -> None: ...
-        def learn(self, word: str) -> None: ...
-        def predict(
-            self, prefix: str, context: list[str], limit: int
-        ) -> list[tuple[str, float, float]]:
+        def handle_key(
+            self, keyval: int, modifiers: int
+        ) -> list[tuple[str, str]]:
+            return [("forward", "")]
+        def focus_lost(self) -> list[tuple[str, str]]:
+            return []
+        def focus_gained(self) -> None: ...
+        def reset(self) -> list[tuple[str, str]]:
+            return []
+        def predictions(self) -> list[tuple[str, float, float]]:
             return []
 
 
 # ---------------------------------------------------------------------------
 # Paths & defaults.
 # ---------------------------------------------------------------------------
-_CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "smartkey"
+_CONFIG_DIR = (
+    Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "smartkey"
+)
 _CONFIG_FILE = _CONFIG_DIR / "smartkey.json"
 _CORPUS_FILE = _CONFIG_DIR / "corpus.json"
 
-_DEFAULT_CONFIG: dict = {
-    "enabled": True,
-    "ghost_text": True,
-    "popup_on_alt": True,
-    "max_candidates": 5,
-    "min_prefix_length": 2,
-    "kill_switch": "Super+Escape",
-    "weights": {"corpus": 0.4, "markov": 0.4, "personal": 0.2},
-    "languages": ["en", "bg"],
-    "personal_db": "~/.config/smartkey/personal.db",
-}
 
-_CONTEXT_SIZE = 5  # number of preceding words kept for Markov context
-
-
-# ---------------------------------------------------------------------------
-# Helper: load JSON with fallback.
-# ---------------------------------------------------------------------------
-def _load_json(path: Path, default: dict | list | None = None) -> dict | list | None:
+def _load_json(
+    path: Path, default: dict | list | None = None
+) -> dict | list | None:
     """Return parsed JSON from *path*, or *default* on any error."""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -118,7 +110,11 @@ def _load_json(path: Path, default: dict | list | None = None) -> dict | list | 
 # SmartKeyEngine -- the IBus.Engine subclass.
 # ===========================================================================
 class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
-    """IBus engine that displays ghost-text predictions from SmartKey."""
+    """IBus engine that displays ghost-text predictions from SmartKey.
+
+    All key event logic lives in the Rust ``InputMethodCore``. This class
+    only translates ``Action`` tuples returned from Rust into IBus API calls.
+    """
 
     __gtype_name__ = "SmartKeyEngine"
 
@@ -128,40 +124,34 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def __init__(self) -> None:
         super().__init__()
 
-        # Prediction backend.
-        self._engine = PySmartKeyEngine()
-
-        # Configuration.
-        self._config: dict = dict(_DEFAULT_CONFIG)
+        # Load user config.
+        config: dict = {
+            "enabled": True,
+            "ghost_text": True,
+            "max_candidates": 5,
+            "min_prefix_length": 2,
+            "weights": {"corpus": 0.4, "markov": 0.4, "personal": 0.2},
+        }
         user_cfg = _load_json(_CONFIG_FILE)
         if isinstance(user_cfg, dict):
-            self._config.update(user_cfg)
+            config.update(user_cfg)
 
-        # Internal state.
-        self._enabled: bool = self._config.get("enabled", True)
-        self._current_word: str = ""
-        self._ghost: str = ""  # current ghost (completion) text
-        self._context: deque[str] = deque(maxlen=_CONTEXT_SIZE)
+        # Create the Rust core with config.
+        self._core = PyInputMethodCore(json.dumps(config))
 
-        # Load corpus if available.
+        # Ghost text state (for IBus auxiliary text display).
+        self._ghost: str = ""
+
+        # Load corpus.
         self._load_corpus()
 
     # -----------------------------------------------------------------------
     # Corpus loading.
     # -----------------------------------------------------------------------
     def _load_corpus(self) -> None:
-        """Populate the engine with n-gram data from corpus files.
-
-        Scans ``~/.config/smartkey/`` for ``corpus_*.json`` (per-language)
-        and the legacy ``corpus.json``, loading all found corpora into the
-        same engine so predictions blend across languages.
-        """
+        """Populate the engine with n-gram data from corpus files."""
         corpus_files: list[Path] = []
-
-        # Per-language corpora (corpus_en.json, corpus_bg.json, ...).
         corpus_files.extend(sorted(_CONFIG_DIR.glob("corpus_*.json")))
-
-        # Legacy single corpus.
         if _CORPUS_FILE.is_file():
             corpus_files.append(_CORPUS_FILE)
 
@@ -174,21 +164,16 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if not isinstance(corpus, dict):
             return
 
-        # Unigrams: {"word": frequency, ...}
         for word, freq in corpus.get("unigrams", {}).items():
-            self._engine.load_word(word, int(freq))
+            self._core.load_word(word, int(freq))
 
-        # Bigrams: [{"ctx": ..., "word": ..., "count": ...}, ...]
         for entry in corpus.get("bigrams", []):
-            self._engine.load_bigram(
-                str(entry["ctx"]),
-                str(entry["word"]),
-                int(entry["count"]),
+            self._core.load_bigram(
+                str(entry["ctx"]), str(entry["word"]), int(entry["count"])
             )
 
-        # Trigrams: [{"w1": ..., "w2": ..., "word": ..., "count": ...}, ...]
         for entry in corpus.get("trigrams", []):
-            self._engine.load_trigram(
+            self._core.load_trigram(
                 str(entry["w1"]),
                 str(entry["w2"]),
                 str(entry["word"]),
@@ -196,17 +181,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             )
 
     # -----------------------------------------------------------------------
-    # Ghost text display.
+    # Ghost text display (IBus-specific).
     # -----------------------------------------------------------------------
     def _show_ghost(self, text: str) -> None:
         """Display *text* as greyed-out auxiliary (ghost) text."""
         self._ghost = text
-        if not text or not self._config.get("ghost_text", True):
-            self.hide_auxiliary_text()
-            return
-
         ibus_text = IBus.Text.new_from_string(text)
-        # Grey foreground (0xAAAAAA) over the full span.
         attrs = IBus.AttrList()
         attrs.append(
             IBus.Attribute.new(IBus.ATTR_TYPE_FOREGROUND, 0xAAAAAA, 0, len(text))
@@ -220,170 +200,51 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self.hide_auxiliary_text()
 
     # -----------------------------------------------------------------------
-    # Prediction request.
+    # Action dispatcher — translates Rust actions to IBus API calls.
     # -----------------------------------------------------------------------
-    def _update_predictions(self) -> None:
-        """Ask the engine for completions and display the top one as ghost text."""
-        min_prefix = self._config.get("min_prefix_length", 2)
-        if len(self._current_word) < min_prefix:
-            self._clear_ghost()
-            return
-
-        limit = self._config.get("max_candidates", 5)
-        context = list(self._context)
-        predictions = self._engine.predict(self._current_word, context, limit)
-
-        if predictions:
-            top_word, _score, _confidence = predictions[0]
-            # Ghost text shows only the *remaining* characters after the typed prefix.
-            suffix = top_word[len(self._current_word) :]
-            if suffix:
-                self._show_ghost(suffix)
-            else:
+    def _execute_actions(
+        self, actions: list[tuple[str, str]]
+    ) -> bool:
+        """Execute action tuples from Rust. Returns True if key was consumed."""
+        consumed = True
+        for action_type, payload in actions:
+            if action_type == "ghost":
+                self._show_ghost(payload)
+            elif action_type == "hide":
                 self._clear_ghost()
-        else:
-            self._clear_ghost()
-
-    # -----------------------------------------------------------------------
-    # Word commit helpers.
-    # -----------------------------------------------------------------------
-    def _commit_word(self, word: str) -> None:
-        """Commit *word* to the application and update context."""
-        if word:
-            self._engine.learn(word)
-            self._context.append(word)
-
-    def _reset_word(self) -> None:
-        """Clear the current in-progress word and ghost text."""
-        self._current_word = ""
-        self._clear_ghost()
+            elif action_type == "commit":
+                self.commit_text(IBus.Text.new_from_string(payload))
+            elif action_type == "forward":
+                consumed = False
+        return consumed
 
     # -----------------------------------------------------------------------
     # Key event handler.
     # -----------------------------------------------------------------------
-    def do_process_key_event(self, keyval: int, keycode: int, state: int) -> bool:  # noqa: C901
-        """Handle an IBus key event.
-
-        Returns ``True`` if the key was consumed, ``False`` to pass it through
-        to the application.
-        """
-        # If engine is disabled, pass everything through.
-        if not self._enabled:
-            # Re-enable with the kill-switch combo.
-            if self._is_kill_switch(keyval, state):
-                self._enabled = True
-                return True
-            return False
-
-        # --- Kill switch: Super+Escape toggles the engine off. ----
-        if self._is_kill_switch(keyval, state):
-            self._enabled = False
-            self._clear_ghost()
-            self._reset_word()
-            return True
-
-        # Only process key-press events (ignore releases).
-        is_release = bool(state & IBus.ModifierType.RELEASE_MASK) if _HAS_IBUS else False
-        if is_release:
-            return False
-
-        # Ignore events with Ctrl/Alt held (except for our combos above).
-        if _HAS_IBUS:
-            mods = state & (IBus.ModifierType.CONTROL_MASK | IBus.ModifierType.MOD1_MASK)
-            if mods:
-                return False
-
-        # --- Tab: accept entire ghost text. ---
-        if keyval == IBus.KEY_Tab:
-            if self._ghost:
-                full_word = self._current_word + self._ghost
-                self.commit_text(IBus.Text.new_from_string(full_word))
-                self._commit_word(full_word)
-                self._reset_word()
-                return True
-            return False
-
-        # --- Right arrow: accept one character of ghost text. ---
-        if keyval == IBus.KEY_Right:
-            if self._ghost:
-                self._current_word += self._ghost[0]
-                self._ghost = self._ghost[1:]
-                # Re-display the shortened ghost.
-                if self._ghost:
-                    self._show_ghost(self._ghost)
-                else:
-                    self._clear_ghost()
-                return True
-            return False
-
-        # --- Escape: dismiss ghost text. ---
-        if keyval == IBus.KEY_Escape:
-            if self._ghost:
-                self._clear_ghost()
-                return True
-            return False
-
-        # --- Space / Enter: commit current word, delimit. ---
-        if keyval in (IBus.KEY_space, IBus.KEY_Return):
-            if self._current_word:
-                self._commit_word(self._current_word)
-            self._reset_word()
-            return False  # let the space/enter reach the application
-
-        # --- Backspace: trim the current word. ---
-        if keyval == IBus.KEY_BackSpace:
-            if self._current_word:
-                self._current_word = self._current_word[:-1]
-                self._update_predictions()
-                return False  # let backspace reach the application
-            return False
-
-        # --- Printable characters: append and re-predict. ---
-        char = chr(keyval) if 0x20 < keyval < 0x7F else ""
-        if not char:
-            # Non-printable / unmapped -- pass through.
-            return False
-
-        self._current_word += char
-        self._update_predictions()
-        return False  # let the character reach the application
-
-    # -----------------------------------------------------------------------
-    # Kill-switch detection.
-    # -----------------------------------------------------------------------
-    @staticmethod
-    def _is_kill_switch(keyval: int, state: int) -> bool:
-        """Return ``True`` when keyval+state matches Super+Escape."""
-        is_escape = keyval == IBus.KEY_Escape
-        if _HAS_IBUS:
-            super_held = bool(state & IBus.ModifierType.SUPER_MASK)
-        else:
-            # Fallback: check raw bit 26 (Mod4/Super on X11).
-            super_held = bool(state & (1 << 26))
-        return is_escape and super_held
+    def do_process_key_event(
+        self, keyval: int, keycode: int, state: int
+    ) -> bool:
+        """Handle an IBus key event via the Rust core."""
+        actions = self._core.handle_key(keyval, state)
+        return self._execute_actions(actions)
 
     # -----------------------------------------------------------------------
     # IBus lifecycle callbacks.
     # -----------------------------------------------------------------------
     def do_focus_in(self) -> None:
-        """Called when the engine gains input focus."""
-        pass
+        self._core.focus_gained()
 
     def do_focus_out(self) -> None:
-        """Called when the engine loses input focus."""
-        if self._current_word:
-            self._commit_word(self._current_word)
-        self._reset_word()
+        actions = self._core.focus_lost()
+        self._execute_actions(actions)
 
     def do_reset(self) -> None:
-        """Called when the engine should reset its internal state."""
-        self._reset_word()
+        actions = self._core.reset()
+        self._execute_actions(actions)
 
     def do_enable(self) -> None:
-        """Called when the engine is enabled by the user."""
-        self._enabled = True
+        pass  # Rust core handles enabled state via kill switch.
 
     def do_disable(self) -> None:
-        """Called when the engine is disabled by the user."""
-        self._enabled = False
-        self._reset_word()
+        actions = self._core.reset()
+        self._execute_actions(actions)

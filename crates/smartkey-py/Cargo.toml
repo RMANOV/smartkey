@@ -13,3 +13,4 @@ crate-type = ["cdylib"]
 [dependencies]
 smartkey-core = { path = "../smartkey-core" }
 pyo3 = { version = "0.28", features = ["extension-module"] }
+serde_json = { workspace = true }
