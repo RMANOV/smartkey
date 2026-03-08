@@ -4,4 +4,4 @@ pub mod markov;
 pub mod ngram;
 pub mod prefix;
 
-// pub use ensemble::SmartKeyEngine; // enabled in Task 6
+pub use ensemble::SmartKeyEngine;
