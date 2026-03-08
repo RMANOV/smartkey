@@ -47,7 +47,7 @@ pub unsafe extern "C" fn smartkey_new(config_json: *const c_char) -> SmartKeyHan
     } else {
         let c_str = unsafe { CStr::from_ptr(config_json) };
         let json_str = c_str.to_str().unwrap_or("{}");
-        parse_config(json_str)
+        InputConfig::from_json(json_str)
     };
     Box::into_raw(Box::new(InputMethodCore::new(config)))
 }
@@ -290,26 +290,6 @@ fn actions_to_c(actions: Vec<Action>) -> *mut CActionList {
         actions: actions_ptr,
         count,
     }))
-}
-
-/// Parse JSON config into InputConfig.
-fn parse_config(json_str: &str) -> InputConfig {
-    let mut config = InputConfig::default();
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-        if let Some(b) = v.get("enabled").and_then(|v| v.as_bool()) {
-            config.enabled = b;
-        }
-        if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
-            config.ghost_text = b;
-        }
-        if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
-            config.max_candidates = n as usize;
-        }
-        if let Some(n) = v.get("min_prefix_length").and_then(|v| v.as_u64()) {
-            config.min_prefix_length = n as usize;
-        }
-    }
-    config
 }
 
 #[cfg(test)]

@@ -124,23 +124,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def __init__(self) -> None:
         super().__init__()
 
-        # Load user config.
-        config: dict = {
-            "enabled": True,
-            "ghost_text": True,
-            "max_candidates": 5,
-            "min_prefix_length": 2,
-            "weights": {"corpus": 0.4, "markov": 0.4, "personal": 0.2},
-        }
+        # Load user config — Rust core handles defaults, we only pass overrides.
         user_cfg = _load_json(_CONFIG_FILE)
-        if isinstance(user_cfg, dict):
-            config.update(user_cfg)
+        config_json = json.dumps(user_cfg) if isinstance(user_cfg, dict) else None
 
         # Create the Rust core with config.
-        self._core = PyInputMethodCore(json.dumps(config))
-
-        # Ghost text state (for IBus auxiliary text display).
-        self._ghost: str = ""
+        self._core = PyInputMethodCore(config_json)
 
         # Load corpus.
         self._load_corpus()
@@ -185,7 +174,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     def _show_ghost(self, text: str) -> None:
         """Display *text* as greyed-out auxiliary (ghost) text."""
-        self._ghost = text
         ibus_text = IBus.Text.new_from_string(text)
         attrs = IBus.AttrList()
         attrs.append(
@@ -196,7 +184,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
     def _clear_ghost(self) -> None:
         """Remove any displayed ghost text."""
-        self._ghost = ""
         self.hide_auxiliary_text()
 
     # -----------------------------------------------------------------------

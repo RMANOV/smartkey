@@ -103,9 +103,8 @@ mod tests {
     }
 
     #[test]
-    fn corpus_files_returns_vec() {
-        // Just verify it doesn't panic on a missing directory.
-        let files = corpus_files();
-        assert!(files.is_empty() || !files.is_empty());
+    fn corpus_files_no_panic() {
+        // Smoke test: doesn't panic on a missing/empty directory.
+        let _files = corpus_files();
     }
 }

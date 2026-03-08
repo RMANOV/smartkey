@@ -107,10 +107,9 @@ impl PyInputMethodCore {
     #[new]
     #[pyo3(signature = (config_json=None))]
     fn new(config_json: Option<&str>) -> Self {
-        let config = if let Some(json_str) = config_json {
-            parse_config(json_str)
-        } else {
-            InputConfig::default()
+        let config = match config_json {
+            Some(json_str) => InputConfig::from_json(json_str),
+            None => InputConfig::default(),
         };
         Self {
             inner: InputMethodCore::new(config),
@@ -172,32 +171,6 @@ impl PyInputMethodCore {
             .map(|p| (p.word.clone(), p.score, p.confidence))
             .collect()
     }
-}
-
-/// Parse a JSON config string into an `InputConfig`.
-fn parse_config(json_str: &str) -> InputConfig {
-    let mut config = InputConfig::default();
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-        if let Some(b) = v.get("enabled").and_then(|v| v.as_bool()) {
-            config.enabled = b;
-        }
-        if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
-            config.ghost_text = b;
-        }
-        if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
-            config.max_candidates = n as usize;
-        }
-        if let Some(n) = v.get("min_prefix_length").and_then(|v| v.as_u64()) {
-            config.min_prefix_length = n as usize;
-        }
-        if let Some(w) = v.get("weights").and_then(|v| v.as_object()) {
-            let a = w.get("corpus").and_then(|v| v.as_f64()).unwrap_or(0.4);
-            let b = w.get("markov").and_then(|v| v.as_f64()).unwrap_or(0.4);
-            let c = w.get("personal").and_then(|v| v.as_f64()).unwrap_or(0.2);
-            config.weights = (a, b, c);
-        }
-    }
-    config
 }
 
 #[pymodule]

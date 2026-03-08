@@ -11,4 +11,3 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 smartkey-core = { path = "../smartkey-core" }
-serde_json = { workspace = true }

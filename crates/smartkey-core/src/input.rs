@@ -73,6 +73,8 @@ const CONTEXT_SIZE: usize = 5;
 /// Platform-agnostic input method configuration.
 #[derive(Debug, Clone)]
 pub struct InputConfig {
+    /// Initial enabled state. After `InputMethodCore::new()`, the core tracks
+    /// its own `enabled` flag independently (toggled by the kill switch).
     pub enabled: bool,
     pub ghost_text: bool,
     pub max_candidates: usize,
@@ -89,6 +91,45 @@ impl Default for InputConfig {
             min_prefix_length: 2,
             weights: (0.4, 0.4, 0.2),
         }
+    }
+}
+
+impl InputConfig {
+    /// Parse a JSON config string, applying values over defaults.
+    ///
+    /// Unknown keys are silently ignored. Missing keys keep their defaults.
+    pub fn from_json(json_str: &str) -> Self {
+        let mut config = Self::default();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            if let Some(b) = v.get("enabled").and_then(|v| v.as_bool()) {
+                config.enabled = b;
+            }
+            if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
+                config.ghost_text = b;
+            }
+            if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
+                config.max_candidates = n as usize;
+            }
+            if let Some(n) = v.get("min_prefix_length").and_then(|v| v.as_u64()) {
+                config.min_prefix_length = n as usize;
+            }
+            if let Some(w) = v.get("weights").and_then(|v| v.as_object()) {
+                let a = w
+                    .get("corpus")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(config.weights.0);
+                let b = w
+                    .get("markov")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(config.weights.1);
+                let c = w
+                    .get("personal")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(config.weights.2);
+                config.weights = (a, b, c);
+            }
+        }
+        config
     }
 }
 
@@ -212,7 +253,8 @@ impl InputMethodCore {
             // Space / Return: commit current word, delimit.
             Key::Space | Key::Return => {
                 if !self.current_word.is_empty() {
-                    self.commit_word(&self.current_word.clone());
+                    let word = std::mem::take(&mut self.current_word);
+                    self.commit_word(&word);
                 }
                 self.reset_word();
                 vec![Action::HideGhost, Action::ForwardKey]
@@ -244,7 +286,8 @@ impl InputMethodCore {
     /// Called when the input field loses focus.
     pub fn focus_lost(&mut self) -> Vec<Action> {
         if !self.current_word.is_empty() {
-            self.commit_word(&self.current_word.clone());
+            let word = std::mem::take(&mut self.current_word);
+            self.commit_word(&word);
         }
         self.reset_word();
         vec![Action::HideGhost]
@@ -544,5 +587,33 @@ mod tests {
         assert!(has_action(&actions, &Action::HideGhost));
         assert_eq!(core.current_word(), "");
         assert!(core.context.iter().any(|w| w == "hello"));
+    }
+
+    #[test]
+    fn test_config_from_json_defaults() {
+        let config = InputConfig::from_json("{}");
+        let default = InputConfig::default();
+        assert_eq!(config.enabled, default.enabled);
+        assert_eq!(config.ghost_text, default.ghost_text);
+        assert_eq!(config.max_candidates, default.max_candidates);
+        assert_eq!(config.min_prefix_length, default.min_prefix_length);
+        assert_eq!(config.weights, default.weights);
+    }
+
+    #[test]
+    fn test_config_from_json_overrides() {
+        let json = r#"{"enabled": false, "max_candidates": 10, "weights": {"corpus": 0.5, "markov": 0.3, "personal": 0.2}}"#;
+        let config = InputConfig::from_json(json);
+        assert!(!config.enabled);
+        assert!(config.ghost_text); // kept default
+        assert_eq!(config.max_candidates, 10);
+        assert_eq!(config.weights, (0.5, 0.3, 0.2));
+    }
+
+    #[test]
+    fn test_config_from_json_invalid() {
+        let config = InputConfig::from_json("not json at all");
+        let default = InputConfig::default();
+        assert_eq!(config.enabled, default.enabled);
     }
 }
