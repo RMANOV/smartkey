@@ -16,14 +16,23 @@ pub fn config_file() -> PathBuf {
     config_dir().join("smartkey.json")
 }
 
-/// Return paths to all corpus files (corpus.json + corpus_*.json).
+/// Return the path to `personal.json` (CVM personal profile).
+pub fn personal_profile_path() -> PathBuf {
+    config_dir().join("personal.json")
+}
+
+/// Return paths to all corpus files, preferring `.bin` when up-to-date.
+///
+/// Scans for `corpus_*.json` and `corpus_*.bin`. For each JSON file, if a
+/// `.bin` sibling exists with mtime >= JSON mtime, the `.bin` is returned
+/// instead. Also checks `corpus.json` / `corpus.bin`.
 pub fn corpus_files() -> Vec<PathBuf> {
     let dir = config_dir();
     let mut files: Vec<PathBuf> = Vec::new();
 
     // Per-language corpora: corpus_en.json, corpus_bg.json, etc.
     if let Ok(entries) = std::fs::read_dir(&dir) {
-        let mut lang_files: Vec<PathBuf> = entries
+        let mut json_files: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| {
@@ -33,17 +42,35 @@ pub fn corpus_files() -> Vec<PathBuf> {
                         .is_some_and(|s| s.starts_with("corpus_"))
             })
             .collect();
-        lang_files.sort();
-        files.append(&mut lang_files);
+        json_files.sort();
+        for json_path in json_files {
+            files.push(prefer_bin(&json_path));
+        }
     }
 
     // Legacy single corpus.
     let legacy = dir.join("corpus.json");
     if legacy.is_file() {
-        files.push(legacy);
+        files.push(prefer_bin(&legacy));
     }
 
     files
+}
+
+/// If a `.bin` sibling exists and its mtime >= the JSON file's mtime, return
+/// the `.bin` path; otherwise return the original JSON path.
+fn prefer_bin(json_path: &PathBuf) -> PathBuf {
+    let bin_path = json_path.with_extension("bin");
+    if bin_path.is_file() {
+        let json_mtime = std::fs::metadata(json_path).and_then(|m| m.modified()).ok();
+        let bin_mtime = std::fs::metadata(&bin_path).and_then(|m| m.modified()).ok();
+        if let (Some(jm), Some(bm)) = (json_mtime, bin_mtime) {
+            if bm >= jm {
+                return bin_path;
+            }
+        }
+    }
+    json_path.clone()
 }
 
 /// Return the platform base config directory (without "smartkey" suffix).
@@ -99,6 +126,22 @@ mod tests {
         assert_eq!(
             file.file_name().and_then(|s| s.to_str()),
             Some("smartkey.json")
+        );
+    }
+
+    #[test]
+    fn personal_profile_path_is_json() {
+        let path = personal_profile_path();
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("personal.json")
+        );
+        // Must live inside the smartkey config dir.
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("smartkey")
         );
     }
 
