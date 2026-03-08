@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/smartkey-core", "crates/smartkey-py"]
+members = ["crates/smartkey-core", "crates/smartkey-py", "crates/smartkey-win", "crates/smartkey-mac"]
 
 [workspace.dependencies]
 aho-corasick = "1"

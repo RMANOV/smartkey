@@ -1,0 +1,14 @@
+[package]
+name = "smartkey-mac"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "SmartKey macOS IME via Input Method Kit (C FFI for Swift)"
+repository = "https://github.com/RMANOV/smartkey"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+smartkey-core = { path = "../smartkey-core" }
+serde_json = { workspace = true }

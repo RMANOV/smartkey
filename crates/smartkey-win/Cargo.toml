@@ -1,0 +1,26 @@
+[package]
+name = "smartkey-win"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "SmartKey Windows IME via Text Services Framework"
+repository = "https://github.com/RMANOV/smartkey"
+
+[dependencies]
+smartkey-core = { path = "../smartkey-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_UI_TextServices",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Registry",
+    "implement",
+] }
+
+[[bin]]
+name = "smartkey-register"
+path = "src/register.rs"
