@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component>
+    <name>org.freedesktop.IBus.SmartKey</name>
+    <description>SmartKey Predictive Input</description>
+    <exec>/usr/lib/ibus-smartkey/ibus-engine-smartkey --ibus</exec>
+    <version>0.1.0</version>
+    <author>SmartKey Contributors</author>
+    <license>MIT</license>
+    <homepage>https://github.com/RMANOV/smartkey</homepage>
+    <textdomain>ibus-smartkey</textdomain>
+
+    <engines>
+        <engine>
+            <name>smartkey</name>
+            <language>en</language>
+            <license>MIT</license>
+            <author>SmartKey Contributors</author>
+            <icon>preferences-desktop-keyboard</icon>
+            <layout>default</layout>
+            <longname>SmartKey Predictive Input</longname>
+            <description>Predictive text input with ghost text completion</description>
+            <rank>80</rank>
+            <symbol>SK</symbol>
+            <setup>/usr/lib/ibus-smartkey/ibus-setup-smartkey</setup>
+        </engine>
+    </engines>
+</component>
