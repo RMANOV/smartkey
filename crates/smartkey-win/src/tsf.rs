@@ -23,7 +23,7 @@ use windows::Win32::UI::TextServices::*;
 /// The SmartKey TSF Text Input Processor.
 ///
 /// Wraps `InputMethodCore` and implements COM interfaces for Windows TSF.
-#[windows::core::implement(ITfTextInputProcessorEx, ITfKeyEventSink)]
+#[windows::core::implement(ITfTextInputProcessor, ITfTextInputProcessorEx, ITfKeyEventSink)]
 pub struct SmartKeyTextService {
     core: std::cell::RefCell<InputMethodCore>,
     thread_mgr: std::cell::RefCell<Option<ITfThreadMgr>>,
@@ -107,7 +107,24 @@ impl SmartKeyTextService {
     }
 }
 
-// -- ITfTextInputProcessorEx implementation --
+// -- ITfTextInputProcessor implementation (base trait: Activate + Deactivate) --
+
+impl ITfTextInputProcessor_Impl for SmartKeyTextService_Impl {
+    /// Base-interface fallback (Win 7/8). Keep in sync with ActivateEx.
+    fn Activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
+        self.client_id.set(tid);
+        *self.thread_mgr.borrow_mut() = ptim.cloned();
+        Ok(())
+    }
+
+    fn Deactivate(&self) -> Result<()> {
+        // TODO: Unadvise key event sink
+        *self.thread_mgr.borrow_mut() = None;
+        Ok(())
+    }
+}
+
+// -- ITfTextInputProcessorEx implementation (extended: ActivateEx) --
 
 impl ITfTextInputProcessorEx_Impl for SmartKeyTextService_Impl {
     fn ActivateEx(&self, ptim: Option<&ITfThreadMgr>, tid: u32, _flags: u32) -> Result<()> {
@@ -117,12 +134,6 @@ impl ITfTextInputProcessorEx_Impl for SmartKeyTextService_Impl {
         // TODO: Install key event sink via ITfKeystrokeMgr::AdviseKeyEventSink
         // TODO: Load corpus files from SmartKeyConfig::load().corpus_files
 
-        Ok(())
-    }
-
-    fn Deactivate(&self) -> Result<()> {
-        // TODO: Unadvise key event sink
-        *self.thread_mgr.borrow_mut() = None;
         Ok(())
     }
 }
@@ -155,8 +166,8 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
 
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         let vk = wparam.0 as u32;
-        let key = Self::vk_to_key(vk);
-        let mods = Self::get_modifiers();
+        let key = SmartKeyTextService::vk_to_key(vk);
+        let mods = SmartKeyTextService::get_modifiers();
         let event = KeyEvent {
             key,
             modifiers: mods,

@@ -728,6 +728,7 @@ dependencies = [
  "serde_json",
  "smartkey-core",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
