@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use smartkey_core::cvm::CvmSnapshot;
 use smartkey_core::ensemble::SmartKeyEngine;
 use smartkey_core::input::{Action, InputConfig, InputMethodCore, Key, KeyEvent, Modifiers};
 
@@ -18,6 +19,41 @@ impl PySmartKeyEngine {
         Self {
             inner: SmartKeyEngine::new(),
         }
+    }
+
+    /// Create an engine from a JSON config string (weights, tuning, etc.).
+    #[staticmethod]
+    fn from_config(config_json: &str) -> Self {
+        let config = InputConfig::from_json(config_json);
+        Self {
+            inner: SmartKeyEngine::from_config(&config),
+        }
+    }
+
+    /// Export the personal CVM profile to a JSON file.
+    fn export_personal(&self, path: &str) -> PyResult<()> {
+        let snap = self.inner.export_personal();
+        let json = serde_json::to_string_pretty(&snap)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        }
+        std::fs::write(path, json).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Import the personal CVM profile from a JSON file (no-op if missing).
+    fn import_personal(&mut self, path: &str) -> PyResult<()> {
+        let p = std::path::Path::new(path);
+        if !p.is_file() {
+            return Ok(());
+        }
+        let data = std::fs::read_to_string(p)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let snap: CvmSnapshot = serde_json::from_str(&data)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        self.inner.import_personal(&snap);
+        Ok(())
     }
 
     fn load_word(&mut self, word: &str, frequency: u32) {
