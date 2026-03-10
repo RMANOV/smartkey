@@ -102,7 +102,11 @@ fn action_to_tuple(action: &Action) -> (String, String) {
     }
 }
 
-/// Translate a raw keyval (IBus / X11 keysym) into a `Key`.
+/// Translate a raw keyval (IBus / X11 keysym or Unicode codepoint) into a `Key`.
+///
+/// The Python layer converts legacy keysyms (e.g. Cyrillic 0x06xx) to Unicode
+/// codepoints via `IBus.keyval_to_unicode()` before calling us, so we accept
+/// both raw keysyms for special keys and Unicode codepoints for printable chars.
 fn keyval_to_key(keyval: u32) -> Key {
     match keyval {
         0xFF09 => Key::Tab,
@@ -111,7 +115,13 @@ fn keyval_to_key(keyval: u32) -> Key {
         0xFF08 => Key::Backspace,
         0x0020 => Key::Space,
         0xFF0D => Key::Return,
+        // ASCII printable
         k if (0x21..=0x7E).contains(&k) => Key::Char(char::from(k as u8)),
+        // Unicode codepoints (Cyrillic, Latin Extended, etc.)
+        k if k >= 0x80 && k <= 0x10FFFF => match char::from_u32(k) {
+            Some(ch) if !ch.is_control() => Key::Char(ch),
+            _ => Key::Other(k),
+        },
         other => Key::Other(other),
     }
 }

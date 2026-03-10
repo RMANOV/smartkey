@@ -9,3 +9,4 @@ data/
 press-releases/
 .ruff_cache/
 .worktrees
+corpus/raw/

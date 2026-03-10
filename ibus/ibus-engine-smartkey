@@ -1,0 +1,5 @@
+#!/bin/bash
+# SmartKey IBus engine launcher
+cd /home/rmanov/smartkey
+export PYTHONPATH="/home/rmanov/smartkey/ibus:$PYTHONPATH"
+exec /home/rmanov/smartkey/.venv/bin/python3 -m ibus.main "$@"

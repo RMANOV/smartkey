@@ -13,6 +13,12 @@ import os
 import time
 from pathlib import Path
 
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s smartkey: %(message)s",
+    filename="/tmp/smartkey-debug.log",
+)
+
 # ---------------------------------------------------------------------------
 # IBus GObject introspection -- may not be installed on all systems.
 # ---------------------------------------------------------------------------
@@ -55,6 +61,8 @@ except (ValueError, ImportError):
         KEY_Super_L = 0xFFEB
         KEY_Super_R = 0xFFEC
         ATTR_TYPE_FOREGROUND = 1
+        ATTR_TYPE_UNDERLINE = 2
+        ATTR_UNDERLINE_SINGLE = 1
 
     IBus = _FakeIBus  # type: ignore[misc,assignment]
 
@@ -188,18 +196,23 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Ghost text display (IBus-specific).
     # -----------------------------------------------------------------------
     def _show_ghost(self, text: str) -> None:
-        """Display *text* as greyed-out auxiliary (ghost) text."""
+        """Display *text* as greyed-out preedit (ghost) text inline at cursor."""
         ibus_text = IBus.Text.new_from_string(text)
         attrs = IBus.AttrList()
         attrs.append(
-            IBus.Attribute.new(IBus.ATTR_TYPE_FOREGROUND, 0xAAAAAA, 0, len(text))
+            IBus.Attribute.new(IBus.ATTR_TYPE_FOREGROUND, 0x888888, 0, len(text))
+        )
+        attrs.append(
+            IBus.Attribute.new(
+                IBus.ATTR_TYPE_UNDERLINE, IBus.ATTR_UNDERLINE_SINGLE, 0, len(text)
+            )
         )
         ibus_text.set_attributes(attrs)
-        self.update_auxiliary_text(ibus_text, True)
+        self.update_preedit_text(ibus_text, 0, True)
 
     def _clear_ghost(self) -> None:
         """Remove any displayed ghost text."""
-        self.hide_auxiliary_text()
+        self.hide_preedit_text()
 
     # -----------------------------------------------------------------------
     # Action dispatcher — translates Rust actions to IBus API calls.
@@ -227,7 +240,23 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self, keyval: int, keycode: int, state: int
     ) -> bool:
         """Handle an IBus key event via the Rust core."""
+        orig_keyval = keyval
+        logging.debug(
+            "key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state
+        )
+        # Convert legacy X11 keysyms (e.g. Cyrillic 0x06xx) to Unicode
+        # codepoints so the Rust core sees them as Key::Char.
+        if _HAS_IBUS and hasattr(IBus, "keyval_to_unicode"):
+            uni = IBus.keyval_to_unicode(keyval)
+            if uni and uni != "\0" and ord(uni) >= 0x80:
+                keyval = ord(uni)
+        # Fallback: Unicode-encoded keysyms (0x0100xxxx → extract codepoint)
+        if keyval >= 0x01000000 and keyval <= 0x0110FFFF:
+            keyval = keyval & 0x00FFFFFF
+        if keyval != orig_keyval:
+            logging.debug("keysym converted: 0x%04X → 0x%04X (%s)", orig_keyval, keyval, chr(keyval))
         actions = self._core.handle_key(keyval, state)
+        logging.debug("actions: %s", actions)
         return self._execute_actions(actions)
 
     # -----------------------------------------------------------------------

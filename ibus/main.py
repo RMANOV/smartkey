@@ -25,7 +25,7 @@ try:
 
     gi.require_version("IBus", "1.0")
     gi.require_version("GLib", "2.0")
-    from gi.repository import GLib, IBus  # type: ignore[attr-defined]
+    from gi.repository import GLib, GObject, IBus  # type: ignore[attr-defined]
 
     _HAS_IBUS = True
 except (ValueError, ImportError):
@@ -46,6 +46,36 @@ _ENGINE_NAME = "smartkey"
 # Main.
 # ---------------------------------------------------------------------------
 def main() -> None:
+    # --xml: print component XML for ibus write-cache discovery, then exit.
+    if "--xml" in sys.argv:
+        _xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<component>\n"
+            f"  <name>{_BUS_NAME}</name>\n"
+            "  <description>SmartKey Predictive Input</description>\n"
+            "  <version>0.1.0</version>\n"
+            "  <license>MIT</license>\n"
+            "  <author>SmartKey Contributors</author>\n"
+            "  <homepage>https://github.com/RMANOV/smartkey</homepage>\n"
+            "  <engines>\n"
+            "    <engine>\n"
+            f"      <name>{_ENGINE_NAME}</name>\n"
+            "      <language>en</language>\n"
+            "      <license>MIT</license>\n"
+            "      <author>SmartKey Contributors</author>\n"
+            "      <icon>preferences-desktop-keyboard</icon>\n"
+            "      <layout>default</layout>\n"
+            "      <longname>SmartKey Predictive Input</longname>\n"
+            "      <description>Predictive text input with ghost text</description>\n"
+            "      <rank>80</rank>\n"
+            "      <symbol>SK</symbol>\n"
+            "    </engine>\n"
+            "  </engines>\n"
+            "</component>\n"
+        )
+        print(_xml)
+        return
+
     if not _HAS_IBUS:
         print(
             "ERROR: IBus GObject introspection bindings not found.\n"
@@ -71,7 +101,7 @@ def main() -> None:
 
     # Create the engine factory.
     factory = IBus.Factory.new(bus.get_connection())
-    factory.add_engine(_ENGINE_NAME, GLib.type_from_name("SmartKeyEngine"))
+    factory.add_engine(_ENGINE_NAME, GObject.type_from_name("SmartKeyEngine"))
 
     if is_ibus:
         bus.request_name(_BUS_NAME, 0)
