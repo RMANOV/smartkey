@@ -14,7 +14,7 @@ fn main() {
     match args.get(1).map(|s| s.as_str()) {
         Some("--install") => {
             println!("SmartKey IME registration");
-            println!("CLSID: {{{}}}", smartkey_win::config::CLSID_SMARTKEY);
+            println!("CLSID: {{{}}}", smartkey_win::config::CLSID_SMARTKEY_STR);
             #[cfg(windows)]
             {
                 // TODO: Write CLSID to HKLM\SOFTWARE\Classes\CLSID\{...}

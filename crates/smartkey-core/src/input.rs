@@ -243,7 +243,15 @@ impl InputMethodCore {
             }
             _ => {
                 let json_str = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-                let corpus = Corpus::from_json(&json_str)?;
+                let (corpus, warnings) = Corpus::from_json_with_warnings(&json_str)?;
+                if warnings.dropped_bigrams > 0 || warnings.dropped_trigrams > 0 {
+                    eprintln!(
+                        "smartkey: corpus {}: dropped {} bigrams, {} trigrams (malformed entries)",
+                        path.display(),
+                        warnings.dropped_bigrams,
+                        warnings.dropped_trigrams
+                    );
+                }
                 // Best-effort: write .bin cache alongside.
                 let bin_path = path.with_extension("bin");
                 if let Ok(bytes) = corpus.to_bincode() {

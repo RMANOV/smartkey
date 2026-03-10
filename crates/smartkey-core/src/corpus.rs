@@ -39,16 +39,16 @@ pub struct Corpus {
     pub trigrams: Vec<CorpusTrigram>,
 }
 
+/// Warnings emitted during corpus parsing.
+#[derive(Debug, Default, Clone)]
+pub struct CorpusWarnings {
+    pub dropped_bigrams: usize,
+    pub dropped_trigrams: usize,
+}
+
 impl Corpus {
-    /// Parse a corpus from JSON string.
-    ///
-    /// Expected format:
-    /// ```json
-    /// { "unigrams": {"word": freq, ...},
-    ///   "bigrams": [{"ctx": "...", "word": "...", "count": N}, ...],
-    ///   "trigrams": [{"w1": "...", "w2": "...", "word": "...", "count": N}, ...] }
-    /// ```
-    pub fn from_json(json_str: &str) -> Result<Self, String> {
+    /// Parse corpus from JSON, reporting dropped entries.
+    pub fn from_json_with_warnings(json_str: &str) -> Result<(Self, CorpusWarnings), String> {
         let v: serde_json::Value = serde_json::from_str(json_str).map_err(|e| e.to_string())?;
 
         let words = if let Some(obj) = v.get("unigrams").and_then(|v| v.as_object()) {
@@ -62,8 +62,12 @@ impl Corpus {
             Vec::new()
         };
 
+        let mut warnings = CorpusWarnings::default();
+
         let bigrams = if let Some(arr) = v.get("bigrams").and_then(|v| v.as_array()) {
-            arr.iter()
+            let total = arr.len();
+            let parsed: Vec<_> = arr
+                .iter()
                 .filter_map(|entry| {
                     Some(CorpusBigram {
                         ctx: entry.get("ctx")?.as_str()?.to_owned(),
@@ -71,13 +75,17 @@ impl Corpus {
                         count: entry.get("count")?.as_u64()? as u32,
                     })
                 })
-                .collect()
+                .collect();
+            warnings.dropped_bigrams = total - parsed.len();
+            parsed
         } else {
             Vec::new()
         };
 
         let trigrams = if let Some(arr) = v.get("trigrams").and_then(|v| v.as_array()) {
-            arr.iter()
+            let total = arr.len();
+            let parsed: Vec<_> = arr
+                .iter()
                 .filter_map(|entry| {
                     Some(CorpusTrigram {
                         w1: entry.get("w1")?.as_str()?.to_owned(),
@@ -86,17 +94,34 @@ impl Corpus {
                         count: entry.get("count")?.as_u64()? as u32,
                     })
                 })
-                .collect()
+                .collect();
+            warnings.dropped_trigrams = total - parsed.len();
+            parsed
         } else {
             Vec::new()
         };
 
-        Ok(Self {
-            version: 1,
-            words,
-            bigrams,
-            trigrams,
-        })
+        Ok((
+            Self {
+                version: 1,
+                words,
+                bigrams,
+                trigrams,
+            },
+            warnings,
+        ))
+    }
+
+    /// Parse a corpus from JSON string.
+    ///
+    /// Expected format:
+    /// ```json
+    /// { "unigrams": {"word": freq, ...},
+    ///   "bigrams": [{"ctx": "...", "word": "...", "count": N}, ...],
+    ///   "trigrams": [{"w1": "...", "w2": "...", "word": "...", "count": N}, ...] }
+    /// ```
+    pub fn from_json(json_str: &str) -> Result<Self, String> {
+        Self::from_json_with_warnings(json_str).map(|(c, _)| c)
     }
 
     /// Serialize to bincode.
@@ -160,6 +185,28 @@ mod tests {
         assert_eq!(restored.trigrams[0].w2, "say");
         assert_eq!(restored.trigrams[0].word, "hello");
         assert_eq!(restored.trigrams[0].count, 3);
+    }
+
+    #[test]
+    fn from_json_reports_dropped_entries() {
+        let json = r#"{
+            "unigrams": {"hello": 10},
+            "bigrams": [
+                {"ctx": "the", "word": "hello", "count": 5},
+                {"ctx": "bad"},
+                {"word": "orphan"}
+            ],
+            "trigrams": [
+                {"w1": "a", "w2": "b", "word": "c", "count": 1},
+                {"w1": "missing"}
+            ]
+        }"#;
+        let (corpus, warnings) = Corpus::from_json_with_warnings(json).unwrap();
+        assert_eq!(corpus.words.len(), 1);
+        assert_eq!(corpus.bigrams.len(), 1);
+        assert_eq!(corpus.trigrams.len(), 1);
+        assert_eq!(warnings.dropped_bigrams, 2);
+        assert_eq!(warnings.dropped_trigrams, 1);
     }
 
     #[test]
