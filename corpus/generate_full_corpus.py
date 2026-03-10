@@ -103,6 +103,68 @@ def ensure_dump(lang: str, raw_dir: Path, wiki_url: str | None = None) -> Path:
     return dump_path
 
 
+def supplement_unigrams_from_wiki(
+    dump_path: Path,
+    existing: dict[str, int],
+    target: int,
+    max_articles: int = 0,
+) -> dict[str, int]:
+    """Extract additional unigrams from Wikipedia to reach target count.
+
+    Streams articles, counts word frequencies, and merges the top-N missing
+    words into the existing unigram dict (existing entries are never overwritten).
+    """
+    if len(existing) >= target:
+        return existing
+
+    need = target - len(existing)
+    vocab = set(existing.keys())
+    word_counts: Counter = Counter()
+    article_count = 0
+
+    print(
+        f"[supplement] Need {need:,} more unigrams from Wikipedia "
+        f"(have {len(existing):,}, target {target:,})",
+        file=sys.stderr,
+    )
+
+    for article_text in iter_articles(str(dump_path)):
+        words = tokenize(article_text)
+        for w in words:
+            if w not in vocab and len(w) >= 2:
+                word_counts[w] += 1
+
+        article_count += 1
+        if article_count % 25_000 == 0:
+            print(
+                f"[supplement] {article_count:,} articles, "
+                f"{len(word_counts):,} candidate words",
+                file=sys.stderr,
+            )
+
+        if 0 < max_articles <= article_count:
+            break
+
+    # Take top-N by frequency, require at least 3 occurrences.
+    top = word_counts.most_common()
+    added = 0
+    merged = dict(existing)
+    for word, count in top:
+        if count < 3:
+            break
+        if added >= need:
+            break
+        merged[word] = count
+        added += 1
+
+    print(
+        f"[supplement] Added {added:,} unigrams from Wikipedia "
+        f"(total: {len(merged):,})",
+        file=sys.stderr,
+    )
+    return merged
+
+
 def extract_ngrams_from_wiki(
     dump_path: Path,
     vocab: set[str],
@@ -291,18 +353,23 @@ def main(argv: list[str] | None = None) -> None:
     print(f"{'='*60}\n", file=sys.stderr)
 
     unigrams = get_wordfreq_unigrams(args.lang, args.unigrams)
+
+    # Step 1b: Supplement from Wikipedia if wordfreq fell short.
+    if args.dump_path:
+        supplement_dump = Path(args.dump_path)
+    else:
+        supplement_dump = ensure_dump(args.lang, raw_dir, args.wiki_url)
+
+    if len(unigrams) < args.unigrams:
+        unigrams = supplement_unigrams_from_wiki(
+            supplement_dump, unigrams, args.unigrams, args.max_articles,
+        )
+
     vocab = set(unigrams.keys())
 
-    # Step 2: Bigrams/trigrams from Wikipedia.
-    if args.dump_path:
-        dump_path = Path(args.dump_path)
-        if not dump_path.exists():
-            print(f"Error: dump not found: {dump_path}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        dump_path = ensure_dump(args.lang, raw_dir, args.wiki_url)
+    # Step 2: Bigrams/trigrams from Wikipedia (reuse resolved dump).
     bigrams, trigrams = extract_ngrams_from_wiki(
-        dump_path,
+        supplement_dump,
         vocab,
         args.max_articles,
         args.min_bigram_freq,
