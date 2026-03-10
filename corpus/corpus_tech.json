@@ -1,0 +1,1454 @@
+{
+  "unigrams": {
+    "function": 10000,
+    "return": 9500,
+    "value": 9000,
+    "type": 8800,
+    "data": 8500,
+    "error": 8200,
+    "file": 8000,
+    "name": 7800,
+    "code": 7600,
+    "string": 7400,
+    "number": 7200,
+    "list": 7000,
+    "object": 6800,
+    "class": 6600,
+    "method": 6500,
+    "variable": 6400,
+    "array": 6200,
+    "key": 6000,
+    "index": 5800,
+    "null": 5600,
+    "true": 5500,
+    "false": 5400,
+    "import": 5200,
+    "module": 5000,
+    "server": 4900,
+    "client": 4800,
+    "request": 4700,
+    "response": 4600,
+    "database": 4500,
+    "query": 4400,
+    "table": 4300,
+    "config": 4200,
+    "test": 4100,
+    "debug": 4000,
+    "log": 3900,
+    "output": 3800,
+    "input": 3700,
+    "path": 3600,
+    "token": 3500,
+    "parameter": 3400,
+    "argument": 3300,
+    "buffer": 3200,
+    "memory": 3100,
+    "thread": 3000,
+    "process": 2950,
+    "callback": 2900,
+    "promise": 2850,
+    "async": 2800,
+    "await": 2750,
+    "event": 2700,
+    "handler": 2650,
+    "listener": 2600,
+    "interface": 2550,
+    "struct": 2500,
+    "enum": 2450,
+    "boolean": 2400,
+    "integer": 2350,
+    "float": 2300,
+    "double": 2250,
+    "char": 2200,
+    "byte": 2150,
+    "binary": 2100,
+    "hex": 2050,
+    "hash": 2000,
+    "api": 1950,
+    "endpoint": 1900,
+    "route": 1850,
+    "middleware": 1800,
+    "controller": 1750,
+    "service": 1700,
+    "repository": 1650,
+    "model": 1600,
+    "view": 1550,
+    "template": 1500,
+    "component": 1480,
+    "widget": 1460,
+    "plugin": 1440,
+    "package": 1420,
+    "library": 1400,
+    "framework": 1380,
+    "runtime": 1360,
+    "compiler": 1340,
+    "parser": 1320,
+    "lexer": 1300,
+    "syntax": 1280,
+    "ast": 1260,
+    "node": 1240,
+    "tree": 1220,
+    "graph": 1200,
+    "stack": 1180,
+    "queue": 1160,
+    "heap": 1140,
+    "cache": 1120,
+    "proxy": 1100,
+    "socket": 1080,
+    "stream": 1060,
+    "pipe": 1040,
+    "channel": 1020,
+    "mutex": 1000,
+    "lock": 980,
+    "semaphore": 960,
+    "atomic": 940,
+    "volatile": 920,
+    "static": 900,
+    "dynamic": 880,
+    "abstract": 860,
+    "virtual": 840,
+    "override": 820,
+    "implement": 800,
+    "extend": 780,
+    "inherit": 760,
+    "polymorphism": 740,
+    "encapsulation": 720,
+    "singleton": 700,
+    "factory": 680,
+    "observer": 660,
+    "iterator": 640,
+    "decorator": 620,
+    "adapter": 600,
+    "facade": 580,
+    "strategy": 560,
+    "command": 540,
+    "state": 520,
+    "builder": 500,
+    "const": 2800,
+    "let": 2700,
+    "var": 2600,
+    "def": 2500,
+    "if": 2400,
+    "else": 2300,
+    "elif": 2200,
+    "switch": 2100,
+    "case": 2050,
+    "while": 2000,
+    "for": 1950,
+    "loop": 1900,
+    "break": 1850,
+    "continue": 1800,
+    "try": 1750,
+    "catch": 1700,
+    "except": 1650,
+    "finally": 1600,
+    "throw": 1550,
+    "raise": 1500,
+    "yield": 1450,
+    "lambda": 1400,
+    "closure": 1350,
+    "generic": 1300,
+    "trait": 1250,
+    "protocol": 1200,
+    "mixin": 1150,
+    "macro": 1100,
+    "annotation": 1050,
+    "attribute": 1000,
+    "property": 950,
+    "getter": 900,
+    "setter": 880,
+    "constructor": 860,
+    "destructor": 840,
+    "allocator": 820,
+    "pointer": 800,
+    "reference": 780,
+    "borrow": 760,
+    "ownership": 740,
+    "lifetime": 720,
+    "scope": 700,
+    "namespace": 680,
+    "public": 660,
+    "private": 640,
+    "protected": 620,
+    "internal": 600,
+    "extern": 580,
+    "unsafe": 560,
+    "inline": 540,
+    "readonly": 520,
+    "mutable": 500,
+    "immutable": 480,
+    "optional": 460,
+    "nullable": 440,
+    "http": 1500,
+    "https": 1480,
+    "url": 1460,
+    "uri": 1440,
+    "json": 1420,
+    "xml": 1400,
+    "html": 1380,
+    "css": 1360,
+    "dom": 1340,
+    "ajax": 1320,
+    "fetch": 1300,
+    "cors": 1280,
+    "cookie": 1260,
+    "session": 1240,
+    "auth": 1220,
+    "oauth": 1200,
+    "jwt": 1180,
+    "bearer": 1160,
+    "header": 1140,
+    "body": 1120,
+    "payload": 1100,
+    "webhook": 1080,
+    "websocket": 1060,
+    "tcp": 1040,
+    "udp": 1020,
+    "dns": 1000,
+    "ssl": 980,
+    "tls": 960,
+    "certificate": 940,
+    "encryption": 920,
+    "decrypt": 900,
+    "cipher": 880,
+    "digest": 860,
+    "signature": 840,
+    "nonce": 820,
+    "salt": 800,
+    "bcrypt": 780,
+    "argon": 760,
+    "sha": 740,
+    "md5": 720,
+    "base64": 700,
+    "utf8": 680,
+    "unicode": 660,
+    "encoding": 640,
+    "serialization": 620,
+    "deserialization": 600,
+    "marshal": 580,
+    "unmarshal": 560,
+    "protobuf": 540,
+    "grpc": 520,
+    "graphql": 500,
+    "rest": 480,
+    "soap": 460,
+    "rpc": 440,
+    "microservice": 420,
+    "container": 400,
+    "docker": 380,
+    "kubernetes": 360,
+    "pod": 340,
+    "sql": 1200,
+    "nosql": 1180,
+    "schema": 1160,
+    "migration": 1140,
+    "transaction": 1120,
+    "commit": 1100,
+    "rollback": 1080,
+    "partition": 1060,
+    "primary": 1040,
+    "foreign": 1020,
+    "constraint": 1000,
+    "join": 980,
+    "select": 960,
+    "insert": 940,
+    "update": 920,
+    "delete": 900,
+    "where": 880,
+    "groupby": 860,
+    "orderby": 840,
+    "limit": 820,
+    "offset": 800,
+    "cursor": 780,
+    "rowset": 760,
+    "bulk": 740,
+    "shard": 720,
+    "replica": 700,
+    "cluster": 680,
+    "ttl": 660,
+    "redis": 640,
+    "postgres": 620,
+    "mysql": 600,
+    "sqlite": 580,
+    "mongo": 560,
+    "elasticsearch": 540,
+    "kafka": 520,
+    "rabbitmq": 500,
+    "git": 800,
+    "branch": 780,
+    "merge": 760,
+    "rebase": 740,
+    "checkout": 720,
+    "stash": 700,
+    "diff": 680,
+    "patch": 660,
+    "deploy": 640,
+    "release": 620,
+    "pipeline": 600,
+    "ci": 580,
+    "cd": 560,
+    "build": 540,
+    "compile": 520,
+    "lint": 500,
+    "format": 480,
+    "refactor": 460,
+    "optimize": 440,
+    "profile": 420,
+    "benchmark": 400,
+    "coverage": 380,
+    "mock": 360,
+    "stub": 340,
+    "fixture": 320,
+    "assertion": 300,
+    "unittest": 280,
+    "pytest": 260,
+    "jest": 240,
+    "mocha": 220,
+    "cypress": 200,
+    "tensor": 800,
+    "matrix": 780,
+    "vector": 760,
+    "scalar": 740,
+    "gradient": 720,
+    "epoch": 700,
+    "batch": 680,
+    "layer": 660,
+    "neuron": 640,
+    "activation": 620,
+    "dropout": 600,
+    "embedding": 580,
+    "transformer": 560,
+    "attention": 540,
+    "encoder": 520,
+    "decoder": 500,
+    "tokenizer": 480,
+    "dataset": 460,
+    "dataloader": 440,
+    "optimizer": 420,
+    "scheduler": 400,
+    "checkpoint": 380,
+    "inference": 360,
+    "training": 340,
+    "validation": 320,
+    "accuracy": 300,
+    "precision": 280,
+    "recall": 260,
+    "metric": 240,
+    "loss": 220,
+    "backpropagation": 200,
+    "kernel": 600,
+    "syscall": 580,
+    "interrupt": 560,
+    "signal": 540,
+    "fork": 520,
+    "exec": 500,
+    "spawn": 480,
+    "daemon": 460,
+    "cron": 440,
+    "ipc": 420,
+    "mmap": 400,
+    "brk": 380,
+    "epoll": 360,
+    "poll": 340,
+    "ioctl": 320,
+    "futex": 300,
+    "ptrace": 280,
+    "strace": 260,
+    "valgrind": 240,
+    "gdb": 220,
+    "lldb": 200,
+    "regex": 500,
+    "pattern": 480,
+    "match": 460,
+    "replace": 440,
+    "split": 420,
+    "trim": 400,
+    "concat": 380,
+    "slice": 360,
+    "map": 340,
+    "filter": 320,
+    "reduce": 300,
+    "sort": 280,
+    "search": 260,
+    "find": 240,
+    "contains": 220,
+    "exists": 200,
+    "append": 500,
+    "push": 480,
+    "pop": 460,
+    "shift": 440,
+    "unshift": 420,
+    "splice": 400,
+    "reverse": 380,
+    "flatten": 360,
+    "unique": 340,
+    "distinct": 320,
+    "aggregate": 300,
+    "transform": 280,
+    "validate": 260,
+    "sanitize": 240,
+    "escape": 220,
+    "encode": 200,
+    "decode": 500,
+    "parse": 480,
+    "stringify": 460,
+    "interpolate": 440,
+    "render": 420,
+    "mount": 400,
+    "unmount": 380,
+    "hydrate": 360,
+    "serialize": 340,
+    "clone": 320,
+    "copy": 300,
+    "move": 280,
+    "swap": 260,
+    "rotate": 240,
+    "permute": 220,
+    "traverse": 200,
+    "algorithm": 500,
+    "complexity": 480,
+    "recursion": 460,
+    "iteration": 440,
+    "memoization": 420,
+    "precompute": 400,
+    "throttle": 380,
+    "debounce": 360,
+    "pagination": 340,
+    "infinite": 320,
+    "scroll": 300,
+    "lazy": 280,
+    "eager": 260,
+    "defer": 240,
+    "suspend": 220,
+    "resume": 200
+  },
+  "bigrams": [
+    {
+      "ctx": "return",
+      "word": "value",
+      "count": 800
+    },
+    {
+      "ctx": "source",
+      "word": "code",
+      "count": 780
+    },
+    {
+      "ctx": "null",
+      "word": "pointer",
+      "count": 760
+    },
+    {
+      "ctx": "data",
+      "word": "type",
+      "count": 740
+    },
+    {
+      "ctx": "data",
+      "word": "structure",
+      "count": 720
+    },
+    {
+      "ctx": "error",
+      "word": "handling",
+      "count": 700
+    },
+    {
+      "ctx": "error",
+      "word": "message",
+      "count": 680
+    },
+    {
+      "ctx": "file",
+      "word": "system",
+      "count": 660
+    },
+    {
+      "ctx": "file",
+      "word": "path",
+      "count": 640
+    },
+    {
+      "ctx": "hash",
+      "word": "map",
+      "count": 620
+    },
+    {
+      "ctx": "hash",
+      "word": "table",
+      "count": 600
+    },
+    {
+      "ctx": "hash",
+      "word": "function",
+      "count": 580
+    },
+    {
+      "ctx": "linked",
+      "word": "list",
+      "count": 560
+    },
+    {
+      "ctx": "binary",
+      "word": "tree",
+      "count": 540
+    },
+    {
+      "ctx": "binary",
+      "word": "search",
+      "count": 520
+    },
+    {
+      "ctx": "search",
+      "word": "algorithm",
+      "count": 500
+    },
+    {
+      "ctx": "sort",
+      "word": "algorithm",
+      "count": 480
+    },
+    {
+      "ctx": "time",
+      "word": "complexity",
+      "count": 460
+    },
+    {
+      "ctx": "space",
+      "word": "complexity",
+      "count": 440
+    },
+    {
+      "ctx": "memory",
+      "word": "allocation",
+      "count": 420
+    },
+    {
+      "ctx": "memory",
+      "word": "leak",
+      "count": 400
+    },
+    {
+      "ctx": "stack",
+      "word": "overflow",
+      "count": 380
+    },
+    {
+      "ctx": "buffer",
+      "word": "overflow",
+      "count": 360
+    },
+    {
+      "ctx": "race",
+      "word": "condition",
+      "count": 340
+    },
+    {
+      "ctx": "dead",
+      "word": "lock",
+      "count": 320
+    },
+    {
+      "ctx": "design",
+      "word": "pattern",
+      "count": 300
+    },
+    {
+      "ctx": "code",
+      "word": "review",
+      "count": 280
+    },
+    {
+      "ctx": "unit",
+      "word": "test",
+      "count": 260
+    },
+    {
+      "ctx": "integration",
+      "word": "test",
+      "count": 240
+    },
+    {
+      "ctx": "test",
+      "word": "case",
+      "count": 220
+    },
+    {
+      "ctx": "test",
+      "word": "suite",
+      "count": 200
+    },
+    {
+      "ctx": "api",
+      "word": "endpoint",
+      "count": 700
+    },
+    {
+      "ctx": "api",
+      "word": "key",
+      "count": 680
+    },
+    {
+      "ctx": "api",
+      "word": "request",
+      "count": 660
+    },
+    {
+      "ctx": "http",
+      "word": "request",
+      "count": 640
+    },
+    {
+      "ctx": "http",
+      "word": "response",
+      "count": 620
+    },
+    {
+      "ctx": "http",
+      "word": "status",
+      "count": 600
+    },
+    {
+      "ctx": "status",
+      "word": "code",
+      "count": 580
+    },
+    {
+      "ctx": "content",
+      "word": "type",
+      "count": 560
+    },
+    {
+      "ctx": "request",
+      "word": "body",
+      "count": 540
+    },
+    {
+      "ctx": "response",
+      "word": "body",
+      "count": 520
+    },
+    {
+      "ctx": "query",
+      "word": "string",
+      "count": 500
+    },
+    {
+      "ctx": "query",
+      "word": "parameter",
+      "count": 480
+    },
+    {
+      "ctx": "base",
+      "word": "url",
+      "count": 460
+    },
+    {
+      "ctx": "web",
+      "word": "server",
+      "count": 440
+    },
+    {
+      "ctx": "web",
+      "word": "socket",
+      "count": 420
+    },
+    {
+      "ctx": "web",
+      "word": "application",
+      "count": 400
+    },
+    {
+      "ctx": "rest",
+      "word": "api",
+      "count": 380
+    },
+    {
+      "ctx": "json",
+      "word": "object",
+      "count": 360
+    },
+    {
+      "ctx": "json",
+      "word": "array",
+      "count": 340
+    },
+    {
+      "ctx": "json",
+      "word": "schema",
+      "count": 320
+    },
+    {
+      "ctx": "access",
+      "word": "token",
+      "count": 300
+    },
+    {
+      "ctx": "refresh",
+      "word": "token",
+      "count": 280
+    },
+    {
+      "ctx": "access",
+      "word": "control",
+      "count": 260
+    },
+    {
+      "ctx": "cross",
+      "word": "origin",
+      "count": 240
+    },
+    {
+      "ctx": "primary",
+      "word": "key",
+      "count": 600
+    },
+    {
+      "ctx": "foreign",
+      "word": "key",
+      "count": 580
+    },
+    {
+      "ctx": "database",
+      "word": "connection",
+      "count": 560
+    },
+    {
+      "ctx": "database",
+      "word": "schema",
+      "count": 540
+    },
+    {
+      "ctx": "database",
+      "word": "migration",
+      "count": 520
+    },
+    {
+      "ctx": "connection",
+      "word": "pool",
+      "count": 500
+    },
+    {
+      "ctx": "connection",
+      "word": "string",
+      "count": 480
+    },
+    {
+      "ctx": "data",
+      "word": "model",
+      "count": 460
+    },
+    {
+      "ctx": "data",
+      "word": "source",
+      "count": 440
+    },
+    {
+      "ctx": "table",
+      "word": "name",
+      "count": 420
+    },
+    {
+      "ctx": "column",
+      "word": "name",
+      "count": 400
+    },
+    {
+      "ctx": "row",
+      "word": "count",
+      "count": 380
+    },
+    {
+      "ctx": "inner",
+      "word": "join",
+      "count": 360
+    },
+    {
+      "ctx": "left",
+      "word": "join",
+      "count": 340
+    },
+    {
+      "ctx": "outer",
+      "word": "join",
+      "count": 320
+    },
+    {
+      "ctx": "group",
+      "word": "by",
+      "count": 300
+    },
+    {
+      "ctx": "order",
+      "word": "by",
+      "count": 280
+    },
+    {
+      "ctx": "insert",
+      "word": "into",
+      "count": 260
+    },
+    {
+      "ctx": "version",
+      "word": "control",
+      "count": 500
+    },
+    {
+      "ctx": "pull",
+      "word": "request",
+      "count": 480
+    },
+    {
+      "ctx": "merge",
+      "word": "conflict",
+      "count": 460
+    },
+    {
+      "ctx": "continuous",
+      "word": "integration",
+      "count": 440
+    },
+    {
+      "ctx": "continuous",
+      "word": "deployment",
+      "count": 420
+    },
+    {
+      "ctx": "build",
+      "word": "system",
+      "count": 400
+    },
+    {
+      "ctx": "build",
+      "word": "tool",
+      "count": 380
+    },
+    {
+      "ctx": "package",
+      "word": "manager",
+      "count": 360
+    },
+    {
+      "ctx": "dependency",
+      "word": "injection",
+      "count": 340
+    },
+    {
+      "ctx": "environment",
+      "word": "variable",
+      "count": 320
+    },
+    {
+      "ctx": "config",
+      "word": "file",
+      "count": 300
+    },
+    {
+      "ctx": "log",
+      "word": "file",
+      "count": 280
+    },
+    {
+      "ctx": "log",
+      "word": "level",
+      "count": 260
+    },
+    {
+      "ctx": "error",
+      "word": "log",
+      "count": 240
+    },
+    {
+      "ctx": "stack",
+      "word": "trace",
+      "count": 220
+    },
+    {
+      "ctx": "debug",
+      "word": "mode",
+      "count": 200
+    },
+    {
+      "ctx": "return",
+      "word": "type",
+      "count": 500
+    },
+    {
+      "ctx": "generic",
+      "word": "type",
+      "count": 480
+    },
+    {
+      "ctx": "abstract",
+      "word": "class",
+      "count": 460
+    },
+    {
+      "ctx": "base",
+      "word": "class",
+      "count": 440
+    },
+    {
+      "ctx": "derived",
+      "word": "class",
+      "count": 420
+    },
+    {
+      "ctx": "inner",
+      "word": "class",
+      "count": 400
+    },
+    {
+      "ctx": "static",
+      "word": "method",
+      "count": 380
+    },
+    {
+      "ctx": "class",
+      "word": "method",
+      "count": 360
+    },
+    {
+      "ctx": "instance",
+      "word": "method",
+      "count": 340
+    },
+    {
+      "ctx": "virtual",
+      "word": "function",
+      "count": 320
+    },
+    {
+      "ctx": "pure",
+      "word": "function",
+      "count": 300
+    },
+    {
+      "ctx": "higher",
+      "word": "order",
+      "count": 280
+    },
+    {
+      "ctx": "callback",
+      "word": "function",
+      "count": 260
+    },
+    {
+      "ctx": "anonymous",
+      "word": "function",
+      "count": 240
+    },
+    {
+      "ctx": "arrow",
+      "word": "function",
+      "count": 220
+    },
+    {
+      "ctx": "lambda",
+      "word": "expression",
+      "count": 200
+    },
+    {
+      "ctx": "machine",
+      "word": "learning",
+      "count": 500
+    },
+    {
+      "ctx": "deep",
+      "word": "learning",
+      "count": 480
+    },
+    {
+      "ctx": "neural",
+      "word": "network",
+      "count": 460
+    },
+    {
+      "ctx": "training",
+      "word": "data",
+      "count": 440
+    },
+    {
+      "ctx": "test",
+      "word": "data",
+      "count": 420
+    },
+    {
+      "ctx": "feature",
+      "word": "extraction",
+      "count": 400
+    },
+    {
+      "ctx": "model",
+      "word": "training",
+      "count": 380
+    },
+    {
+      "ctx": "loss",
+      "word": "function",
+      "count": 360
+    },
+    {
+      "ctx": "learning",
+      "word": "rate",
+      "count": 340
+    },
+    {
+      "ctx": "batch",
+      "word": "size",
+      "count": 320
+    },
+    {
+      "ctx": "attention",
+      "word": "mechanism",
+      "count": 300
+    },
+    {
+      "ctx": "natural",
+      "word": "language",
+      "count": 280
+    },
+    {
+      "ctx": "language",
+      "word": "model",
+      "count": 260
+    },
+    {
+      "ctx": "large",
+      "word": "language",
+      "count": 240
+    },
+    {
+      "ctx": "public",
+      "word": "key",
+      "count": 400
+    },
+    {
+      "ctx": "private",
+      "word": "key",
+      "count": 380
+    },
+    {
+      "ctx": "secret",
+      "word": "key",
+      "count": 360
+    },
+    {
+      "ctx": "encryption",
+      "word": "key",
+      "count": 340
+    },
+    {
+      "ctx": "security",
+      "word": "token",
+      "count": 320
+    },
+    {
+      "ctx": "sql",
+      "word": "injection",
+      "count": 300
+    },
+    {
+      "ctx": "cross",
+      "word": "site",
+      "count": 280
+    },
+    {
+      "ctx": "input",
+      "word": "validation",
+      "count": 260
+    },
+    {
+      "ctx": "authentication",
+      "word": "token",
+      "count": 240
+    },
+    {
+      "ctx": "authorization",
+      "word": "header",
+      "count": 220
+    },
+    {
+      "ctx": "open",
+      "word": "source",
+      "count": 400
+    },
+    {
+      "ctx": "command",
+      "word": "line",
+      "count": 380
+    },
+    {
+      "ctx": "regular",
+      "word": "expression",
+      "count": 360
+    },
+    {
+      "ctx": "string",
+      "word": "literal",
+      "count": 340
+    },
+    {
+      "ctx": "null",
+      "word": "value",
+      "count": 320
+    },
+    {
+      "ctx": "default",
+      "word": "value",
+      "count": 300
+    },
+    {
+      "ctx": "key",
+      "word": "value",
+      "count": 280
+    },
+    {
+      "ctx": "boolean",
+      "word": "expression",
+      "count": 260
+    },
+    {
+      "ctx": "type",
+      "word": "annotation",
+      "count": 240
+    },
+    {
+      "ctx": "type",
+      "word": "inference",
+      "count": 220
+    },
+    {
+      "ctx": "type",
+      "word": "safety",
+      "count": 200
+    },
+    {
+      "ctx": "compile",
+      "word": "time",
+      "count": 500
+    },
+    {
+      "ctx": "run",
+      "word": "time",
+      "count": 480
+    },
+    {
+      "ctx": "execution",
+      "word": "time",
+      "count": 460
+    },
+    {
+      "ctx": "response",
+      "word": "time",
+      "count": 440
+    },
+    {
+      "ctx": "load",
+      "word": "time",
+      "count": 420
+    }
+  ],
+  "trigrams": [
+    {
+      "w1": "end",
+      "w2": "of",
+      "word": "file",
+      "count": 500
+    },
+    {
+      "w1": "out",
+      "w2": "of",
+      "word": "memory",
+      "count": 480
+    },
+    {
+      "w1": "out",
+      "w2": "of",
+      "word": "bounds",
+      "count": 460
+    },
+    {
+      "w1": "out",
+      "w2": "of",
+      "word": "range",
+      "count": 440
+    },
+    {
+      "w1": "null",
+      "w2": "pointer",
+      "word": "exception",
+      "count": 420
+    },
+    {
+      "w1": "stack",
+      "w2": "overflow",
+      "word": "error",
+      "count": 400
+    },
+    {
+      "w1": "command",
+      "w2": "line",
+      "word": "interface",
+      "count": 380
+    },
+    {
+      "w1": "application",
+      "w2": "programming",
+      "word": "interface",
+      "count": 360
+    },
+    {
+      "w1": "object",
+      "w2": "oriented",
+      "word": "programming",
+      "count": 340
+    },
+    {
+      "w1": "model",
+      "w2": "view",
+      "word": "controller",
+      "count": 320
+    },
+    {
+      "w1": "create",
+      "w2": "read",
+      "word": "update",
+      "count": 300
+    },
+    {
+      "w1": "continuous",
+      "w2": "integration",
+      "word": "deployment",
+      "count": 280
+    },
+    {
+      "w1": "test",
+      "w2": "driven",
+      "word": "development",
+      "count": 260
+    },
+    {
+      "w1": "domain",
+      "w2": "driven",
+      "word": "design",
+      "count": 240
+    },
+    {
+      "w1": "don",
+      "w2": "t",
+      "word": "repeat",
+      "count": 220
+    },
+    {
+      "w1": "single",
+      "w2": "responsibility",
+      "word": "principle",
+      "count": 200
+    },
+    {
+      "w1": "open",
+      "w2": "closed",
+      "word": "principle",
+      "count": 500
+    },
+    {
+      "w1": "dependency",
+      "w2": "injection",
+      "word": "container",
+      "count": 480
+    },
+    {
+      "w1": "primary",
+      "w2": "key",
+      "word": "constraint",
+      "count": 460
+    },
+    {
+      "w1": "foreign",
+      "w2": "key",
+      "word": "constraint",
+      "count": 440
+    },
+    {
+      "w1": "cross",
+      "w2": "site",
+      "word": "scripting",
+      "count": 420
+    },
+    {
+      "w1": "sql",
+      "w2": "injection",
+      "word": "attack",
+      "count": 400
+    },
+    {
+      "w1": "public",
+      "w2": "key",
+      "word": "infrastructure",
+      "count": 380
+    },
+    {
+      "w1": "transport",
+      "w2": "layer",
+      "word": "security",
+      "count": 360
+    },
+    {
+      "w1": "secure",
+      "w2": "socket",
+      "word": "layer",
+      "count": 340
+    },
+    {
+      "w1": "hypertext",
+      "w2": "transfer",
+      "word": "protocol",
+      "count": 320
+    },
+    {
+      "w1": "uniform",
+      "w2": "resource",
+      "word": "locator",
+      "count": 300
+    },
+    {
+      "w1": "javascript",
+      "w2": "object",
+      "word": "notation",
+      "count": 280
+    },
+    {
+      "w1": "version",
+      "w2": "control",
+      "word": "system",
+      "count": 260
+    },
+    {
+      "w1": "integrated",
+      "w2": "development",
+      "word": "environment",
+      "count": 240
+    },
+    {
+      "w1": "natural",
+      "w2": "language",
+      "word": "processing",
+      "count": 220
+    },
+    {
+      "w1": "large",
+      "w2": "language",
+      "word": "model",
+      "count": 200
+    },
+    {
+      "w1": "machine",
+      "w2": "learning",
+      "word": "model",
+      "count": 500
+    },
+    {
+      "w1": "neural",
+      "w2": "network",
+      "word": "architecture",
+      "count": 480
+    },
+    {
+      "w1": "deep",
+      "w2": "learning",
+      "word": "framework",
+      "count": 460
+    },
+    {
+      "w1": "convolutional",
+      "w2": "neural",
+      "word": "network",
+      "count": 440
+    },
+    {
+      "w1": "recurrent",
+      "w2": "neural",
+      "word": "network",
+      "count": 420
+    },
+    {
+      "w1": "generative",
+      "w2": "adversarial",
+      "word": "network",
+      "count": 400
+    },
+    {
+      "w1": "long",
+      "w2": "short",
+      "word": "term",
+      "count": 380
+    },
+    {
+      "w1": "attention",
+      "w2": "is",
+      "word": "all",
+      "count": 360
+    },
+    {
+      "w1": "not",
+      "w2": "a",
+      "word": "number",
+      "count": 340
+    },
+    {
+      "w1": "end",
+      "w2": "to",
+      "word": "end",
+      "count": 320
+    },
+    {
+      "w1": "key",
+      "w2": "value",
+      "word": "pair",
+      "count": 300
+    },
+    {
+      "w1": "key",
+      "w2": "value",
+      "word": "store",
+      "count": 280
+    },
+    {
+      "w1": "hash",
+      "w2": "map",
+      "word": "implementation",
+      "count": 260
+    },
+    {
+      "w1": "binary",
+      "w2": "search",
+      "word": "tree",
+      "count": 240
+    },
+    {
+      "w1": "breadth",
+      "w2": "first",
+      "word": "search",
+      "count": 220
+    },
+    {
+      "w1": "depth",
+      "w2": "first",
+      "word": "search",
+      "count": 200
+    },
+    {
+      "w1": "linked",
+      "w2": "list",
+      "word": "node",
+      "count": 500
+    },
+    {
+      "w1": "doubly",
+      "w2": "linked",
+      "word": "list",
+      "count": 480
+    }
+  ]
+}

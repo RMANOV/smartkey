@@ -309,38 +309,37 @@ mod tests {
 
     #[test]
     fn test_personal_boost() {
-        // CVM is probabilistic — run multiple trials and check that the
-        // personal boost works in the majority of them.
-        let mut boosted = 0;
-        let trials = 50;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
-        for _ in 0..trials {
-            let mut engine = SmartKeyEngine::new();
-            engine.load_word("apple", 50);
-            engine.load_word("apply", 50);
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("apple", 50);
+        engine.load_word("apply", 50);
 
-            // Learn "apply" so CVM retains it.
-            for _ in 0..100 {
-                engine.learn("apply");
-            }
+        // Import a deterministic CVM snapshot with "apply" guaranteed in buffer.
+        // This avoids flakiness from probabilistic CVM eviction.
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let snap = CvmSnapshot {
+            version: 1,
+            saved_at_unix: now_unix,
+            capacity: 500,
+            max_capacity: 5000,
+            round: 0,
+            decay_lambda: 0.001,
+            words: vec!["apply".into()],
+            age_secs: [("apply".into(), 0.0)].into(),
+        };
+        engine.import_personal(&snap);
 
-            let preds = engine.predict("app", &[], 5);
-            if preds.len() >= 2 {
-                let apply_pos = preds.iter().position(|p| p.word == "apply");
-                let apple_pos = preds.iter().position(|p| p.word == "apple");
-                if let (Some(ap), Some(al)) = (apply_pos, apple_pos) {
-                    if ap < al {
-                        boosted += 1;
-                    }
-                }
-            }
-        }
-
-        // Personal boost should win in at least 50% of trials (67% expected).
+        let preds = engine.predict("app", &[], 5);
+        assert!(preds.len() >= 2);
+        let apply_pos = preds.iter().position(|p| p.word == "apply").unwrap();
+        let apple_pos = preds.iter().position(|p| p.word == "apple").unwrap();
         assert!(
-            boosted >= trials / 2,
-            "personal boost should rank 'apply' first in >=50% of trials, \
-             but only won {boosted}/{trials}"
+            apply_pos < apple_pos,
+            "personal boost should rank 'apply' before 'apple'"
         );
     }
 
