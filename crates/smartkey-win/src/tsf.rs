@@ -151,7 +151,7 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
-        let key = Self::vk_to_key(wparam.0 as u32);
+        let key = SmartKeyTextService::vk_to_key(wparam.0 as u32);
         let dominated = !matches!(key, Key::Other(_));
         Ok(BOOL::from(dominated))
     }
