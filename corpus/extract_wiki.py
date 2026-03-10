@@ -41,7 +41,7 @@ _RE_CODE = re.compile(
     r"<(?:code|syntaxhighlight|source|nowiki)[^>]*>.*?</(?:code|syntaxhighlight|source|nowiki)>",
     re.DOTALL | re.IGNORECASE,
 )
-_RE_TABLE = re.compile(r"\{\|.*?\|\}", re.DOTALL)
+_RE_TABLE = re.compile(r"\{\|[^{]*?\|\}", re.DOTALL)
 _RE_TEMPLATE = re.compile(r"\{\{[^{}]*\}\}")  # innermost first
 _RE_FILE_LINK = re.compile(
     r"\[\[(?:File|Image|Файл|Изображение):[^\]]*\]\]", re.IGNORECASE
@@ -173,8 +173,14 @@ def _iter_articles_iterparse(path: str, min_words: int):
     current_ns = None
     current_text = None
 
+    try:
+        import defusedxml.ElementTree as SafeET
+        _iterparse = SafeET.iterparse
+    except ImportError:
+        _iterparse = ET.iterparse
+
     with bz2.open(path, "rb") as fh:
-        for event, elem in ET.iterparse(fh, events=("end",)):
+        for event, elem in _iterparse(fh, events=("end",)):
             tag = elem.tag.replace(f"{{{ns}}}", "")
 
             if tag == "ns":

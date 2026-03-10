@@ -88,15 +88,15 @@ impl SmartKeyTextService {
         for action in actions {
             match action {
                 Action::ShowGhost(_text) => {
-                    // TODO: Create or update TSF composition with grey display
-                    // attribute to show ghost text inline.
+                    // TODO: Create TSF composition for ghost text
+                    consumed = false;
                 }
                 Action::HideGhost => {
                     // TODO: End any active TSF composition.
                 }
                 Action::CommitText(_text) => {
-                    // TODO: End composition and insert finalized text via
-                    // ITfInsertAtSelection or ITfRange::SetText.
+                    // TODO: Insert text via ITfInsertAtSelection
+                    consumed = false;
                 }
                 Action::ForwardKey => {
                     consumed = false;
@@ -148,11 +148,12 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
     fn OnTestKeyDown(
         &self,
         _pic: Option<&ITfContext>,
-        _wparam: WPARAM,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
-        // Return TRUE if we want to handle this key.
-        Ok(BOOL::from(true))
+        let key = Self::vk_to_key(wparam.0 as u32);
+        let dominated = !matches!(key, Key::Other(_));
+        Ok(BOOL::from(dominated))
     }
 
     fn OnTestKeyUp(

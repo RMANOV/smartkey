@@ -95,18 +95,16 @@ impl CvmCounter {
         let now = Instant::now();
 
         if self.buffer.contains(element) {
-            // Probabilistic eviction: flip up to (round + 1) coins.
-            let mut evicted = false;
-            for _ in 0..=self.round {
-                if rng.gen::<f64>() >= 0.5 {
-                    self.buffer.remove(element);
-                    self.last_seen.remove(element);
-                    evicted = true;
-                    break;
-                }
-            }
-            if !evicted {
-                // Element survived — refresh its timestamp.
+            self.buffer.remove(element);
+            self.last_seen.remove(element);
+            // Re-insert with probability 2^(-round) per CVM paper.
+            let p = if self.round >= 64 {
+                0.0
+            } else {
+                0.5_f64.powi(self.round as i32)
+            };
+            if rng.gen::<f64>() < p {
+                self.buffer.insert(element.to_owned());
                 self.last_seen.insert(element.to_owned(), now);
             }
         } else {
@@ -232,7 +230,8 @@ impl CvmCounter {
             .words
             .iter()
             .filter_map(|word| {
-                let age_at_save = snap.age_secs.get(word).copied().unwrap_or(0.0);
+                // Words missing from age_secs are at least as old as the offline period.
+                let age_at_save = snap.age_secs.get(word).copied().unwrap_or(offline_secs);
                 let total_age = (age_at_save + offline_secs).max(0.0);
                 if !total_age.is_finite() {
                     return None;
@@ -274,7 +273,7 @@ impl CvmCounter {
         elems.truncate(retain_count);
         self.buffer = elems.into_iter().collect();
 
-        self.round += 1;
+        self.round = self.round.saturating_add(1);
     }
 }
 
@@ -615,6 +614,40 @@ mod tests {
         assert_eq!(deser.version, snap.version);
         assert_eq!(deser.capacity, snap.capacity);
         assert_eq!(deser.words, snap.words);
+    }
+
+    #[test]
+    fn from_snapshot_missing_age_defaults_to_stale() {
+        let snap = CvmSnapshot {
+            version: 1,
+            saved_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+                - 10.0, // saved 10s ago
+            capacity: 64,
+            max_capacity: 256,
+            round: 0,
+            decay_lambda: 1.0,
+            words: vec!["known".into(), "orphan".into()],
+            age_secs: {
+                let mut m = HashMap::new();
+                m.insert("known".into(), 2.0); // was 2s old at save time
+                                               // "orphan" deliberately omitted
+                m
+            },
+        };
+        let counter = CvmCounter::from_snapshot(&snap);
+
+        let score_known = counter.frequency_score("known");
+        let score_orphan = counter.frequency_score("orphan");
+
+        // "orphan" with missing age should NOT score higher than "known"
+        assert!(
+            score_orphan <= score_known,
+            "orphan (missing age) scored {score_orphan} > known {score_known} — \
+             should be stale, not fresh"
+        );
     }
 
     #[test]

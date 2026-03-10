@@ -243,10 +243,20 @@ impl InputMethodCore {
             }
             _ => {
                 let json_str = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-                let corpus = Corpus::from_json(&json_str)?;
+                let (corpus, warnings) = Corpus::from_json_with_warnings(&json_str)?;
+                if warnings.dropped_bigrams > 0 || warnings.dropped_trigrams > 0 {
+                    eprintln!(
+                        "smartkey: corpus {}: dropped {} bigrams, {} trigrams (malformed entries)",
+                        path.display(),
+                        warnings.dropped_bigrams,
+                        warnings.dropped_trigrams
+                    );
+                }
                 // Best-effort: write .bin cache alongside.
                 let bin_path = path.with_extension("bin");
-                let _ = std::fs::write(&bin_path, corpus.to_bincode());
+                if let Ok(bytes) = corpus.to_bincode() {
+                    let _ = std::fs::write(&bin_path, bytes);
+                }
                 corpus
             }
         };
@@ -264,7 +274,7 @@ impl InputMethodCore {
         if !self.enabled {
             if is_kill {
                 self.enabled = true;
-                return vec![Action::ForwardKey];
+                return vec![Action::HideGhost];
             }
             return vec![Action::ForwardKey];
         }
@@ -462,7 +472,10 @@ impl InputMethodCore {
                 .predict(&self.current_word, &ctx_refs, self.config.max_candidates);
 
         if let Some(top) = self.last_predictions.first() {
-            let suffix = top.word.get(self.current_word.len()..).unwrap_or("");
+            let suffix = top
+                .word
+                .strip_prefix(self.current_word.as_str())
+                .unwrap_or("");
             if !suffix.is_empty() && self.config.ghost_text {
                 self.ghost = suffix.to_string();
                 return Action::ShowGhost(self.ghost.clone());
@@ -633,10 +646,10 @@ mod tests {
         assert!(has_action(&actions, &Action::ForwardKey));
         assert_eq!(core.current_word(), "");
 
-        // Super+Escape again → re-enable.
+        // Super+Escape again → re-enable (symmetric with disable: returns HideGhost).
         let actions = core.handle_key(press_with(Key::Escape, Modifiers::SUPER));
         assert!(core.is_enabled());
-        assert!(has_action(&actions, &Action::ForwardKey));
+        assert!(has_action(&actions, &Action::HideGhost));
     }
 
     #[test]
@@ -752,9 +765,8 @@ mod tests {
 
     #[test]
     fn test_personal_save_load_round_trip() {
-        let dir = std::env::temp_dir().join("smartkey_test_profile");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("personal_test.json");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("personal_test.json");
 
         let mut core = test_core();
         // Learn some words so CVM has state.
@@ -766,10 +778,6 @@ mod tests {
 
         let mut core2 = InputMethodCore::new(InputConfig::default());
         core2.load_personal(&path).expect("load should succeed");
-
-        // Cleanup.
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

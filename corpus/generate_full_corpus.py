@@ -14,6 +14,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -274,6 +275,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Output path (default: ~/.config/smartkey/corpus_{lang}.json).",
     )
     args = parser.parse_args(argv)
+
+    if not re.fullmatch(r'[a-z]{2,5}', args.lang):
+        print(f"Error: invalid language code '{args.lang}' (expected 2-5 lowercase letters)", file=sys.stderr)
+        sys.exit(1)
 
     raw_dir = Path(args.raw_dir) if args.raw_dir else Path(__file__).parent / "raw"
     output = Path(args.output) if args.output else (

@@ -1,11 +1,17 @@
 {
     "enabled": true,
     "ghost_text": true,
-    "popup_on_alt": true,
     "max_candidates": 5,
     "min_prefix_length": 2,
     "kill_switch": "Super+Escape",
     "weights": {"corpus": 0.4, "markov": 0.4, "personal": 0.2},
     "languages": ["en", "bg"],
-    "personal_db": "~/.config/smartkey/personal.db"
+    "tuning": {
+        "cvm_initial_size": 1024,
+        "cvm_max_size": 8192,
+        "cvm_decay_lambda": 50.0,
+        "fuzzy_max_edits": 1,
+        "fuzzy_discount": 0.7,
+        "markov_lambdas": [0.6, 0.3, 0.1]
+    }
 }

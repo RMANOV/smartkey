@@ -45,7 +45,14 @@ impl PrefixMatcher {
         }
 
         // Build an Aho-Corasick automaton over the prefixes.
-        let ac = AhoCorasick::new(prefixes).expect("valid patterns");
+        let Ok(ac) = AhoCorasick::new(prefixes) else {
+            return self
+                .words
+                .iter()
+                .filter(|w| prefixes.iter().any(|p| w.starts_with(p)))
+                .cloned()
+                .collect();
+        };
 
         self.words
             .iter()

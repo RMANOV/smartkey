@@ -13,11 +13,7 @@ import os
 import time
 from pathlib import Path
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s smartkey: %(message)s",
-    filename="/tmp/smartkey-debug.log",
-)
+log = logging.getLogger("smartkey")
 
 # ---------------------------------------------------------------------------
 # IBus GObject introspection -- may not be installed on all systems.
@@ -149,7 +145,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         try:
             self._core.load_personal()
         except Exception:
-            logging.debug("smartkey: no personal profile loaded (first run?)")
+            log.debug("smartkey: no personal profile loaded (first run?)")
 
         # Debounce timer for auto-save on focus-out (60s cooldown).
         self._last_save: float = 0.0
@@ -208,7 +204,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             )
         )
         ibus_text.set_attributes(attrs)
-        self.update_preedit_text(ibus_text, 0, True)
+        self.update_preedit_text(ibus_text, len(text), True)
 
     def _clear_ghost(self) -> None:
         """Remove any displayed ghost text."""
@@ -241,7 +237,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     ) -> bool:
         """Handle an IBus key event via the Rust core."""
         orig_keyval = keyval
-        logging.debug(
+        log.debug(
             "key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state
         )
         # Convert legacy X11 keysyms (e.g. Cyrillic 0x06xx) to Unicode
@@ -254,9 +250,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if keyval >= 0x01000000 and keyval <= 0x0110FFFF:
             keyval = keyval & 0x00FFFFFF
         if keyval != orig_keyval:
-            logging.debug("keysym converted: 0x%04X → 0x%04X (%s)", orig_keyval, keyval, chr(keyval))
+            try:
+                ch_repr = chr(keyval)
+            except (ValueError, OverflowError):
+                ch_repr = f"\\u{keyval:04X}"
+            log.debug("keysym converted: 0x%04X → 0x%04X (%s)", orig_keyval, keyval, ch_repr)
         actions = self._core.handle_key(keyval, state)
-        logging.debug("actions: %s", actions)
+        log.debug("actions: %s", actions)
         return self._execute_actions(actions)
 
     # -----------------------------------------------------------------------
@@ -275,7 +275,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 self._core.save_personal()
                 self._last_save = now
             except Exception:
-                pass
+                log.warning("Failed to save personal profile", exc_info=True)
 
     def do_reset(self) -> None:
         actions = self._core.reset()
@@ -291,4 +291,4 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         try:
             self._core.save_personal()
         except Exception:
-            pass
+            log.warning("Failed to save personal profile", exc_info=True)

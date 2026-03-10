@@ -13,10 +13,8 @@ const UNSEEN_FLOOR: f64 = 1e-6;
 pub struct MarkovChain {
     /// context_word → { next_word → count }
     bigrams: HashMap<String, HashMap<String, u32>>,
-    /// (w1, w2) → { next_word → count }
-    trigrams: HashMap<(String, String), HashMap<String, u32>>,
-    /// Total unigram mass (sum of all bigram counts, used for uniform fallback).
-    unigram_total: u32,
+    /// w1 → w2 → { next_word → count }
+    trigrams: HashMap<String, HashMap<String, HashMap<String, u32>>>,
     /// Distinct words observed (tracked incrementally).
     vocab: HashSet<String>,
     /// Interpolation weights: [trigram, bigram, unigram].
@@ -29,7 +27,6 @@ impl MarkovChain {
         Self {
             bigrams: HashMap::new(),
             trigrams: HashMap::new(),
-            unigram_total: 0,
             vocab: HashSet::new(),
             lambda: [0.6, 0.3, 0.1],
         }
@@ -40,7 +37,6 @@ impl MarkovChain {
         Self {
             bigrams: HashMap::new(),
             trigrams: HashMap::new(),
-            unigram_total: 0,
             vocab: HashSet::new(),
             lambda,
         }
@@ -59,7 +55,6 @@ impl MarkovChain {
             .entry(word.to_owned())
             .or_insert(0);
         *entry += count;
-        self.unigram_total += count;
         self.vocab.insert(word.to_owned());
     }
 
@@ -67,11 +62,14 @@ impl MarkovChain {
     pub fn train_trigram(&mut self, w1: &str, w2: &str, word: &str, count: u32) {
         let entry = self
             .trigrams
-            .entry((w1.to_owned(), w2.to_owned()))
+            .entry(w1.to_owned())
+            .or_default()
+            .entry(w2.to_owned())
             .or_default()
             .entry(word.to_owned())
             .or_insert(0);
         *entry += count;
+        self.vocab.insert(word.to_owned());
     }
 
     // ------------------------------------------------------------------
@@ -101,8 +99,10 @@ impl MarkovChain {
     /// Returns `UNSEEN_FLOOR` when the `(w1, w2)` context has never been
     /// observed.
     pub fn trigram_prob(&self, word: &str, w1: &str, w2: &str) -> f64 {
-        let key = (w1.to_owned(), w2.to_owned());
-        let Some(followers) = self.trigrams.get(&key) else {
+        let Some(level2) = self.trigrams.get(w1) else {
+            return UNSEEN_FLOOR;
+        };
+        let Some(followers) = level2.get(w2) else {
             return UNSEEN_FLOOR;
         };
         let total: u32 = followers.values().sum();
