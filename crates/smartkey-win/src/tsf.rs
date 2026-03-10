@@ -30,6 +30,12 @@ pub struct SmartKeyTextService {
     client_id: std::cell::Cell<u32>,
 }
 
+impl Default for SmartKeyTextService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SmartKeyTextService {
     pub fn new() -> Self {
         Self {
