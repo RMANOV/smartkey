@@ -95,18 +95,16 @@ impl CvmCounter {
         let now = Instant::now();
 
         if self.buffer.contains(element) {
-            // Probabilistic eviction: flip up to (round + 1) coins.
-            let mut evicted = false;
-            for _ in 0..=self.round {
-                if rng.gen::<f64>() >= 0.5 {
-                    self.buffer.remove(element);
-                    self.last_seen.remove(element);
-                    evicted = true;
-                    break;
-                }
-            }
-            if !evicted {
-                // Element survived — refresh its timestamp.
+            self.buffer.remove(element);
+            self.last_seen.remove(element);
+            // Re-insert with probability 2^(-round) per CVM paper.
+            let p = if self.round >= 64 {
+                0.0
+            } else {
+                0.5_f64.powi(self.round as i32)
+            };
+            if rng.gen::<f64>() < p {
+                self.buffer.insert(element.to_owned());
                 self.last_seen.insert(element.to_owned(), now);
             }
         } else {
@@ -274,7 +272,7 @@ impl CvmCounter {
         elems.truncate(retain_count);
         self.buffer = elems.into_iter().collect();
 
-        self.round += 1;
+        self.round = self.round.saturating_add(1);
     }
 }
 

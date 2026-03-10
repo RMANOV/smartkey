@@ -23,18 +23,24 @@ impl PySmartKeyEngine {
 
     /// Create an engine from a JSON config string (weights, tuning, etc.).
     #[staticmethod]
-    fn from_config(config_json: &str) -> Self {
+    fn from_config(config_json: &str) -> PyResult<Self> {
+        serde_json::from_str::<serde_json::Value>(config_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid config JSON: {e}"))
+        })?;
         let config = InputConfig::from_json(config_json);
-        Self {
+        Ok(Self {
             inner: SmartKeyEngine::from_config(&config),
-        }
+        })
     }
 
     /// Export the personal CVM profile to a JSON file.
     fn export_personal(&self, path: &str) -> PyResult<()> {
         let snap = self.inner.export_personal();
-        let json = serde_json::to_string_pretty(&snap)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&snap).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to serialize personal profile: {e}"
+            ))
+        })?;
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
@@ -118,7 +124,7 @@ fn keyval_to_key(keyval: u32) -> Key {
         // ASCII printable
         k if (0x21..=0x7E).contains(&k) => Key::Char(char::from(k as u8)),
         // Unicode codepoints (Cyrillic, Latin Extended, etc.)
-        k if k >= 0x80 && k <= 0x10FFFF => match char::from_u32(k) {
+        k if (0x80..=0xEFFF).contains(&k) => match char::from_u32(k) {
             Some(ch) if !ch.is_control() => Key::Char(ch),
             _ => Key::Other(k),
         },

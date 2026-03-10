@@ -28,9 +28,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p smartkey-core
+      - run: cargo test -p smartkey-win
       - run: cargo check -p smartkey-win
+      - run: cargo clippy -p smartkey-win -- -D warnings
 
   build-macos:
     name: Build (macOS)
@@ -53,6 +57,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p smartkey-core -p smartkey-mac -- -D warnings
+      - run: cargo clippy -p smartkey-py -- -D warnings
 
   fmt:
     name: Format
@@ -62,4 +67,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check

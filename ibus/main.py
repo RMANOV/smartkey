@@ -15,7 +15,10 @@ connect to the existing bus rather than spawning a new one.
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # IBus GObject introspection -- graceful fallback if not installed.
@@ -87,6 +90,16 @@ def main() -> None:
     # Parse IBus-specific flags (--ibus).
     is_ibus = "--ibus" in sys.argv
 
+    # Set up logging to XDG-compliant location.
+    log_dir = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "smartkey"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_level = logging.DEBUG if os.environ.get("SMARTKEY_DEBUG") else logging.WARNING
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s smartkey: %(message)s",
+        filename=str(log_dir / "smartkey.log"),
+    )
+
     # Initialise IBus.
     IBus.init()
 
@@ -95,9 +108,6 @@ def main() -> None:
     if not bus.is_connected():
         print("ERROR: Cannot connect to IBus bus. Is ibus-daemon running?", file=sys.stderr)
         sys.exit(1)
-
-    # Request the well-known bus name.
-    bus.request_name(_BUS_NAME, 0)
 
     # Create the engine factory.
     factory = IBus.Factory.new(bus.get_connection())

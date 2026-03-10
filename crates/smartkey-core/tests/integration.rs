@@ -148,27 +148,48 @@ fn personal_round_trip_persists_boost() {
         assert!(profile_path.is_file());
     }
 
-    // Engine 2: load profile and verify the profile file is valid.
-    // We verify the snapshot loaded successfully and that "help" appears
-    // in predictions. The CVM boost may or may not rank it first (it's
-    // probabilistic), but the profile should load without error and
-    // the personal layer should be non-empty.
-    let mut core = InputMethodCore::new(InputConfig::default());
-    core.load_word("hello", 100);
-    core.load_word("help", 100);
+    // Engine 2 (baseline): same corpus, NO profile — establish rank without personal boost.
+    let mut core2 = InputMethodCore::new(InputConfig::default());
+    core2.load_word("hello", 100);
+    core2.load_word("help", 100);
 
-    core.load_personal(&profile_path)
+    type_string(&mut core2, "hel");
+    let baseline_preds = core2.predictions();
+    assert!(
+        baseline_preds.len() >= 2,
+        "baseline should have at least 2 predictions for 'hel'"
+    );
+    let help_rank_without_profile = baseline_preds
+        .iter()
+        .position(|p| p.word == "help")
+        .expect("'help' should appear in baseline predictions");
+
+    // Engine 3: same corpus, WITH loaded profile — personal CVM boost should elevate "help".
+    let mut core3 = InputMethodCore::new(InputConfig::default());
+    core3.load_word("hello", 100);
+    core3.load_word("help", 100);
+
+    core3
+        .load_personal(&profile_path)
         .expect("load should succeed");
 
-    type_string(&mut core, "hel");
-    let preds = core.predictions();
-    assert!(
-        preds.len() >= 2,
-        "should have at least 2 predictions for 'hel'"
-    );
+    type_string(&mut core3, "hel");
+    let preds = core3.predictions();
     assert!(
         preds.iter().any(|p| p.word == "help"),
-        "'help' should appear in predictions after loading personal profile"
+        "loaded profile should include learned word in predictions"
+    );
+    let help_rank_with_profile = preds
+        .iter()
+        .position(|p| p.word == "help")
+        .expect("'help' should appear in predictions after loading personal profile");
+
+    assert!(
+        help_rank_with_profile <= help_rank_without_profile,
+        "loading personal profile should not reduce 'help' rank: \
+         baseline={}, with_profile={}",
+        help_rank_without_profile,
+        help_rank_with_profile
     );
 }
 

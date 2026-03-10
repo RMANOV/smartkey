@@ -100,8 +100,8 @@ impl Corpus {
     }
 
     /// Serialize to bincode.
-    pub fn to_bincode(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("bincode serialization should not fail")
+    pub fn to_bincode(&self) -> Result<Vec<u8>, String> {
+        bincode::serialize(self).map_err(|e| e.to_string())
     }
 
     /// Deserialize from bincode.
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(corpus.trigrams.len(), 1);
 
         // Round-trip through bincode.
-        let bytes = corpus.to_bincode();
+        let bytes = corpus.to_bincode().expect("serialize to bincode");
         let restored = Corpus::from_bincode(&bytes).expect("parse bincode");
 
         assert_eq!(restored.version, corpus.version);

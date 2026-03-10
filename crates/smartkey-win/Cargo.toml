@@ -8,8 +8,6 @@ repository = "https://github.com/RMANOV/smartkey"
 
 [dependencies]
 smartkey-core = { path = "../smartkey-core" }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.58"

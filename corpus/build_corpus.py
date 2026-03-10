@@ -14,6 +14,7 @@ import argparse
 import json
 import re
 import sys
+import typing
 from collections import Counter
 from pathlib import Path
 
@@ -173,17 +174,18 @@ def _process_line(
     trigrams: Counter,
 ) -> None:
     """Tokenize a single line and update counters in-place."""
-    words = tokenize(line)
-    if not words:
-        return
-    unigrams.update(words)
-    if len(words) >= 2:
-        bigrams.update(zip(words, words[1:]))
-    if len(words) >= 3:
-        trigrams.update(zip(words, words[1:], words[2:]))
+    for sentence in tokenize_sentences(line):
+        words = tokenize_words(sentence)
+        if not words:
+            continue
+        unigrams.update(words)
+        if len(words) >= 2:
+            bigrams.update(zip(words, words[1:]))
+        if len(words) >= 3:
+            trigrams.update(zip(words, words[1:], words[2:]))
 
 
-def _iter_lines(args) -> tuple:
+def _iter_lines(args) -> tuple[typing.Iterator[str], str]:
     """Yield lines from stdin or input files. Returns (line_iter, source_name)."""
     if args.stdin:
         return sys.stdin, "stdin"
@@ -265,16 +267,13 @@ def main(argv: list[str] | None = None) -> None:
         line = line.rstrip("\n")
         if not line:
             continue
-        words = tokenize(line)
-        if not words:
+        before = sum(unigrams.values())
+        _process_line(line, unigrams, bigrams, trigrams)
+        after = sum(unigrams.values())
+        added = after - before
+        if added == 0:
             continue
-        n = len(words)
-        total_tokens += n
-        unigrams.update(words)
-        if n >= 2:
-            bigrams.update(zip(words, words[1:]))
-        if n >= 3:
-            trigrams.update(zip(words, words[1:], words[2:]))
+        total_tokens += added
         total_lines += 1
 
         if total_lines % 100_000 == 0:

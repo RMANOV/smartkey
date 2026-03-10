@@ -4,7 +4,7 @@
 // Windows: %APPDATA%\smartkey\
 // macOS:   ~/Library/Application Support/smartkey/
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Return the platform-specific SmartKey configuration directory.
 pub fn config_dir() -> PathBuf {
@@ -59,7 +59,7 @@ pub fn corpus_files() -> Vec<PathBuf> {
 
 /// If a `.bin` sibling exists and its mtime >= the JSON file's mtime, return
 /// the `.bin` path; otherwise return the original JSON path.
-fn prefer_bin(json_path: &PathBuf) -> PathBuf {
+fn prefer_bin(json_path: &Path) -> PathBuf {
     let bin_path = json_path.with_extension("bin");
     if bin_path.is_file() {
         let json_mtime = std::fs::metadata(json_path).and_then(|m| m.modified()).ok();
@@ -70,7 +70,7 @@ fn prefer_bin(json_path: &PathBuf) -> PathBuf {
             }
         }
     }
-    json_path.clone()
+    json_path.to_path_buf()
 }
 
 /// Return the platform base config directory (without "smartkey" suffix).

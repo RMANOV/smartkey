@@ -20,7 +20,8 @@ fn main() {
                 // TODO: Write CLSID to HKLM\SOFTWARE\Classes\CLSID\{...}
                 // TODO: Register TIP via ITfInputProcessorProfileMgr::RegisterProfile
                 // TODO: Set display name and icon path
-                println!("Registered SmartKey as TSF Text Input Processor.");
+                eprintln!("WARNING: Registration not yet implemented.");
+                std::process::exit(1);
             }
             #[cfg(not(windows))]
             {
@@ -32,7 +33,8 @@ fn main() {
             #[cfg(windows)]
             {
                 // TODO: Remove CLSID and TIP registration
-                println!("Unregistered SmartKey.");
+                eprintln!("WARNING: Registration not yet implemented.");
+                std::process::exit(1);
             }
             #[cfg(not(windows))]
             {

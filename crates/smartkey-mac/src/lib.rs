@@ -85,8 +85,12 @@ pub unsafe extern "C" fn smartkey_free_actions(list: *mut CActionList) {
         return;
     }
     let list = unsafe { Box::from_raw(list) };
-    let actions =
-        unsafe { Vec::from_raw_parts(list.actions, list.count as usize, list.count as usize) };
+    let actions = unsafe {
+        Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+            list.actions,
+            list.count as usize,
+        ))
+    };
     for action in actions {
         if !action.payload.is_null() {
             drop(unsafe { CString::from_raw(action.payload) });
@@ -165,6 +169,9 @@ pub unsafe extern "C" fn smartkey_load_word(
     freq: c_uint,
 ) {
     let core = unsafe { &mut *handle };
+    if word.is_null() {
+        return;
+    }
     if let Ok(w) = unsafe { CStr::from_ptr(word) }.to_str() {
         core.load_word(w, freq);
     }
@@ -182,6 +189,9 @@ pub unsafe extern "C" fn smartkey_load_bigram(
     count: c_uint,
 ) {
     let core = unsafe { &mut *handle };
+    if ctx.is_null() || word.is_null() {
+        return;
+    }
     let ctx_s = unsafe { CStr::from_ptr(ctx) }.to_str().unwrap_or("");
     let word_s = unsafe { CStr::from_ptr(word) }.to_str().unwrap_or("");
     core.load_bigram(ctx_s, word_s, count);
@@ -231,6 +241,17 @@ fn mac_keycode_to_key(keycode: c_uint) -> Key {
         0x33 => Key::Backspace, // kVK_Delete
         0x31 => Key::Space,     // kVK_Space
         0x24 => Key::Return,    // kVK_Return
+        // Digit keys
+        0x12 => Key::Char('1'), // kVK_ANSI_1
+        0x13 => Key::Char('2'), // kVK_ANSI_2
+        0x14 => Key::Char('3'), // kVK_ANSI_3
+        0x15 => Key::Char('4'), // kVK_ANSI_4
+        0x17 => Key::Char('5'), // kVK_ANSI_5
+        0x16 => Key::Char('6'), // kVK_ANSI_6
+        0x1A => Key::Char('7'), // kVK_ANSI_7
+        0x1C => Key::Char('8'), // kVK_ANSI_8
+        0x19 => Key::Char('9'), // kVK_ANSI_9
+        0x1D => Key::Char('0'), // kVK_ANSI_0
         // Letters: kVK_ANSI_A (0x00) through kVK_ANSI_Z
         k if k <= 0x2F => {
             // Approximate: macOS keycodes aren't sequential like ASCII.
@@ -296,7 +317,9 @@ fn actions_to_c(actions: Vec<Action>) -> *mut CActionList {
         .map(|a| match a {
             Action::ShowGhost(text) => CAction {
                 action_type: 0,
-                payload: CString::new(text).unwrap_or_default().into_raw(),
+                payload: CString::new(text.replace('\0', ""))
+                    .expect("null-free after replace")
+                    .into_raw(),
             },
             Action::HideGhost => CAction {
                 action_type: 1,
@@ -304,7 +327,9 @@ fn actions_to_c(actions: Vec<Action>) -> *mut CActionList {
             },
             Action::CommitText(text) => CAction {
                 action_type: 2,
-                payload: CString::new(text).unwrap_or_default().into_raw(),
+                payload: CString::new(text.replace('\0', ""))
+                    .expect("null-free after replace")
+                    .into_raw(),
             },
             Action::ForwardKey => CAction {
                 action_type: 3,

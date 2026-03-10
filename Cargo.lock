@@ -724,8 +724,6 @@ dependencies = [
 name = "smartkey-win"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
  "smartkey-core",
  "windows",
  "windows-core",
