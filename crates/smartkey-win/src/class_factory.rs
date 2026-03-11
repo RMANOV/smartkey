@@ -4,7 +4,6 @@
 //! when Windows calls CoCreateInstance with CLSID_SMARTKEY.
 
 use std::ffi::c_void;
-use std::mem::ManuallyDrop;
 use std::sync::atomic::Ordering;
 
 use windows::core::*;
@@ -12,7 +11,7 @@ use windows::Win32::Foundation::BOOL;
 use windows::Win32::System::Com::IClassFactory;
 use windows::Win32::System::Com::IClassFactory_Impl;
 
-use crate::dll::LOCK_COUNT;
+use crate::dll::{LOCK_COUNT, OBJECT_COUNT};
 use crate::tsf::SmartKeyTextService;
 
 const CLASS_E_NOAGGREGATION: HRESULT = HRESULT(0x80040110_u32 as i32);
@@ -26,7 +25,7 @@ impl IClassFactory_Impl for SmartKeyClassFactory_Impl {
     fn CreateInstance(
         &self,
         punkouter: Option<&IUnknown>,
-        _riid: *const GUID,
+        riid: *const GUID,
         ppvobject: *mut *mut c_void,
     ) -> Result<()> {
         // COM aggregation not supported.
@@ -41,13 +40,23 @@ impl IClassFactory_Impl for SmartKeyClassFactory_Impl {
             *ppvobject = std::ptr::null_mut();
         }
 
-        // Create the TIP and transfer ownership to the caller.
+        // Create the TIP and QueryInterface for the requested riid.
         let tip = SmartKeyTextService::new();
         let unknown: IUnknown = tip.into();
         unsafe {
-            *ppvobject = ManuallyDrop::new(unknown).as_raw();
+            let hr = (Interface::vtable(&unknown).QueryInterface)(
+                Interface::as_raw(&unknown),
+                riid,
+                ppvobject,
+            );
+            if hr.is_err() {
+                return Err(Error::from_hresult(hr));
+            }
         }
+        // `unknown` drops here → Release balances the initial ref.
+        // Caller holds their own AddRef'd reference from QueryInterface.
 
+        OBJECT_COUNT.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -55,7 +64,11 @@ impl IClassFactory_Impl for SmartKeyClassFactory_Impl {
         if flock.as_bool() {
             LOCK_COUNT.fetch_add(1, Ordering::SeqCst);
         } else {
-            LOCK_COUNT.fetch_sub(1, Ordering::SeqCst);
+            LOCK_COUNT
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .ok();
         }
         Ok(())
     }

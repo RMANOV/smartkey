@@ -10,10 +10,11 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use windows::core::{Interface, GUID};
+use windows::core::{IUnknown, Interface, GUID};
 use windows::Win32::Foundation::{
     BOOL, E_FAIL, E_POINTER, HINSTANCE, HMODULE, MAX_PATH, S_FALSE, S_OK,
 };
+
 use windows::Win32::System::Com::{
     CoInitializeEx, CoUninitialize, IClassFactory, COINIT_APARTMENTTHREADED,
 };
@@ -24,6 +25,7 @@ use crate::config::CLSID_SMARTKEY;
 
 const CLASS_E_CLASSNOTAVAILABLE: windows::core::HRESULT =
     windows::core::HRESULT(0x80040111_u32 as i32);
+const E_NOINTERFACE: windows::core::HRESULT = windows::core::HRESULT(0x80004002_u32 as i32);
 
 /// Raw HINSTANCE pointer, set once in DllMain. Using AtomicPtr because
 /// HINSTANCE wraps a raw pointer (*mut c_void) which is !Send + !Sync.
@@ -31,6 +33,9 @@ static DLL_INSTANCE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Server lock count from IClassFactory::LockServer.
 pub(crate) static LOCK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Live COM object count, incremented in CreateInstance, decremented in Deactivate.
+pub(crate) static OBJECT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Get the full filesystem path of this DLL.
 pub(crate) fn dll_path() -> Option<String> {
@@ -58,10 +63,10 @@ pub extern "system" fn DllMain(hinst: HINSTANCE, reason: u32, _reserved: *mut c_
     BOOL::from(true)
 }
 
-/// Returns S_OK if the DLL can be safely unloaded (no server locks).
+/// Returns S_OK if the DLL can be safely unloaded (no live objects or server locks).
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> windows::core::HRESULT {
-    if LOCK_COUNT.load(Ordering::SeqCst) == 0 {
+    if OBJECT_COUNT.load(Ordering::SeqCst) == 0 && LOCK_COUNT.load(Ordering::SeqCst) == 0 {
         S_OK
     } else {
         S_FALSE
@@ -78,7 +83,7 @@ pub extern "system" fn DllCanUnloadNow() -> windows::core::HRESULT {
 #[no_mangle]
 pub unsafe extern "system" fn DllGetClassObject(
     rclsid: *const GUID,
-    _riid: *const GUID,
+    riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> windows::core::HRESULT {
     if ppv.is_null() {
@@ -88,6 +93,11 @@ pub unsafe extern "system" fn DllGetClassObject(
 
     if rclsid.is_null() || *rclsid != CLSID_SMARTKEY {
         return CLASS_E_CLASSNOTAVAILABLE;
+    }
+
+    // Honor the requested interface — only IClassFactory and IUnknown are valid here.
+    if riid.is_null() || (*riid != IClassFactory::IID && *riid != IUnknown::IID) {
+        return E_NOINTERFACE;
     }
 
     let factory: IClassFactory = SmartKeyClassFactory.into();

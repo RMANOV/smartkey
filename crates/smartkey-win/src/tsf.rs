@@ -15,8 +15,11 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
 use smartkey_core::input::{Action, InputConfig, InputMethodCore, Key, KeyEvent, Modifiers};
+
+use crate::dll::OBJECT_COUNT;
 
 use crate::config::SmartKeyConfig;
 use crate::edit_session::{self, EditOp};
@@ -180,6 +183,14 @@ impl ITfTextInputProcessor_Impl for SmartKeyTextService_Impl {
         // Clear composition state.
         *self.composition.borrow_mut() = None;
         *self.thread_mgr.borrow_mut() = None;
+
+        // Track live object count for DllCanUnloadNow.
+        OBJECT_COUNT
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            })
+            .ok();
+
         Ok(())
     }
 }
