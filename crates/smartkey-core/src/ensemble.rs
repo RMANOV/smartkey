@@ -117,8 +117,7 @@ impl SmartKeyEngine {
 
             // Build a set of words already found by exact prefix search to
             // avoid scoring the same word twice.
-            let exact_words: HashSet<&str> =
-                candidates.iter().map(|c| c.word.as_str()).collect();
+            let exact_words: HashSet<&str> = candidates.iter().map(|c| c.word.as_str()).collect();
 
             let mut discount_map: HashMap<String, f64> = HashMap::new();
             let mut merged: Vec<WordEntry> = Vec::new();

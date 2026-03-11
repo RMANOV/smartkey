@@ -145,9 +145,7 @@ impl InputConfig {
                 if (sum - 1.0).abs() < 1e-6 {
                     config.weights = (a, b, c);
                 } else {
-                    eprintln!(
-                        "smartkey: weights sum to {sum:.3}, expected 1.0 — using defaults"
-                    );
+                    eprintln!("smartkey: weights sum to {sum:.3}, expected 1.0 — using defaults");
                 }
             }
             if let Some(t) = v.get("tuning").and_then(|v| v.as_object()) {
