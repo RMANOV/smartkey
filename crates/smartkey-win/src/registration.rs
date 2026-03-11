@@ -120,6 +120,11 @@ fn register_categories() -> Result<()> {
 
     unsafe {
         cat_mgr.RegisterCategory(&CLSID_SMARTKEY, &GUID_TFCAT_TIP_KEYBOARD, &CLSID_SMARTKEY)?;
+        cat_mgr.RegisterCategory(
+            &CLSID_SMARTKEY,
+            &GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
+            &CLSID_SMARTKEY,
+        )?;
     }
 
     Ok(())
@@ -131,6 +136,11 @@ fn unregister_categories() -> Result<()> {
 
     unsafe {
         cat_mgr.UnregisterCategory(&CLSID_SMARTKEY, &GUID_TFCAT_TIP_KEYBOARD, &CLSID_SMARTKEY)?;
+        let _ = cat_mgr.UnregisterCategory(
+            &CLSID_SMARTKEY,
+            &GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
+            &CLSID_SMARTKEY,
+        );
     }
 
     Ok(())

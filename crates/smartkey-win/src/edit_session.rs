@@ -22,6 +22,8 @@ pub enum EditOp {
         composition: Rc<RefCell<Option<ITfComposition>>>,
         /// Composition sink to receive OnCompositionTerminated callbacks.
         comp_sink: ITfCompositionSink,
+        /// TfGuidAtom for ghost display attribute (grey styling). 0 = no styling.
+        ghost_attr_atom: u32,
     },
     /// Remove ghost text and end the composition.
     HideGhost {
@@ -60,7 +62,8 @@ impl ITfEditSession_Impl for SmartKeyEditSession_Impl {
                 text,
                 composition,
                 comp_sink,
-            } => self.do_show_ghost(ec, text, composition, comp_sink),
+                ghost_attr_atom,
+            } => self.do_show_ghost(ec, text, composition, comp_sink, *ghost_attr_atom),
             EditOp::HideGhost { composition } => self.do_hide_ghost(ec, composition),
             EditOp::CommitText { text, composition } => self.do_commit_text(ec, text, composition),
         }
@@ -78,6 +81,7 @@ impl SmartKeyEditSession_Impl {
         text: &str,
         composition: &Rc<RefCell<Option<ITfComposition>>>,
         comp_sink: &ITfCompositionSink,
+        ghost_attr_atom: u32,
     ) -> Result<()> {
         let text_utf16: Vec<u16> = text.encode_utf16().collect();
         let mut comp = composition.borrow_mut();
@@ -87,6 +91,8 @@ impl SmartKeyEditSession_Impl {
             unsafe {
                 let range = active.GetRange()?;
                 range.SetText(ec, 0, &text_utf16)?;
+                // Re-apply attribute after SetText (SetText clears properties).
+                self.apply_ghost_attr(ec, &range, ghost_attr_atom)?;
                 self.set_caret_to_range_start(ec, &range)?;
             }
         } else {
@@ -99,8 +105,26 @@ impl SmartKeyEditSession_Impl {
                 let new_comp = ctx_comp.StartComposition(ec, &range, Some(comp_sink))?;
                 *comp = Some(new_comp);
 
+                self.apply_ghost_attr(ec, &range, ghost_attr_atom)?;
                 self.set_caret_to_range_start(ec, &range)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Set GUID_PROP_ATTRIBUTE on a range to apply ghost text styling (grey).
+    ///
+    /// The atom is a TfGuidAtom obtained from ITfCategoryMgr::RegisterGUID.
+    /// TSF resolves it back through our ITfDisplayAttributeProvider to get
+    /// the actual TF_DISPLAYATTRIBUTE (grey foreground).
+    fn apply_ghost_attr(&self, ec: u32, range: &ITfRange, atom: u32) -> Result<()> {
+        if atom == 0 {
+            return Ok(());
+        }
+        unsafe {
+            let prop = self.context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+            let variant = VARIANT::from(atom as i32);
+            prop.SetValue(ec, range, &variant)?;
         }
         Ok(())
     }

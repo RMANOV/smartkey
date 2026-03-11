@@ -22,10 +22,12 @@ use smartkey_core::input::{Action, InputConfig, InputMethodCore, Key, KeyEvent, 
 use crate::dll::OBJECT_COUNT;
 
 use crate::config::SmartKeyConfig;
+use crate::display::{GhostAttributeInfo, SingleItemEnum, GUID_GHOST_ATTR};
 use crate::edit_session::{self, EditOp};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::TextServices::*;
 
@@ -36,7 +38,8 @@ use windows::Win32::UI::TextServices::*;
     ITfTextInputProcessor,
     ITfTextInputProcessorEx,
     ITfKeyEventSink,
-    ITfCompositionSink
+    ITfCompositionSink,
+    ITfDisplayAttributeProvider
 )]
 pub struct SmartKeyTextService {
     core: RefCell<InputMethodCore>,
@@ -47,6 +50,8 @@ pub struct SmartKeyTextService {
     composition: Rc<RefCell<Option<ITfComposition>>>,
     /// Guard against duplicate corpus loading on reactivation.
     corpus_loaded: std::cell::Cell<bool>,
+    /// TfGuidAtom for GUID_GHOST_ATTR, obtained from ITfCategoryMgr::RegisterGUID.
+    ghost_attr_atom: std::cell::Cell<u32>,
 }
 
 impl Default for SmartKeyTextService {
@@ -63,6 +68,7 @@ impl SmartKeyTextService {
             client_id: std::cell::Cell::new(0),
             composition: Rc::new(RefCell::new(None)),
             corpus_loaded: std::cell::Cell::new(false),
+            ghost_attr_atom: std::cell::Cell::new(0),
         }
     }
 
@@ -123,6 +129,7 @@ impl SmartKeyTextService {
                                 text: text.clone(),
                                 composition: self.composition.clone(),
                                 comp_sink,
+                                ghost_attr_atom: self.ghost_attr_atom.get(),
                             };
                             if let Err(e) = edit_session::request_edit_session(context, cid, op) {
                                 eprintln!("smartkey: ShowGhost failed: {e}");
@@ -212,11 +219,37 @@ impl ITfTextInputProcessorEx_Impl for SmartKeyTextService_Impl {
             }
         }
 
-        // Load corpus files once per instance (guard against reactivation).
+        // Load config + corpus files once per instance (guard against reactivation).
         if !self.corpus_loaded.get() {
-            let config = SmartKeyConfig::load();
+            let win_config = SmartKeyConfig::load();
+
+            // Read user config JSON and build InputConfig (or fall back to defaults).
+            let input_config = if win_config.config_file.is_file() {
+                match std::fs::read_to_string(&win_config.config_file) {
+                    Ok(json) => InputConfig::from_json(&json),
+                    Err(e) => {
+                        eprintln!("smartkey: config read error: {e}");
+                        InputConfig::default()
+                    }
+                }
+            } else {
+                InputConfig::default()
+            };
+            *self.core.borrow_mut() = InputMethodCore::new(input_config);
+
+            // Register ghost attribute GUID → get TfGuidAtom for SetValue.
+            let cat_mgr: std::result::Result<ITfCategoryMgr, _> =
+                unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER) };
+            match cat_mgr {
+                Ok(mgr) => match unsafe { mgr.RegisterGUID(&GUID_GHOST_ATTR) } {
+                    Ok(atom) => self.ghost_attr_atom.set(atom),
+                    Err(e) => eprintln!("smartkey: RegisterGUID failed: {e}"),
+                },
+                Err(e) => eprintln!("smartkey: ITfCategoryMgr creation failed: {e}"),
+            }
+
             let mut core = self.core.borrow_mut();
-            for path in &config.corpus_files {
+            for path in &win_config.corpus_files {
                 if let Err(e) = core.load_corpus_file(path) {
                     eprintln!("smartkey: failed to load corpus {}: {e}", path.display());
                 }
@@ -284,6 +317,21 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
 
     fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
         Ok(BOOL::from(false))
+    }
+}
+
+// -- ITfDisplayAttributeProvider implementation --
+
+impl ITfDisplayAttributeProvider_Impl for SmartKeyTextService_Impl {
+    fn EnumDisplayAttributeInfo(&self) -> Result<IEnumTfDisplayAttributeInfo> {
+        Ok(SingleItemEnum::new().into())
+    }
+
+    fn GetDisplayAttributeInfo(&self, guid: *const GUID) -> Result<ITfDisplayAttributeInfo> {
+        if guid.is_null() || unsafe { *guid } != GUID_GHOST_ATTR {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        }
+        Ok(GhostAttributeInfo.into())
     }
 }
 
