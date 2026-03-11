@@ -13,7 +13,13 @@
 //   Action::CommitText → end composition + insert finalized text
 //   Action::ForwardKey → return S_FALSE (don't consume)
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use smartkey_core::input::{Action, InputConfig, InputMethodCore, Key, KeyEvent, Modifiers};
+
+use crate::config::SmartKeyConfig;
+use crate::edit_session::{self, EditOp};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -23,11 +29,19 @@ use windows::Win32::UI::TextServices::*;
 /// The SmartKey TSF Text Input Processor.
 ///
 /// Wraps `InputMethodCore` and implements COM interfaces for Windows TSF.
-#[windows::core::implement(ITfTextInputProcessor, ITfTextInputProcessorEx, ITfKeyEventSink)]
+#[windows::core::implement(
+    ITfTextInputProcessor,
+    ITfTextInputProcessorEx,
+    ITfKeyEventSink,
+    ITfCompositionSink
+)]
 pub struct SmartKeyTextService {
-    core: std::cell::RefCell<InputMethodCore>,
-    thread_mgr: std::cell::RefCell<Option<ITfThreadMgr>>,
+    core: RefCell<InputMethodCore>,
+    thread_mgr: RefCell<Option<ITfThreadMgr>>,
     client_id: std::cell::Cell<u32>,
+    /// Active ghost text composition. Shared with edit sessions via Rc.
+    /// Safe because TSF is STA COM (single-threaded apartment).
+    composition: Rc<RefCell<Option<ITfComposition>>>,
 }
 
 impl Default for SmartKeyTextService {
@@ -39,9 +53,10 @@ impl Default for SmartKeyTextService {
 impl SmartKeyTextService {
     pub fn new() -> Self {
         Self {
-            core: std::cell::RefCell::new(InputMethodCore::new(InputConfig::default())),
-            thread_mgr: std::cell::RefCell::new(None),
+            core: RefCell::new(InputMethodCore::new(InputConfig::default())),
+            thread_mgr: RefCell::new(None),
             client_id: std::cell::Cell::new(0),
+            composition: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -55,12 +70,11 @@ impl SmartKeyTextService {
             VK_SPACE => Key::Space,
             VK_RETURN => Key::Return,
             _ => {
-                // Try to map to a character via the virtual key.
                 // For A-Z keys (0x41-0x5A), produce lowercase.
                 if (0x41..=0x5A).contains(&vk) {
-                    Key::Char((vk as u8 + 32) as char) // lowercase
+                    Key::Char((vk as u8 + 32) as char)
                 } else if (0x30..=0x39).contains(&vk) {
-                    Key::Char(vk as u8 as char) // digits
+                    Key::Char(vk as u8 as char)
                 } else {
                     Key::Other(vk)
                 }
@@ -89,24 +103,44 @@ impl SmartKeyTextService {
     }
 
     /// Execute actions returned by InputMethodCore.
-    fn execute_actions(&self, actions: &[Action], _context: &ITfContext) -> bool {
+    fn execute_actions(&self, actions: &[Action], context: &ITfContext) -> bool {
         let mut consumed = false;
+        let cid = self.client_id.get();
+
         for action in actions {
             match action {
-                Action::ShowGhost(_text) => {
-                    // TODO: Create TSF composition for ghost text
+                Action::ShowGhost(text) => {
+                    let op = EditOp::ShowGhost {
+                        text: text.clone(),
+                        composition: self.composition.clone(),
+                    };
+                    if let Err(e) = edit_session::request_edit_session(context, cid, op) {
+                        eprintln!("smartkey: ShowGhost failed: {e}");
+                    }
                     consumed = true;
                 }
                 Action::HideGhost => {
-                    // TODO: End any active TSF composition.
+                    let op = EditOp::HideGhost {
+                        composition: self.composition.clone(),
+                    };
+                    if let Err(e) = edit_session::request_edit_session(context, cid, op) {
+                        eprintln!("smartkey: HideGhost failed: {e}");
+                    }
                     consumed = true;
                 }
-                Action::CommitText(_text) => {
-                    // TODO: Insert text via ITfInsertAtSelection
+                Action::CommitText(text) => {
+                    let op = EditOp::CommitText {
+                        text: text.clone(),
+                        composition: self.composition.clone(),
+                    };
+                    if let Err(e) = edit_session::request_edit_session(context, cid, op) {
+                        eprintln!("smartkey: CommitText failed: {e}");
+                    }
                     consumed = true;
                 }
                 Action::ForwardKey => {
-                    // Explicitly not consumed — forward to application.
+                    // Key must reach the application — override any prior consumption.
+                    consumed = false;
                 }
             }
         }
@@ -125,7 +159,16 @@ impl ITfTextInputProcessor_Impl for SmartKeyTextService_Impl {
     }
 
     fn Deactivate(&self) -> Result<()> {
-        // TODO: Unadvise key event sink
+        // Unadvise key event sink.
+        if let Some(ref mgr) = *self.thread_mgr.borrow() {
+            let keystroke_mgr: Result<ITfKeystrokeMgr> = mgr.cast();
+            if let Ok(km) = keystroke_mgr {
+                let _ = unsafe { km.UnadviseKeyEventSink(self.client_id.get()) };
+            }
+        }
+
+        // Clear composition state.
+        *self.composition.borrow_mut() = None;
         *self.thread_mgr.borrow_mut() = None;
         Ok(())
     }
@@ -138,8 +181,27 @@ impl ITfTextInputProcessorEx_Impl for SmartKeyTextService_Impl {
         self.client_id.set(tid);
         *self.thread_mgr.borrow_mut() = ptim.cloned();
 
-        // TODO: Install key event sink via ITfKeystrokeMgr::AdviseKeyEventSink
-        // TODO: Load corpus files from SmartKeyConfig::load().corpus_files
+        // Install key event sink so we receive OnKeyDown/OnKeyUp callbacks.
+        if let Some(ref mgr) = *self.thread_mgr.borrow() {
+            let keystroke_mgr: ITfKeystrokeMgr = mgr.cast()?;
+            // Get ITfKeyEventSink interface from ourselves.
+            let sink: ITfKeyEventSink = unsafe { self.cast()? };
+            unsafe {
+                keystroke_mgr.AdviseKeyEventSink(tid, &sink, true)?;
+            }
+        }
+
+        // Load corpus files from configuration.
+        let config = SmartKeyConfig::load();
+        let mut core = self.core.borrow_mut();
+        for path in &config.corpus_files {
+            if let Err(e) = core.load_corpus_file(path) {
+                eprintln!("smartkey: failed to load corpus {}: {e}", path.display());
+            }
+        }
+        if let Err(e) = core.load_personal_default() {
+            eprintln!("smartkey: failed to load personal profile: {e}");
+        }
 
         Ok(())
     }
@@ -198,5 +260,20 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
 
     fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
         Ok(BOOL::from(false))
+    }
+}
+
+// -- ITfCompositionSink implementation --
+
+impl ITfCompositionSink_Impl for SmartKeyTextService_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        _ecwrite: u32,
+        _pcomposition: Option<&ITfComposition>,
+    ) -> Result<()> {
+        // External termination (e.g. application or another TIP ended our composition).
+        // Clean up our state to stay in sync.
+        *self.composition.borrow_mut() = None;
+        Ok(())
     }
 }
