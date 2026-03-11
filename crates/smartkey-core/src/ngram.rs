@@ -71,22 +71,11 @@ impl NgramTrie {
         }
 
         // DFS to collect every word below this node.
+        // Uses a single String buffer with backtracking (push/truncate) to avoid
+        // allocating a new String per trie node.
         let mut results = Vec::new();
-        let mut stack: Vec<(&TrieNode, String)> = vec![(node, prefix.to_string())];
-
-        while let Some((cur, cur_word)) = stack.pop() {
-            if let Some(freq) = cur.frequency {
-                results.push(WordEntry {
-                    word: cur_word.clone(),
-                    frequency: freq,
-                });
-            }
-            for (&ch, child) in &cur.children {
-                let mut next_word = cur_word.clone();
-                next_word.push(ch);
-                stack.push((child, next_word));
-            }
-        }
+        let mut current_word = prefix.to_string();
+        Self::collect_prefix_matches(node, &mut current_word, &mut results);
 
         // Sort by frequency descending; break ties alphabetically.
         results.sort_by(|a, b| b.frequency.cmp(&a.frequency).then(a.word.cmp(&b.word)));
@@ -243,6 +232,27 @@ impl NgramTrie {
                 current_word,
                 results,
             );
+            current_word.truncate(word_len_before);
+        }
+    }
+
+    /// Collect all complete words below `node` using a single reusable `String`
+    /// buffer with backtracking (push/truncate) to avoid per-node heap allocation.
+    fn collect_prefix_matches(
+        node: &TrieNode,
+        current_word: &mut String,
+        results: &mut Vec<WordEntry>,
+    ) {
+        if let Some(freq) = node.frequency {
+            results.push(WordEntry {
+                word: current_word.clone(),
+                frequency: freq,
+            });
+        }
+        let word_len_before = current_word.len();
+        for (&ch, child) in &node.children {
+            current_word.push(ch);
+            Self::collect_prefix_matches(child, current_word, results);
             current_word.truncate(word_len_before);
         }
     }

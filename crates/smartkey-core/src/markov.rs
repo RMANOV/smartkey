@@ -83,15 +83,7 @@ impl MarkovChain {
         let Some(followers) = self.bigrams.get(context) else {
             return UNSEEN_FLOOR;
         };
-        let total: u32 = followers.values().sum();
-        if total == 0 {
-            return UNSEEN_FLOOR;
-        }
-        let count = followers.get(word).copied().unwrap_or(0);
-        if count == 0 {
-            return UNSEEN_FLOOR;
-        }
-        count as f64 / total as f64
+        Self::prob_from_followers(word, followers)
     }
 
     /// P(word | w1, w2) from trigram counts.
@@ -105,6 +97,11 @@ impl MarkovChain {
         let Some(followers) = level2.get(w2) else {
             return UNSEEN_FLOOR;
         };
+        Self::prob_from_followers(word, followers)
+    }
+
+    /// Shared probability computation from a follower frequency map.
+    fn prob_from_followers(word: &str, followers: &HashMap<String, u32>) -> f64 {
         let total: u32 = followers.values().sum();
         if total == 0 {
             return UNSEEN_FLOOR;
@@ -132,15 +129,18 @@ impl MarkovChain {
 
     /// Interpolated backoff score.
     ///
-    /// * Both `prev1` and `prev2` present → full trigram interpolation.
-    /// * Only `prev1` → bigram + unigram (trigram weight redistributed).
+    /// * Both `recent` and `older` present → full trigram interpolation.
+    /// * Only `recent` → bigram + unigram (trigram weight redistributed).
     /// * Neither → unigram only.
     ///
+    /// * `recent` — the most recent preceding word (bigram context).
+    /// * `older`  — the second-to-last word (trigram context, paired with `recent`).
+    ///
     /// The score is clamped to at least `UNSEEN_FLOOR`.
-    pub fn score_with_backoff(&self, word: &str, prev1: Option<&str>, prev2: Option<&str>) -> f64 {
+    pub fn score_with_backoff(&self, word: &str, recent: Option<&str>, older: Option<&str>) -> f64 {
         let p_uni = self.unigram_prob();
 
-        let score = match (prev2, prev1) {
+        let score = match (older, recent) {
             (Some(w1), Some(w2)) => {
                 let p_tri = self.trigram_prob(word, w1, w2);
                 let p_bi = self.bigram_prob(word, w2);
@@ -165,13 +165,13 @@ impl MarkovChain {
     pub fn rank_candidates(
         &self,
         candidates: &[String],
-        prev1: Option<&str>,
-        prev2: Option<&str>,
+        recent: Option<&str>,
+        older: Option<&str>,
     ) -> Vec<(String, f64)> {
         let mut scored: Vec<(String, f64)> = candidates
             .iter()
             .map(|w| {
-                let s = self.score_with_backoff(w, prev1, prev2);
+                let s = self.score_with_backoff(w, recent, older);
                 (w.clone(), s)
             })
             .collect();

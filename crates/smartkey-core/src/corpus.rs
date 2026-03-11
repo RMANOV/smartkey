@@ -55,7 +55,7 @@ impl Corpus {
             obj.iter()
                 .map(|(word, freq)| CorpusWord {
                     word: word.clone(),
-                    frequency: freq.as_u64().unwrap_or(0) as u32,
+                    frequency: freq.as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
                 })
                 .collect()
         } else {
@@ -72,7 +72,7 @@ impl Corpus {
                     Some(CorpusBigram {
                         ctx: entry.get("ctx")?.as_str()?.to_owned(),
                         word: entry.get("word")?.as_str()?.to_owned(),
-                        count: entry.get("count")?.as_u64()? as u32,
+                        count: entry.get("count")?.as_u64()?.min(u32::MAX as u64) as u32,
                     })
                 })
                 .collect();
@@ -91,7 +91,7 @@ impl Corpus {
                         w1: entry.get("w1")?.as_str()?.to_owned(),
                         w2: entry.get("w2")?.as_str()?.to_owned(),
                         word: entry.get("word")?.as_str()?.to_owned(),
-                        count: entry.get("count")?.as_u64()? as u32,
+                        count: entry.get("count")?.as_u64()?.min(u32::MAX as u64) as u32,
                     })
                 })
                 .collect();

@@ -141,7 +141,14 @@ impl InputConfig {
                     .get("personal")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(config.weights.2);
-                config.weights = (a, b, c);
+                let sum = a + b + c;
+                if (sum - 1.0).abs() < 1e-6 {
+                    config.weights = (a, b, c);
+                } else {
+                    eprintln!(
+                        "smartkey: weights sum to {sum:.3}, expected 1.0 — using defaults"
+                    );
+                }
             }
             if let Some(t) = v.get("tuning").and_then(|v| v.as_object()) {
                 if let Some(n) = t.get("cvm_initial_size").and_then(|v| v.as_u64()) {
