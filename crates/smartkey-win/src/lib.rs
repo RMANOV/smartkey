@@ -10,6 +10,8 @@ pub mod config;
 #[cfg(windows)]
 mod display;
 #[cfg(windows)]
+mod edit_session;
+#[cfg(windows)]
 mod tsf;
 
 pub use config::SmartKeyConfig;
