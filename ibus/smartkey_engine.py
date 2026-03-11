@@ -79,15 +79,16 @@ except ImportError:
         def load_word(self, word: str, freq: int) -> None: ...
         def load_bigram(self, ctx: str, word: str, count: int) -> None: ...
         def load_trigram(self, w1: str, w2: str, word: str, count: int) -> None: ...
-        def handle_key(
-            self, keyval: int, modifiers: int
-        ) -> list[tuple[str, str]]:
+        def handle_key(self, keyval: int, modifiers: int) -> list[tuple[str, str]]:
             return [("forward", "")]
+
         def focus_lost(self) -> list[tuple[str, str]]:
             return []
+
         def focus_gained(self) -> None: ...
         def reset(self) -> list[tuple[str, str]]:
             return []
+
         def save_personal(self) -> None: ...
         def load_personal(self) -> None: ...
         def export_personal(self, path: str) -> None: ...
@@ -106,9 +107,7 @@ _CONFIG_FILE = _CONFIG_DIR / "smartkey.json"
 _CORPUS_FILE = _CONFIG_DIR / "corpus.json"
 
 
-def _load_json(
-    path: Path, default: dict | list | None = None
-) -> dict | list | None:
+def _load_json(path: Path, default: dict | list | None = None) -> dict | list | None:
     """Return parsed JSON from *path*, or *default* on any error."""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -194,17 +193,18 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def _show_ghost(self, text: str) -> None:
         """Display *text* as greyed-out preedit (ghost) text inline at cursor."""
         ibus_text = IBus.Text.new_from_string(text)
+        byte_len = len(text.encode("utf-8"))
         attrs = IBus.AttrList()
         attrs.append(
-            IBus.Attribute.new(IBus.ATTR_TYPE_FOREGROUND, 0x888888, 0, len(text))
+            IBus.Attribute.new(IBus.ATTR_TYPE_FOREGROUND, 0x888888, 0, byte_len)
         )
         attrs.append(
             IBus.Attribute.new(
-                IBus.ATTR_TYPE_UNDERLINE, IBus.ATTR_UNDERLINE_SINGLE, 0, len(text)
+                IBus.ATTR_TYPE_UNDERLINE, IBus.ATTR_UNDERLINE_SINGLE, 0, byte_len
             )
         )
         ibus_text.set_attributes(attrs)
-        self.update_preedit_text(ibus_text, len(text), True)
+        self.update_preedit_text(ibus_text, byte_len, True)
 
     def _clear_ghost(self) -> None:
         """Remove any displayed ghost text."""
@@ -213,9 +213,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     # Action dispatcher — translates Rust actions to IBus API calls.
     # -----------------------------------------------------------------------
-    def _execute_actions(
-        self, actions: list[tuple[str, str]]
-    ) -> bool:
+    def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
         consumed = True
         for action_type, payload in actions:
@@ -232,14 +230,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     # Key event handler.
     # -----------------------------------------------------------------------
-    def do_process_key_event(
-        self, keyval: int, keycode: int, state: int
-    ) -> bool:
+    def do_process_key_event(self, keyval: int, keycode: int, state: int) -> bool:
         """Handle an IBus key event via the Rust core."""
         orig_keyval = keyval
-        log.debug(
-            "key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state
-        )
+        log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)
         # Convert legacy X11 keysyms (e.g. Cyrillic 0x06xx) to Unicode
         # codepoints so the Rust core sees them as Key::Char.
         if _HAS_IBUS and hasattr(IBus, "keyval_to_unicode"):
@@ -254,7 +248,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 ch_repr = chr(keyval)
             except (ValueError, OverflowError):
                 ch_repr = f"\\u{keyval:04X}"
-            log.debug("keysym converted: 0x%04X → 0x%04X (%s)", orig_keyval, keyval, ch_repr)
+            log.debug(
+                "keysym converted: 0x%04X → 0x%04X (%s)", orig_keyval, keyval, ch_repr
+            )
         actions = self._core.handle_key(keyval, state)
         log.debug("actions: %s", actions)
         return self._execute_actions(actions)

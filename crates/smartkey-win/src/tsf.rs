@@ -90,22 +90,23 @@ impl SmartKeyTextService {
 
     /// Execute actions returned by InputMethodCore.
     fn execute_actions(&self, actions: &[Action], _context: &ITfContext) -> bool {
-        let mut consumed = true;
+        let mut consumed = false;
         for action in actions {
             match action {
                 Action::ShowGhost(_text) => {
                     // TODO: Create TSF composition for ghost text
-                    consumed = false;
+                    consumed = true;
                 }
                 Action::HideGhost => {
                     // TODO: End any active TSF composition.
+                    consumed = true;
                 }
                 Action::CommitText(_text) => {
                     // TODO: Insert text via ITfInsertAtSelection
-                    consumed = false;
+                    consumed = true;
                 }
                 Action::ForwardKey => {
-                    consumed = false;
+                    // Explicitly not consumed — forward to application.
                 }
             }
         }

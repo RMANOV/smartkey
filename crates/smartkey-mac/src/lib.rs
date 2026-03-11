@@ -85,6 +85,9 @@ pub unsafe extern "C" fn smartkey_free_actions(list: *mut CActionList) {
         return;
     }
     let list = unsafe { Box::from_raw(list) };
+    if list.actions.is_null() {
+        return;
+    }
     let actions = unsafe {
         Box::from_raw(std::ptr::slice_from_raw_parts_mut(
             list.actions,

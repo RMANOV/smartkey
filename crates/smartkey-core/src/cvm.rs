@@ -6,7 +6,8 @@
 //! Used as the personal vocabulary learning layer in SmartKey — tracks which words
 //! the user types frequently so the prediction engine can boost them.
 
-use rand::Rng;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,6 +39,8 @@ pub struct CvmCounter {
     last_seen: HashMap<String, Instant>,
     /// Exponential decay rate `λ` used in `exp(-λ * Δt)`.
     decay_lambda: f64,
+    /// Cached RNG — avoids thread-local lookup on every keystroke.
+    rng: SmallRng,
 }
 
 impl CvmCounter {
@@ -59,6 +62,7 @@ impl CvmCounter {
             round: 0,
             last_seen: HashMap::with_capacity(initial_size),
             decay_lambda: DEFAULT_DECAY_LAMBDA,
+            rng: SmallRng::from_entropy(),
         }
     }
 
@@ -91,7 +95,6 @@ impl CvmCounter {
     /// When the buffer reaches capacity a new round begins (half the elements
     /// are randomly discarded).
     pub fn process(&mut self, element: &str) {
-        let mut rng = rand::thread_rng();
         let now = Instant::now();
 
         if self.buffer.contains(element) {
@@ -103,7 +106,7 @@ impl CvmCounter {
             } else {
                 0.5_f64.powi(self.round as i32)
             };
-            if rng.gen::<f64>() < p {
+            if self.rng.gen::<f64>() < p {
                 self.buffer.insert(element.to_owned());
                 self.last_seen.insert(element.to_owned(), now);
             }
@@ -248,6 +251,7 @@ impl CvmCounter {
             round: snap.round,
             last_seen,
             decay_lambda: snap.decay_lambda,
+            rng: SmallRng::from_entropy(),
         }
     }
 
@@ -255,7 +259,6 @@ impl CvmCounter {
 
     /// Begin a new round: randomly discard ~half the buffer, bump round counter.
     fn start_new_round(&mut self) {
-        let mut rng = rand::thread_rng();
         let retain_count = self.buffer.len() / 2;
 
         // Drain into a Vec, shuffle, keep the first half.
@@ -263,7 +266,7 @@ impl CvmCounter {
         let len = elems.len();
         // Fisher–Yates partial shuffle (only need `retain_count` positions).
         for i in 0..retain_count.min(len) {
-            let j = rng.gen_range(i..len);
+            let j = self.rng.gen_range(i..len);
             elems.swap(i, j);
         }
         // Elements beyond retain_count are evicted — remove their timestamps.

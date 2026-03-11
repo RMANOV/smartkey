@@ -1,5 +1,7 @@
 // Ensemble scorer — combines corpus frequency, Markov context, and CVM personal boost.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::cvm::{CvmCounter, CvmSnapshot};
 use crate::input::InputConfig;
 use crate::markov::MarkovChain;
@@ -107,7 +109,7 @@ impl SmartKeyEngine {
 
         // Step 1b: fuzzy fallback — if exact prefix returned fewer than `limit`
         // candidates, fill the gap with fuzzy matches (edit distance ≤ 2).
-        let fuzzy_discount = if candidates.len() < limit && !prefix.is_empty() {
+        let (fuzzy_candidates, discount_map) = if candidates.len() < limit && !prefix.is_empty() {
             let fuzzy_slots = candidate_pool.saturating_sub(candidates.len());
             let fuzzy_matches = self
                 .trie
@@ -115,12 +117,9 @@ impl SmartKeyEngine {
 
             // Build a set of words already found by exact prefix search to
             // avoid scoring the same word twice.
-            let exact_words: std::collections::HashSet<&str> =
-                candidates.iter().map(|c| c.word.as_str()).collect();
+            let exact_words: HashSet<&str> = candidates.iter().map(|c| c.word.as_str()).collect();
 
-            let mut discount_map: std::collections::HashMap<String, f64> =
-                std::collections::HashMap::new();
-
+            let mut discount_map: HashMap<String, f64> = HashMap::new();
             let mut merged: Vec<WordEntry> = Vec::new();
             for fm in &fuzzy_matches {
                 if exact_words.contains(fm.word.as_str()) {
@@ -135,10 +134,8 @@ impl SmartKeyEngine {
             }
             (merged, discount_map)
         } else {
-            (Vec::new(), std::collections::HashMap::new())
+            (Vec::new(), HashMap::new())
         };
-
-        let (fuzzy_candidates, discount_map) = fuzzy_discount;
 
         // If both exact and fuzzy are empty, nothing to do.
         if candidates.is_empty() && fuzzy_candidates.is_empty() {
