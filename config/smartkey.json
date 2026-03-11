@@ -9,9 +9,9 @@
     "tuning": {
         "cvm_initial_size": 1024,
         "cvm_max_size": 8192,
-        "cvm_decay_lambda": 50.0,
+        "cvm_decay_lambda": 0.001,
         "fuzzy_max_edits": 1,
-        "fuzzy_discount": 0.7,
+        "fuzzy_discounts": [1.0, 0.7, 0.4],
         "markov_lambdas": [0.6, 0.3, 0.1]
     }
 }
