@@ -4,9 +4,7 @@
 //   smartkey-register.exe --install    Register as a TSF Text Input Processor
 //   smartkey-register.exe --uninstall  Remove registration
 //
-// Registers:
-//   - CLSID in HKLM\SOFTWARE\Classes\CLSID\{CLSID_SMARTKEY}
-//   - TIP profile in HKLM\SOFTWARE\Microsoft\CTF\TIP\{CLSID_SMARTKEY}
+// Requires: Administrator privileges (writes to HKLM).
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -15,35 +13,79 @@ fn main() {
         Some("--install") => {
             println!("SmartKey IME registration");
             println!("CLSID: {{{}}}", smartkey_win::config::CLSID_SMARTKEY_STR);
+
             #[cfg(windows)]
             {
-                // TODO: Write CLSID to HKLM\SOFTWARE\Classes\CLSID\{...}
-                // TODO: Register TIP via ITfInputProcessorProfileMgr::RegisterProfile
-                // TODO: Set display name and icon path
-                eprintln!("WARNING: Registration not yet implemented.");
-                std::process::exit(1);
+                let dll_path = find_dll_path();
+                println!("DLL: {dll_path}");
+
+                init_com();
+                match smartkey_win::registration::register(&dll_path) {
+                    Ok(()) => println!("SmartKey IME registered successfully."),
+                    Err(e) => {
+                        eprintln!("Registration failed: {e}");
+                        uninit_com();
+                        std::process::exit(1);
+                    }
+                }
+                uninit_com();
             }
+
             #[cfg(not(windows))]
-            {
-                println!("(dry run — not on Windows)");
-            }
+            println!("(dry run — not on Windows)");
         }
         Some("--uninstall") => {
             println!("Unregistering SmartKey IME...");
+
             #[cfg(windows)]
             {
-                // TODO: Remove CLSID and TIP registration
-                eprintln!("WARNING: Registration not yet implemented.");
-                std::process::exit(1);
+                init_com();
+                match smartkey_win::registration::unregister() {
+                    Ok(()) => println!("SmartKey IME unregistered successfully."),
+                    Err(e) => {
+                        eprintln!("Unregistration failed: {e}");
+                        uninit_com();
+                        std::process::exit(1);
+                    }
+                }
+                uninit_com();
             }
+
             #[cfg(not(windows))]
-            {
-                println!("(dry run — not on Windows)");
-            }
+            println!("(dry run — not on Windows)");
         }
         _ => {
             eprintln!("Usage: smartkey-register [--install | --uninstall]");
             std::process::exit(1);
         }
+    }
+}
+
+/// Find the DLL in the same directory as this executable.
+#[cfg(windows)]
+fn find_dll_path() -> String {
+    let exe = std::env::current_exe().expect("cannot determine exe path");
+    let dir = exe.parent().expect("exe has no parent directory");
+    dir.join("smartkey_win.dll").to_string_lossy().into_owned()
+}
+
+#[cfg(windows)]
+fn init_com() {
+    let hr = unsafe {
+        windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        )
+    };
+    if hr.is_err() {
+        eprintln!("COM initialization failed: {hr:?}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(windows)]
+fn uninit_com() {
+    unsafe {
+        windows::Win32::System::Com::CoUninitialize();
     }
 }

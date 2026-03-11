@@ -6,6 +6,9 @@ license = "GPL-3.0-only"
 description = "SmartKey Windows IME via Text Services Framework"
 repository = "https://github.com/RMANOV/smartkey"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 smartkey-core = { path = "../smartkey-core" }
 
@@ -17,6 +20,7 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
     "implement",
 ] }
 
