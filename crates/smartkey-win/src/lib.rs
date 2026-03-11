@@ -6,11 +6,17 @@
 //
 // On non-Windows platforms this crate compiles as a no-op for workspace checks.
 
+#[cfg(windows)]
+mod class_factory;
 pub mod config;
 #[cfg(windows)]
 mod display;
 #[cfg(windows)]
+pub mod dll;
+#[cfg(windows)]
 mod edit_session;
+#[cfg(windows)]
+pub mod registration;
 #[cfg(windows)]
 mod tsf;
 
