@@ -42,6 +42,8 @@ pub struct SmartKeyTextService {
     /// Active ghost text composition. Shared with edit sessions via Rc.
     /// Safe because TSF is STA COM (single-threaded apartment).
     composition: Rc<RefCell<Option<ITfComposition>>>,
+    /// Guard against duplicate corpus loading on reactivation.
+    corpus_loaded: std::cell::Cell<bool>,
 }
 
 impl Default for SmartKeyTextService {
@@ -57,6 +59,7 @@ impl SmartKeyTextService {
             thread_mgr: RefCell::new(None),
             client_id: std::cell::Cell::new(0),
             composition: Rc::new(RefCell::new(None)),
+            corpus_loaded: std::cell::Cell::new(false),
         }
     }
 
@@ -110,12 +113,19 @@ impl SmartKeyTextService {
         for action in actions {
             match action {
                 Action::ShowGhost(text) => {
-                    let op = EditOp::ShowGhost {
-                        text: text.clone(),
-                        composition: self.composition.clone(),
-                    };
-                    if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                        eprintln!("smartkey: ShowGhost failed: {e}");
+                    let sink: Result<ITfCompositionSink> = unsafe { self.cast() };
+                    match sink {
+                        Ok(comp_sink) => {
+                            let op = EditOp::ShowGhost {
+                                text: text.clone(),
+                                composition: self.composition.clone(),
+                                comp_sink,
+                            };
+                            if let Err(e) = edit_session::request_edit_session(context, cid, op) {
+                                eprintln!("smartkey: ShowGhost failed: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("smartkey: failed to get composition sink: {e}"),
                     }
                     consumed = true;
                 }
@@ -191,16 +201,19 @@ impl ITfTextInputProcessorEx_Impl for SmartKeyTextService_Impl {
             }
         }
 
-        // Load corpus files from configuration.
-        let config = SmartKeyConfig::load();
-        let mut core = self.core.borrow_mut();
-        for path in &config.corpus_files {
-            if let Err(e) = core.load_corpus_file(path) {
-                eprintln!("smartkey: failed to load corpus {}: {e}", path.display());
+        // Load corpus files once per instance (guard against reactivation).
+        if !self.corpus_loaded.get() {
+            let config = SmartKeyConfig::load();
+            let mut core = self.core.borrow_mut();
+            for path in &config.corpus_files {
+                if let Err(e) = core.load_corpus_file(path) {
+                    eprintln!("smartkey: failed to load corpus {}: {e}", path.display());
+                }
             }
-        }
-        if let Err(e) = core.load_personal_default() {
-            eprintln!("smartkey: failed to load personal profile: {e}");
+            if let Err(e) = core.load_personal_default() {
+                eprintln!("smartkey: failed to load personal profile: {e}");
+            }
+            self.corpus_loaded.set(true);
         }
 
         Ok(())

@@ -7,9 +7,11 @@
 // Rationale: 3 operations don't justify 3 COM classes; one struct reduces COM lifetime bugs.
 
 use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use windows::core::*;
+use windows::Win32::Foundation::*;
 use windows::Win32::UI::TextServices::*;
 
 /// The operation to perform inside the edit session.
@@ -18,6 +20,8 @@ pub enum EditOp {
     ShowGhost {
         text: String,
         composition: Rc<RefCell<Option<ITfComposition>>>,
+        /// Composition sink to receive OnCompositionTerminated callbacks.
+        comp_sink: ITfCompositionSink,
     },
     /// Remove ghost text and end the composition.
     HideGhost {
@@ -52,7 +56,11 @@ impl SmartKeyEditSession {
 impl ITfEditSession_Impl for SmartKeyEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         match &self.op {
-            EditOp::ShowGhost { text, composition } => self.do_show_ghost(ec, text, composition),
+            EditOp::ShowGhost {
+                text,
+                composition,
+                comp_sink,
+            } => self.do_show_ghost(ec, text, composition, comp_sink),
             EditOp::HideGhost { composition } => self.do_hide_ghost(ec, composition),
             EditOp::CommitText { text, composition } => self.do_commit_text(ec, text, composition),
         }
@@ -61,11 +69,15 @@ impl ITfEditSession_Impl for SmartKeyEditSession_Impl {
 
 impl SmartKeyEditSession_Impl {
     /// Show or update ghost text via a TSF composition.
+    ///
+    /// After inserting/updating ghost text, the selection (caret) is moved to the
+    /// START of the ghost range so that forwarded keys are inserted before the ghost.
     fn do_show_ghost(
         &self,
         ec: u32,
         text: &str,
         composition: &Rc<RefCell<Option<ITfComposition>>>,
+        comp_sink: &ITfCompositionSink,
     ) -> Result<()> {
         let text_utf16: Vec<u16> = text.encode_utf16().collect();
         let mut comp = composition.borrow_mut();
@@ -75,6 +87,7 @@ impl SmartKeyEditSession_Impl {
             unsafe {
                 let range = active.GetRange()?;
                 range.SetText(ec, 0, &text_utf16)?;
+                self.set_caret_to_range_start(ec, &range)?;
             }
         } else {
             // Start a new composition.
@@ -83,11 +96,10 @@ impl SmartKeyEditSession_Impl {
                 let range = insert.InsertTextAtSelection(ec, TF_IAS_NOQUERY, &text_utf16)?;
 
                 let ctx_comp: ITfContextComposition = self.context.cast()?;
-                // StartComposition needs a composition sink. We pass None since
-                // SmartKeyTextService implements ITfCompositionSink separately
-                // and handles OnCompositionTerminated via its own impl.
-                let new_comp = ctx_comp.StartComposition(ec, &range, None)?;
+                let new_comp = ctx_comp.StartComposition(ec, &range, Some(comp_sink))?;
                 *comp = Some(new_comp);
+
+                self.set_caret_to_range_start(ec, &range)?;
             }
         }
         Ok(())
@@ -111,31 +123,51 @@ impl SmartKeyEditSession_Impl {
         Ok(())
     }
 
-    /// Commit text: end any ghost composition, then insert finalized text.
+    /// Commit text: end the ghost composition so the suffix becomes permanent.
+    ///
+    /// When a ghost composition is active, the typed prefix is already in the
+    /// document (via ForwardKey) and the ghost suffix is in the composition range.
+    /// EndComposition makes the suffix permanent — no text replacement needed.
+    /// The `text` parameter is only used when there's no active composition
+    /// (e.g. direct commit without prior ghost).
     fn do_commit_text(
         &self,
         ec: u32,
         text: &str,
         composition: &Rc<RefCell<Option<ITfComposition>>>,
     ) -> Result<()> {
-        let text_utf16: Vec<u16> = text.encode_utf16().collect();
-
-        // End ghost composition first — ghost text becomes permanent.
         let mut comp = composition.borrow_mut();
         if let Some(active) = comp.take() {
             unsafe {
-                // Replace the ghost text with the committed text in-place.
-                let range = active.GetRange()?;
-                range.SetText(ec, 0, &text_utf16)?;
+                // Ghost suffix is already in the document. Just finalize it.
                 active.EndComposition(ec)?;
             }
         } else {
-            // No active composition — insert at the current selection.
+            // No active composition — insert the full text at selection.
+            let text_utf16: Vec<u16> = text.encode_utf16().collect();
             unsafe {
                 let insert: ITfInsertAtSelection = self.context.cast()?;
                 insert.InsertTextAtSelection(ec, TF_IAS_NOQUERY, &text_utf16)?;
             }
         }
+        Ok(())
+    }
+
+    /// Move the caret (selection) to the start of the given range.
+    ///
+    /// This ensures forwarded keys are inserted before the ghost text, not after.
+    unsafe fn set_caret_to_range_start(&self, ec: u32, range: &ITfRange) -> Result<()> {
+        let caret = range.Clone()?;
+        caret.Collapse(ec, TF_ANCHOR_START)?;
+
+        let selection = TF_SELECTION {
+            range: ManuallyDrop::new(Some(caret)),
+            style: TF_SELECTIONSTYLE {
+                ase: TF_AE_END,
+                fInterimChar: BOOL(0),
+            },
+        };
+        self.context.SetSelection(ec, &[selection])?;
         Ok(())
     }
 }
