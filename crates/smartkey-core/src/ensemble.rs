@@ -119,8 +119,8 @@ impl SmartKeyEngine {
             // avoid scoring the same word twice.
             let exact_words: HashSet<&str> = candidates.iter().map(|c| c.word.as_str()).collect();
 
-            let mut discount_map: HashMap<String, f64> = HashMap::new();
-            let mut merged: Vec<WordEntry> = Vec::new();
+            let mut discount_map: HashMap<String, f64> = HashMap::with_capacity(fuzzy_matches.len());
+            let mut merged: Vec<WordEntry> = Vec::with_capacity(fuzzy_matches.len());
             for fm in &fuzzy_matches {
                 if exact_words.contains(fm.word.as_str()) {
                     continue;
@@ -162,28 +162,39 @@ impl SmartKeyEngine {
             None
         };
 
-        // Determine max personal score among candidates for normalisation.
-        let max_personal = all_candidates
-            .iter()
-            .map(|c| self.personal.frequency_score(&c.word))
-            .fold(0.0_f64, f64::max)
-            .max(1.0); // avoid division by zero
+        // Single pass: compute raw scores and track maxima simultaneously.
+        // This avoids calling markov.score_with_backoff() and personal.frequency_score()
+        // twice per candidate (was: once for max, once for scoring).
+        struct RawScores {
+            corpus: f64,
+            markov: f64,
+            personal: f64,
+        }
 
-        // Determine max Markov score among candidates for normalisation.
-        let max_markov = all_candidates
-            .iter()
-            .map(|c| self.markov.score_with_backoff(&c.word, prev1, prev2))
-            .fold(0.0_f64, f64::max)
-            .max(1e-6);
+        let mut raw: Vec<RawScores> = Vec::with_capacity(all_candidates.len());
+        let mut max_markov = 1e-6_f64;
+        let mut max_personal = 1.0_f64;
 
-        // Step 2-3: score each candidate.
+        for c in &all_candidates {
+            let m = self.markov.score_with_backoff(&c.word, prev1, prev2);
+            let p = self.personal.frequency_score(&c.word);
+            max_markov = max_markov.max(m);
+            max_personal = max_personal.max(p);
+            raw.push(RawScores {
+                corpus: c.frequency as f64,
+                markov: m,
+                personal: p,
+            });
+        }
+
+        // Normalize and blend in a second pass (but no redundant score calls).
         let mut scored: Vec<Prediction> = all_candidates
             .iter()
-            .map(|entry| {
-                let corpus_score = entry.frequency as f64 / max_freq;
-                let markov_score =
-                    self.markov.score_with_backoff(&entry.word, prev1, prev2) / max_markov;
-                let personal_score = self.personal.frequency_score(&entry.word) / max_personal;
+            .zip(raw.iter())
+            .map(|(entry, r)| {
+                let corpus_score = r.corpus / max_freq;
+                let markov_score = r.markov / max_markov;
+                let personal_score = r.personal / max_personal;
 
                 let mut score = self.alpha * corpus_score
                     + self.beta * markov_score
@@ -197,7 +208,7 @@ impl SmartKeyEngine {
                 Prediction {
                     word: entry.word.clone(),
                     score,
-                    confidence: 0.0, // filled in after sorting
+                    confidence: 0.0,
                 }
             })
             .collect();

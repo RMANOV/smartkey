@@ -9,7 +9,7 @@
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default exponential decay rate.
@@ -31,12 +31,12 @@ pub struct CvmCounter {
     capacity: usize,
     /// Hard upper bound on capacity.
     max_capacity: usize,
-    /// The random sample of elements currently retained.
-    buffer: HashSet<String>,
+    /// Unified data store: element → last-seen timestamp.
+    /// Replaces the previous `buffer: HashSet` + `last_seen: HashMap` pair,
+    /// eliminating one hash probe and one String allocation per operation.
+    data: HashMap<String, Instant>,
     /// How many halving rounds have occurred.
     round: u32,
-    /// Timestamp of the last time each element was seen (inserted or re-processed).
-    last_seen: HashMap<String, Instant>,
     /// Exponential decay rate `λ` used in `exp(-λ * Δt)`.
     decay_lambda: f64,
     /// Cached RNG — avoids thread-local lookup on every keystroke.
@@ -58,9 +58,8 @@ impl CvmCounter {
         Self {
             capacity: initial_size,
             max_capacity: max_size,
-            buffer: HashSet::with_capacity(initial_size),
+            data: HashMap::with_capacity(initial_size),
             round: 0,
-            last_seen: HashMap::with_capacity(initial_size),
             decay_lambda: DEFAULT_DECAY_LAMBDA,
             rng: SmallRng::from_entropy(),
         }
@@ -97,9 +96,7 @@ impl CvmCounter {
     pub fn process(&mut self, element: &str) {
         let now = Instant::now();
 
-        if self.buffer.contains(element) {
-            self.buffer.remove(element);
-            self.last_seen.remove(element);
+        if self.data.remove(element).is_some() {
             // Re-insert with probability 2^(-round) per CVM paper.
             let p = if self.round >= 64 {
                 0.0
@@ -107,22 +104,20 @@ impl CvmCounter {
                 0.5_f64.powi(self.round as i32)
             };
             if self.rng.gen::<f64>() < p {
-                self.buffer.insert(element.to_owned());
-                self.last_seen.insert(element.to_owned(), now);
+                self.data.insert(element.to_owned(), now);
             }
         } else {
-            self.buffer.insert(element.to_owned());
-            self.last_seen.insert(element.to_owned(), now);
+            self.data.insert(element.to_owned(), now);
         }
 
-        if self.buffer.len() >= self.capacity {
+        if self.data.len() >= self.capacity {
             self.start_new_round();
         }
     }
 
     /// Estimate the number of distinct elements seen so far.
     pub fn estimate(&self) -> usize {
-        self.buffer
+        self.data
             .len()
             .saturating_mul(1_usize << self.round.min(63))
     }
@@ -152,7 +147,7 @@ impl CvmCounter {
     /// False negatives are possible (the element may have been evicted); false
     /// positives are not.
     pub fn contains(&self, element: &str) -> bool {
-        self.buffer.contains(element)
+        self.data.contains_key(element)
     }
 
     /// Frequency score for ranking predictions, with recency decay.
@@ -162,21 +157,16 @@ impl CvmCounter {
     /// exponential decay factor `exp(-λ · Δt)` where `Δt` is the number of
     /// seconds since the element was last seen.
     ///
-    /// * If the element is not in the buffer, returns `0.0`.
+    /// * If the element is not in the data map, returns `0.0`.
     /// * If `decay_lambda` is `0.0`, behaves identically to the un-decayed
     ///   version (decay factor is `1.0`).
     pub fn frequency_score(&self, element: &str) -> f64 {
-        if self.buffer.contains(element) {
+        if let Some(&ts) = self.data.get(element) {
             let base = (1_u64 << self.round.min(63)) as f64;
             let decay = if self.decay_lambda == 0.0 {
                 1.0
-            } else if let Some(&ts) = self.last_seen.get(element) {
-                let dt = ts.elapsed().as_secs_f64();
-                (-self.decay_lambda * dt).exp()
             } else {
-                // Element in buffer but missing from last_seen (shouldn't happen
-                // in normal use). Treat as maximally stale — full decay.
-                0.0
+                (-self.decay_lambda * ts.elapsed().as_secs_f64()).exp()
             };
             base * decay
         } else {
@@ -197,12 +187,12 @@ impl CvmCounter {
             .unwrap_or_default()
             .as_secs_f64();
 
-        let words: Vec<String> = self.buffer.iter().cloned().collect();
-        let age_secs: HashMap<String, f64> = self
-            .last_seen
-            .iter()
-            .map(|(word, &ts)| (word.clone(), (now - ts).as_secs_f64()))
-            .collect();
+        let mut words = Vec::with_capacity(self.data.len());
+        let mut age_secs = HashMap::with_capacity(self.data.len());
+        for (word, &ts) in &self.data {
+            words.push(word.clone());
+            age_secs.insert(word.clone(), (now - ts).as_secs_f64());
+        }
 
         CvmSnapshot {
             version: 1,
@@ -228,8 +218,7 @@ impl CvmCounter {
             .as_secs_f64();
         let offline_secs = (now_unix - snap.saved_at_unix).max(0.0);
 
-        let buffer: HashSet<String> = snap.words.iter().cloned().collect();
-        let last_seen: HashMap<String, Instant> = snap
+        let data: HashMap<String, Instant> = snap
             .words
             .iter()
             .filter_map(|word| {
@@ -247,9 +236,8 @@ impl CvmCounter {
         Self {
             capacity: snap.capacity,
             max_capacity: snap.max_capacity,
-            buffer,
+            data,
             round: snap.round,
-            last_seen,
             decay_lambda: snap.decay_lambda,
             rng: SmallRng::from_entropy(),
         }
@@ -257,25 +245,16 @@ impl CvmCounter {
 
     // ── internal ────────────────────────────────────────────────────────
 
-    /// Begin a new round: randomly discard ~half the buffer, bump round counter.
+    /// Begin a new round: randomly discard ~half the data, bump round counter.
+    ///
+    /// Uses `retain()` for in-place eviction — no Vec allocation, no rehash.
+    /// Statistically equivalent to Fisher-Yates: keeps Binomial(N, 0.5)
+    /// elements (≈ N/2 ± √(N/4)), acceptable for a probabilistic estimator.
     fn start_new_round(&mut self) {
-        let retain_count = self.buffer.len() / 2;
-
-        // Drain into a Vec, shuffle, keep the first half.
-        let mut elems: Vec<String> = self.buffer.drain().collect();
-        let len = elems.len();
-        // Fisher–Yates partial shuffle (only need `retain_count` positions).
-        for i in 0..retain_count.min(len) {
-            let j = self.rng.gen_range(i..len);
-            elems.swap(i, j);
-        }
-        // Elements beyond retain_count are evicted — remove their timestamps.
-        for evicted in &elems[retain_count..] {
-            self.last_seen.remove(evicted);
-        }
-        elems.truncate(retain_count);
-        self.buffer = elems.into_iter().collect();
-
+        // Clone RNG to avoid borrow conflict with self.data.
+        let mut rng = self.rng.clone();
+        self.data.retain(|_, _| rng.gen::<bool>());
+        self.rng = rng;
         self.round = self.round.saturating_add(1);
     }
 }
@@ -325,7 +304,7 @@ mod tests {
             c.process("word");
         }
         // "word" either survived or was evicted; buffer has at most 1 entry.
-        assert!(c.buffer.len() <= 1);
+        assert!(c.data.len() <= 1);
         assert_eq!(c.round(), 0);
     }
 
@@ -382,12 +361,13 @@ mod tests {
         for i in 0..10 {
             c.process(&format!("el_{i}"));
         }
-        // After the round fires the buffer should be roughly half.
+        // After the round fires the data should be roughly half.
+        // With retain()-based Binomial(10, 0.5), expect ~5 ± 2.
         assert_eq!(c.round(), 1);
         assert!(
-            c.buffer.len() <= 6,
-            "buffer should be ~5 after halving 10, got {}",
-            c.buffer.len()
+            c.data.len() <= 9,
+            "data should be ~5 after halving 10, got {}",
+            c.data.len()
         );
     }
 
@@ -523,7 +503,7 @@ mod tests {
     fn last_seen_cleaned_on_eviction_in_process() {
         let mut c = CvmCounter::new(64, 256).with_decay_lambda(0.0);
         c.process("victim");
-        assert!(c.last_seen.contains_key("victim"));
+        assert!(c.data.contains_key("victim"));
 
         // Repeatedly process the same element; probabilistic eviction will
         // eventually remove it (given enough attempts in round 0, p=0.5 each).
@@ -537,7 +517,7 @@ mod tests {
         }
         if evicted {
             assert!(
-                !c.last_seen.contains_key("victim"),
+                !c.data.contains_key("victim"),
                 "last_seen should be cleaned when element is evicted"
             );
         }
@@ -552,18 +532,12 @@ mod tests {
         }
         // A round should have fired, evicting ~half the elements.
         assert_eq!(c.round(), 1);
-        // Every element in the buffer should have a last_seen entry,
-        // and every evicted element should NOT.
-        for elem in c.buffer.iter() {
-            assert!(
-                c.last_seen.contains_key(elem),
-                "surviving element {elem} should have a last_seen entry"
-            );
-        }
-        assert_eq!(
-            c.buffer.len(),
-            c.last_seen.len(),
-            "last_seen should have exactly as many entries as the buffer"
+        // With unified data map, all surviving elements inherently have timestamps.
+        // Just verify the count is roughly half.
+        assert!(
+            c.data.len() <= 9,
+            "data should be ~5 after halving 10, got {}",
+            c.data.len()
         );
     }
 
@@ -582,14 +556,12 @@ mod tests {
         assert_eq!(restored.max_capacity, c.max_capacity);
         assert_eq!(restored.round, c.round);
         assert!((restored.decay_lambda - c.decay_lambda).abs() < f64::EPSILON);
-        assert_eq!(restored.buffer, c.buffer);
-        // Every surviving word should have a last_seen entry.
-        for word in restored.buffer.iter() {
-            assert!(
-                restored.last_seen.contains_key(word),
-                "restored counter missing last_seen for '{word}'"
-            );
-        }
+        // All restored keys should match the original keys.
+        let mut orig_keys: Vec<&String> = c.data.keys().collect();
+        let mut rest_keys: Vec<&String> = restored.data.keys().collect();
+        orig_keys.sort();
+        rest_keys.sort();
+        assert_eq!(rest_keys, orig_keys);
     }
 
     #[test]
@@ -602,7 +574,7 @@ mod tests {
 
         let restored = CvmCounter::from_snapshot(&snap);
         assert_eq!(restored.estimate(), 0);
-        assert!(restored.buffer.is_empty());
+        assert!(restored.data.is_empty());
     }
 
     #[test]
