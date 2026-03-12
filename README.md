@@ -82,7 +82,7 @@ Final: α·corpus + β·markov + γ·personal ──── < 10μs total
 | InputMethodCore | Rust | Key dispatch, ghost text lifecycle, context tracking |
 | Platform Adapters | PyO3 / COM / C FFI | Translate OS events ↔ Action list |
 | Prediction Engine | Rust | N-gram lookup, Markov scoring, ensemble |
-| Learning Layer | CVM + SQLite | Personal vocabulary, adaptive memory |
+| Learning Layer | CVM (JSON persistence) | Personal vocabulary, adaptive memory |
 | UI | IBus Panel / TSF / IMK | Ghost text overlay, floating popup |
 
 ---
@@ -119,7 +119,7 @@ cvm.frequency_score("function")   // → 64.0  (survived 6 rounds — you're a p
 cvm.frequency_score("synergy")    // → 0.0   (evicted — you stopped writing corporate email)
 ```
 
-**Novel extension — zero-config language detection:** Per-language CVM counters track vocabulary cardinality. The counter with the lowest round count (least memory pressure) is the best language match. Switch from English to Bulgarian mid-sentence? SmartKey detects it automatically.
+**Planned extension — zero-config language detection:** Per-language CVM counters could track vocabulary cardinality. The counter with the lowest round count (least memory pressure) would be the best language match — enabling automatic mid-sentence language switching.
 
 ### Ensemble Scorer
 
@@ -182,7 +182,7 @@ ibus restart
                   │ Esc = dismiss
 ```
 
-**Alt-hold popup** — alternatives with confidence scores:
+**Alt-hold popup** (planned) — alternatives with confidence scores:
 
 ```
 ┌─────────────────────────┐
@@ -206,7 +206,6 @@ ibus restart
 {
     "enabled": true,
     "ghost_text": true,
-    "popup_on_alt": true,
     "max_candidates": 5,
     "min_prefix_length": 2,
     "kill_switch": "Super+Escape",
@@ -219,7 +218,7 @@ ibus restart
 }
 ```
 
-Hot-reload — changes take effect without restart.
+Changes require engine restart.
 
 ---
 
@@ -325,12 +324,12 @@ SmartKey builds on algorithms proven in production across other projects:
 - [ ] macOS .app bundle + DMG
 
 ### Engine
-- [ ] Benchmark suite (Criterion) with latency targets
+- [x] Benchmark suite (Criterion) with latency targets
 - [ ] Memory-mapped binary corpus format (mmap, no JSON parse at startup)
 - [ ] GTK4 popup panel for Alt-hold alternatives
 - [ ] SQLite persistence for CVM personal vocabulary
-- [ ] Pre-built English and Bulgarian corpus packages
-- [ ] Typo correction via Levenshtein distance (fuzzy prefix matching)
+- [x] Pre-built English and Bulgarian corpus packages
+- [x] Typo correction via Levenshtein distance (fuzzy prefix matching)
 - [ ] Mobile port (Android IME via JNI)
 
 ---
