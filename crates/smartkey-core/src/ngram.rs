@@ -1,6 +1,7 @@
 // N-gram trie storage — word dictionary with frequency-ranked prefix search.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 /// A word with its associated frequency count.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +25,15 @@ struct TrieNode {
     children: HashMap<char, TrieNode>,
     /// `Some(freq)` when this node marks the end of a stored word.
     frequency: Option<u32>,
+    /// Maximum frequency in this subtree (enables top-K pruning).
+    ///
+    /// **Invariant:** Only maintained for non-decreasing frequency updates.
+    /// If `insert()` is called with a *lower* frequency for an existing word,
+    /// `max_freq` may remain stale (over-estimate). This is acceptable because
+    /// it only weakens pruning (fewer subtrees skipped), never causes incorrect
+    /// results. Callers should ensure frequencies are non-decreasing, or accept
+    /// slightly degraded pruning performance.
+    max_freq: u32,
 }
 
 /// Character-level trie that stores words with frequency counts and
@@ -48,8 +58,10 @@ impl NgramTrie {
     /// its frequency is **replaced** (last-write-wins).
     pub fn insert(&mut self, word: &str, frequency: u32) {
         let mut node = &mut self.root;
+        node.max_freq = node.max_freq.max(frequency);
         for ch in word.chars() {
             node = node.children.entry(ch).or_default();
+            node.max_freq = node.max_freq.max(frequency);
         }
         if node.frequency.is_none() {
             self.count += 1;
@@ -70,17 +82,20 @@ impl NgramTrie {
             }
         }
 
-        // DFS to collect every word below this node.
-        // Uses a single String buffer with backtracking (push/truncate) to avoid
-        // allocating a new String per trie node.
-        let mut results = Vec::new();
+        // Min-heap of (frequency, word) — keeps top-K by frequency.
+        // Reverse wrapping makes this a min-heap so we can efficiently
+        // evict the weakest candidate when a better one appears.
+        let mut heap: BinaryHeap<Reverse<(u32, String)>> =
+            BinaryHeap::with_capacity(limit + 1);
         let mut current_word = prefix.to_string();
-        Self::collect_prefix_matches(node, &mut current_word, &mut results);
+        Self::collect_top_k(node, &mut current_word, limit, &mut heap);
 
-        // Sort by frequency descending; break ties alphabetically.
-        results.sort_by(|a, b| b.frequency.cmp(&a.frequency).then(a.word.cmp(&b.word)));
-        results.truncate(limit);
-        results
+        // into_sorted_vec on BinaryHeap<Reverse<T>> returns ascending Reverse order
+        // = descending original order = highest frequency first. Exactly what we want.
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((freq, word))| WordEntry { word, frequency: freq })
+            .collect()
     }
 
     /// Find words whose prefix is within Damerau-Levenshtein distance `max_edits`
@@ -102,18 +117,31 @@ impl NgramTrie {
         let prefix_chars: Vec<char> = prefix.chars().collect();
         let prefix_len = prefix_chars.len();
 
+        // Max-heap: (edit_distance, Reverse(frequency), word).
+        // The maximum = worst entry (highest distance, lowest frequency).
+        // peek() returns the worst → evict when a better entry arrives.
+        let mut heap: BinaryHeap<(u8, Reverse<u32>, String)> =
+            BinaryHeap::with_capacity(limit + 1);
+
         // Special case: empty prefix matches every word at distance 0.
         if prefix_len == 0 {
-            let mut results = Vec::new();
-            Self::collect_words(&self.root, &mut String::new(), 0, &mut results);
-            results.sort_by(|a, b| {
-                a.edit_distance
-                    .cmp(&b.edit_distance)
-                    .then(b.frequency.cmp(&a.frequency))
-                    .then(a.word.cmp(&b.word))
-            });
-            results.truncate(limit);
-            return results;
+            Self::collect_words_bounded(
+                &self.root,
+                &mut String::new(),
+                0,
+                &mut heap,
+                limit,
+            );
+            // into_sorted_vec returns ascending = (dist ASC, freq DESC). Correct order.
+            return heap
+                .into_sorted_vec()
+                .into_iter()
+                .map(|(dist, Reverse(freq), word)| FuzzyMatch {
+                    word,
+                    frequency: freq,
+                    edit_distance: dist,
+                })
+                .collect();
         }
 
         // Initial row: [0, 1, 2, ..., prefix_len]
@@ -121,46 +149,37 @@ impl NgramTrie {
             .map(|i| i.min(u8::MAX as usize) as u8)
             .collect();
 
-        let mut results = Vec::new();
-
         // DFS: process each child of root to start the walk.
         for (&ch, child) in &self.root.children {
-            Self::fuzzy_dfs(
+            Self::fuzzy_dfs_bounded(
                 child,
                 ch,
                 &prefix_chars,
                 max_edits,
                 &initial_row,
-                None, // no grandparent row at depth 0
-                None, // no previous trie char at depth 0
+                None,
+                None,
                 &mut String::from(ch),
-                &mut results,
+                &mut heap,
+                limit,
             );
         }
 
-        // Sort: edit_distance ascending, then frequency descending, then word alphabetically.
-        results.sort_by(|a, b| {
-            a.edit_distance
-                .cmp(&b.edit_distance)
-                .then(b.frequency.cmp(&a.frequency))
-                .then(a.word.cmp(&b.word))
-        });
-        results.truncate(limit);
-        results
+        // into_sorted_vec returns ascending = (dist ASC, freq DESC). Correct order.
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|(dist, Reverse(freq), word)| FuzzyMatch {
+                word,
+                frequency: freq,
+                edit_distance: dist,
+            })
+            .collect()
     }
 
-    /// Recursive fuzzy DFS helper using Damerau-Levenshtein distance.
-    ///
-    /// `node` — the trie node we just arrived at by following character `ch`.
-    /// `prefix_chars` — the query prefix as a char slice.
-    /// `max_edits` — maximum allowed edit distance.
-    /// `prev_row` — the edit distance row computed at the parent node.
-    /// `prev_prev_row` — the edit distance row computed at the grandparent (for transpositions).
-    /// `prev_ch` — the character of the parent edge (for transposition detection).
-    /// `current_word` — the word built so far along this trie path.
-    /// `results` — accumulator for matches found.
+    /// Recursive fuzzy DFS helper using Damerau-Levenshtein distance
+    /// with bounded collection into a min-heap.
     #[allow(clippy::too_many_arguments)]
-    fn fuzzy_dfs(
+    fn fuzzy_dfs_bounded(
         node: &TrieNode,
         ch: char,
         prefix_chars: &[char],
@@ -169,7 +188,8 @@ impl NgramTrie {
         prev_prev_row: Option<&[u8]>,
         prev_ch: Option<char>,
         current_word: &mut String,
-        results: &mut Vec<FuzzyMatch>,
+        heap: &mut BinaryHeap<(u8, Reverse<u32>, String)>,
+        limit: usize,
     ) {
         let prefix_len = prefix_chars.len();
         let mut current_row = vec![0u8; prefix_len + 1];
@@ -187,9 +207,6 @@ impl NgramTrie {
             let mut dist = delete.min(insert).min(replace);
 
             // Damerau extension: transposition.
-            // If the current trie char matches prefix[i-2] and the previous trie
-            // char matches prefix[i-1], these two adjacent characters are swapped.
-            // The transposition cost uses the grandparent row: prev_prev_row[i-2] + 1.
             if i >= 2 {
                 if let (Some(p_ch), Some(pp_row)) = (prev_ch, prev_prev_row) {
                     if prefix_chars[i - 1] == p_ch && prefix_chars[i - 2] == ch {
@@ -202,12 +219,11 @@ impl NgramTrie {
             current_row[i] = dist;
         }
 
-        // The value at current_row[prefix_len] is the edit distance between the
-        // prefix and the trie path so far. If it's within max_edits, then this
-        // trie path is a fuzzy prefix match — collect all words in this subtree.
+        // If prefix distance is within max_edits, collect subtree words
+        // into the bounded heap instead of an unbounded Vec.
         let prefix_dist = current_row[prefix_len];
         if prefix_dist <= max_edits {
-            Self::collect_words(node, current_word, prefix_dist, results);
+            Self::collect_words_bounded(node, current_word, prefix_dist, heap, limit);
         }
 
         // Prune: if the minimum value in current_row exceeds max_edits,
@@ -217,11 +233,21 @@ impl NgramTrie {
             return;
         }
 
-        // Recurse into children, passing current_row as prev_row and prev_row as prev_prev_row.
+        // Early termination: if heap is full and the worst entry is distance 0,
+        // all entries are distance 0 — skip branches that yield higher distance.
+        if heap.len() >= limit {
+            if let Some(&(worst_dist, _, _)) = heap.peek() {
+                if worst_dist == 0 && prefix_dist > 0 {
+                    return;
+                }
+            }
+        }
+
+        // Recurse into children.
         let word_len_before = current_word.len();
         for (&next_ch, child) in &node.children {
             current_word.push(next_ch);
-            Self::fuzzy_dfs(
+            Self::fuzzy_dfs_bounded(
                 child,
                 next_ch,
                 prefix_chars,
@@ -230,51 +256,91 @@ impl NgramTrie {
                 Some(prev_row),
                 Some(ch),
                 current_word,
-                results,
+                heap,
+                limit,
             );
             current_word.truncate(word_len_before);
         }
     }
 
-    /// Collect all complete words below `node` using a single reusable `String`
-    /// buffer with backtracking (push/truncate) to avoid per-node heap allocation.
-    fn collect_prefix_matches(
+    /// Bounded top-K collection with subtree pruning.
+    ///
+    /// Uses `max_freq` on each node to skip entire subtrees whose best
+    /// possible frequency can't beat the current K-th best in the heap.
+    fn collect_top_k(
         node: &TrieNode,
         current_word: &mut String,
-        results: &mut Vec<WordEntry>,
+        limit: usize,
+        heap: &mut BinaryHeap<Reverse<(u32, String)>>,
     ) {
-        if let Some(freq) = node.frequency {
-            results.push(WordEntry {
-                word: current_word.clone(),
-                frequency: freq,
-            });
+        // Subtree pruning: if heap is full and this subtree's max_freq
+        // can't beat the current K-th best, skip entirely.
+        if heap.len() >= limit {
+            if let Some(&Reverse((min_freq, _))) = heap.peek() {
+                if node.max_freq <= min_freq {
+                    return;
+                }
+            }
         }
+
+        if let Some(freq) = node.frequency {
+            // Check acceptance BEFORE cloning the string.
+            if heap.len() < limit {
+                heap.push(Reverse((freq, current_word.clone())));
+            } else if heap.peek().map_or(false, |&Reverse((min_freq, _))| freq > min_freq) {
+                heap.pop();
+                heap.push(Reverse((freq, current_word.clone())));
+            }
+        }
+
         let word_len_before = current_word.len();
         for (&ch, child) in &node.children {
             current_word.push(ch);
-            Self::collect_prefix_matches(child, current_word, results);
+            Self::collect_top_k(child, current_word, limit, heap);
             current_word.truncate(word_len_before);
         }
     }
 
-    /// Collect all complete words in a subtree, all sharing the same `edit_distance`.
-    fn collect_words(
+    /// Bounded collection for fuzzy matches using a min-heap.
+    ///
+    /// Entries are ordered by (edit_distance ASC, frequency DESC) — the heap
+    /// evicts the worst match (highest distance or lowest frequency) when full.
+    fn collect_words_bounded(
         node: &TrieNode,
         current_word: &mut String,
         edit_distance: u8,
-        results: &mut Vec<FuzzyMatch>,
+        heap: &mut BinaryHeap<(u8, Reverse<u32>, String)>,
+        limit: usize,
     ) {
-        if let Some(freq) = node.frequency {
-            results.push(FuzzyMatch {
-                word: current_word.clone(),
-                frequency: freq,
-                edit_distance,
-            });
+        // Early pruning: if heap is full and this edit_distance is already
+        // worse than the worst entry, skip this node and its entire subtree.
+        if heap.len() >= limit {
+            if let Some(&(worst_dist, _, _)) = heap.peek() {
+                if edit_distance > worst_dist {
+                    return;
+                }
+            }
         }
+
+        if let Some(freq) = node.frequency {
+            // Check acceptance BEFORE cloning the string.
+            let dominated = heap.len() >= limit
+                && heap
+                    .peek()
+                    .map_or(false, |w| (edit_distance, Reverse(freq)) >= (w.0, w.1));
+            if !dominated {
+                let entry = (edit_distance, Reverse(freq), current_word.clone());
+                if heap.len() >= limit {
+                    heap.pop();
+                }
+                heap.push(entry);
+            }
+        }
+
         let word_len_before = current_word.len();
         for (&ch, child) in &node.children {
             current_word.push(ch);
-            Self::collect_words(child, current_word, edit_distance, results);
+            Self::collect_words_bounded(child, current_word, edit_distance, heap, limit);
             current_word.truncate(word_len_before);
         }
     }
