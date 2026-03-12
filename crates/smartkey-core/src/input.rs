@@ -411,6 +411,11 @@ impl InputMethodCore {
         &self.current_word
     }
 
+    /// Whether ghost text is currently displayed.
+    pub fn has_ghost(&self) -> bool {
+        !self.ghost.is_empty()
+    }
+
     // -- personal profile persistence -----------------------------------
 
     /// Save the personal CVM profile to the given path.
