@@ -93,7 +93,10 @@ impl SmartKeyTextService {
             let _ = GetKeyboardState(&mut keyboard_state);
             let layout = GetKeyboardLayout(0);
             let mut buf = [0u16; 4];
-            let result = ToUnicodeEx(vk, scan_code, &keyboard_state, &mut buf, 0, layout);
+            // Flag 4 = do not modify the dead-key composition buffer.
+            // Without this, calling ToUnicodeEx from OnTestKeyDown would consume
+            // pending dead-key state (e.g. ^ + e → ê), breaking compose sequences.
+            let result = ToUnicodeEx(vk, scan_code, &keyboard_state, &mut buf, 4, layout);
             if result >= 1 {
                 if let Some(ch) = char::decode_utf16(buf[..result as usize].iter().copied())
                     .next()

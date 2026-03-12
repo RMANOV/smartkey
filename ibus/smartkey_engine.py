@@ -160,7 +160,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         """Populate the engine with n-gram data from corpus files."""
         corpus_files: list[Path] = []
         corpus_files.extend(sorted(_CONFIG_DIR.glob("corpus_*.json")))
-        corpus_files.extend(sorted(_CONFIG_DIR.glob("corpus_*.bin")))
+        # Add .bin files only if no matching .json exists (Rust auto-caches
+        # .json → .bin, so loading both would double all n-gram counts).
+        json_stems = {p.stem for p in corpus_files}
+        corpus_files.extend(
+            p
+            for p in sorted(_CONFIG_DIR.glob("corpus_*.bin"))
+            if p.stem not in json_stems
+        )
         if _CORPUS_FILE.is_file():
             corpus_files.append(_CORPUS_FILE)
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -151,7 +152,6 @@ def main() -> None:
     loop = GLib.MainLoop()
 
     # Graceful shutdown: quit GLib loop on SIGTERM/SIGINT.
-    import signal
 
     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, loop.quit)
     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, loop.quit)
