@@ -79,6 +79,7 @@ except ImportError:
         def load_word(self, word: str, freq: int) -> None: ...
         def load_bigram(self, ctx: str, word: str, count: int) -> None: ...
         def load_trigram(self, w1: str, w2: str, word: str, count: int) -> None: ...
+        def load_corpus_file(self, path: str) -> None: ...
         def handle_key(self, keyval: int, modifiers: int) -> list[tuple[str, str]]:
             return [("forward", "")]
 
@@ -159,33 +160,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         """Populate the engine with n-gram data from corpus files."""
         corpus_files: list[Path] = []
         corpus_files.extend(sorted(_CONFIG_DIR.glob("corpus_*.json")))
+        corpus_files.extend(sorted(_CONFIG_DIR.glob("corpus_*.bin")))
         if _CORPUS_FILE.is_file():
             corpus_files.append(_CORPUS_FILE)
 
         for path in corpus_files:
-            self._load_corpus_file(path)
-
-    def _load_corpus_file(self, path: Path) -> None:
-        """Load a single corpus JSON file into the engine."""
-        corpus = _load_json(path)
-        if not isinstance(corpus, dict):
-            return
-
-        for word, freq in corpus.get("unigrams", {}).items():
-            self._core.load_word(word, int(freq))
-
-        for entry in corpus.get("bigrams", []):
-            self._core.load_bigram(
-                str(entry["ctx"]), str(entry["word"]), int(entry["count"])
-            )
-
-        for entry in corpus.get("trigrams", []):
-            self._core.load_trigram(
-                str(entry["w1"]),
-                str(entry["w2"]),
-                str(entry["word"]),
-                int(entry["count"]),
-            )
+            try:
+                self._core.load_corpus_file(str(path))
+            except Exception:
+                log.warning("Failed to load corpus %s", path, exc_info=True)
 
     # -----------------------------------------------------------------------
     # Ghost text display (IBus-specific).
