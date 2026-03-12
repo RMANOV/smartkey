@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -91,7 +92,10 @@ def main() -> None:
     is_ibus = "--ibus" in sys.argv
 
     # Set up logging to XDG-compliant location.
-    log_dir = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "smartkey"
+    log_dir = (
+        Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+        / "smartkey"
+    )
     log_dir.mkdir(parents=True, exist_ok=True)
     log_level = logging.DEBUG if os.environ.get("SMARTKEY_DEBUG") else logging.WARNING
     logging.basicConfig(
@@ -106,7 +110,10 @@ def main() -> None:
     # Connect to the IBus bus.
     bus = IBus.Bus()
     if not bus.is_connected():
-        print("ERROR: Cannot connect to IBus bus. Is ibus-daemon running?", file=sys.stderr)
+        print(
+            "ERROR: Cannot connect to IBus bus. Is ibus-daemon running?",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Create the engine factory.
@@ -143,6 +150,12 @@ def main() -> None:
 
     # Enter the GLib main loop.
     loop = GLib.MainLoop()
+
+    # Graceful shutdown: quit GLib loop on SIGTERM/SIGINT.
+
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, loop.quit)
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, loop.quit)
+
     loop.run()
 
 

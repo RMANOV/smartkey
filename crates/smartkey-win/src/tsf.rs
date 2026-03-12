@@ -73,25 +73,42 @@ impl SmartKeyTextService {
     }
 
     /// Translate a Windows virtual key code to our platform-neutral Key.
-    fn vk_to_key(vk: u32) -> Key {
+    ///
+    /// Uses `ToUnicodeEx` for layout-aware character resolution — supports
+    /// Shift, Cyrillic, and any keyboard layout installed on the system.
+    fn vk_to_key(vk: u32, scan_code: u32) -> Key {
+        // Special keys first (layout-independent).
         match VIRTUAL_KEY(vk as u16) {
-            VK_TAB => Key::Tab,
-            VK_ESCAPE => Key::Escape,
-            VK_RIGHT => Key::Right,
-            VK_BACK => Key::Backspace,
-            VK_SPACE => Key::Space,
-            VK_RETURN => Key::Return,
-            _ => {
-                // For A-Z keys (0x41-0x5A), produce lowercase.
-                if (0x41..=0x5A).contains(&vk) {
-                    Key::Char((vk as u8 + 32) as char)
-                } else if (0x30..=0x39).contains(&vk) {
-                    Key::Char(vk as u8 as char)
-                } else {
-                    Key::Other(vk)
+            VK_TAB => return Key::Tab,
+            VK_ESCAPE => return Key::Escape,
+            VK_RIGHT => return Key::Right,
+            VK_BACK => return Key::Backspace,
+            VK_SPACE => return Key::Space,
+            VK_RETURN => return Key::Return,
+            _ => {}
+        }
+        // Use ToUnicodeEx for layout-aware character resolution.
+        unsafe {
+            let mut keyboard_state = [0u8; 256];
+            let _ = GetKeyboardState(&mut keyboard_state);
+            let layout = GetKeyboardLayout(0);
+            let mut buf = [0u16; 4];
+            // Flag 4 = do not modify the dead-key composition buffer.
+            // Without this, calling ToUnicodeEx from OnTestKeyDown would consume
+            // pending dead-key state (e.g. ^ + e → ê), breaking compose sequences.
+            let result = ToUnicodeEx(vk, scan_code, &keyboard_state, &mut buf, 4, layout);
+            if result >= 1 {
+                if let Some(ch) = char::decode_utf16(buf[..result as usize].iter().copied())
+                    .next()
+                    .and_then(|r| r.ok())
+                {
+                    if !ch.is_control() {
+                        return Key::Char(ch);
+                    }
                 }
             }
         }
+        Key::Other(vk)
     }
 
     /// Build Modifiers from the current keyboard state.
@@ -275,11 +292,29 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
         &self,
         _pic: Option<&ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
-        let key = SmartKeyTextService::vk_to_key(wparam.0 as u32);
-        let dominated = !matches!(key, Key::Other(_));
-        Ok(BOOL::from(dominated))
+        let scan_code = ((lparam.0 >> 16) & 0xFF) as u32;
+        let key = SmartKeyTextService::vk_to_key(wparam.0 as u32, scan_code);
+        let core = self.core.borrow();
+
+        if !core.is_enabled() {
+            // Only claim Super+Escape (kill switch to re-enable).
+            if matches!(key, Key::Escape)
+                && SmartKeyTextService::get_modifiers().contains(Modifiers::SUPER)
+            {
+                return Ok(BOOL::from(true));
+            }
+            return Ok(BOOL::from(false));
+        }
+
+        let has_ghost = core.has_ghost();
+        let should_claim = match &key {
+            Key::Tab | Key::Right | Key::Escape => has_ghost,
+            Key::Space | Key::Return | Key::Backspace | Key::Char(_) => true,
+            Key::Other(_) => false,
+        };
+        Ok(BOOL::from(should_claim))
     }
 
     fn OnTestKeyUp(
@@ -291,9 +326,10 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
         Ok(BOOL::from(false))
     }
 
-    fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
         let vk = wparam.0 as u32;
-        let key = SmartKeyTextService::vk_to_key(vk);
+        let scan_code = ((lparam.0 >> 16) & 0xFF) as u32;
+        let key = SmartKeyTextService::vk_to_key(vk, scan_code);
         let mods = SmartKeyTextService::get_modifiers();
         let event = KeyEvent {
             key,

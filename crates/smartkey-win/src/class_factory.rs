@@ -56,6 +56,8 @@ impl IClassFactory_Impl for SmartKeyClassFactory_Impl {
         // `unknown` drops here → Release balances the initial ref.
         // Caller holds their own AddRef'd reference from QueryInterface.
 
+        // NOTE: This only executes after successful QueryInterface.
+        // If QI fails, the function returns early (line 53-54) — no count drift.
         OBJECT_COUNT.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }

@@ -200,6 +200,51 @@ pub unsafe extern "C" fn smartkey_load_bigram(
     core.load_bigram(ctx_s, word_s, count);
 }
 
+/// Load a trigram.
+///
+/// # Safety
+/// `handle` must be valid. String args must be null-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_load_trigram(
+    handle: SmartKeyHandle,
+    w1: *const c_char,
+    w2: *const c_char,
+    word: *const c_char,
+    count: c_uint,
+) {
+    let core = unsafe { &mut *handle };
+    if w1.is_null() || w2.is_null() || word.is_null() {
+        return;
+    }
+    let w1_s = unsafe { CStr::from_ptr(w1) }.to_str().unwrap_or("");
+    let w2_s = unsafe { CStr::from_ptr(w2) }.to_str().unwrap_or("");
+    let word_s = unsafe { CStr::from_ptr(word) }.to_str().unwrap_or("");
+    core.load_trigram(w1_s, w2_s, word_s, count);
+}
+
+/// Load a corpus file (JSON or bincode). Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `handle` must be valid. `path` must be null-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn smartkey_load_corpus_file(
+    handle: SmartKeyHandle,
+    path: *const c_char,
+) -> c_int {
+    let core = unsafe { &mut *handle };
+    if path.is_null() {
+        return -1;
+    }
+    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match core.load_corpus_file(std::path::Path::new(path_str)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 // ======================================================================
 // Personal profile persistence
 // ======================================================================
@@ -355,6 +400,7 @@ fn actions_to_c(actions: Vec<Action>) -> *mut CActionList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn test_mac_keycode_mapping() {
@@ -374,6 +420,28 @@ mod tests {
             assert!(!list.is_null());
             smartkey_free_actions(list);
 
+            smartkey_free(handle);
+        }
+    }
+
+    #[test]
+    fn test_trigram_ffi() {
+        unsafe {
+            let handle = smartkey_new(ptr::null());
+            let w1 = CString::new("say").unwrap();
+            let w2 = CString::new("i").unwrap();
+            let word = CString::new("hello").unwrap();
+            smartkey_load_trigram(handle, w1.as_ptr(), w2.as_ptr(), word.as_ptr(), 5);
+            smartkey_free(handle);
+        }
+    }
+
+    #[test]
+    fn test_load_corpus_file_ffi_null() {
+        unsafe {
+            let handle = smartkey_new(ptr::null());
+            let result = smartkey_load_corpus_file(handle, ptr::null());
+            assert_eq!(result, -1);
             smartkey_free(handle);
         }
     }
