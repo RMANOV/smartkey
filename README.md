@@ -2,7 +2,7 @@
 
 **Rust-powered predictive keyboard engine with word-by-word smart suggestions, CVM streaming adaptation, and cross-platform input method integration.**
 
-All prediction happens in pure Rust. Zero network. Zero cloud. Sub-microsecond lookups. Your typing patterns never leave your machine.
+All prediction happens in pure Rust. Zero network. Zero cloud. Sub-millisecond predictions. Your typing patterns never leave your machine.
 
 ## Platform Support
 
@@ -35,16 +35,16 @@ SmartKey is a system-wide IBus input method engine that predicts the **next word
 ```
 Keystroke → "hel"
 
-Stage 1: N-gram Prefix Match ─────────────── < 1μs
-  └─ Aho-Corasick trie returns: ["hello", "help", "helmet", "helium"]
+Stage 1: N-gram Prefix Match ─────────────── ~140μs (1K corpus)
+  └─ Character trie returns: ["hello", "help", "helmet", "helium"]
 
-Stage 2: Markov Context Weighting ─────────── < 5μs
+Stage 2: Markov Context Weighting ─────────── < 130ns
   └─ P(word | prev_words) via Katz backoff: λ₁·P₃ + λ₂·P₂ + λ₃·P₁
 
-Stage 3: CVM Personal Boost ──────────────── < 2μs
+Stage 3: CVM Personal Boost ──────────────── < 200ns
   └─ Streaming cardinality estimator boosts YOUR frequent words
 
-Final: α·corpus + β·markov + γ·personal ──── < 10μs total
+Final: α·corpus + β·markov + γ·personal ──── < 200μs (1K corpus)
   └─ "hello" (87%) → ghost text appears inline
 ```
 
@@ -236,29 +236,33 @@ The engine is language-agnostic by design. The character-level trie handles any 
 
 ## Performance Targets
 
-| Metric | Target | Actual |
+| Metric | Target | Actual (Criterion) |
 |---|---|---|
-| Prefix search (100K words) | < 1μs | TBD |
-| Full predict pipeline | < 10ms | TBD |
-| CVM process per element | < 100ns | TBD |
-| Memory (EN+BG corpora) | < 50MB | TBD |
-| Ghost text render latency | < 10ms | TBD |
+| Full predict (1K corpus) | < 10ms | **137 µs** |
+| Full predict (10K corpus) | < 10ms | **1.74 ms** |
+| Markov trigram scoring | < 1μs | **125 ns** |
+| CVM frequency score | < 100ns | **151 ns** |
+| Fuzzy search (1K, 1-edit) | < 1ms | **505 µs** |
+| Personal profile save/load | < 1ms | **62.5 µs** |
+| Ghost text render latency | < 10ms | Platform-dependent |
 
 ---
 
 ## Test Suite
 
 ```
-54 tests across 8 modules:
+94 tests across 10 modules:
 
-  cvm       10 tests  (streaming counter, adaptive memory, probabilistic eviction)
-  ngram      7 tests  (trie operations, Cyrillic, prefix search, frequency ranking)
+  cvm       22 tests  (streaming counter, decay, snapshots, probabilistic eviction)
+  ngram     17 tests  (trie operations, Cyrillic, prefix search, fuzzy matching)
   markov     7 tests  (bigram/trigram probability, Katz backoff, candidate ranking)
   prefix     8 tests  (single/multi-prefix matching, Aho-Corasick batch)
-  ensemble   6 tests  (prediction pipeline, personal boost, context handling)
-  input     11 tests  (key dispatch, ghost text, kill switch, focus lifecycle)
-  paths      3 tests  (cross-platform config/corpus path resolution)
-  mac        2 tests  (keycode mapping, FFI lifecycle roundtrip)
+  ensemble  11 tests  (prediction pipeline, personal boost, fuzzy discount, config)
+  input     16 tests  (key dispatch, ghost text, kill switch, focus lifecycle)
+  corpus     3 tests  (JSON round-trip, load into engine, dropped entries)
+  paths      4 tests  (cross-platform config/corpus path resolution)
+  mac        4 tests  (keycode mapping, FFI lifecycle, trigram, corpus file)
+  integration 5 tests (full pipeline, kill switch, multi-language, personal round-trip)
 ```
 
 ---
