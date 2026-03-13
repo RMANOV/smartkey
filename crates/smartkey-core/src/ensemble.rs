@@ -366,6 +366,20 @@ impl SmartKeyEngine {
         self.trie.prefix_search(prefix, limit).len()
     }
 
+    /// Return the corpus frequency of the top trie candidate for `prefix`.
+    ///
+    /// Used by wrong-layout detection: comparing max frequencies across
+    /// languages is far more discriminative than comparing candidate counts,
+    /// especially with 100K+ word corpora where virtually every 2-letter
+    /// prefix has 3+ candidates in both languages.
+    pub fn max_prefix_frequency(&self, prefix: &str) -> u32 {
+        self.trie
+            .prefix_search(prefix, 1)
+            .first()
+            .map(|e| e.frequency)
+            .unwrap_or(0)
+    }
+
     /// Produce up to `limit` predictions for the given prefix and context.
     ///
     /// * `prefix` — the characters typed so far for the current word.

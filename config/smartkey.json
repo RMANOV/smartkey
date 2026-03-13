@@ -3,6 +3,7 @@
     "ghost_text": true,
     "max_candidates": 5,
     "min_prefix_length": 2,
+    "ghost_text_min_confidence": 0.15,
     "kill_switch": "Super+Escape",
     "weights": {"corpus": 0.4, "markov": 0.4, "personal": 0.2},
     "languages": ["en", "bg"],

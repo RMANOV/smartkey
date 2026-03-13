@@ -607,9 +607,10 @@ impl InputMethodCore {
 
     /// Check if the user is typing on the wrong keyboard layout.
     ///
-    /// Compares trie candidate counts for the Latin prefix vs its Cyrillic
-    /// transliteration. If Cyrillic has candidates but Latin doesn't (or has
-    /// far fewer + momentum agrees), returns true.
+    /// Compares the **corpus frequency of the top trie candidate** for the
+    /// Latin prefix vs its Cyrillic transliteration. Frequency-based
+    /// comparison is far more discriminative than candidate counts (which
+    /// saturate at small limits with 100K+ word corpora).
     fn check_wrong_layout(&self) -> bool {
         if self.current_word.len() < 2 || !self.config.lang_detection {
             return false;
@@ -618,21 +619,43 @@ impl InputMethodCore {
         if !self.current_word.chars().all(|c| c.is_ascii_alphabetic()) {
             return false;
         }
+
         let bg_prefix = lang_detect::transliterate(&self.current_word);
-        let en_count = self.engine.candidate_count(&self.current_word, 3);
-        let bg_count = self.engine.candidate_count(&bg_prefix, 3);
-        // Clear signal: BG has candidates, EN doesn't.
-        // Require momentum agreement to avoid false positives on English words
-        // not in the corpus (e.g., rare proper nouns typed in Latin).
-        if bg_count > 0 && en_count == 0 && self.lang_detector.momentum_lang() != Some(LangId::En) {
-            return true;
+        let en_freq = self.engine.max_prefix_frequency(&self.current_word);
+        let bg_freq = self.engine.max_prefix_frequency(&bg_prefix);
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "smartkey: check_wrong_layout: '{}' → '{}' | en_freq={} bg_freq={} momentum={:?}",
+            self.current_word,
+            bg_prefix,
+            en_freq,
+            bg_freq,
+            self.lang_detector.momentum_lang(),
+        );
+
+        // Guard: if momentum is clearly English, never trigger.
+        if self.lang_detector.momentum_lang() == Some(LangId::En) {
+            return false;
         }
-        // Probabilistic: BG much stronger + momentum agrees.
-        if bg_count > en_count * 2 {
-            if let Some(LangId::Bg) = self.lang_detector.momentum_lang() {
+
+        // Only trigger when BG frequency dominates EN by ≥50x AND momentum
+        // confirms BG context. This is conservative: avoids false positives
+        // on legitimate English words while catching clear wrong-layout
+        // cases like "zd" (1351x), "mn" (550x), "ka" (224x).
+        // Words like "ok" (4.8x), "vs" (28x), "da" (32x) correctly don't trigger.
+        if bg_freq > 0 && en_freq > 0 {
+            let ratio = bg_freq as f64 / en_freq as f64;
+            if ratio >= 50.0 && self.lang_detector.momentum_lang() == Some(LangId::Bg) {
                 return true;
             }
         }
+
+        // BG has candidates but EN has zero — still require BG momentum.
+        if bg_freq > 0 && en_freq == 0 && self.lang_detector.momentum_lang() == Some(LangId::Bg) {
+            return true;
+        }
+
         false
     }
 
@@ -986,5 +1009,110 @@ mod tests {
         let mut core = test_core();
         let result = core.load_personal(&path);
         assert!(result.is_ok(), "loading missing file should be a no-op");
+    }
+
+    // ── Wrong-layout detection tests (v0.4.3) ────────────────────────
+
+    /// Build a core with both EN and BG vocabulary for layout detection tests.
+    fn test_core_bilingual() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        // EN words with realistic frequencies.
+        core.load_word("hello", 4_897_788);
+        core.load_word("help", 2_000_000);
+        core.load_word("he", 4_897_788);
+        core.load_word("we", 3_467_368);
+        core.load_word("ok", 138_038);
+        core.load_word("zdnet", 120); // weak EN word starting with "zd"
+        core.load_word("mn", 5_370);
+        // BG words (Cyrillic) — phonetic transliteration targets.
+        // "zd" → "зд" (здравей)
+        core.load_word("здравей", 162_181);
+        core.load_word("здравейте", 100_000);
+        // "mn" → "мн" (много)
+        core.load_word("много", 2_951_209);
+        // "ka" → "ка" (като)
+        core.load_word("като", 5_248_074);
+        // "he" → "хе" (хей) — weak BG
+        core.load_word("хей", 43_651);
+        core
+    }
+
+    #[test]
+    fn test_wrong_layout_clear_signal() {
+        // "zd" — EN top freq=120 (zdnet), BG top freq=162181 (здравей).
+        // Ratio=1351x + BG momentum → should trigger.
+        let mut core = test_core_bilingual();
+        core.lang_detector.record_commit(LangId::Bg);
+        core.lang_detector.record_commit(LangId::Bg);
+        core.lang_detector.record_commit(LangId::Bg);
+        core.current_word = "zd".into();
+        assert!(
+            core.check_wrong_layout(),
+            "'zd' should trigger wrong-layout (ratio=1351x, momentum=Bg)"
+        );
+    }
+
+    #[test]
+    fn test_wrong_layout_no_momentum_no_trigger() {
+        // "zd" — high ratio but NO momentum → should NOT trigger.
+        // This prevents false positives at session start.
+        let mut core = test_core_bilingual();
+        core.current_word = "zd".into();
+        assert!(
+            !core.check_wrong_layout(),
+            "'zd' without BG momentum should NOT trigger"
+        );
+    }
+
+    #[test]
+    fn test_wrong_layout_english_word_safe() {
+        // "he" — strong EN (4.8M), weak BG (43K). Should NOT trigger.
+        let mut core = test_core_bilingual();
+        core.current_word = "he".into();
+        assert!(
+            !core.check_wrong_layout(),
+            "'he' should NOT trigger wrong-layout (strong EN word)"
+        );
+    }
+
+    #[test]
+    fn test_wrong_layout_with_momentum_bg() {
+        // "mn" — EN freq=5370, BG freq=2.9M. Ratio=549x.
+        // With momentum=Bg and ratio≥50, should trigger.
+        let mut core = test_core_bilingual();
+        // Set BG momentum (3 commits = 100% Bg → momentum_lang() = Some(Bg)).
+        core.lang_detector.record_commit(LangId::Bg);
+        core.lang_detector.record_commit(LangId::Bg);
+        core.lang_detector.record_commit(LangId::Bg);
+        core.current_word = "mn".into();
+        assert!(
+            core.check_wrong_layout(),
+            "'mn' with BG momentum should trigger (ratio ≈ 549x)"
+        );
+    }
+
+    #[test]
+    fn test_wrong_layout_momentum_en_blocks() {
+        // "mn" — would normally trigger on ratio, but EN momentum blocks it.
+        let mut core = test_core_bilingual();
+        core.lang_detector.record_commit(LangId::En);
+        core.lang_detector.record_commit(LangId::En);
+        core.lang_detector.record_commit(LangId::En);
+        core.current_word = "mn".into();
+        assert!(
+            !core.check_wrong_layout(),
+            "'mn' with EN momentum should NOT trigger (guard blocks)"
+        );
+    }
+
+    #[test]
+    fn test_no_trigger_without_corpus() {
+        // Empty engine — no words loaded. Should never trigger.
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.current_word = "zd".into();
+        assert!(
+            !core.check_wrong_layout(),
+            "empty corpus should never trigger wrong-layout"
+        );
     }
 }
