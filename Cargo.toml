@@ -9,6 +9,7 @@ serde_json = "1"
 bincode = "1"
 thiserror = "2"
 rand = { version = "0.8", features = ["small_rng"] }
+arrayvec = "0.7"
 
 [profile.release]
 lto = true

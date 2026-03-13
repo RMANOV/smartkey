@@ -11,10 +11,10 @@ const UNSEEN_FLOOR: f64 = 1e-6;
 
 /// Interpolated Markov chain language model (up to trigram).
 pub struct MarkovChain {
-    /// context_word → { next_word → count }
-    bigrams: HashMap<String, HashMap<String, u32>>,
-    /// w1 → w2 → { next_word → count }
-    trigrams: HashMap<String, HashMap<String, HashMap<String, u32>>>,
+    /// context_word → (followers_map, cached_total)
+    bigrams: HashMap<String, (HashMap<String, u32>, u32)>,
+    /// w1 → w2 → (followers_map, cached_total)
+    trigrams: HashMap<String, HashMap<String, (HashMap<String, u32>, u32)>>,
     /// Distinct words observed (tracked incrementally).
     vocab: HashSet<String>,
     /// Interpolation weights: [trigram, bigram, unigram].
@@ -48,27 +48,27 @@ impl MarkovChain {
 
     /// Record `count` observations of the bigram `context → word`.
     pub fn train_bigram(&mut self, context: &str, word: &str, count: u32) {
-        let entry = self
+        let (followers, total) = self
             .bigrams
             .entry(context.to_owned())
-            .or_default()
-            .entry(word.to_owned())
-            .or_insert(0);
+            .or_insert_with(|| (HashMap::new(), 0));
+        let entry = followers.entry(word.to_owned()).or_insert(0);
         *entry += count;
+        *total += count;
         self.vocab.insert(word.to_owned());
     }
 
     /// Record `count` observations of the trigram `(w1, w2) → word`.
     pub fn train_trigram(&mut self, w1: &str, w2: &str, word: &str, count: u32) {
-        let entry = self
+        let (followers, total) = self
             .trigrams
             .entry(w1.to_owned())
             .or_default()
             .entry(w2.to_owned())
-            .or_default()
-            .entry(word.to_owned())
-            .or_insert(0);
+            .or_insert_with(|| (HashMap::new(), 0));
+        let entry = followers.entry(word.to_owned()).or_insert(0);
         *entry += count;
+        *total += count;
         self.vocab.insert(word.to_owned());
     }
 
@@ -80,10 +80,10 @@ impl MarkovChain {
     ///
     /// Returns `UNSEEN_FLOOR` when `context` has never been observed.
     pub fn bigram_prob(&self, word: &str, context: &str) -> f64 {
-        let Some(followers) = self.bigrams.get(context) else {
+        let Some((followers, total)) = self.bigrams.get(context) else {
             return UNSEEN_FLOOR;
         };
-        Self::prob_from_followers(word, followers)
+        Self::prob_from_followers(word, followers, *total)
     }
 
     /// P(word | w1, w2) from trigram counts.
@@ -94,15 +94,14 @@ impl MarkovChain {
         let Some(level2) = self.trigrams.get(w1) else {
             return UNSEEN_FLOOR;
         };
-        let Some(followers) = level2.get(w2) else {
+        let Some((followers, total)) = level2.get(w2) else {
             return UNSEEN_FLOOR;
         };
-        Self::prob_from_followers(word, followers)
+        Self::prob_from_followers(word, followers, *total)
     }
 
     /// Shared probability computation from a follower frequency map.
-    fn prob_from_followers(word: &str, followers: &HashMap<String, u32>) -> f64 {
-        let total: u32 = followers.values().sum();
+    fn prob_from_followers(word: &str, followers: &HashMap<String, u32>, total: u32) -> f64 {
         if total == 0 {
             return UNSEEN_FLOOR;
         }
@@ -182,6 +181,16 @@ impl MarkovChain {
     /// Number of distinct words in the vocabulary.
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
+    }
+
+    /// Raw bigram data access (for serialization).
+    pub fn bigrams_raw(&self) -> &HashMap<String, (HashMap<String, u32>, u32)> {
+        &self.bigrams
+    }
+
+    /// Raw trigram data access (for serialization).
+    pub fn trigrams_raw(&self) -> &HashMap<String, HashMap<String, (HashMap<String, u32>, u32)>> {
+        &self.trigrams
     }
 }
 
@@ -333,5 +342,22 @@ mod tests {
             (score - expected).abs() < 1e-9,
             "expected {expected}, got {score}"
         );
+    }
+
+    #[test]
+    fn test_precomputed_total_matches_sum() {
+        let m = small_model();
+        // Verify bigram totals
+        for (ctx, (followers, total)) in &m.bigrams {
+            let computed: u32 = followers.values().sum();
+            assert_eq!(*total, computed, "bigram total mismatch for context '{ctx}'");
+        }
+        // Verify trigram totals
+        for (w1, level2) in &m.trigrams {
+            for (w2, (followers, total)) in level2 {
+                let computed: u32 = followers.values().sum();
+                assert_eq!(*total, computed, "trigram total mismatch for ({w1}, {w2})");
+            }
+        }
     }
 }

@@ -5,6 +5,7 @@
 //!
 //! Registration creates:
 //!   1. HKLM\SOFTWARE\Classes\CLSID\{CLSID}\InProcServer32 → DLL path + Apartment
+//!      (or HKCU equivalent when the current user lacks admin privileges)
 //!   2. TSF TIP profile via ITfInputProcessorProfileMgr::RegisterProfile
 //!   3. TSF keyboard category via ITfCategoryMgr::RegisterCategory
 //!
@@ -25,25 +26,57 @@ const LANGID_BG: u16 = 0x0402;
 /// Display name shown in Windows language settings.
 const DISPLAY_NAME: &str = "SmartKey";
 
+/// TSF flag: register profile as process-local only (required for HKCU installs).
+const TF_RP_LOCALPROCESS: u32 = 0x4;
+
 // -- Public API ---------------------------------------------------------
 
 /// Register the SmartKey IME. `dll_path` is the absolute path to the DLL.
-pub fn register(dll_path: &str) -> Result<()> {
-    register_com_server(dll_path)?;
-    register_tip_profile(dll_path)?;
-    register_categories()?;
-    Ok(())
+///
+/// Attempts HKLM (system-wide) first; falls back to HKCU (per-user) if
+/// the current user lacks admin privileges.
+///
+/// Returns `true` if registered system-wide (HKLM), `false` for per-user (HKCU).
+pub fn register(dll_path: &str) -> Result<bool> {
+    if is_hklm_writable() {
+        register_com_server(dll_path)?;
+        register_tip_profile(dll_path, 0)?;
+        register_categories()?;
+        Ok(true)
+    } else {
+        register_com_server_hkcu(dll_path)?;
+        register_tip_profile(dll_path, TF_RP_LOCALPROCESS)?;
+        register_categories()?;
+        Ok(false)
+    }
 }
 
 /// Unregister the SmartKey IME. Errors are non-fatal (best-effort cleanup).
 pub fn unregister() -> Result<()> {
     let _ = unregister_categories();
     let _ = unregister_tip_profile();
-    unregister_com_server()?;
+    // Clean both hives (best-effort).
+    let _ = unregister_com_server_hklm();
+    let _ = unregister_com_server_hkcu();
     Ok(())
 }
 
 // -- COM server registration (registry) --------------------------------
+
+fn is_hklm_writable() -> bool {
+    let subkey = "SOFTWARE\\Classes";
+    let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut hkey = HKEY::default();
+    let result = unsafe {
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_w.as_ptr()), 0, KEY_WRITE, &mut hkey)
+    };
+    if result.0 == 0 {
+        let _ = unsafe { RegCloseKey(hkey) };
+        true
+    } else {
+        false
+    }
+}
 
 fn register_com_server(dll_path: &str) -> Result<()> {
     let subkey = format!(
@@ -57,26 +90,49 @@ fn register_com_server(dll_path: &str) -> Result<()> {
         RegCreateKeyW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_w.as_ptr()), &mut hkey)
     })?;
 
-    // Default value = DLL path.
     set_reg_sz(hkey, None, dll_path)?;
-
-    // ThreadingModel = Apartment (STA — required for TSF).
     set_reg_sz(hkey, Some("ThreadingModel"), "Apartment")?;
 
     let _ = unsafe { RegCloseKey(hkey) };
     Ok(())
 }
 
-fn unregister_com_server() -> Result<()> {
+fn register_com_server_hkcu(dll_path: &str) -> Result<()> {
+    let subkey = format!(
+        "SOFTWARE\\Classes\\CLSID\\{{{}}}\\InProcServer32",
+        CLSID_SMARTKEY_STR
+    );
+    let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut hkey = HKEY::default();
+    check_win32(unsafe {
+        RegCreateKeyW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr()), &mut hkey)
+    })?;
+
+    set_reg_sz(hkey, None, dll_path)?;
+    set_reg_sz(hkey, Some("ThreadingModel"), "Apartment")?;
+
+    let _ = unsafe { RegCloseKey(hkey) };
+    Ok(())
+}
+
+fn unregister_com_server_hklm() -> Result<()> {
     let subkey = format!("SOFTWARE\\Classes\\CLSID\\{{{}}}", CLSID_SMARTKEY_STR);
     let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
     let _ = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_w.as_ptr())) };
     Ok(())
 }
 
+fn unregister_com_server_hkcu() -> Result<()> {
+    let subkey = format!("SOFTWARE\\Classes\\CLSID\\{{{}}}", CLSID_SMARTKEY_STR);
+    let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr())) };
+    Ok(())
+}
+
 // -- TSF TIP profile registration --------------------------------------
 
-fn register_tip_profile(dll_path: &str) -> Result<()> {
+fn register_tip_profile(dll_path: &str, flags: u32) -> Result<()> {
     let profile_mgr: ITfInputProcessorProfileMgr =
         unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)? };
 
@@ -94,7 +150,7 @@ fn register_tip_profile(dll_path: &str) -> Result<()> {
             HKL::default(), // no substitute layout
             0,              // no preferred layout
             true,           // enable by default
-            0,              // flags
+            flags,
         )?;
     }
 

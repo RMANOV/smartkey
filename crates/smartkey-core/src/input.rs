@@ -8,9 +8,9 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use crate::cvm::CvmSnapshot;
 use crate::ensemble::{Prediction, SmartKeyEngine};
 use crate::paths;
+use crate::personal;
 
 // ======================================================================
 // Key abstraction
@@ -89,6 +89,9 @@ pub struct InputConfig {
     pub fuzzy_max_edits: u8,
     pub fuzzy_discounts: [f64; 3],
     pub markov_lambdas: [f64; 3],
+    /// Minimum absolute score for the top prediction to show ghost text.
+    /// Predictions below this threshold are suppressed.
+    pub ghost_text_min_confidence: f64,
 }
 
 impl Default for InputConfig {
@@ -105,6 +108,7 @@ impl Default for InputConfig {
             fuzzy_max_edits: 2,
             fuzzy_discounts: [1.0, 0.7, 0.4],
             markov_lambdas: [0.6, 0.3, 0.1],
+            ghost_text_min_confidence: 0.3,
         }
     }
 }
@@ -127,6 +131,9 @@ impl InputConfig {
             }
             if let Some(n) = v.get("min_prefix_length").and_then(|v| v.as_u64()) {
                 config.min_prefix_length = n as usize;
+            }
+            if let Some(f) = v.get("ghost_text_min_confidence").and_then(|v| v.as_f64()) {
+                config.ghost_text_min_confidence = f;
             }
             if let Some(w) = v.get("weights").and_then(|v| v.as_object()) {
                 let a = w
@@ -308,6 +315,9 @@ impl InputMethodCore {
                     let full_word = format!("{}{}", self.current_word, self.ghost);
                     // Commit only the ghost suffix — typed chars were already forwarded.
                     let actions = vec![Action::CommitText(self.ghost.clone()), Action::HideGhost];
+                    // Notify engine of accepted prediction for adaptive weight learning.
+                    let ctx: Vec<&str> = self.context.iter().map(|s| s.as_str()).collect();
+                    self.engine.on_prediction_accepted(&full_word, &ctx);
                     self.commit_word(&full_word);
                     self.reset_word();
                     actions
@@ -419,26 +429,27 @@ impl InputMethodCore {
 
     // -- personal profile persistence -----------------------------------
 
-    /// Save the personal CVM profile to the given path.
+    /// Save the personal profile (CVM + Markov + weights) to the given path.
     pub fn save_personal(&self, path: &Path) -> Result<(), String> {
-        let snap = self.engine.export_personal();
-        let json = serde_json::to_string_pretty(&snap).map_err(|e| e.to_string())?;
+        let profile = self.engine.export_personal_profile();
+        let json = serde_json::to_string_pretty(&profile).map_err(|e| e.to_string())?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         std::fs::write(path, json).map_err(|e| e.to_string())
     }
 
-    /// Load the personal CVM profile from the given path.
+    /// Load the personal profile from the given path.
     ///
+    /// Supports both v2 (PersonalProfile) and v1 (bare CvmSnapshot) formats.
     /// Silent no-op if the file does not exist.
     pub fn load_personal(&mut self, path: &Path) -> Result<(), String> {
         if !path.is_file() {
             return Ok(());
         }
         let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let snap: CvmSnapshot = serde_json::from_str(&data).map_err(|e| e.to_string())?;
-        self.engine.import_personal(&snap);
+        let profile = personal::load_personal_json(&data)?;
+        self.engine.import_personal_profile(&profile);
         Ok(())
     }
 
@@ -456,7 +467,17 @@ impl InputMethodCore {
 
     fn commit_word(&mut self, word: &str) {
         if !word.is_empty() {
+            // Extract context BEFORE pushing new word (for online Markov training).
+            let prev1 = self.context.back().map(|s| s.as_str());
+            let prev2 = if self.context.len() >= 2 {
+                Some(self.context[self.context.len() - 2].as_str())
+            } else {
+                None
+            };
+
             self.engine.learn(word);
+            self.engine.learn_online_markov(prev1, prev2, word);
+
             if self.context.len() >= CONTEXT_SIZE {
                 self.context.pop_front();
             }
@@ -477,12 +498,17 @@ impl InputMethodCore {
             return Action::HideGhost;
         }
 
-        let ctx_refs: Vec<&str> = self.context.iter().map(|s| s.as_str()).collect();
+        let ctx_refs: arrayvec::ArrayVec<&str, 5> = self.context.iter().map(|s| s.as_str()).collect();
         self.last_predictions =
             self.engine
                 .predict(&self.current_word, &ctx_refs, self.config.max_candidates);
 
         if let Some(top) = self.last_predictions.first() {
+            // T8: Suppress ghost text if top score is below confidence threshold.
+            if top.score < self.config.ghost_text_min_confidence {
+                self.ghost.clear();
+                return Action::HideGhost;
+            }
             let suffix = top
                 .word
                 .strip_prefix(self.current_word.as_str())
