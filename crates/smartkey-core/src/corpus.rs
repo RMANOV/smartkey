@@ -273,7 +273,7 @@ mod tests {
         let mut engine = SmartKeyEngine::new();
         corpus.load_into_engine(&mut engine);
 
-        let preds = engine.predict("hel", &[], 5);
+        let preds = engine.predict("hel", &[], 5, None);
         assert!(
             !preds.is_empty(),
             "engine should produce predictions after loading corpus"

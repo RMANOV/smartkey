@@ -82,7 +82,7 @@ fn bench_predict_by_prefix(c: &mut Criterion) {
             &prefix,
             |b, pfx| {
                 b.iter(|| {
-                    black_box(engine.predict(black_box(pfx), black_box(&context), 5));
+                    black_box(engine.predict(black_box(pfx), black_box(&context), 5, None));
                 });
             },
         );
@@ -101,7 +101,7 @@ fn bench_predict_by_corpus(c: &mut Criterion) {
         let context: Vec<&str> = vec!["word_0001", "word_0002"];
         group.bench_with_input(BenchmarkId::new("corpus_size", size), &size, |b, _| {
             b.iter(|| {
-                black_box(engine.predict(black_box("wor"), black_box(&context), 5));
+                black_box(engine.predict(black_box("wor"), black_box(&context), 5, None));
             });
         });
     }
@@ -120,7 +120,7 @@ fn bench_predict_by_limit(c: &mut Criterion) {
     for &limit in &[1, 3, 5, 10] {
         group.bench_with_input(BenchmarkId::new("limit", limit), &limit, |b, &lim| {
             b.iter(|| {
-                black_box(engine.predict(black_box("word_0"), black_box(&context), lim));
+                black_box(engine.predict(black_box("word_0"), black_box(&context), lim, None));
             });
         });
     }

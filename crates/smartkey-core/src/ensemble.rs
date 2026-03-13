@@ -43,6 +43,9 @@ const DECAY_RATE: f64 = 0.1;
 /// Session cache blend factor: personal_score = max(cvm, session_cache * BLEND).
 const SESSION_BLEND: f64 = 0.4;
 
+/// Boost factor for per-language CVM track scores (v0.4.1).
+const LANG_CVM_BOOST: f64 = 1.5;
+
 /// Unified prediction engine that blends three scoring signals:
 ///
 /// * **Corpus frequency** (α) — how common the word is in the language model trie.
@@ -362,6 +365,13 @@ impl SmartKeyEngine {
         self.cache.lock().unwrap().invalidate();
     }
 
+    /// Fast candidate count for a prefix (without full scoring).
+    ///
+    /// Used by transliteration mode to compare prefix viability across layouts.
+    pub fn candidate_count(&self, prefix: &str, limit: usize) -> usize {
+        self.trie.prefix_search(prefix, limit).len()
+    }
+
     /// Produce up to `limit` predictions for the given prefix and context.
     ///
     /// * `prefix` — the characters typed so far for the current word.
@@ -373,7 +383,10 @@ impl SmartKeyEngine {
     /// 2. Score each candidate on three axes (corpus, markov, personal).
     /// 3. Blend with `α·corpus + β·markov + γ·personal`.
     /// 4. Sort descending, truncate to `limit`, normalise confidence.
-    pub fn predict(&self, prefix: &str, context: &[&str], limit: usize) -> Vec<Prediction> {
+    ///
+    /// When `lang` is `Some`, per-language CVM tracks are consulted for scoring
+    /// boost (v0.4.1). Pass `None` for backward-compatible behavior.
+    pub fn predict(&self, prefix: &str, context: &[&str], limit: usize, lang: Option<LangId>) -> Vec<Prediction> {
         if limit == 0 {
             return Vec::new();
         }
@@ -523,11 +536,18 @@ impl SmartKeyEngine {
             let m = (1.0 - self.personal_markov_delta) * corpus_m
                 + self.personal_markov_delta * personal_m;
             let cvm_score = self.personal.frequency_score(&c.word);
+            // Language-conditioned CVM boost (v0.4.1): consult per-language track.
+            let lang_boost = if let Some(lang) = lang {
+                self.personal_tracks.frequency_score(&c.word, lang) * LANG_CVM_BOOST
+            } else {
+                0.0
+            };
+            let base_personal = cvm_score.max(lang_boost);
             // Blend session cache into personal score if enabled.
             let p = if self.use_session_cache_lm {
-                cvm_score.max(self.session_cache.score(&c.word) * SESSION_BLEND)
+                base_personal.max(self.session_cache.score(&c.word) * SESSION_BLEND)
             } else {
-                cvm_score
+                base_personal
             };
             // PPM scoring (if enabled).
             let ppm_score = if let Some(ref ppm) = self.ppm {
@@ -665,7 +685,7 @@ mod tests {
         let engine = test_engine();
 
         // Predict words starting with "hel" given context ["i"].
-        let preds = engine.predict("hel", &["i"], 5);
+        let preds = engine.predict("hel", &["i"], 5, None);
         assert!(!preds.is_empty(), "should produce predictions");
 
         // "hello" should rank higher than "help" — it has higher corpus freq
@@ -734,7 +754,7 @@ mod tests {
         };
         engine.import_personal(&snap);
 
-        let preds = engine.predict("app", &[], 5);
+        let preds = engine.predict("app", &[], 5, None);
         assert!(preds.len() >= 2);
         let apply_pos = preds.iter().position(|p| p.word == "apply").unwrap();
         let apple_pos = preds.iter().position(|p| p.word == "apple").unwrap();
@@ -749,7 +769,7 @@ mod tests {
         let engine = test_engine();
 
         // Predict with no context at all.
-        let preds = engine.predict("hel", &[], 3);
+        let preds = engine.predict("hel", &[], 3, None);
         assert!(
             !preds.is_empty(),
             "should produce predictions even without context"
@@ -767,7 +787,7 @@ mod tests {
     fn test_empty_prefix() {
         let engine = test_engine();
         // Empty prefix should return top words from the whole trie.
-        let preds = engine.predict("", &[], 3);
+        let preds = engine.predict("", &[], 3, None);
         assert_eq!(preds.len(), 3);
         // Top by corpus frequency: hello(100), world(90), help(80).
         assert_eq!(preds[0].word, "hello");
@@ -779,14 +799,14 @@ mod tests {
     fn test_unknown_prefix_returns_empty() {
         let engine = test_engine();
         // "zzz" is too far from any word — even fuzzy can't help.
-        let preds = engine.predict("zzz", &[], 5);
+        let preds = engine.predict("zzz", &[], 5, None);
         assert!(preds.is_empty());
     }
 
     #[test]
     fn test_limit_zero() {
         let engine = test_engine();
-        let preds = engine.predict("hel", &[], 0);
+        let preds = engine.predict("hel", &[], 0, None);
         assert!(preds.is_empty());
     }
 
@@ -803,7 +823,7 @@ mod tests {
 
         // "fucn" — transposition of n and c — exact prefix search finds nothing.
         // Fuzzy fallback should kick in and return "function" / "functional".
-        let preds = engine.predict("fucn", &[], 5);
+        let preds = engine.predict("fucn", &[], 5, None);
         assert!(
             !preds.is_empty(),
             "misspelled prefix should produce predictions via fuzzy fallback"
@@ -822,7 +842,7 @@ mod tests {
         engine.load_word("help", 80);
 
         // "hallo" — substitution of 'e' → 'a'. Exact prefix "hallo" finds nothing.
-        let preds = engine.predict("hallo", &[], 5);
+        let preds = engine.predict("hallo", &[], 5, None);
         assert!(
             preds.iter().any(|p| p.word == "hello"),
             "'hello' should appear for 'hallo': got {:?}",
@@ -843,7 +863,7 @@ mod tests {
         engine.load_word("hero", 90);
 
         // "hel" matches hello, help, held exactly. "hero" is not a prefix match.
-        let preds = engine.predict("hel", &[], 5);
+        let preds = engine.predict("hel", &[], 5, None);
         // All three exact matches should appear.
         assert!(preds.iter().any(|p| p.word == "hello"));
         assert!(preds.iter().any(|p| p.word == "help"));
@@ -883,7 +903,7 @@ mod tests {
         engine.load_word("best", 100);
 
         // "tes" — exact prefix matches "test" only. "best" is distance 1.
-        let preds = engine.predict("tes", &[], 5);
+        let preds = engine.predict("tes", &[], 5, None);
         let test_pred = preds.iter().find(|p| p.word == "test");
         let best_pred = preds.iter().find(|p| p.word == "best");
         assert!(test_pred.is_some(), "'test' should appear");
@@ -909,7 +929,7 @@ mod tests {
         engine.load_bigram("hello", "world", 10);
         // No bigram support for "worry" from "hello".
 
-        let preds = engine.predict("wor", &["hello"], 5);
+        let preds = engine.predict("wor", &["hello"], 5, None);
         let world_pos = preds.iter().position(|p| p.word == "world");
         let worry_pos = preds.iter().position(|p| p.word == "worry");
         assert!(
@@ -934,7 +954,7 @@ mod tests {
         engine.load_word("best", 100); // distance 1 from "tes" prefix
 
         // "tes" matches "test" exactly; "best" only via fuzzy (distance 1).
-        let preds = engine.predict("tes", &[], 5);
+        let preds = engine.predict("tes", &[], 5, None);
         let test_pred = preds.iter().find(|p| p.word == "test");
         let best_pred = preds.iter().find(|p| p.word == "best");
         assert!(test_pred.is_some(), "'test' should appear");

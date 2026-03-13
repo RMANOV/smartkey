@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::ensemble::{Prediction, SmartKeyEngine};
 use crate::eval::PredictionMetrics;
-use crate::lang_detect::LanguageDetector;
+use crate::lang_detect::{self, LanguageDetector, LangId};
 use crate::paths;
 use crate::personal;
 
@@ -68,6 +68,9 @@ pub enum Action {
     CommitText(String),
     /// Do not consume the key — let it reach the application.
     ForwardKey,
+    /// Replace `replace_len` characters before cursor with `text`.
+    /// Used for transliteration: "zd" → "зд".
+    ReplaceWord { replace_len: usize, text: String },
 }
 
 // ======================================================================
@@ -234,6 +237,8 @@ pub struct InputMethodCore {
     metrics: PredictionMetrics,
     /// Character trigram language detector (v0.4.0).
     lang_detector: LanguageDetector,
+    /// Whether transliteration mode is active for the current word (v0.4.1).
+    transliteration_active: bool,
 }
 
 impl InputMethodCore {
@@ -249,6 +254,7 @@ impl InputMethodCore {
             context: VecDeque::with_capacity(CONTEXT_SIZE),
             enabled,
             last_predictions: Vec::new(),
+            transliteration_active: false,
         }
     }
 
@@ -410,13 +416,50 @@ impl InputMethodCore {
                 vec![ghost_action, Action::ForwardKey]
             }
 
-            // Printable character: append and re-predict.
+            // Printable character: detect language, then predict.
             Key::Char(ch) => {
                 self.current_word.push(ch);
-                // Feed character to language detector for bilingual switching.
+
+                // v0.4.1: detection BEFORE prediction (instant classify).
                 if self.config.lang_detection {
-                    self.lang_detector.feed_char(ch);
+                    self.lang_detector.feed_char_instant(ch);
                 }
+
+                // v0.4.1: transliteration — auto-map Latin to Cyrillic when
+                // the user is on the wrong keyboard layout.
+                if self.transliteration_active {
+                    if let Some(cyrillic) = lang_detect::phonetic_map(ch) {
+                        self.current_word.pop(); // Remove the Latin char
+                        self.current_word.push(cyrillic);
+                        let ghost_action = self.update_predictions();
+                        return vec![
+                            Action::ReplaceWord {
+                                replace_len: 1,
+                                text: cyrillic.to_string(),
+                            },
+                            ghost_action,
+                        ];
+                    }
+                }
+
+                // Check for wrong layout on 2nd+ Latin char.
+                if !self.transliteration_active && self.current_word.len() >= 2 {
+                    if self.check_wrong_layout() {
+                        self.transliteration_active = true;
+                        let transliterated = lang_detect::transliterate(&self.current_word);
+                        let replace_len = self.current_word.len();
+                        self.current_word = transliterated;
+                        let ghost_action = self.update_predictions();
+                        return vec![
+                            Action::ReplaceWord {
+                                replace_len,
+                                text: self.current_word.clone(),
+                            },
+                            ghost_action,
+                        ];
+                    }
+                }
+
                 let ghost_action = self.update_predictions();
                 vec![ghost_action, Action::ForwardKey]
             }
@@ -538,10 +581,11 @@ impl InputMethodCore {
             self.engine.learn(word);
             self.engine.learn_online_markov(prev1, prev2, word);
 
-            // Feed word to per-language CVM track.
+            // Feed word to per-language CVM track + momentum.
             if self.config.lang_detection {
                 let lang = self.lang_detector.detected().lang;
                 self.engine.learn_with_lang(word, lang);
+                self.lang_detector.record_commit(lang);
             }
 
             // Feed word to session cache LM for burstiness tracking.
@@ -560,6 +604,36 @@ impl InputMethodCore {
         self.current_word.clear();
         self.ghost.clear();
         self.last_predictions.clear();
+        self.transliteration_active = false;
+    }
+
+    /// Check if the user is typing on the wrong keyboard layout.
+    ///
+    /// Compares trie candidate counts for the Latin prefix vs its Cyrillic
+    /// transliteration. If Cyrillic has candidates but Latin doesn't (or has
+    /// far fewer + momentum agrees), returns true.
+    fn check_wrong_layout(&self) -> bool {
+        if self.current_word.len() < 2 || !self.config.lang_detection {
+            return false;
+        }
+        // Only check all-ASCII-alpha prefixes.
+        if !self.current_word.chars().all(|c| c.is_ascii_alphabetic()) {
+            return false;
+        }
+        let bg_prefix = lang_detect::transliterate(&self.current_word);
+        let en_count = self.engine.candidate_count(&self.current_word, 3);
+        let bg_count = self.engine.candidate_count(&bg_prefix, 3);
+        // Clear signal: BG has candidates, EN doesn't.
+        if bg_count > 0 && en_count == 0 {
+            return true;
+        }
+        // Probabilistic: BG much stronger + momentum agrees.
+        if bg_count > en_count * 2 {
+            if let Some(LangId::Bg) = self.lang_detector.momentum_lang() {
+                return true;
+            }
+        }
+        false
     }
 
     fn update_predictions(&mut self) -> Action {
@@ -577,10 +651,15 @@ impl InputMethodCore {
         }
 
         let ctx_refs: arrayvec::ArrayVec<&str, 5> = self.context.iter().map(|s| s.as_str()).collect();
+        let lang = if self.config.lang_detection {
+            Some(self.lang_detector.detected().lang)
+        } else {
+            None
+        };
         let t0 = Instant::now();
         self.last_predictions =
             self.engine
-                .predict(&self.current_word, &ctx_refs, self.config.max_candidates);
+                .predict(&self.current_word, &ctx_refs, self.config.max_candidates, lang);
         self.metrics.record_latency(t0.elapsed());
 
         if let Some(top) = self.last_predictions.first() {

@@ -81,7 +81,7 @@ impl PySmartKeyEngine {
     fn predict(&self, prefix: &str, context: Vec<String>, limit: usize) -> Vec<(String, f64, f64)> {
         let ctx_refs: Vec<&str> = context.iter().map(|s| s.as_str()).collect();
         self.inner
-            .predict(prefix, &ctx_refs, limit)
+            .predict(prefix, &ctx_refs, limit, None)
             .into_iter()
             .map(|p| (p.word, p.score, p.confidence))
             .collect()
