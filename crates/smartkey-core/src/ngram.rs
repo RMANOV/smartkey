@@ -284,7 +284,7 @@ impl NgramTrie {
                 heap.push(Reverse((freq, current_word.clone())));
             } else if heap
                 .peek()
-                .map_or(false, |&Reverse((min_freq, _))| freq > min_freq)
+                .is_some_and(|&Reverse((min_freq, _))| freq > min_freq)
             {
                 heap.pop();
                 heap.push(Reverse((freq, current_word.clone())));
@@ -325,7 +325,7 @@ impl NgramTrie {
             let dominated = heap.len() >= limit
                 && heap
                     .peek()
-                    .map_or(false, |w| (edit_distance, Reverse(freq)) >= (w.0, w.1));
+                    .is_some_and(|w| (edit_distance, Reverse(freq)) >= (w.0, w.1));
             if !dominated {
                 let entry = (edit_distance, Reverse(freq), current_word.clone());
                 if heap.len() >= limit {
