@@ -122,7 +122,7 @@ pub extern "system" fn DllRegisterServer() -> windows::core::HRESULT {
     unsafe { CoUninitialize() };
 
     match result {
-        Ok(()) => S_OK,
+        Ok(_) => S_OK,
         Err(e) => e.code(),
     }
 }

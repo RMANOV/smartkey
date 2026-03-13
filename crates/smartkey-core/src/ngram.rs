@@ -144,6 +144,12 @@ impl NgramTrie {
             .map(|i| i.min(u8::MAX as usize) as u8)
             .collect();
 
+        // Pre-allocate arena for DFS rows. Max depth = 64 (practical word length).
+        // Each level needs (prefix_len + 1) bytes. Safe because DFS is sequential —
+        // each depth level uses a distinct non-overlapping slice via split_at_mut.
+        let row_size = prefix_len + 1;
+        let mut arena = vec![0u8; 64 * row_size];
+
         // DFS: process each child of root to start the walk.
         for (&ch, child) in &self.root.children {
             Self::fuzzy_dfs_bounded(
@@ -157,6 +163,7 @@ impl NgramTrie {
                 &mut String::from(ch),
                 &mut heap,
                 limit,
+                &mut arena,
             );
         }
 
@@ -185,9 +192,24 @@ impl NgramTrie {
         current_word: &mut String,
         heap: &mut BinaryHeap<(u8, Reverse<u32>, String)>,
         limit: usize,
+        arena: &mut [u8],
     ) {
         let prefix_len = prefix_chars.len();
-        let mut current_row = vec![0u8; prefix_len + 1];
+        let row_size = prefix_len + 1;
+
+        // Use arena slice for this depth level instead of heap allocation.
+        // split_at_mut gives non-overlapping mutable slices: current_row for
+        // this level, child_arena for all deeper recursive calls.
+        // Falls back to Vec if arena is exhausted (words deeper than max_depth).
+        let mut fallback;
+        let (current_row, child_arena) = if arena.len() >= row_size {
+            let (row, rest) = arena.split_at_mut(row_size);
+            row.fill(0);
+            (row, rest)
+        } else {
+            fallback = vec![0u8; row_size];
+            (&mut fallback[..], &mut [][..])
+        };
 
         // current_row[0] = depth in trie = prev_row[0] + 1
         current_row[0] = prev_row[0].saturating_add(1);
@@ -247,12 +269,13 @@ impl NgramTrie {
                 next_ch,
                 prefix_chars,
                 max_edits,
-                &current_row,
+                current_row,
                 Some(prev_row),
                 Some(ch),
                 current_word,
                 heap,
                 limit,
+                child_arena,
             );
             current_word.truncate(word_len_before);
         }
@@ -667,6 +690,23 @@ mod tests {
         let trie = NgramTrie::new();
         let results = trie.fuzzy_search("hello", 2, 10);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_fuzzy_arena_correct_for_deep_word() {
+        let mut trie = NgramTrie::new();
+        // Insert a 30-char word to exercise deep arena paths.
+        let deep_word = "abcdefghijklmnopqrstuvwxyzabcd";
+        trie.insert(deep_word, 50);
+        trie.insert("abcdefghijklmnopqrstuvwxyzabce", 30); // similar long word
+
+        // Exact prefix match on the long word.
+        let results = trie.fuzzy_search("abcdefghijklmnopqrstuvwxyzabc", 1, 10);
+        assert!(
+            results.iter().any(|m| m.word == deep_word),
+            "should find deep word via arena-backed fuzzy search: got {:?}",
+            results
+        );
     }
 
     #[test]

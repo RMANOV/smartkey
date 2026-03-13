@@ -3,8 +3,6 @@
 // Usage:
 //   smartkey-register.exe --install    Register as a TSF Text Input Processor
 //   smartkey-register.exe --uninstall  Remove registration
-//
-// Requires: Administrator privileges (writes to HKLM).
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -21,7 +19,13 @@ fn main() {
 
                 init_com();
                 match smartkey_win::registration::register(&dll_path) {
-                    Ok(()) => println!("SmartKey IME registered successfully."),
+                    Ok(system_wide) => {
+                        if system_wide {
+                            println!("SmartKey IME registered system-wide (HKLM).");
+                        } else {
+                            println!("SmartKey IME registered per-user (HKCU).");
+                        }
+                    }
                     Err(e) => {
                         eprintln!("Registration failed: {e}");
                         uninit_com();

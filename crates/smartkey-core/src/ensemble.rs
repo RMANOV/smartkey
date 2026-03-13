@@ -1,11 +1,16 @@
 // Ensemble scorer — combines corpus frequency, Markov context, and CVM personal boost.
 
+use std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 
+use crate::cache::PredictionCache;
 use crate::cvm::{CvmCounter, CvmSnapshot};
 use crate::input::InputConfig;
 use crate::markov::MarkovChain;
 use crate::ngram::{NgramTrie, WordEntry};
+use crate::personal::{
+    extract_markov_snapshot, AdaptiveWeightsSnapshot, PersonalProfile,
+};
 
 /// A single prediction with its ensemble score and UI confidence.
 #[derive(Debug, Clone)]
@@ -15,6 +20,18 @@ pub struct Prediction {
     /// Normalised confidence in `[0.0, 1.0]` — the top candidate is ~1.0.
     pub confidence: f64,
 }
+
+/// Default blend factor for personal Markov vs corpus Markov.
+const DEFAULT_PERSONAL_MARKOV_DELTA: f64 = 0.2;
+
+/// Default learning rate for adaptive weight updates.
+const ADAPTIVE_LR: f64 = 0.05;
+
+/// Decay toward default weights every N commits.
+const DECAY_INTERVAL: u32 = 20;
+
+/// Decay rate toward default weights.
+const DECAY_RATE: f64 = 0.1;
 
 /// Unified prediction engine that blends three scoring signals:
 ///
@@ -27,11 +44,24 @@ pub struct SmartKeyEngine {
     trie: NgramTrie,
     markov: MarkovChain,
     personal: CvmCounter,
+    /// Personal Markov chain — learns from user input, separate from corpus Markov.
+    personal_markov: MarkovChain,
+    /// Blend factor: `markov_score = (1-δ) * corpus_markov + δ * personal_markov`.
+    personal_markov_delta: f64,
     alpha: f64,
     beta: f64,
     gamma: f64,
+    /// Default weights for decay-toward-defaults.
+    default_alpha: f64,
+    default_beta: f64,
+    default_gamma: f64,
+    /// Number of word commits (for adaptive weight decay interval).
+    commit_count: u32,
     fuzzy_max_edits: u8,
     fuzzy_discounts: [f64; 3],
+    /// Prediction cache (Mutex: predict takes &self but cache needs mutation;
+    /// Mutex instead of RefCell for Send+Sync required by PyO3).
+    cache: Mutex<PredictionCache>,
 }
 
 impl SmartKeyEngine {
@@ -48,11 +78,18 @@ impl SmartKeyEngine {
             markov: MarkovChain::with_lambdas(config.markov_lambdas),
             personal: CvmCounter::new(config.cvm_initial_size, config.cvm_max_size)
                 .with_decay_lambda(config.cvm_decay_lambda),
+            personal_markov: MarkovChain::new(),
+            personal_markov_delta: DEFAULT_PERSONAL_MARKOV_DELTA,
             alpha: config.weights.0,
             beta: config.weights.1,
             gamma: config.weights.2,
+            default_alpha: config.weights.0,
+            default_beta: config.weights.1,
+            default_gamma: config.weights.2,
+            commit_count: 0,
             fuzzy_max_edits: config.fuzzy_max_edits,
             fuzzy_discounts: config.fuzzy_discounts,
+            cache: Mutex::new(PredictionCache::new()),
         }
     }
 
@@ -74,16 +111,137 @@ impl SmartKeyEngine {
     /// Feed a word into the personal CVM layer (call when the user types a word).
     pub fn learn(&mut self, word: &str) {
         self.personal.process(word);
+        self.cache.lock().unwrap().invalidate();
     }
 
-    /// Export the personal CVM layer as a portable snapshot.
+    /// Train the personal Markov chain with online bigram/trigram data.
+    ///
+    /// Called from `commit_word()` with the preceding context words.
+    pub fn learn_online_markov(&mut self, prev1: Option<&str>, prev2: Option<&str>, word: &str) {
+        if let Some(ctx) = prev1 {
+            self.personal_markov.train_bigram(ctx, word, 1);
+        }
+        if let (Some(w1), Some(w2)) = (prev2, prev1) {
+            self.personal_markov.train_trigram(w1, w2, word, 1);
+        }
+        self.cache.lock().unwrap().invalidate();
+    }
+
+    /// Handle a prediction being accepted (Tab press) — update adaptive weights.
+    ///
+    /// Identifies the dominant scoring component for the accepted word and
+    /// shifts weights toward it using an EMA update.
+    pub fn on_prediction_accepted(&mut self, word: &str, context: &[&str]) {
+        let prev1 = context.last().copied();
+        let prev2 = if context.len() >= 2 {
+            Some(context[context.len() - 2])
+        } else {
+            None
+        };
+
+        // Recompute raw scores for the accepted word.
+        let corpus_score = if let Some(entry) = self.trie.prefix_search(word, 1).first() {
+            entry.frequency as f64
+        } else {
+            0.0
+        };
+        let markov_score = self.markov.score_with_backoff(word, prev1, prev2);
+        let personal_score = self.personal.frequency_score(word);
+
+        // Find dominant component.
+        let scores = [
+            (0usize, corpus_score),
+            (1, markov_score),
+            (2, personal_score),
+        ];
+        let dominant = scores
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|&(idx, _)| idx)
+            .unwrap_or(0);
+
+        // EMA update toward dominant component.
+        let mut new_weights = [self.alpha, self.beta, self.gamma];
+        new_weights[dominant] += ADAPTIVE_LR * (1.0 - new_weights[dominant]);
+
+        // Renormalize to sum = 1.0.
+        let sum: f64 = new_weights.iter().sum();
+        if sum > 0.0 {
+            self.alpha = new_weights[0] / sum;
+            self.beta = new_weights[1] / sum;
+            self.gamma = new_weights[2] / sum;
+        }
+
+        self.commit_count += 1;
+
+        // Decay toward defaults every DECAY_INTERVAL commits.
+        if self.commit_count % DECAY_INTERVAL == 0 {
+            self.alpha += DECAY_RATE * (self.default_alpha - self.alpha);
+            self.beta += DECAY_RATE * (self.default_beta - self.beta);
+            self.gamma += DECAY_RATE * (self.default_gamma - self.gamma);
+            // Renormalize.
+            let sum = self.alpha + self.beta + self.gamma;
+            if sum > 0.0 {
+                self.alpha /= sum;
+                self.beta /= sum;
+                self.gamma /= sum;
+            }
+        }
+
+        self.cache.lock().unwrap().invalidate();
+    }
+
+    /// Export the full personal profile (CVM + Markov + weights).
+    pub fn export_personal_profile(&self) -> PersonalProfile {
+        let cvm = self.personal.to_snapshot();
+        let markov = extract_markov_snapshot(
+            &self.personal_markov.bigrams_raw(),
+            &self.personal_markov.trigrams_raw(),
+        );
+        let weights = Some(AdaptiveWeightsSnapshot {
+            alpha: self.alpha,
+            beta: self.beta,
+            gamma: self.gamma,
+            personal_markov_delta: self.personal_markov_delta,
+            commit_count: self.commit_count,
+        });
+        PersonalProfile::new(cvm, markov, weights)
+    }
+
+    /// Import a full personal profile (CVM + Markov + weights).
+    pub fn import_personal_profile(&mut self, profile: &PersonalProfile) {
+        self.personal = CvmCounter::from_snapshot(&profile.cvm);
+
+        // Restore personal Markov.
+        self.personal_markov = MarkovChain::new();
+        for (ctx, word, count) in &profile.markov_bigrams {
+            self.personal_markov.train_bigram(ctx, word, *count);
+        }
+        for (w1, w2, word, count) in &profile.markov_trigrams {
+            self.personal_markov.train_trigram(w1, w2, word, *count);
+        }
+
+        // Restore adaptive weights.
+        if let Some(w) = &profile.weights {
+            self.alpha = w.alpha;
+            self.beta = w.beta;
+            self.gamma = w.gamma;
+            self.personal_markov_delta = w.personal_markov_delta;
+            self.commit_count = w.commit_count;
+        }
+
+        self.cache.lock().unwrap().invalidate();
+    }
+
+    /// Export the personal CVM layer as a portable snapshot (backward compat).
     pub fn export_personal(&self) -> CvmSnapshot {
         self.personal.to_snapshot()
     }
 
-    /// Replace the personal CVM layer from a snapshot (import / load).
+    /// Replace the personal CVM layer from a snapshot (backward compat).
     pub fn import_personal(&mut self, snapshot: &CvmSnapshot) {
         self.personal = CvmCounter::from_snapshot(snapshot);
+        self.cache.lock().unwrap().invalidate();
     }
 
     /// Produce up to `limit` predictions for the given prefix and context.
@@ -100,6 +258,11 @@ impl SmartKeyEngine {
     pub fn predict(&self, prefix: &str, context: &[&str], limit: usize) -> Vec<Prediction> {
         if limit == 0 {
             return Vec::new();
+        }
+
+        // Check cache first.
+        if let Some(cached) = self.cache.lock().unwrap().get(prefix, context) {
+            return cached;
         }
 
         let candidate_pool = limit * 3;
@@ -172,21 +335,37 @@ impl SmartKeyEngine {
             personal: f64,
         }
 
-        let mut raw: Vec<RawScores> = Vec::with_capacity(all_candidates.len());
+        // Stack-allocate for the common case (≤30 candidates; default limit*3=15).
+        // Falls back to Vec for unusually large candidate pools.
+        let mut raw_small = arrayvec::ArrayVec::<RawScores, 30>::new();
+        let mut raw_large = Vec::new();
         let mut max_markov = 1e-6_f64;
         let mut max_personal = 1.0_f64;
+        let use_stack = all_candidates.len() <= 30;
 
         for c in &all_candidates {
-            let m = self.markov.score_with_backoff(&c.word, prev1, prev2);
+            // Blend corpus Markov and personal Markov.
+            let corpus_m = self.markov.score_with_backoff(&c.word, prev1, prev2);
+            let personal_m = self.personal_markov.score_with_backoff(&c.word, prev1, prev2);
+            let m = (1.0 - self.personal_markov_delta) * corpus_m
+                + self.personal_markov_delta * personal_m;
             let p = self.personal.frequency_score(&c.word);
             max_markov = max_markov.max(m);
             max_personal = max_personal.max(p);
-            raw.push(RawScores {
+            let scores = RawScores {
                 corpus: c.frequency as f64,
                 markov: m,
                 personal: p,
-            });
+            };
+            if use_stack {
+                // SAFETY: use_stack guarantees len <= 30.
+                raw_small.push(scores);
+            } else {
+                raw_large.push(scores);
+            }
         }
+
+        let raw: &[RawScores] = if use_stack { &raw_small } else { &raw_large };
 
         // Normalize and blend in a second pass (but no redundant score calls).
         let mut scored: Vec<Prediction> = all_candidates
@@ -231,7 +410,18 @@ impl SmartKeyEngine {
             }
         }
 
+        // Store in cache before returning.
+        self.cache
+            .lock()
+            .unwrap()
+            .put(prefix, context, scored.clone());
+
         scored
+    }
+
+    /// Current ensemble weights (for testing / inspection).
+    pub fn weights(&self) -> (f64, f64, f64) {
+        (self.alpha, self.beta, self.gamma)
     }
 }
 
