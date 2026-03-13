@@ -62,9 +62,8 @@ impl LanguageDetector {
         let scores = self.score_char(ch);
 
         // EMA update: score[i] = (1-α) * old + α * new
-        for i in 0..3 {
-            self.ema_scores[i] = (1.0 - self.ema_alpha) * self.ema_scores[i]
-                + self.ema_alpha * scores[i];
+        for (ema, &s) in self.ema_scores.iter_mut().zip(scores.iter()) {
+            *ema = (1.0 - self.ema_alpha) * *ema + self.ema_alpha * s;
         }
 
         // Determine winner.
@@ -147,9 +146,8 @@ impl LanguageDetector {
             // Ambiguous: use adaptive α.
             let scores = self.score_char(ch);
             let alpha = self.adaptive_alpha(ch);
-            for i in 0..3 {
-                self.ema_scores[i] =
-                    (1.0 - alpha) * self.ema_scores[i] + alpha * scores[i];
+            for (ema, &s) in self.ema_scores.iter_mut().zip(scores.iter()) {
+                *ema = (1.0 - alpha) * *ema + alpha * s;
             }
             // Winner selection.
             let total: f64 = self.ema_scores.iter().sum();
@@ -168,11 +166,7 @@ impl LanguageDetector {
             };
             self.detected = DetectedLanguage {
                 lang,
-                confidence: if total > 0.0 {
-                    best_score / total
-                } else {
-                    0.0
-                },
+                confidence: if total > 0.0 { best_score / total } else { 0.0 },
             };
             // Low confidence: fall back to momentum.
             if self.detected.confidence < 0.5 {
@@ -222,11 +216,7 @@ impl LanguageDetector {
             }
         }
         let total = self.momentum.len() as f64;
-        let (best_idx, &best_count) = counts
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, &c)| c)
-            .unwrap();
+        let (best_idx, &best_count) = counts.iter().enumerate().max_by_key(|(_, &c)| c).unwrap();
         if (best_count as f64 / total) >= 0.6 {
             Some(match best_idx {
                 0 => LangId::Bg,
@@ -254,9 +244,8 @@ impl LanguageDetector {
             // Digits: Tech with some En credit
             '0'..='9' => [0.0, 0.1, 0.9],
             // Programming symbols: strongly Tech
-            '{' | '}' | '[' | ']' | '(' | ')' | '<' | '>' | '=' | '+'
-            | '-' | '*' | '/' | '\\' | '|' | '&' | '^' | '~' | '#'
-            | '@' | '!' | '%' | '$' | '`' => [0.0, 0.05, 0.95],
+            '{' | '}' | '[' | ']' | '(' | ')' | '<' | '>' | '=' | '+' | '-' | '*' | '/' | '\\'
+            | '|' | '&' | '^' | '~' | '#' | '@' | '!' | '%' | '$' | '`' => [0.0, 0.05, 0.95],
             // Common punctuation: split between En and Bg
             '.' | ',' | ';' | ':' | '?' | '\'' | '"' => [0.3, 0.4, 0.3],
             // Underscore: Tech (variable names)
@@ -276,37 +265,66 @@ impl LanguageDetector {
 /// Map a Latin character to its BG Phonetic keyboard Cyrillic equivalent.
 pub fn phonetic_map(ch: char) -> Option<char> {
     Some(match ch {
-        'a' => 'а', 'A' => 'А',
-        'b' => 'б', 'B' => 'Б',
-        'c' => 'ц', 'C' => 'Ц',
-        'd' => 'д', 'D' => 'Д',
-        'e' => 'е', 'E' => 'Е',
-        'f' => 'ф', 'F' => 'Ф',
-        'g' => 'г', 'G' => 'Г',
-        'h' => 'х', 'H' => 'Х',
-        'i' => 'и', 'I' => 'И',
-        'j' => 'й', 'J' => 'Й',
-        'k' => 'к', 'K' => 'К',
-        'l' => 'л', 'L' => 'Л',
-        'm' => 'м', 'M' => 'М',
-        'n' => 'н', 'N' => 'Н',
-        'o' => 'о', 'O' => 'О',
-        'p' => 'п', 'P' => 'П',
-        'q' => 'я', 'Q' => 'Я',
-        'r' => 'р', 'R' => 'Р',
-        's' => 'с', 'S' => 'С',
-        't' => 'т', 'T' => 'Т',
-        'u' => 'у', 'U' => 'У',
-        'v' => 'в', 'V' => 'В',
-        'w' => 'ш', 'W' => 'Ш',
-        'x' => 'ь', 'X' => 'Ь',
-        'y' => 'ъ', 'Y' => 'Ъ',
-        'z' => 'з', 'Z' => 'З',
+        'a' => 'а',
+        'A' => 'А',
+        'b' => 'б',
+        'B' => 'Б',
+        'c' => 'ц',
+        'C' => 'Ц',
+        'd' => 'д',
+        'D' => 'Д',
+        'e' => 'е',
+        'E' => 'Е',
+        'f' => 'ф',
+        'F' => 'Ф',
+        'g' => 'г',
+        'G' => 'Г',
+        'h' => 'х',
+        'H' => 'Х',
+        'i' => 'и',
+        'I' => 'И',
+        'j' => 'й',
+        'J' => 'Й',
+        'k' => 'к',
+        'K' => 'К',
+        'l' => 'л',
+        'L' => 'Л',
+        'm' => 'м',
+        'M' => 'М',
+        'n' => 'н',
+        'N' => 'Н',
+        'o' => 'о',
+        'O' => 'О',
+        'p' => 'п',
+        'P' => 'П',
+        'q' => 'я',
+        'Q' => 'Я',
+        'r' => 'р',
+        'R' => 'Р',
+        's' => 'с',
+        'S' => 'С',
+        't' => 'т',
+        'T' => 'Т',
+        'u' => 'у',
+        'U' => 'У',
+        'v' => 'в',
+        'V' => 'В',
+        'w' => 'ш',
+        'W' => 'Ш',
+        'x' => 'ь',
+        'X' => 'Ь',
+        'y' => 'ъ',
+        'Y' => 'Ъ',
+        'z' => 'з',
+        'Z' => 'З',
         _ => return None,
     })
 }
 
 /// Transliterate a Latin string to Cyrillic using BG Phonetic layout.
+///
+/// Non-alphabetic characters (digits, spaces, punctuation) are dropped.
+/// Callers should pre-filter to ensure input contains only ASCII letters.
 pub fn transliterate(input: &str) -> String {
     input.chars().filter_map(phonetic_map).collect()
 }

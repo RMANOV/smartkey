@@ -87,6 +87,9 @@ impl SessionCacheLM {
     }
 
     /// Evict the entry with the smallest `last_seen` position (oldest).
+    ///
+    /// O(n) linear scan — acceptable at max_entries=200. Consider BTreeMap
+    /// keyed by position for O(log n) eviction if scaling beyond ~1000 entries.
     fn evict_oldest(&mut self) {
         if let Some(oldest_key) = self
             .cache

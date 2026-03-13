@@ -179,9 +179,18 @@ impl SmartKeyTextService {
                     // Key must reach the application — override any prior consumption.
                     consumed = false;
                 }
-                Action::ReplaceWord { replace_len: _, text } => {
-                    // TODO: Implement TSF range replacement via ITfRange.
-                    // For now, treat as CommitText (replace full composition).
+                Action::ReplaceWord {
+                    replace_len: _,
+                    text,
+                } => {
+                    // LIMITATION: Proper ITfRange-based replacement not yet implemented.
+                    // This falls back to CommitText which replaces the entire composition
+                    // rather than just the last `replace_len` characters. As a result,
+                    // transliteration on Windows may produce incorrect behavior when
+                    // partially through a word. Full implementation requires:
+                    //   1. Get composition range via ITfComposition::GetRange
+                    //   2. Create a sub-range covering the last `replace_len` chars
+                    //   3. Set text on that sub-range via ITfRange::SetText
                     let op = EditOp::CommitText {
                         text: text.clone(),
                         composition: self.composition.clone(),

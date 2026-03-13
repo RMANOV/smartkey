@@ -34,7 +34,15 @@ impl PySmartKeyEngine {
     }
 
     /// Export the personal CVM profile to a JSON file.
+    ///
+    /// **Deprecated:** This exports only the CVM snapshot, losing Markov chain
+    /// and per-language CVM data. Use `PyInputMethodCore.export_personal()` instead
+    /// for full profile persistence.
     fn export_personal(&self, path: &str) -> PyResult<()> {
+        eprintln!(
+            "smartkey: WARNING: PySmartKeyEngine.export_personal() is deprecated — \
+                   use PyInputMethodCore.export_personal() for full profile persistence"
+        );
         let snap = self.inner.export_personal();
         let json = serde_json::to_string_pretty(&snap).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(

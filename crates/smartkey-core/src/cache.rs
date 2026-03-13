@@ -31,8 +31,9 @@ struct CacheEntry {
 /// On hit, the entry is moved to the back (most recently used).
 /// On miss + insert, the oldest entry (front) is evicted if at capacity.
 ///
-/// Thread safety: wrapped in `RefCell` inside `SmartKeyEngine` — safe
-/// because TSF/IMK/IBus are all single-threaded (STA COM / main thread).
+/// Thread safety: wrapped in `Mutex` inside `SmartKeyEngine` (required by
+/// PyO3's Send+Sync bounds). TSF/IMK/IBus are single-threaded, but the
+/// Mutex satisfies Rust's thread-safety requirements for the Python binding.
 #[derive(Debug)]
 pub struct PredictionCache {
     entries: VecDeque<CacheEntry>,

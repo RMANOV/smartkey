@@ -1,7 +1,7 @@
 // Ensemble scorer — combines corpus frequency, Markov context, and CVM personal boost.
 
-use std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use crate::bpe::BpeTokenizer;
 use crate::cache::PredictionCache;
@@ -13,9 +13,7 @@ use crate::lang_cvm::LangCvmTracks;
 use crate::lang_detect::LangId;
 use crate::markov::MarkovChain;
 use crate::ngram::{NgramTrie, WordEntry};
-use crate::personal::{
-    extract_markov_snapshot, AdaptiveWeightsSnapshot, PersonalProfile,
-};
+use crate::personal::{extract_markov_snapshot, AdaptiveWeightsSnapshot, PersonalProfile};
 use crate::ppm::PpmModel;
 use crate::session_cache::SessionCacheLM;
 
@@ -89,9 +87,7 @@ pub struct SmartKeyEngine {
     hedge: Option<HedgeMixer>,
     /// Feature flags snapshot from config.
     use_session_cache_lm: bool,
-    use_ppm: bool,
     bpe_enabled: bool,
-    lang_detection: bool,
     use_kneser_ney: bool,
     use_hedge: bool,
 }
@@ -145,9 +141,7 @@ impl SmartKeyEngine {
                 None
             },
             use_session_cache_lm: config.use_session_cache_lm,
-            use_ppm: config.use_ppm,
             bpe_enabled: config.bpe_enabled,
-            lang_detection: config.lang_detection,
             use_kneser_ney: config.use_kneser_ney,
             use_hedge: config.use_hedge,
         }
@@ -310,8 +304,8 @@ impl SmartKeyEngine {
     pub fn export_personal_profile(&self) -> PersonalProfile {
         let cvm = self.personal.to_snapshot();
         let markov = extract_markov_snapshot(
-            &self.personal_markov.bigrams_raw(),
-            &self.personal_markov.trigrams_raw(),
+            self.personal_markov.bigrams_raw(),
+            self.personal_markov.trigrams_raw(),
         );
         let weights = Some(AdaptiveWeightsSnapshot {
             alpha: self.alpha,
@@ -386,7 +380,13 @@ impl SmartKeyEngine {
     ///
     /// When `lang` is `Some`, per-language CVM tracks are consulted for scoring
     /// boost (v0.4.1). Pass `None` for backward-compatible behavior.
-    pub fn predict(&self, prefix: &str, context: &[&str], limit: usize, lang: Option<LangId>) -> Vec<Prediction> {
+    pub fn predict(
+        &self,
+        prefix: &str,
+        context: &[&str],
+        limit: usize,
+        lang: Option<LangId>,
+    ) -> Vec<Prediction> {
         if limit == 0 {
             return Vec::new();
         }
@@ -532,7 +532,9 @@ impl SmartKeyEngine {
             } else {
                 self.markov.score_with_backoff(&c.word, prev1, prev2)
             };
-            let personal_m = self.personal_markov.score_with_backoff(&c.word, prev1, prev2);
+            let personal_m = self
+                .personal_markov
+                .score_with_backoff(&c.word, prev1, prev2);
             let m = (1.0 - self.personal_markov_delta) * corpus_m
                 + self.personal_markov_delta * personal_m;
             let cvm_score = self.personal.frequency_score(&c.word);
@@ -576,7 +578,8 @@ impl SmartKeyEngine {
 
         // Normalize and blend in a second pass (but no redundant score calls).
         // When PPM is active, borrow δ weight from β (markov) for short prefixes.
-        let (eff_alpha, eff_beta, eff_gamma, eff_delta) = if self.ppm.is_some() && prefix.len() <= 1 {
+        let (eff_alpha, eff_beta, eff_gamma, eff_delta) = if self.ppm.is_some() && prefix.len() <= 1
+        {
             // Short prefix: PPM gets 0.15 borrowed from markov.
             let delta = 0.15_f64.min(self.beta * 0.5);
             (self.alpha, self.beta - delta, self.gamma, delta)

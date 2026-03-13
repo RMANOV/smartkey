@@ -200,8 +200,16 @@ mod tests {
         // After decay interval (20), weights should have nudged back toward defaults
         let w = m.weights();
         // Signal 0 should still be dominant but not as extreme
-        assert!(w[1] > MIN_WEIGHT, "signal 1 should not be zeroed out: {:?}", w);
-        assert!(w[2] > MIN_WEIGHT, "signal 2 should not be zeroed out: {:?}", w);
+        assert!(
+            w[1] > MIN_WEIGHT,
+            "signal 1 should not be zeroed out: {:?}",
+            w
+        );
+        assert!(
+            w[2] > MIN_WEIGHT,
+            "signal 2 should not be zeroed out: {:?}",
+            w
+        );
     }
 
     #[test]
@@ -212,8 +220,16 @@ mod tests {
             m.update(&[1.0, 0.0, 0.0]);
         }
         let w = m.weights();
-        assert!(w[1] >= MIN_WEIGHT, "weight should not go below floor: {:?}", w);
-        assert!(w[2] >= MIN_WEIGHT, "weight should not go below floor: {:?}", w);
+        assert!(
+            w[1] >= MIN_WEIGHT,
+            "weight should not go below floor: {:?}",
+            w
+        );
+        assert!(
+            w[2] >= MIN_WEIGHT,
+            "weight should not go below floor: {:?}",
+            w
+        );
     }
 
     #[test]

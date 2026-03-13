@@ -4,9 +4,15 @@
 // for lower-order models instead of raw frequency, providing better
 // probability estimates for rare and unseen n-grams than Katz backoff.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use crate::markov::{BigramData, TrigramData};
 
 /// Discount parameters for Modified Kneser-Ney.
+///
+/// NOTE: These are fixed approximations, not estimated from training data
+/// using the standard n1/n2/n3/n4 formula. D3_PLUS = 1.5 is intentionally
+/// aggressive to favor lower-order backoff for rare trigrams.
 const D1: f64 = 0.75;
 const D2: f64 = 1.0;
 const D3_PLUS: f64 = 1.5;
@@ -28,28 +34,20 @@ pub struct KneserNeyScorer {
     continuation_count: HashMap<String, u32>,
     /// Total number of unique bigram types (for normalization)
     total_bigram_types: u32,
-    /// Vocabulary set.
-    vocab: HashSet<String>,
 }
 
 impl KneserNeyScorer {
     /// Create a new scorer from existing Markov data.
     ///
     /// Takes the raw bigram and trigram maps from `MarkovChain`.
-    pub fn from_markov_data(
-        bigram_data: &HashMap<String, (HashMap<String, u32>, u32)>,
-        trigram_data: &HashMap<String, HashMap<String, (HashMap<String, u32>, u32)>>,
-    ) -> Self {
+    pub fn from_markov_data(bigram_data: &BigramData, trigram_data: &TrigramData) -> Self {
         let mut bigrams: HashMap<String, HashMap<String, u32>> = HashMap::new();
-        let mut vocab = HashSet::new();
         let mut continuation_count: HashMap<String, u32> = HashMap::new();
         let mut total_bigram_types = 0u32;
 
         for (ctx, (followers, _)) in bigram_data {
-            vocab.insert(ctx.clone());
             let entry = bigrams.entry(ctx.clone()).or_default();
             for (word, &count) in followers {
-                vocab.insert(word.clone());
                 entry.insert(word.clone(), count);
                 // Each (ctx, word) pair is a unique bigram type that contributes
                 // to word's continuation count.
@@ -74,11 +72,16 @@ impl KneserNeyScorer {
             trigrams,
             continuation_count,
             total_bigram_types,
-            vocab,
         }
     }
 
-    /// Score a word with Interpolated Kneser-Ney smoothing.
+    /// Score a word with Modified Interpolated Kneser-Ney smoothing.
+    ///
+    /// Uses a two-level interpolation: each KN level (trigram, bigram) has its
+    /// own discount-based lambda for internal backoff, and the top-level `score()`
+    /// applies additional fixed mixing weights across levels. This deviates from
+    /// standard MKN (which uses a single recursive interpolation) to allow tuning
+    /// the relative influence of each n-gram order independently.
     ///
     /// * `recent` — most recent preceding word (bigram context)
     /// * `older` — second-to-last word (trigram context)
@@ -177,7 +180,7 @@ mod tests {
     use super::*;
 
     fn test_scorer() -> KneserNeyScorer {
-        let mut bigrams: HashMap<String, (HashMap<String, u32>, u32)> = HashMap::new();
+        let mut bigrams: BigramData = HashMap::new();
         let mut followers = HashMap::new();
         followers.insert("love".into(), 3u32);
         followers.insert("like".into(), 2);
@@ -188,8 +191,7 @@ mod tests {
         followers2.insert("python".into(), 1);
         bigrams.insert("love".into(), (followers2, 5));
 
-        let mut trigrams: HashMap<String, HashMap<String, (HashMap<String, u32>, u32)>> =
-            HashMap::new();
+        let mut trigrams: TrigramData = HashMap::new();
         let mut tri_followers = HashMap::new();
         tri_followers.insert("rust".into(), 3u32);
         tri_followers.insert("python".into(), 1);
@@ -228,7 +230,10 @@ mod tests {
     fn test_kn_unseen_context() {
         let scorer = test_scorer();
         let score = scorer.score("rust", Some("unknown_context"), None);
-        assert!(score >= KN_FLOOR, "unseen context should still give non-zero score");
+        assert!(
+            score >= KN_FLOOR,
+            "unseen context should still give non-zero score"
+        );
     }
 
     #[test]
@@ -242,6 +247,9 @@ mod tests {
     fn test_kn_bigram_only() {
         let scorer = test_scorer();
         let score = scorer.score("rust", Some("love"), None);
-        assert!(score > KN_FLOOR, "bigram context should boost score above floor");
+        assert!(
+            score > KN_FLOOR,
+            "bigram context should boost score above floor"
+        );
     }
 }

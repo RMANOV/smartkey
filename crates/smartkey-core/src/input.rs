@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::ensemble::{Prediction, SmartKeyEngine};
 use crate::eval::PredictionMetrics;
-use crate::lang_detect::{self, LanguageDetector, LangId};
+use crate::lang_detect::{self, LangId, LanguageDetector};
 use crate::paths;
 use crate::personal;
 
@@ -359,11 +359,8 @@ impl InputMethodCore {
                         .position(|p| p.word == full_word)
                         .map(|i| i + 1) // 1-based
                         .unwrap_or(1);
-                    self.metrics.record_acceptance(
-                        rank,
-                        self.ghost.len(),
-                        full_word.len(),
-                    );
+                    self.metrics
+                        .record_acceptance(rank, self.ghost.len(), full_word.len());
                     self.commit_word_internal(&full_word, false);
                     self.reset_word();
                     actions
@@ -443,21 +440,22 @@ impl InputMethodCore {
                 }
 
                 // Check for wrong layout on 2nd+ Latin char.
-                if !self.transliteration_active && self.current_word.len() >= 2 {
-                    if self.check_wrong_layout() {
-                        self.transliteration_active = true;
-                        let transliterated = lang_detect::transliterate(&self.current_word);
-                        let replace_len = self.current_word.len();
-                        self.current_word = transliterated;
-                        let ghost_action = self.update_predictions();
-                        return vec![
-                            Action::ReplaceWord {
-                                replace_len,
-                                text: self.current_word.clone(),
-                            },
-                            ghost_action,
-                        ];
-                    }
+                if !self.transliteration_active
+                    && self.current_word.len() >= 2
+                    && self.check_wrong_layout()
+                {
+                    self.transliteration_active = true;
+                    let transliterated = lang_detect::transliterate(&self.current_word);
+                    let replace_len = self.current_word.len();
+                    self.current_word = transliterated;
+                    let ghost_action = self.update_predictions();
+                    return vec![
+                        Action::ReplaceWord {
+                            replace_len,
+                            text: self.current_word.clone(),
+                        },
+                        ghost_action,
+                    ];
                 }
 
                 let ghost_action = self.update_predictions();
@@ -624,7 +622,9 @@ impl InputMethodCore {
         let en_count = self.engine.candidate_count(&self.current_word, 3);
         let bg_count = self.engine.candidate_count(&bg_prefix, 3);
         // Clear signal: BG has candidates, EN doesn't.
-        if bg_count > 0 && en_count == 0 {
+        // Require momentum agreement to avoid false positives on English words
+        // not in the corpus (e.g., rare proper nouns typed in Latin).
+        if bg_count > 0 && en_count == 0 && self.lang_detector.momentum_lang() != Some(LangId::En) {
             return true;
         }
         // Probabilistic: BG much stronger + momentum agrees.
@@ -650,16 +650,20 @@ impl InputMethodCore {
             return Action::HideGhost;
         }
 
-        let ctx_refs: arrayvec::ArrayVec<&str, 5> = self.context.iter().map(|s| s.as_str()).collect();
+        let ctx_refs: arrayvec::ArrayVec<&str, 5> =
+            self.context.iter().map(|s| s.as_str()).collect();
         let lang = if self.config.lang_detection {
             Some(self.lang_detector.detected().lang)
         } else {
             None
         };
         let t0 = Instant::now();
-        self.last_predictions =
-            self.engine
-                .predict(&self.current_word, &ctx_refs, self.config.max_candidates, lang);
+        self.last_predictions = self.engine.predict(
+            &self.current_word,
+            &ctx_refs,
+            self.config.max_candidates,
+            lang,
+        );
         self.metrics.record_latency(t0.elapsed());
 
         if let Some(top) = self.last_predictions.first() {

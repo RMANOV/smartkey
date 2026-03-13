@@ -38,13 +38,9 @@ impl LangCvmTracks {
 
     /// Learn a word in the context of a detected language.
     pub fn learn(&mut self, word: &str, lang: LangId) {
-        let counter = self
-            .tracks
-            .entry(lang)
-            .or_insert_with(|| {
-                CvmCounter::new(self.initial_size, self.max_size)
-                    .with_decay_lambda(self.decay_lambda)
-            });
+        let counter = self.tracks.entry(lang).or_insert_with(|| {
+            CvmCounter::new(self.initial_size, self.max_size).with_decay_lambda(self.decay_lambda)
+        });
         counter.process(word);
     }
 
@@ -90,6 +86,8 @@ impl LangCvmTracks {
         let mut max_size = 5000;
         let mut decay_lambda = 0.001;
 
+        let mut params_set = false;
+
         for (key, cvm_snap) in &snap.tracks {
             let lang = match key.as_str() {
                 "bg" => LangId::Bg,
@@ -97,9 +95,12 @@ impl LangCvmTracks {
                 "tech" => LangId::Tech,
                 _ => continue,
             };
-            initial_size = cvm_snap.capacity;
-            max_size = cvm_snap.max_capacity;
-            decay_lambda = cvm_snap.decay_lambda;
+            if !params_set {
+                initial_size = cvm_snap.capacity;
+                max_size = cvm_snap.max_capacity;
+                decay_lambda = cvm_snap.decay_lambda;
+                params_set = true;
+            }
             tracks.insert(lang, CvmCounter::from_snapshot(cvm_snap));
         }
 
@@ -166,9 +167,7 @@ mod tests {
 
     #[test]
     fn test_backward_compat_empty_snapshot() {
-        let snap = LangCvmSnapshot {
-            tracks: Vec::new(),
-        };
+        let snap = LangCvmSnapshot { tracks: Vec::new() };
         let restored = LangCvmTracks::from_snapshot(&snap);
         assert_eq!(restored.frequency_score("anything", LangId::En), 0.0);
     }

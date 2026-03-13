@@ -9,12 +9,18 @@ use std::collections::{HashMap, HashSet};
 /// is ever assigned a probability of exactly zero.
 const UNSEEN_FLOOR: f64 = 1e-6;
 
+/// Bigram data: context_word → (followers_map, cached_total).
+pub type BigramData = HashMap<String, (HashMap<String, u32>, u32)>;
+
+/// Trigram data: w1 → w2 → (followers_map, cached_total).
+pub type TrigramData = HashMap<String, HashMap<String, (HashMap<String, u32>, u32)>>;
+
 /// Interpolated Markov chain language model (up to trigram).
 pub struct MarkovChain {
     /// context_word → (followers_map, cached_total)
-    bigrams: HashMap<String, (HashMap<String, u32>, u32)>,
+    bigrams: BigramData,
     /// w1 → w2 → (followers_map, cached_total)
-    trigrams: HashMap<String, HashMap<String, (HashMap<String, u32>, u32)>>,
+    trigrams: TrigramData,
     /// Distinct words observed (tracked incrementally).
     vocab: HashSet<String>,
     /// Interpolation weights: [trigram, bigram, unigram].
@@ -184,12 +190,12 @@ impl MarkovChain {
     }
 
     /// Raw bigram data access (for serialization).
-    pub fn bigrams_raw(&self) -> &HashMap<String, (HashMap<String, u32>, u32)> {
+    pub fn bigrams_raw(&self) -> &BigramData {
         &self.bigrams
     }
 
     /// Raw trigram data access (for serialization).
-    pub fn trigrams_raw(&self) -> &HashMap<String, HashMap<String, (HashMap<String, u32>, u32)>> {
+    pub fn trigrams_raw(&self) -> &TrigramData {
         &self.trigrams
     }
 }
@@ -350,7 +356,10 @@ mod tests {
         // Verify bigram totals
         for (ctx, (followers, total)) in &m.bigrams {
             let computed: u32 = followers.values().sum();
-            assert_eq!(*total, computed, "bigram total mismatch for context '{ctx}'");
+            assert_eq!(
+                *total, computed,
+                "bigram total mismatch for context '{ctx}'"
+            );
         }
         // Verify trigram totals
         for (w1, level2) in &m.trigrams {

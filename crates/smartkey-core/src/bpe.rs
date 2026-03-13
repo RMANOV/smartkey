@@ -18,8 +18,6 @@ pub struct MergeRule {
 pub struct BpeTokenizer {
     /// Ordered list of merge rules (applied in priority order).
     merges: Vec<MergeRule>,
-    /// Reverse lookup: merged → (a, b) for decomposition.
-    merge_map: HashMap<String, (String, String)>,
     /// Subword token frequencies from corpus training.
     token_freqs: HashMap<String, u32>,
 }
@@ -27,13 +25,8 @@ pub struct BpeTokenizer {
 impl BpeTokenizer {
     /// Create a new tokenizer from merge rules and token frequencies.
     pub fn new(merges: Vec<MergeRule>, token_freqs: HashMap<String, u32>) -> Self {
-        let merge_map = merges
-            .iter()
-            .map(|r| (r.merged.clone(), (r.a.clone(), r.b.clone())))
-            .collect();
         Self {
             merges,
-            merge_map,
             token_freqs,
         }
     }
@@ -42,7 +35,6 @@ impl BpeTokenizer {
     pub fn empty() -> Self {
         Self {
             merges: Vec::new(),
-            merge_map: HashMap::new(),
             token_freqs: HashMap::new(),
         }
     }
@@ -175,12 +167,36 @@ mod tests {
 
     fn test_tokenizer() -> BpeTokenizer {
         let merges = vec![
-            MergeRule { a: "с".into(), b: "а".into(), merged: "са".into() },
-            MergeRule { a: "м".into(), b: "о".into(), merged: "мо".into() },
-            MergeRule { a: "л".into(), b: "е".into(), merged: "ле".into() },
-            MergeRule { a: "са".into(), b: "мо".into(), merged: "само".into() },
-            MergeRule { a: "ле".into(), b: "т".into(), merged: "лет".into() },
-            MergeRule { a: "само".into(), b: "лет".into(), merged: "самолет".into() },
+            MergeRule {
+                a: "с".into(),
+                b: "а".into(),
+                merged: "са".into(),
+            },
+            MergeRule {
+                a: "м".into(),
+                b: "о".into(),
+                merged: "мо".into(),
+            },
+            MergeRule {
+                a: "л".into(),
+                b: "е".into(),
+                merged: "ле".into(),
+            },
+            MergeRule {
+                a: "са".into(),
+                b: "мо".into(),
+                merged: "само".into(),
+            },
+            MergeRule {
+                a: "ле".into(),
+                b: "т".into(),
+                merged: "лет".into(),
+            },
+            MergeRule {
+                a: "само".into(),
+                b: "лет".into(),
+                merged: "самолет".into(),
+            },
         ];
         let mut freqs = HashMap::new();
         freqs.insert("само".into(), 100);

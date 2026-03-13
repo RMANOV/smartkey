@@ -71,7 +71,12 @@ impl PredictionMetrics {
     /// * `rank` — 1-based position of the accepted word in `last_predictions`.
     /// * `ghost_suffix_len` — characters saved (ghost text length).
     /// * `full_word_len` — total length of the committed word.
-    pub fn record_acceptance(&mut self, rank: usize, ghost_suffix_len: usize, full_word_len: usize) {
+    pub fn record_acceptance(
+        &mut self,
+        rank: usize,
+        ghost_suffix_len: usize,
+        full_word_len: usize,
+    ) {
         self.accepted_predictions += 1;
         if rank > 0 {
             self.mrr_sum += 1.0 / rank as f64;
@@ -197,7 +202,7 @@ mod tests {
         assert_eq!(s.total_commits, 2);
         assert_eq!(s.accepted_predictions, 2);
         assert_eq!(s.top1_accept_rate, 1.0); // 2/2
-        // MRR = (1/1 + 1/2) / 2 = 0.75
+                                             // MRR = (1/1 + 1/2) / 2 = 0.75
         assert!((s.mrr_at_5 - 0.75).abs() < 1e-9);
         // Keystroke savings = 5 / (5 + 5) = 0.5
         assert!((s.keystroke_savings - 0.5).abs() < 1e-9);

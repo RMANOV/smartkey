@@ -4,7 +4,6 @@
 // v2: PersonalProfile { cvm, markov bigrams/trigrams, adaptive weights }
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::cvm::CvmSnapshot;
 use crate::lang_cvm::LangCvmSnapshot;
@@ -119,8 +118,8 @@ pub fn load_personal_json(json_str: &str) -> Result<PersonalProfile, String> {
 
 /// Extract personal Markov data from a MarkovChain for snapshot.
 pub fn extract_markov_snapshot(
-    bigrams: &HashMap<String, (HashMap<String, u32>, u32)>,
-    trigrams: &HashMap<String, HashMap<String, (HashMap<String, u32>, u32)>>,
+    bigrams: &crate::markov::BigramData,
+    trigrams: &crate::markov::TrigramData,
 ) -> PersonalMarkovSnapshot {
     let mut bi = Vec::new();
     for (ctx, (followers, _)) in bigrams {

@@ -298,6 +298,42 @@ fn bench_personal_serialization(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark: BPE tokenization (v0.4.0 module)
+// ---------------------------------------------------------------------------
+
+fn bench_bpe_tokenize(c: &mut Criterion) {
+    use smartkey_core::bpe::{parse_merge_rules, BpeTokenizer};
+    use std::collections::HashMap;
+
+    // Build a BPE tokenizer with synthetic merge rules.
+    let raw_rules: Vec<(String, String, String)> = (0..50)
+        .map(|i| {
+            let a = format!("t{i}");
+            let b = format!("t{}", i + 1);
+            let merged = format!("t{i}t{}", i + 1);
+            (a, b, merged)
+        })
+        .collect();
+    let merge_rules = parse_merge_rules(&raw_rules);
+    let mut token_freqs = HashMap::new();
+    for i in 0..100 {
+        token_freqs.insert(format!("t{i}"), (100 - i) as u32);
+    }
+    let bpe = BpeTokenizer::new(merge_rules, token_freqs);
+
+    let mut group = c.benchmark_group("bpe_tokenize");
+    for word_len in [5, 10, 20] {
+        let word: String = (0..word_len).map(|i| format!("t{}", i % 50)).collect();
+        group.bench_with_input(BenchmarkId::new("word_len", word_len), &word, |b, w| {
+            b.iter(|| {
+                black_box(bpe.tokenize(black_box(w)));
+            });
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
 
@@ -311,5 +347,6 @@ criterion_group!(
     bench_cvm_process_and_score,
     bench_fuzzy_search,
     bench_personal_serialization,
+    bench_bpe_tokenize,
 );
 criterion_main!(benches);

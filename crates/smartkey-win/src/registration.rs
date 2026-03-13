@@ -79,7 +79,13 @@ fn is_hklm_writable() -> bool {
     let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
     let mut hkey = HKEY::default();
     let result = unsafe {
-        RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(subkey_w.as_ptr()), 0, KEY_WRITE, &mut hkey)
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_w.as_ptr()),
+            0,
+            KEY_WRITE,
+            &mut hkey,
+        )
     };
     if result.0 == 0 {
         let _ = unsafe { RegCloseKey(hkey) };
@@ -116,9 +122,7 @@ fn register_com_server_hkcu(dll_path: &str) -> Result<()> {
     let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
 
     let mut hkey = HKEY::default();
-    check_win32(unsafe {
-        RegCreateKeyW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr()), &mut hkey)
-    })?;
+    check_win32(unsafe { RegCreateKeyW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr()), &mut hkey) })?;
 
     set_reg_sz(hkey, None, dll_path)?;
     set_reg_sz(hkey, Some("ThreadingModel"), "Apartment")?;

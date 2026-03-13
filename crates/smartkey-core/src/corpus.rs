@@ -48,7 +48,7 @@ pub struct Corpus {
     pub bigrams: Vec<CorpusBigram>,
     pub trigrams: Vec<CorpusTrigram>,
     /// Optional BPE merge rules for OOV fallback (v0.4.0).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub bpe_merges: Vec<CorpusBpeMerge>,
 }
 

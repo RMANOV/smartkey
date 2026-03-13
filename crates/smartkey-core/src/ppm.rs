@@ -72,7 +72,7 @@ impl PpmModel {
         let mut log_prob = 0.0;
         for i in 0..chars.len() {
             // Build context from preceding characters (up to max_order).
-            let ctx_start = if i > self.max_order { i - self.max_order } else { 0 };
+            let ctx_start = i.saturating_sub(self.max_order);
             let context: Vec<char> = chars[ctx_start..i].to_vec();
             let p = self.char_probability(&context, chars[i]);
             if p <= 0.0 {
@@ -84,10 +84,7 @@ impl PpmModel {
 
         // Give bonus if candidate starts with the prefix.
         let prefix_chars: Vec<char> = prefix.chars().collect();
-        let prefix_match = chars
-            .iter()
-            .zip(prefix_chars.iter())
-            .all(|(a, b)| a == b);
+        let prefix_match = chars.iter().zip(prefix_chars.iter()).all(|(a, b)| a == b);
         if !prefix_match {
             log_prob -= 10.0; // heavy penalty for non-matching prefix
         }
@@ -116,9 +113,9 @@ impl PpmModel {
             if let Some(node) = self.find_node(ctx) {
                 if node.total > 0 {
                     for (ch, (_, count)) in &node.children {
-                        results.entry(*ch).or_insert_with(|| {
-                            *count as f64 / node.total as f64
-                        });
+                        results
+                            .entry(*ch)
+                            .or_insert_with(|| *count as f64 / node.total as f64);
                     }
                     break; // Use highest order that has data
                 }
@@ -133,7 +130,7 @@ impl PpmModel {
 
     /// Number of nodes in the tree (for memory estimation).
     pub fn node_count(&self) -> usize {
-        self.count_nodes(&self.root)
+        Self::count_nodes(&self.root)
     }
 
     /// Prune nodes with count below threshold to control memory.
@@ -199,11 +196,11 @@ impl PpmModel {
         1.0 / 256.0
     }
 
-    fn count_nodes(&self, node: &PpmNode) -> usize {
+    fn count_nodes(node: &PpmNode) -> usize {
         1 + node
             .children
             .values()
-            .map(|(child, _)| self.count_nodes(child))
+            .map(|(child, _)| Self::count_nodes(child))
             .sum::<usize>()
     }
 
@@ -247,7 +244,10 @@ mod tests {
         let m = trained_model();
         // "h" context → next chars should include 'e' (from hello, help, hero, helicopter)
         let ranked = m.rank_next_chars("h", 5);
-        assert!(!ranked.is_empty(), "should have next-char predictions after 'h'");
+        assert!(
+            !ranked.is_empty(),
+            "should have next-char predictions after 'h'"
+        );
         // 'e' should be top (all h-words continue with 'e')
         assert_eq!(ranked[0].0, 'e', "most likely char after 'h' should be 'e'");
     }
@@ -282,11 +282,14 @@ mod tests {
     fn test_ppm_order_fallback() {
         let m = trained_model();
         // Unseen context should still produce results via lower-order fallback
-        let ranked = m.rank_next_chars("xyz", 5);
+        let _ranked = m.rank_next_chars("xyz", 5);
         // May be empty (no data at all for 'xyz') or may have fallback results
         // from lower orders — either is acceptable
         let score = m.score_candidate("xyz", "xyzabc");
-        assert!(score > 0.0, "score should be > 0 even for unseen context (uniform fallback)");
+        assert!(
+            score > 0.0,
+            "score should be > 0 even for unseen context (uniform fallback)"
+        );
     }
 
     #[test]
@@ -295,7 +298,10 @@ mod tests {
         let ranked = m.rank_next_chars("h", 5);
         assert!(ranked.is_empty());
         let score = m.score_candidate("", "hello");
-        assert!(score > 0.0, "empty model should still give non-zero uniform score");
+        assert!(
+            score > 0.0,
+            "empty model should still give non-zero uniform score"
+        );
     }
 
     #[test]
@@ -318,6 +324,9 @@ mod tests {
         m.train_word("зима");
 
         let ranked = m.rank_next_chars("здрав", 5);
-        assert!(!ranked.is_empty(), "should rank next chars for Cyrillic prefix");
+        assert!(
+            !ranked.is_empty(),
+            "should rank next chars for Cyrillic prefix"
+        );
     }
 }
