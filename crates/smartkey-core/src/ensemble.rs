@@ -119,7 +119,8 @@ impl SmartKeyEngine {
             // avoid scoring the same word twice.
             let exact_words: HashSet<&str> = candidates.iter().map(|c| c.word.as_str()).collect();
 
-            let mut discount_map: HashMap<String, f64> = HashMap::with_capacity(fuzzy_matches.len());
+            let mut discount_map: HashMap<String, f64> =
+                HashMap::with_capacity(fuzzy_matches.len());
             let mut merged: Vec<WordEntry> = Vec::with_capacity(fuzzy_matches.len());
             for fm in &fuzzy_matches {
                 if exact_words.contains(fm.word.as_str()) {

@@ -306,7 +306,8 @@ impl InputMethodCore {
             Key::Tab => {
                 if !self.ghost.is_empty() {
                     let full_word = format!("{}{}", self.current_word, self.ghost);
-                    let actions = vec![Action::CommitText(full_word.clone()), Action::HideGhost];
+                    // Commit only the ghost suffix — typed chars were already forwarded.
+                    let actions = vec![Action::CommitText(self.ghost.clone()), Action::HideGhost];
                     self.commit_word(&full_word);
                     self.reset_word();
                     actions
@@ -566,9 +567,9 @@ mod tests {
         assert!(g.is_some(), "should have ghost text for 'hel'");
         assert_eq!(g.unwrap(), "lo");
 
-        // Tab → commit "hello".
+        // Tab → commit ghost suffix "lo" (typed "hel" was already forwarded).
         let actions = core.handle_key(press(Key::Tab));
-        assert!(has_action(&actions, &Action::CommitText("hello".into())));
+        assert!(has_action(&actions, &Action::CommitText("lo".into())));
         assert!(has_action(&actions, &Action::HideGhost));
 
         // State should be reset.

@@ -101,12 +101,12 @@ fn tab_acceptance_then_bigram_boost() {
     }"#;
     load_json_corpus(&mut core, corpus);
 
-    // Type "hel" → ghost "lo" → Tab to commit "hello".
+    // Type "hel" → ghost "lo" → Tab commits ghost suffix only (typed chars were forwarded).
     type_string(&mut core, "hel");
     let actions = core.handle_key(press(Key::Tab));
     assert!(
-        has_action(&actions, &Action::CommitText("hello".into())),
-        "Tab should commit 'hello'"
+        has_action(&actions, &Action::CommitText("lo".into())),
+        "Tab should commit ghost suffix 'lo' (not full word)"
     );
 
     // Now type "wor" — with "hello" in context, "world" should rank first

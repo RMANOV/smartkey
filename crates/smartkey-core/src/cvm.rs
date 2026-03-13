@@ -24,7 +24,6 @@ const DEFAULT_DECAY_LAMBDA: f64 = 0.001;
 /// Maintains a random sample of observed elements. When the sample buffer fills,
 /// a new "round" begins: half the elements are randomly evicted and the round
 /// counter increments. The cardinality estimate is `|buffer| * 2^round`.
-
 #[derive(Debug, Clone)]
 pub struct CvmCounter {
     /// Current memory capacity (may grow via [`adjust_memory`]).
@@ -173,8 +172,6 @@ impl CvmCounter {
             0.0
         }
     }
-
-    // ── internal ────────────────────────────────────────────────────────
 
     /// Snapshot the counter state for persistence / export.
     ///

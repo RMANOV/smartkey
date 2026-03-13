@@ -85,8 +85,7 @@ impl NgramTrie {
         // Min-heap of (frequency, word) — keeps top-K by frequency.
         // Reverse wrapping makes this a min-heap so we can efficiently
         // evict the weakest candidate when a better one appears.
-        let mut heap: BinaryHeap<Reverse<(u32, String)>> =
-            BinaryHeap::with_capacity(limit + 1);
+        let mut heap: BinaryHeap<Reverse<(u32, String)>> = BinaryHeap::with_capacity(limit + 1);
         let mut current_word = prefix.to_string();
         Self::collect_top_k(node, &mut current_word, limit, &mut heap);
 
@@ -94,7 +93,10 @@ impl NgramTrie {
         // = descending original order = highest frequency first. Exactly what we want.
         heap.into_sorted_vec()
             .into_iter()
-            .map(|Reverse((freq, word))| WordEntry { word, frequency: freq })
+            .map(|Reverse((freq, word))| WordEntry {
+                word,
+                frequency: freq,
+            })
             .collect()
     }
 
@@ -120,18 +122,11 @@ impl NgramTrie {
         // Max-heap: (edit_distance, Reverse(frequency), word).
         // The maximum = worst entry (highest distance, lowest frequency).
         // peek() returns the worst → evict when a better entry arrives.
-        let mut heap: BinaryHeap<(u8, Reverse<u32>, String)> =
-            BinaryHeap::with_capacity(limit + 1);
+        let mut heap: BinaryHeap<(u8, Reverse<u32>, String)> = BinaryHeap::with_capacity(limit + 1);
 
         // Special case: empty prefix matches every word at distance 0.
         if prefix_len == 0 {
-            Self::collect_words_bounded(
-                &self.root,
-                &mut String::new(),
-                0,
-                &mut heap,
-                limit,
-            );
+            Self::collect_words_bounded(&self.root, &mut String::new(), 0, &mut heap, limit);
             // into_sorted_vec returns ascending = (dist ASC, freq DESC). Correct order.
             return heap
                 .into_sorted_vec()
@@ -287,7 +282,10 @@ impl NgramTrie {
             // Check acceptance BEFORE cloning the string.
             if heap.len() < limit {
                 heap.push(Reverse((freq, current_word.clone())));
-            } else if heap.peek().map_or(false, |&Reverse((min_freq, _))| freq > min_freq) {
+            } else if heap
+                .peek()
+                .map_or(false, |&Reverse((min_freq, _))| freq > min_freq)
+            {
                 heap.pop();
                 heap.push(Reverse((freq, current_word.clone())));
             }
