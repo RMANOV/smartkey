@@ -3,14 +3,21 @@
 use std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 
+use crate::bpe::BpeTokenizer;
 use crate::cache::PredictionCache;
 use crate::cvm::{CvmCounter, CvmSnapshot};
+use crate::hedge::HedgeMixer;
 use crate::input::InputConfig;
+use crate::kneser_ney::KneserNeyScorer;
+use crate::lang_cvm::LangCvmTracks;
+use crate::lang_detect::LangId;
 use crate::markov::MarkovChain;
 use crate::ngram::{NgramTrie, WordEntry};
 use crate::personal::{
     extract_markov_snapshot, AdaptiveWeightsSnapshot, PersonalProfile,
 };
+use crate::ppm::PpmModel;
+use crate::session_cache::SessionCacheLM;
 
 /// A single prediction with its ensemble score and UI confidence.
 #[derive(Debug, Clone)]
@@ -33,6 +40,9 @@ const DECAY_INTERVAL: u32 = 20;
 /// Decay rate toward default weights.
 const DECAY_RATE: f64 = 0.1;
 
+/// Session cache blend factor: personal_score = max(cvm, session_cache * BLEND).
+const SESSION_BLEND: f64 = 0.4;
+
 /// Unified prediction engine that blends three scoring signals:
 ///
 /// * **Corpus frequency** (α) — how common the word is in the language model trie.
@@ -44,6 +54,8 @@ pub struct SmartKeyEngine {
     trie: NgramTrie,
     markov: MarkovChain,
     personal: CvmCounter,
+    /// Per-language CVM tracks (v0.4.0) — separate vocabulary per detected language.
+    personal_tracks: LangCvmTracks,
     /// Personal Markov chain — learns from user input, separate from corpus Markov.
     personal_markov: MarkovChain,
     /// Blend factor: `markov_score = (1-δ) * corpus_markov + δ * personal_markov`.
@@ -62,6 +74,23 @@ pub struct SmartKeyEngine {
     /// Prediction cache (Mutex: predict takes &self but cache needs mutation;
     /// Mutex instead of RefCell for Send+Sync required by PyO3).
     cache: Mutex<PredictionCache>,
+    /// PPM character-level model (v0.4.0, behind flag).
+    ppm: Option<PpmModel>,
+    /// BPE tokenizer for OOV fallback (v0.4.0).
+    bpe: Option<BpeTokenizer>,
+    /// Session cache LM for burstiness tracking (v0.4.0).
+    session_cache: SessionCacheLM,
+    /// Interpolated Kneser-Ney scorer (experimental, behind flag).
+    kn_scorer: Option<KneserNeyScorer>,
+    /// Hedge/Exp3 adaptive weight mixer (experimental, behind flag).
+    hedge: Option<HedgeMixer>,
+    /// Feature flags snapshot from config.
+    use_session_cache_lm: bool,
+    use_ppm: bool,
+    bpe_enabled: bool,
+    lang_detection: bool,
+    use_kneser_ney: bool,
+    use_hedge: bool,
 }
 
 impl SmartKeyEngine {
@@ -78,6 +107,11 @@ impl SmartKeyEngine {
             markov: MarkovChain::with_lambdas(config.markov_lambdas),
             personal: CvmCounter::new(config.cvm_initial_size, config.cvm_max_size)
                 .with_decay_lambda(config.cvm_decay_lambda),
+            personal_tracks: LangCvmTracks::new(
+                config.cvm_initial_size,
+                config.cvm_max_size,
+                config.cvm_decay_lambda,
+            ),
             personal_markov: MarkovChain::new(),
             personal_markov_delta: DEFAULT_PERSONAL_MARKOV_DELTA,
             alpha: config.weights.0,
@@ -90,12 +124,39 @@ impl SmartKeyEngine {
             fuzzy_max_edits: config.fuzzy_max_edits,
             fuzzy_discounts: config.fuzzy_discounts,
             cache: Mutex::new(PredictionCache::new()),
+            ppm: if config.use_ppm {
+                Some(PpmModel::default_order())
+            } else {
+                None
+            },
+            bpe: None, // Loaded from corpus if bpe_enabled
+            session_cache: SessionCacheLM::new(),
+            kn_scorer: None, // Built lazily after corpus load when flag is set
+            hedge: if config.use_hedge {
+                Some(HedgeMixer::with_defaults(&[
+                    config.weights.0,
+                    config.weights.1,
+                    config.weights.2,
+                ]))
+            } else {
+                None
+            },
+            use_session_cache_lm: config.use_session_cache_lm,
+            use_ppm: config.use_ppm,
+            bpe_enabled: config.bpe_enabled,
+            lang_detection: config.lang_detection,
+            use_kneser_ney: config.use_kneser_ney,
+            use_hedge: config.use_hedge,
         }
     }
 
     /// Insert a word with its corpus frequency into the trie.
     pub fn load_word(&mut self, word: &str, frequency: u32) {
         self.trie.insert(word, frequency);
+        // Train PPM model if enabled.
+        if let Some(ref mut ppm) = self.ppm {
+            ppm.train_word(word);
+        }
     }
 
     /// Train a bigram transition `context → word` with the given count.
@@ -112,6 +173,40 @@ impl SmartKeyEngine {
     pub fn learn(&mut self, word: &str) {
         self.personal.process(word);
         self.cache.lock().unwrap().invalidate();
+    }
+
+    /// Feed a word into the per-language CVM track.
+    pub fn learn_with_lang(&mut self, word: &str, lang: LangId) {
+        self.personal_tracks.learn(word, lang);
+        self.cache.lock().unwrap().invalidate();
+    }
+
+    /// Set the BPE tokenizer (loaded from corpus).
+    pub fn set_bpe(&mut self, bpe: BpeTokenizer) {
+        self.bpe = Some(bpe);
+    }
+
+    /// Record a word commit in the session cache for burstiness tracking.
+    pub fn observe_session(&mut self, word: &str) {
+        self.session_cache.observe(word);
+    }
+
+    /// Clear the session cache (e.g. on session restart).
+    pub fn clear_session_cache(&mut self) {
+        self.session_cache.clear();
+    }
+
+    /// Build the Kneser-Ney scorer from the currently loaded Markov data.
+    ///
+    /// Call after corpus loading is complete. Only effective when `use_kneser_ney`
+    /// flag is set; otherwise a no-op.
+    pub fn build_kneser_ney(&mut self) {
+        if self.use_kneser_ney {
+            self.kn_scorer = Some(KneserNeyScorer::from_markov_data(
+                self.markov.bigrams_raw(),
+                self.markov.trigrams_raw(),
+            ));
+        }
     }
 
     /// Train the personal Markov chain with online bigram/trigram data.
@@ -148,34 +243,51 @@ impl SmartKeyEngine {
         let markov_score = self.markov.score_with_backoff(word, prev1, prev2);
         let personal_score = self.personal.frequency_score(word);
 
-        // Find dominant component.
-        let scores = [
-            (0usize, corpus_score),
-            (1, markov_score),
-            (2, personal_score),
-        ];
-        let dominant = scores
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|&(idx, _)| idx)
-            .unwrap_or(0);
+        if self.use_hedge {
+            // Hedge/Exp3 multiplicative weights update.
+            // Normalize raw scores to [0,1] rewards.
+            let max_s = corpus_score.max(markov_score).max(personal_score).max(1e-6);
+            let rewards = [
+                corpus_score / max_s,
+                markov_score / max_s,
+                personal_score / max_s,
+            ];
+            if let Some(ref mut hedge) = self.hedge {
+                hedge.update(&rewards);
+                let (a, b, g) = hedge.weights_triple();
+                self.alpha = a;
+                self.beta = b;
+                self.gamma = g;
+            }
+        } else {
+            // EMA update toward dominant component.
+            let scores = [
+                (0usize, corpus_score),
+                (1, markov_score),
+                (2, personal_score),
+            ];
+            let dominant = scores
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|&(idx, _)| idx)
+                .unwrap_or(0);
 
-        // EMA update toward dominant component.
-        let mut new_weights = [self.alpha, self.beta, self.gamma];
-        new_weights[dominant] += ADAPTIVE_LR * (1.0 - new_weights[dominant]);
+            let mut new_weights = [self.alpha, self.beta, self.gamma];
+            new_weights[dominant] += ADAPTIVE_LR * (1.0 - new_weights[dominant]);
 
-        // Renormalize to sum = 1.0.
-        let sum: f64 = new_weights.iter().sum();
-        if sum > 0.0 {
-            self.alpha = new_weights[0] / sum;
-            self.beta = new_weights[1] / sum;
-            self.gamma = new_weights[2] / sum;
+            // Renormalize to sum = 1.0.
+            let sum: f64 = new_weights.iter().sum();
+            if sum > 0.0 {
+                self.alpha = new_weights[0] / sum;
+                self.beta = new_weights[1] / sum;
+                self.gamma = new_weights[2] / sum;
+            }
         }
 
         self.commit_count += 1;
 
-        // Decay toward defaults every DECAY_INTERVAL commits.
-        if self.commit_count % DECAY_INTERVAL == 0 {
+        // Decay toward defaults every DECAY_INTERVAL commits (EMA path only).
+        if !self.use_hedge && self.commit_count % DECAY_INTERVAL == 0 {
             self.alpha += DECAY_RATE * (self.default_alpha - self.alpha);
             self.beta += DECAY_RATE * (self.default_beta - self.beta);
             self.gamma += DECAY_RATE * (self.default_gamma - self.gamma);
@@ -191,7 +303,7 @@ impl SmartKeyEngine {
         self.cache.lock().unwrap().invalidate();
     }
 
-    /// Export the full personal profile (CVM + Markov + weights).
+    /// Export the full personal profile (CVM + Markov + weights + lang CVM).
     pub fn export_personal_profile(&self) -> PersonalProfile {
         let cvm = self.personal.to_snapshot();
         let markov = extract_markov_snapshot(
@@ -205,12 +317,18 @@ impl SmartKeyEngine {
             personal_markov_delta: self.personal_markov_delta,
             commit_count: self.commit_count,
         });
-        PersonalProfile::new(cvm, markov, weights)
+        let lang_cvm = self.personal_tracks.to_snapshot();
+        PersonalProfile::with_lang_cvm(cvm, markov, weights, lang_cvm)
     }
 
-    /// Import a full personal profile (CVM + Markov + weights).
+    /// Import a full personal profile (CVM + Markov + weights + lang CVM).
     pub fn import_personal_profile(&mut self, profile: &PersonalProfile) {
         self.personal = CvmCounter::from_snapshot(&profile.cvm);
+
+        // Restore per-language CVM tracks if present (v3).
+        if let Some(ref lang_snap) = profile.lang_cvm {
+            self.personal_tracks = LangCvmTracks::from_snapshot(lang_snap);
+        }
 
         // Restore personal Markov.
         self.personal_markov = MarkovChain::new();
@@ -268,7 +386,33 @@ impl SmartKeyEngine {
         let candidate_pool = limit * 3;
 
         // Step 1: candidate generation via trie prefix search.
-        let candidates = self.trie.prefix_search(prefix, candidate_pool);
+        // When PPM is enabled and prefix is short (≤ 1 char), use PPM to guide
+        // candidate generation — rank_next_chars() identifies the most likely
+        // next characters, then we search the trie with each extended prefix.
+        let candidates = if self.ppm.is_some() && !prefix.is_empty() && prefix.len() <= 1 {
+            let ppm = self.ppm.as_ref().unwrap();
+            let next_chars = ppm.rank_next_chars(prefix, 5);
+            let per_char_pool = candidate_pool / next_chars.len().max(1);
+            let mut guided: Vec<WordEntry> = Vec::new();
+            let mut seen = HashSet::new();
+            for (ch, _) in &next_chars {
+                let extended = format!("{}{}", prefix, ch);
+                for entry in self.trie.prefix_search(&extended, per_char_pool) {
+                    if seen.insert(entry.word.clone()) {
+                        guided.push(entry);
+                    }
+                }
+            }
+            // Also include regular prefix search results for coverage.
+            for entry in self.trie.prefix_search(prefix, candidate_pool) {
+                if seen.insert(entry.word.clone()) {
+                    guided.push(entry);
+                }
+            }
+            guided
+        } else {
+            self.trie.prefix_search(prefix, candidate_pool)
+        };
 
         // Step 1b: fuzzy fallback — if exact prefix returned fewer than `limit`
         // candidates, fill the gap with fuzzy matches (edit distance ≤ 2).
@@ -301,8 +445,30 @@ impl SmartKeyEngine {
             (Vec::new(), HashMap::new())
         };
 
-        // If both exact and fuzzy are empty, nothing to do.
+        // If both exact and fuzzy are empty, try BPE fallback.
         if candidates.is_empty() && fuzzy_candidates.is_empty() {
+            if self.bpe_enabled {
+                if let Some(ref bpe) = self.bpe {
+                    let bpe_suggestions = bpe.suggest_completions(prefix, limit);
+                    if !bpe_suggestions.is_empty() {
+                        let max_score = bpe_suggestions[0].1.max(1e-6);
+                        let mut preds: Vec<Prediction> = bpe_suggestions
+                            .into_iter()
+                            .map(|(word, score)| Prediction {
+                                word,
+                                score,
+                                confidence: score / max_score,
+                            })
+                            .collect();
+                        preds.truncate(limit);
+                        self.cache
+                            .lock()
+                            .unwrap()
+                            .put(prefix, context, preds.clone());
+                        return preds;
+                    }
+                }
+            }
             return Vec::new();
         }
 
@@ -333,6 +499,7 @@ impl SmartKeyEngine {
             corpus: f64,
             markov: f64,
             personal: f64,
+            ppm: f64,
         }
 
         // Stack-allocate for the common case (≤30 candidates; default limit*3=15).
@@ -341,21 +508,41 @@ impl SmartKeyEngine {
         let mut raw_large = Vec::new();
         let mut max_markov = 1e-6_f64;
         let mut max_personal = 1.0_f64;
+        let mut max_ppm = 1e-6_f64;
         let use_stack = all_candidates.len() <= 30;
 
         for c in &all_candidates {
             // Blend corpus Markov and personal Markov.
-            let corpus_m = self.markov.score_with_backoff(&c.word, prev1, prev2);
+            // When KN is enabled, use interpolated Kneser-Ney instead of Katz backoff.
+            let corpus_m = if let Some(ref kn) = self.kn_scorer {
+                kn.score(&c.word, prev1, prev2)
+            } else {
+                self.markov.score_with_backoff(&c.word, prev1, prev2)
+            };
             let personal_m = self.personal_markov.score_with_backoff(&c.word, prev1, prev2);
             let m = (1.0 - self.personal_markov_delta) * corpus_m
                 + self.personal_markov_delta * personal_m;
-            let p = self.personal.frequency_score(&c.word);
+            let cvm_score = self.personal.frequency_score(&c.word);
+            // Blend session cache into personal score if enabled.
+            let p = if self.use_session_cache_lm {
+                cvm_score.max(self.session_cache.score(&c.word) * SESSION_BLEND)
+            } else {
+                cvm_score
+            };
+            // PPM scoring (if enabled).
+            let ppm_score = if let Some(ref ppm) = self.ppm {
+                ppm.score_candidate(prefix, &c.word)
+            } else {
+                0.0
+            };
             max_markov = max_markov.max(m);
             max_personal = max_personal.max(p);
+            max_ppm = max_ppm.max(ppm_score);
             let scores = RawScores {
                 corpus: c.frequency as f64,
                 markov: m,
                 personal: p,
+                ppm: ppm_score,
             };
             if use_stack {
                 // SAFETY: use_stack guarantees len <= 30.
@@ -368,6 +555,19 @@ impl SmartKeyEngine {
         let raw: &[RawScores] = if use_stack { &raw_small } else { &raw_large };
 
         // Normalize and blend in a second pass (but no redundant score calls).
+        // When PPM is active, borrow δ weight from β (markov) for short prefixes.
+        let (eff_alpha, eff_beta, eff_gamma, eff_delta) = if self.ppm.is_some() && prefix.len() <= 1 {
+            // Short prefix: PPM gets 0.15 borrowed from markov.
+            let delta = 0.15_f64.min(self.beta * 0.5);
+            (self.alpha, self.beta - delta, self.gamma, delta)
+        } else if self.ppm.is_some() {
+            // Longer prefix: PPM gets a smaller share.
+            let delta = 0.05_f64.min(self.beta * 0.2);
+            (self.alpha, self.beta - delta, self.gamma, delta)
+        } else {
+            (self.alpha, self.beta, self.gamma, 0.0)
+        };
+
         let mut scored: Vec<Prediction> = all_candidates
             .iter()
             .zip(raw.iter())
@@ -375,10 +575,12 @@ impl SmartKeyEngine {
                 let corpus_score = r.corpus / max_freq;
                 let markov_score = r.markov / max_markov;
                 let personal_score = r.personal / max_personal;
+                let ppm_score = if max_ppm > 1e-6 { r.ppm / max_ppm } else { 0.0 };
 
-                let mut score = self.alpha * corpus_score
-                    + self.beta * markov_score
-                    + self.gamma * personal_score;
+                let mut score = eff_alpha * corpus_score
+                    + eff_beta * markov_score
+                    + eff_gamma * personal_score
+                    + eff_delta * ppm_score;
 
                 // Apply fuzzy discount if this came from fuzzy matching.
                 if let Some(&discount) = discount_map.get(&entry.word) {

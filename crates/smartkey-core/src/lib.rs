@@ -1,12 +1,20 @@
+pub mod bpe;
 pub mod cache;
 pub mod corpus;
 pub mod cvm;
 pub mod ensemble;
+pub mod eval;
+pub mod hedge;
 pub mod input;
+pub mod kneser_ney;
+pub mod lang_cvm;
+pub mod lang_detect;
 pub mod markov;
 pub mod ngram;
 pub mod paths;
 pub mod personal;
+pub mod ppm;
+pub mod session_cache;
 
 pub use ensemble::SmartKeyEngine;
 pub use input::InputMethodCore;

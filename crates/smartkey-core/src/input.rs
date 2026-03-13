@@ -7,8 +7,11 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
+use std::time::Instant;
 
 use crate::ensemble::{Prediction, SmartKeyEngine};
+use crate::eval::PredictionMetrics;
+use crate::lang_detect::LanguageDetector;
 use crate::paths;
 use crate::personal;
 
@@ -92,6 +95,19 @@ pub struct InputConfig {
     /// Minimum absolute score for the top prediction to show ghost text.
     /// Predictions below this threshold are suppressed.
     pub ghost_text_min_confidence: f64,
+    // ── Feature flags (v0.4.0) ──────────────────────────────────
+    /// Enable language detection and per-language CVM tracks.
+    pub lang_detection: bool,
+    /// Enable session cache LM (burstiness boost for repeated words).
+    pub use_session_cache_lm: bool,
+    /// Enable PPM character-level prediction model.
+    pub use_ppm: bool,
+    /// Enable BPE-based OOV fallback suggestions.
+    pub bpe_enabled: bool,
+    /// Enable interpolated Kneser-Ney smoothing (experimental, replaces Katz).
+    pub use_kneser_ney: bool,
+    /// Enable Hedge/Exp3 adaptive weight mixer (experimental, replaces EMA).
+    pub use_hedge: bool,
 }
 
 impl Default for InputConfig {
@@ -109,6 +125,12 @@ impl Default for InputConfig {
             fuzzy_discounts: [1.0, 0.7, 0.4],
             markov_lambdas: [0.6, 0.3, 0.1],
             ghost_text_min_confidence: 0.3,
+            lang_detection: true,
+            use_session_cache_lm: true,
+            use_ppm: false,
+            bpe_enabled: true,
+            use_kneser_ney: false,
+            use_hedge: false,
         }
     }
 }
@@ -208,6 +230,10 @@ pub struct InputMethodCore {
     context: VecDeque<String>,
     enabled: bool,
     last_predictions: Vec<Prediction>,
+    /// Prediction quality and performance metrics (v0.4.0).
+    metrics: PredictionMetrics,
+    /// Character trigram language detector (v0.4.0).
+    lang_detector: LanguageDetector,
 }
 
 impl InputMethodCore {
@@ -215,6 +241,8 @@ impl InputMethodCore {
         let enabled = config.enabled;
         Self {
             engine: SmartKeyEngine::from_config(&config),
+            lang_detector: LanguageDetector::new(),
+            metrics: PredictionMetrics::new(),
             config,
             current_word: String::new(),
             ghost: String::new(),
@@ -318,7 +346,19 @@ impl InputMethodCore {
                     // Notify engine of accepted prediction for adaptive weight learning.
                     let ctx: Vec<&str> = self.context.iter().map(|s| s.as_str()).collect();
                     self.engine.on_prediction_accepted(&full_word, &ctx);
-                    self.commit_word(&full_word);
+                    // Record acceptance metrics: find rank in last_predictions.
+                    let rank = self
+                        .last_predictions
+                        .iter()
+                        .position(|p| p.word == full_word)
+                        .map(|i| i + 1) // 1-based
+                        .unwrap_or(1);
+                    self.metrics.record_acceptance(
+                        rank,
+                        self.ghost.len(),
+                        full_word.len(),
+                    );
+                    self.commit_word_internal(&full_word, false);
                     self.reset_word();
                     actions
                 } else {
@@ -355,7 +395,7 @@ impl InputMethodCore {
             Key::Space | Key::Return => {
                 if !self.current_word.is_empty() {
                     let word = std::mem::take(&mut self.current_word);
-                    self.commit_word(&word);
+                    self.commit_word_internal(&word, true);
                 }
                 self.reset_word();
                 vec![Action::HideGhost, Action::ForwardKey]
@@ -373,6 +413,10 @@ impl InputMethodCore {
             // Printable character: append and re-predict.
             Key::Char(ch) => {
                 self.current_word.push(ch);
+                // Feed character to language detector for bilingual switching.
+                if self.config.lang_detection {
+                    self.lang_detector.feed_char(ch);
+                }
                 let ghost_action = self.update_predictions();
                 vec![ghost_action, Action::ForwardKey]
             }
@@ -388,7 +432,7 @@ impl InputMethodCore {
     pub fn focus_lost(&mut self) -> Vec<Action> {
         if !self.current_word.is_empty() {
             let word = std::mem::take(&mut self.current_word);
-            self.commit_word(&word);
+            self.commit_word_internal(&word, true);
         }
         self.reset_word();
         vec![Action::HideGhost]
@@ -463,10 +507,26 @@ impl InputMethodCore {
         self.load_personal(&paths::personal_profile_path())
     }
 
+    /// Access prediction metrics (read-only).
+    pub fn metrics(&self) -> &PredictionMetrics {
+        &self.metrics
+    }
+
+    /// Access the current detected language.
+    pub fn detected_language(&self) -> crate::lang_detect::DetectedLanguage {
+        self.lang_detector.detected()
+    }
+
     // -- internal helpers -----------------------------------------------
 
-    fn commit_word(&mut self, word: &str) {
+    /// Shared commit logic. `record_commit_metric` is false for Tab-accepted
+    /// words (already recorded via `record_acceptance`).
+    fn commit_word_internal(&mut self, word: &str, record_commit_metric: bool) {
         if !word.is_empty() {
+            if record_commit_metric {
+                self.metrics.record_commit(word.len());
+            }
+
             // Extract context BEFORE pushing new word (for online Markov training).
             let prev1 = self.context.back().map(|s| s.as_str());
             let prev2 = if self.context.len() >= 2 {
@@ -477,6 +537,17 @@ impl InputMethodCore {
 
             self.engine.learn(word);
             self.engine.learn_online_markov(prev1, prev2, word);
+
+            // Feed word to per-language CVM track.
+            if self.config.lang_detection {
+                let lang = self.lang_detector.detected().lang;
+                self.engine.learn_with_lang(word, lang);
+            }
+
+            // Feed word to session cache LM for burstiness tracking.
+            if self.config.use_session_cache_lm {
+                self.engine.observe_session(word);
+            }
 
             if self.context.len() >= CONTEXT_SIZE {
                 self.context.pop_front();
@@ -492,16 +563,25 @@ impl InputMethodCore {
     }
 
     fn update_predictions(&mut self) -> Action {
-        if self.current_word.chars().count() < self.config.min_prefix_length {
+        // When PPM is enabled, lower min_prefix_length to 1 so predictions
+        // start on the first character (PPM guides candidate generation).
+        let effective_min = if self.config.use_ppm {
+            1
+        } else {
+            self.config.min_prefix_length
+        };
+        if self.current_word.chars().count() < effective_min {
             self.ghost.clear();
             self.last_predictions.clear();
             return Action::HideGhost;
         }
 
         let ctx_refs: arrayvec::ArrayVec<&str, 5> = self.context.iter().map(|s| s.as_str()).collect();
+        let t0 = Instant::now();
         self.last_predictions =
             self.engine
                 .predict(&self.current_word, &ctx_refs, self.config.max_candidates);
+        self.metrics.record_latency(t0.elapsed());
 
         if let Some(top) = self.last_predictions.first() {
             // T8: Suppress ghost text if top score is below confidence threshold.
