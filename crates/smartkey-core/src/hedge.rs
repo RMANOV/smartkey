@@ -103,7 +103,7 @@ impl HedgeMixer {
         self.update_count += 1;
 
         // Periodic decay toward defaults
-        if self.update_count % self.decay_interval == 0 {
+        if self.update_count.is_multiple_of(self.decay_interval) {
             for (w, d) in self.weights.iter_mut().zip(self.defaults.iter()) {
                 *w += self.decay_rate * (d - *w);
             }

@@ -284,7 +284,7 @@ impl SmartKeyEngine {
         self.commit_count += 1;
 
         // Decay toward defaults every DECAY_INTERVAL commits (EMA path only).
-        if !self.use_hedge && self.commit_count % DECAY_INTERVAL == 0 {
+        if !self.use_hedge && self.commit_count.is_multiple_of(DECAY_INTERVAL) {
             self.alpha += DECAY_RATE * (self.default_alpha - self.alpha);
             self.beta += DECAY_RATE * (self.default_beta - self.beta);
             self.gamma += DECAY_RATE * (self.default_gamma - self.gamma);
@@ -402,8 +402,11 @@ impl SmartKeyEngine {
         // When PPM is enabled and prefix is short (≤ 1 char), use PPM to guide
         // candidate generation — rank_next_chars() identifies the most likely
         // next characters, then we search the trie with each extended prefix.
-        let candidates = if self.ppm.is_some() && !prefix.is_empty() && prefix.len() <= 1 {
-            let ppm = self.ppm.as_ref().unwrap();
+        let candidates = if let Some(ppm) = self
+            .ppm
+            .as_ref()
+            .filter(|_| !prefix.is_empty() && prefix.len() <= 1)
+        {
             let next_chars = ppm.rank_next_chars(prefix, 5);
             let per_char_pool = candidate_pool / next_chars.len().max(1);
             let mut guided: Vec<WordEntry> = Vec::new();
