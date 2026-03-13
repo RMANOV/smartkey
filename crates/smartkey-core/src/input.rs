@@ -127,7 +127,7 @@ impl Default for InputConfig {
             fuzzy_max_edits: 2,
             fuzzy_discounts: [1.0, 0.7, 0.4],
             markov_lambdas: [0.6, 0.3, 0.1],
-            ghost_text_min_confidence: 0.3,
+            ghost_text_min_confidence: 0.15,
             lang_detection: true,
             use_session_cache_lm: true,
             use_ppm: false,
@@ -624,13 +624,22 @@ impl InputMethodCore {
         let en_freq = self.engine.max_prefix_frequency(&self.current_word);
         let bg_freq = self.engine.max_prefix_frequency(&bg_prefix);
 
+        let ratio = if en_freq > 0 {
+            bg_freq as f64 / en_freq as f64
+        } else if bg_freq > 0 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+
         #[cfg(debug_assertions)]
         eprintln!(
-            "smartkey: check_wrong_layout: '{}' → '{}' | en_freq={} bg_freq={} momentum={:?}",
+            "smartkey: check_wrong_layout: '{}' → '{}' | en_freq={} bg_freq={} ratio={:.1} momentum={:?}",
             self.current_word,
             bg_prefix,
             en_freq,
             bg_freq,
+            ratio,
             self.lang_detector.momentum_lang(),
         );
 
@@ -639,20 +648,12 @@ impl InputMethodCore {
             return false;
         }
 
-        // Only trigger when BG frequency dominates EN by ≥50x AND momentum
-        // confirms BG context. This is conservative: avoids false positives
-        // on legitimate English words while catching clear wrong-layout
-        // cases like "zd" (1351x), "mn" (550x), "ka" (224x).
-        // Words like "ok" (4.8x), "vs" (28x), "da" (32x) correctly don't trigger.
-        if bg_freq > 0 && en_freq > 0 {
-            let ratio = bg_freq as f64 / en_freq as f64;
-            if ratio >= 50.0 && self.lang_detector.momentum_lang() == Some(LangId::Bg) {
-                return true;
-            }
-        }
-
-        // BG has candidates but EN has zero — still require BG momentum.
-        if bg_freq > 0 && en_freq == 0 && self.lang_detector.momentum_lang() == Some(LangId::Bg) {
+        // Trigger when BG frequency dominates EN by ≥50x (or EN has zero).
+        // Momentum guard above already blocked EN momentum; here we allow
+        // None (cold start) and Some(Bg) — that's what `!= Some(En)` achieves.
+        // Conservative: "ok" (4.8x), "vs" (28x), "da" (32x) don't trigger.
+        // Clear wrong-layout: "zd" (1351x), "mn" (550x), "ka" (224x) do.
+        if bg_freq > 0 && ratio >= 50.0 {
             return true;
         }
 
@@ -1053,14 +1054,14 @@ mod tests {
     }
 
     #[test]
-    fn test_wrong_layout_no_momentum_no_trigger() {
-        // "zd" — high ratio but NO momentum → should NOT trigger.
-        // This prevents false positives at session start.
+    fn test_wrong_layout_cold_start_triggers() {
+        // "zd" — ratio=1351x, momentum=None (cold start).
+        // With != Some(En), None momentum allows triggering for extreme ratios.
         let mut core = test_core_bilingual();
         core.current_word = "zd".into();
         assert!(
-            !core.check_wrong_layout(),
-            "'zd' without BG momentum should NOT trigger"
+            core.check_wrong_layout(),
+            "'zd' at cold start (momentum=None) should trigger (ratio=1351x)"
         );
     }
 
