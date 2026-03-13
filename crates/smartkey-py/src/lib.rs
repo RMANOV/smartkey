@@ -105,6 +105,9 @@ fn action_to_tuple(action: &Action) -> (String, String) {
         Action::HideGhost => ("hide".into(), String::new()),
         Action::CommitText(text) => ("commit".into(), text.clone()),
         Action::ForwardKey => ("forward".into(), String::new()),
+        Action::ReplaceWord { replace_len, text } => {
+            ("replace".into(), format!("{replace_len}:{text}"))
+        }
     }
 }
 

@@ -179,6 +179,18 @@ impl SmartKeyTextService {
                     // Key must reach the application — override any prior consumption.
                     consumed = false;
                 }
+                Action::ReplaceWord { replace_len: _, text } => {
+                    // TODO: Implement TSF range replacement via ITfRange.
+                    // For now, treat as CommitText (replace full composition).
+                    let op = EditOp::CommitText {
+                        text: text.clone(),
+                        composition: self.composition.clone(),
+                    };
+                    if let Err(e) = edit_session::request_edit_session(context, cid, op) {
+                        eprintln!("smartkey: ReplaceWord failed: {e}");
+                    }
+                    consumed = true;
+                }
             }
         }
         consumed

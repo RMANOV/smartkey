@@ -383,6 +383,15 @@ fn actions_to_c(actions: Vec<Action>) -> *mut CActionList {
                 action_type: 3,
                 payload: ptr::null_mut(),
             },
+            Action::ReplaceWord { replace_len, text } => {
+                let payload = format!("{replace_len}:{text}");
+                CAction {
+                    action_type: 4,
+                    payload: CString::new(payload.replace('\0', ""))
+                        .expect("null-free after replace")
+                        .into_raw(),
+                }
+            }
         })
         .collect();
 
