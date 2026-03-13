@@ -44,9 +44,20 @@ pub fn register(dll_path: &str) -> Result<bool> {
         register_categories()?;
         Ok(true)
     } else {
-        register_com_server_hkcu(dll_path)?;
-        register_tip_profile(dll_path, TF_RP_LOCALPROCESS)?;
-        register_categories()?;
+        register_com_server_hkcu(dll_path).map_err(|e| {
+            eprintln!("  [FAIL] COM server (HKCU): {e}");
+            e
+        })?;
+        eprintln!("  [OK] COM server registered (HKCU)");
+        register_tip_profile(dll_path, TF_RP_LOCALPROCESS).map_err(|e| {
+            eprintln!("  [FAIL] TIP profile: {e}");
+            e
+        })?;
+        eprintln!("  [OK] TIP profile registered");
+        match register_categories() {
+            Ok(()) => eprintln!("  [OK] Categories registered"),
+            Err(e) => eprintln!("  [SKIP] Categories (needs admin): {e}"),
+        }
         Ok(false)
     }
 }
