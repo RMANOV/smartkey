@@ -150,6 +150,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # Debounce timer for auto-save on focus-out (60s cooldown).
         self._last_save: float = 0.0
 
+        # IBus client capabilities (set by do_set_capabilities callback).
+        self._caps: int = 0
+
         # Load corpus.
         self._load_corpus()
 
@@ -213,9 +216,23 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 self._clear_ghost()
             elif action_type == "commit":
                 self.commit_text(IBus.Text.new_from_string(payload))
+            elif action_type == "replace":
+                n_str, text = payload.split(":", 1)
+                replace_len = int(n_str)
+                if self._caps & 0x8:  # SURROUNDING_TEXT capability
+                    self.delete_surrounding_text(-replace_len, replace_len)
+                else:
+                    # Fallback: backspace key events for apps without
+                    # surrounding text support (GTK4 Wayland, Electron, etc.)
+                    for _ in range(replace_len):
+                        self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
+                self.commit_text(IBus.Text.new_from_string(text))
             elif action_type == "forward":
                 consumed = False
         return consumed
+
+    def do_set_capabilities(self, caps: int) -> None:
+        self._caps = caps
 
     # -----------------------------------------------------------------------
     # Key event handler.
