@@ -429,13 +429,10 @@ impl InputMethodCore {
                         self.current_word.pop(); // Remove the Latin char
                         self.current_word.push(cyrillic);
                         let ghost_action = self.update_predictions();
-                        return vec![
-                            Action::ReplaceWord {
-                                replace_len: 1,
-                                text: cyrillic.to_string(),
-                            },
-                            ghost_action,
-                        ];
+                        // The Latin key was consumed by SmartKey (not forwarded
+                        // to the app), so just commit the Cyrillic char directly
+                        // — no delete/replace needed.
+                        return vec![Action::CommitText(cyrillic.to_string()), ghost_action];
                     }
                 }
 
@@ -446,7 +443,10 @@ impl InputMethodCore {
                 {
                     self.transliteration_active = true;
                     let transliterated = lang_detect::transliterate(&self.current_word);
-                    let replace_len = self.current_word.len();
+                    // Only previously-forwarded chars are in the application text.
+                    // The current char that triggered detection was consumed (not forwarded),
+                    // so subtract 1.
+                    let replace_len = self.current_word.len() - 1;
                     self.current_word = transliterated;
                     let ghost_action = self.update_predictions();
                     return vec![

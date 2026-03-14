@@ -219,7 +219,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             elif action_type == "replace":
                 n_str, text = payload.split(":", 1)
                 replace_len = int(n_str)
-                if self._caps & 0x8:  # SURROUNDING_TEXT capability
+                if self._caps & 0x20:  # SURROUNDING_TEXT capability
                     self.delete_surrounding_text(-replace_len, replace_len)
                 else:
                     # Fallback: backspace key events for apps without
