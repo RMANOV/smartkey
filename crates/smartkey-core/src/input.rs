@@ -9,8 +9,10 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::time::Instant;
 
+use crate::dual_buffer::{DualBuffer, DualBufferConfig};
 use crate::ensemble::{Prediction, SmartKeyEngine};
 use crate::eval::PredictionMetrics;
+use crate::keymap;
 use crate::lang_detect::{self, LangId, LanguageDetector};
 use crate::paths;
 use crate::personal;
@@ -42,6 +44,10 @@ pub enum Key {
     Backspace,
     Space,
     Return,
+    /// Raw hardware scancode (evdev) for dual-buffer layout-agnostic input.
+    /// Routed through the dual buffer when enabled, resolved to `Char` or
+    /// a special key otherwise.
+    RawCode(u16),
     /// Unrecognised key — pass through.
     Other(u32),
 }
@@ -111,6 +117,9 @@ pub struct InputConfig {
     pub use_kneser_ney: bool,
     /// Enable Hedge/Exp3 adaptive weight mixer (experimental, replaces EMA).
     pub use_hedge: bool,
+    // ── Dual buffer (v0.5.0) ─────────────────────────────────────
+    /// Enable layout-agnostic dual-buffer input.
+    pub dual_buffer: DualBufferConfig,
 }
 
 impl Default for InputConfig {
@@ -134,6 +143,7 @@ impl Default for InputConfig {
             bpe_enabled: true,
             use_kneser_ney: false,
             use_hedge: false,
+            dual_buffer: DualBufferConfig::default(),
         }
     }
 }
@@ -178,6 +188,17 @@ impl InputConfig {
                     config.weights = (a, b, c);
                 } else {
                     eprintln!("smartkey: weights sum to {sum:.3}, expected 1.0 — using defaults");
+                }
+            }
+            if let Some(db) = v.get("dual_buffer").and_then(|v| v.as_object()) {
+                if let Some(b) = db.get("enabled").and_then(|v| v.as_bool()) {
+                    config.dual_buffer.enabled = b;
+                }
+                if let Some(f) = db.get("lock_threshold").and_then(|v| v.as_f64()) {
+                    config.dual_buffer.lock_threshold = f;
+                }
+                if let Some(n) = db.get("min_lock_chars").and_then(|v| v.as_u64()) {
+                    config.dual_buffer.min_lock_chars = n as usize;
                 }
             }
             if let Some(t) = v.get("tuning").and_then(|v| v.as_object()) {
@@ -239,6 +260,9 @@ pub struct InputMethodCore {
     lang_detector: LanguageDetector,
     /// Whether transliteration mode is active for the current word (v0.4.1).
     transliteration_active: bool,
+    /// Dual-interpretation buffer for layout-agnostic input (v0.5.0).
+    /// `Some` when active (after first `Key::RawCode` in a word), `None` otherwise.
+    dual_buffer: Option<DualBuffer>,
 }
 
 impl InputMethodCore {
@@ -255,6 +279,7 @@ impl InputMethodCore {
             enabled,
             last_predictions: Vec::new(),
             transliteration_active: false,
+            dual_buffer: None,
         }
     }
 
@@ -342,6 +367,42 @@ impl InputMethodCore {
             return vec![Action::ForwardKey];
         }
 
+        // ── Resolve RawCode (v0.5.0) ─────────────────────────────────
+        // Convert hardware scancode to either a dual-buffer operation or
+        // a regular Key before entering the main match.
+        let event = if let Key::RawCode(code) = event.key {
+            let shift = event.modifiers.contains(Modifiers::SHIFT);
+            // Special keys (Tab, Space, etc.) → rewrite to their Key variant.
+            if let Some(special) = keymap::scancode_to_special(code) {
+                let key = match special {
+                    keymap::SpecialKey::Tab => Key::Tab,
+                    keymap::SpecialKey::Escape => Key::Escape,
+                    keymap::SpecialKey::Backspace => Key::Backspace,
+                    keymap::SpecialKey::Return => Key::Return,
+                    keymap::SpecialKey::Space => Key::Space,
+                    keymap::SpecialKey::Right => Key::Right,
+                };
+                KeyEvent {
+                    key,
+                    modifiers: event.modifiers,
+                }
+            } else if let Some((en_ch, bg_ch)) = keymap::scancode_to_both(code, shift) {
+                if en_ch != bg_ch && self.config.dual_buffer.enabled {
+                    // Dual-interpretable character → handle via dual buffer.
+                    return self.handle_dual_buffer_key(en_ch, bg_ch);
+                }
+                // Same char on both layouts → treat as regular Char.
+                KeyEvent {
+                    key: Key::Char(en_ch),
+                    modifiers: event.modifiers,
+                }
+            } else {
+                return vec![Action::ForwardKey];
+            }
+        } else {
+            event
+        };
+
         match event.key {
             // Tab: accept entire ghost text.
             Key::Tab => {
@@ -406,6 +467,45 @@ impl InputMethodCore {
 
             // Backspace: trim the current word.
             Key::Backspace => {
+                if let Some(ref mut db) = self.dual_buffer {
+                    if !db.is_empty() {
+                        let old_len = db.len();
+                        let old_winner = db.winner_lang();
+                        db.pop();
+                        if db.is_empty() {
+                            self.dual_buffer = None;
+                            self.current_word.clear();
+                            // Delete the last committed char via ReplaceWord.
+                            return vec![
+                                Action::ReplaceWord {
+                                    replace_len: 1,
+                                    text: String::new(),
+                                },
+                                Action::HideGhost,
+                            ];
+                        }
+                        // Re-score after removing a character.
+                        let (en_freq, bg_freq) = self.engine.score_both(db.en_text(), db.bg_text());
+                        db.update_scores(en_freq, bg_freq);
+
+                        if db.winner_lang() != old_winner {
+                            // Winner changed — replace all remaining chars.
+                            let new_text = db.winner_text().to_string();
+                            self.current_word = new_text.clone();
+                            let ghost_action = self.update_predictions();
+                            return vec![
+                                Action::ReplaceWord {
+                                    replace_len: old_len,
+                                    text: new_text,
+                                },
+                                ghost_action,
+                            ];
+                        }
+                        self.current_word = db.winner_text().to_string();
+                        let ghost_action = self.update_predictions();
+                        return vec![ghost_action, Action::ForwardKey];
+                    }
+                }
                 if !self.current_word.is_empty() {
                     self.current_word.pop();
                 }
@@ -462,6 +562,8 @@ impl InputMethodCore {
                 vec![ghost_action, Action::ForwardKey]
             }
 
+            // RawCode is resolved before this match — unreachable.
+            Key::RawCode(_) => unreachable!("RawCode resolved before match"),
             // Unknown key: pass through.
             Key::Other(_) => vec![Action::ForwardKey],
         }
@@ -603,6 +705,67 @@ impl InputMethodCore {
         self.ghost.clear();
         self.last_predictions.clear();
         self.transliteration_active = false;
+        self.dual_buffer = None;
+    }
+
+    // ── Dual buffer key handling (v0.5.0) ────────────────────────────
+
+    /// Handle a key that has two different interpretations (EN vs BG).
+    ///
+    /// The dual buffer scores both interpretations against the corpus and
+    /// commits the winner character. On confidence flip, emits `ReplaceWord`
+    /// to fix previously committed characters.
+    fn handle_dual_buffer_key(&mut self, en_ch: char, bg_ch: char) -> Vec<Action> {
+        // Initialize dual buffer on first dual-interpretable key in this word.
+        if self.dual_buffer.is_none() {
+            self.dual_buffer = Some(DualBuffer::from_config(&self.config.dual_buffer));
+        }
+
+        let db = self.dual_buffer.as_mut().unwrap();
+        db.push(en_ch, bg_ch);
+
+        // Score both interpretations.
+        let (en_freq, bg_freq) = self.engine.score_both(db.en_text(), db.bg_text());
+        db.update_scores(en_freq, bg_freq);
+
+        // Check for confidence flip after lock.
+        if db.flip_detected() {
+            let replace_len = db.len() - 1; // Previous chars already in app.
+            let new_text = db.winner_text().to_string();
+            self.current_word = new_text.clone();
+            db.clear_flip();
+
+            if self.config.lang_detection {
+                self.lang_detector
+                    .feed_dual_result(db.winner_lang(), db.confidence());
+            }
+
+            let ghost_action = self.update_predictions();
+            return vec![
+                Action::ReplaceWord {
+                    replace_len,
+                    text: new_text,
+                },
+                ghost_action,
+            ];
+        }
+
+        // Update current_word to the winner text.
+        self.current_word = db.winner_text().to_string();
+
+        // Feed the winner char to language detection.
+        let winner_char = match db.winner_lang() {
+            LangId::En => en_ch,
+            LangId::Bg | LangId::Tech => bg_ch,
+        };
+        if self.config.lang_detection {
+            self.lang_detector.feed_char_instant(winner_char);
+        }
+
+        let ghost_action = self.update_predictions();
+
+        // Commit the winner character (consume the raw key — don't forward).
+        vec![Action::CommitText(winner_char.to_string()), ghost_action]
     }
 
     /// Check if the user is typing on the wrong keyboard layout.
@@ -1115,5 +1278,151 @@ mod tests {
             !core.check_wrong_layout(),
             "empty corpus should never trigger wrong-layout"
         );
+    }
+
+    // ── Dual buffer tests (v0.5.0) ────────────────────────────────
+
+    fn press_raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    /// Build a bilingual core for dual buffer tests.
+    fn test_core_dual() -> InputMethodCore {
+        let core = test_core_bilingual();
+        // Ensure dual buffer is enabled.
+        assert!(core.config.dual_buffer.enabled);
+        core
+    }
+
+    #[test]
+    fn test_dual_buffer_en_wins() {
+        // Type "he" via scancodes — strong EN word "he" (4.8M) vs weak BG "хе" (43K).
+        let mut core = test_core_dual();
+        // Scancode 43 = 'h'/'х', 26 = 'e'/'е'
+        let actions = core.handle_key(press_raw(43));
+        // First char committed.
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::CommitText(_))),
+            "should commit winner char"
+        );
+
+        let actions = core.handle_key(press_raw(26));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::CommitText(_))),
+            "should commit second winner char"
+        );
+        // EN should win — current_word should be "he".
+        assert_eq!(core.current_word(), "he");
+    }
+
+    #[test]
+    fn test_dual_buffer_bg_wins() {
+        // Type "zd" via scancodes — weak EN "zd" (120) vs strong BG "зд" (162K).
+        let mut core = test_core_dual();
+        // Scancode 52 = 'z'/'з', 40 = 'd'/'д'
+        core.handle_key(press_raw(52));
+        let actions = core.handle_key(press_raw(40));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::CommitText(_))),
+            "should commit winner char"
+        );
+        // BG should win — current_word should be Cyrillic "зд".
+        assert_eq!(core.current_word(), "зд");
+    }
+
+    #[test]
+    fn test_dual_buffer_special_keys_resolve() {
+        // Tab via RawCode (scancode 15) should be resolved to Key::Tab.
+        let mut core = test_core_dual();
+        // First type something to have a ghost.
+        core.handle_key(press_raw(43)); // h
+        core.handle_key(press_raw(26)); // e
+        core.handle_key(press_raw(46)); // l
+                                        // Now press Tab via RawCode.
+        let actions = core.handle_key(press_raw(15));
+        // Should either commit ghost or forward (depending on ghost presence).
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ForwardKey)),
+            "Tab via RawCode should work like regular Tab"
+        );
+    }
+
+    #[test]
+    fn test_dual_buffer_space_clears() {
+        let mut core = test_core_dual();
+        core.handle_key(press_raw(43)); // h
+        core.handle_key(press_raw(26)); // e
+                                        // Space via RawCode (scancode 65) commits word and clears dual buffer.
+        core.handle_key(press_raw(65));
+        assert_eq!(core.current_word(), "");
+        assert!(core.dual_buffer.is_none());
+    }
+
+    #[test]
+    fn test_dual_buffer_numbers_passthrough() {
+        // Number keys produce same char on both layouts → should go through
+        // normal Key::Char path, not dual buffer.
+        let mut core = test_core_dual();
+        let actions = core.handle_key(press_raw(10)); // '1'
+                                                      // Should forward (no dual buffer involvement for identical chars).
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::ForwardKey)),
+            "number key should be forwarded normally"
+        );
+        assert!(core.dual_buffer.is_none());
+    }
+
+    #[test]
+    fn test_dual_buffer_backspace() {
+        let mut core = test_core_dual();
+        core.handle_key(press_raw(43)); // h
+        core.handle_key(press_raw(26)); // e
+        assert_eq!(core.current_word().len(), 2);
+
+        // Backspace via RawCode.
+        core.handle_key(press_raw(22));
+        assert_eq!(core.current_word().len(), 1);
+
+        // Backspace again — clears dual buffer.
+        core.handle_key(press_raw(22));
+        assert_eq!(core.current_word(), "");
+        assert!(core.dual_buffer.is_none());
+    }
+
+    #[test]
+    fn test_dual_buffer_disabled() {
+        let mut config = InputConfig::default();
+        config.dual_buffer.enabled = false;
+        let mut core = InputMethodCore::new(config);
+        core.load_word("hello", 100);
+
+        // RawCode with dual buffer disabled → should resolve to normal Char.
+        let actions = core.handle_key(press_raw(43)); // h → resolved to Key::Char('h')
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::ForwardKey)),
+            "with dual buffer disabled, should forward key normally"
+        );
+        assert!(core.dual_buffer.is_none());
+        assert_eq!(core.current_word(), "h");
+    }
+
+    #[test]
+    fn test_dual_buffer_config_from_json() {
+        let json = r#"{
+            "dual_buffer": {
+                "enabled": true,
+                "lock_threshold": 0.8,
+                "min_lock_chars": 3
+            }
+        }"#;
+        let config = InputConfig::from_json(json);
+        assert!(config.dual_buffer.enabled);
+        assert!((config.dual_buffer.lock_threshold - 0.8).abs() < 1e-9);
+        assert_eq!(config.dual_buffer.min_lock_chars, 3);
     }
 }

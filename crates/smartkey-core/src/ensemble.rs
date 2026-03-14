@@ -380,6 +380,17 @@ impl SmartKeyEngine {
             .unwrap_or(0)
     }
 
+    /// Score two prefixes (EN and BG interpretations) for dual-buffer comparison.
+    ///
+    /// Returns raw corpus frequencies as `(en_freq, bg_freq)`. The dual buffer
+    /// normalises these to determine the winner. Uses `max_prefix_frequency`
+    /// for speed — a single trie lookup per language, no full prediction pass.
+    pub fn score_both(&self, en_prefix: &str, bg_prefix: &str) -> (f64, f64) {
+        let en = self.max_prefix_frequency(en_prefix) as f64;
+        let bg = self.max_prefix_frequency(bg_prefix) as f64;
+        (en, bg)
+    }
+
     /// Produce up to `limit` predictions for the given prefix and context.
     ///
     /// * `prefix` — the characters typed so far for the current word.

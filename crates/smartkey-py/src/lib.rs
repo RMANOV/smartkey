@@ -261,6 +261,27 @@ impl PyInputMethodCore {
             .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
+    /// Process a key event using the raw hardware scancode (evdev keycode).
+    ///
+    /// This enables the dual-buffer engine: the scancode identifies the
+    /// physical key, which is mapped to both EN QWERTY and BG Phonetic
+    /// characters. The engine scores both interpretations and commits the
+    /// winner, eliminating the need for manual language switching.
+    ///
+    /// `keycode`: evdev hardware scancode (e.g. 43 for the 'H' key position).
+    /// `modifiers`: raw IBus modifier bitmask.
+    fn process_keycode(&mut self, keycode: u16, modifiers: u32) -> Vec<(String, String)> {
+        let event = KeyEvent {
+            key: Key::RawCode(keycode),
+            modifiers: raw_mods_to_modifiers(modifiers),
+        };
+        self.inner
+            .handle_key(event)
+            .iter()
+            .map(action_to_tuple)
+            .collect()
+    }
+
     /// Current predictions as `(word, score, confidence)` tuples.
     fn predictions(&self) -> Vec<(String, f64, f64)> {
         self.inner

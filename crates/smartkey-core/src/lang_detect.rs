@@ -201,6 +201,22 @@ impl LanguageDetector {
         }
     }
 
+    /// Feed the dual-buffer's winner into the detector's state.
+    ///
+    /// Called after each dual-buffer scoring round so that the language
+    /// detector's EMA and momentum stay in sync with layout-agnostic input.
+    pub fn feed_dual_result(&mut self, lang: LangId, confidence: f64) {
+        let idx = match lang {
+            LangId::Bg => 0,
+            LangId::En => 1,
+            LangId::Tech => 2,
+        };
+        // Bias EMA toward the dual-buffer winner, weighted by confidence.
+        self.ema_scores = [0.1, 0.1, 0.1];
+        self.ema_scores[idx] = 0.7 * confidence;
+        self.detected = DetectedLanguage { lang, confidence };
+    }
+
     /// Get the dominant language from recent commits (momentum).
     /// Returns None if no clear majority (< 60%).
     pub fn momentum_lang(&self) -> Option<LangId> {

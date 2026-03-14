@@ -83,6 +83,9 @@ except ImportError:
         def handle_key(self, keyval: int, modifiers: int) -> list[tuple[str, str]]:
             return [("forward", "")]
 
+        def process_keycode(self, keycode: int, modifiers: int) -> list[tuple[str, str]]:
+            return [("forward", "")]
+
         def focus_lost(self) -> list[tuple[str, str]]:
             return []
 
@@ -238,9 +241,23 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Key event handler.
     # -----------------------------------------------------------------------
     def do_process_key_event(self, keyval: int, keycode: int, state: int) -> bool:
-        """Handle an IBus key event via the Rust core."""
-        orig_keyval = keyval
+        """Handle an IBus key event via the Rust core.
+
+        When a valid hardware scancode is available (keycode > 0), the event
+        is routed through ``process_keycode()`` which enables the dual-buffer
+        engine for layout-agnostic input.  Falls back to the keyval path
+        (``handle_key()``) when keycode is unavailable.
+        """
         log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)
+
+        # v0.5.0: prefer raw scancode path for dual-buffer layout-agnostic input.
+        if keycode > 0 and _HAS_CORE:
+            actions = self._core.process_keycode(keycode, state)
+            log.debug("actions (keycode): %s", actions)
+            return self._execute_actions(actions)
+
+        # Fallback: keyval path (backward compat, or when keycode is 0).
+        orig_keyval = keyval
         # Convert legacy X11 keysyms (e.g. Cyrillic 0x06xx) to Unicode
         # codepoints so the Rust core sees them as Key::Char.
         if _HAS_IBUS and hasattr(IBus, "keyval_to_unicode"):

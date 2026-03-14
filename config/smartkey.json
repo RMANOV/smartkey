@@ -7,6 +7,11 @@
     "kill_switch": "Super+Escape",
     "weights": {"corpus": 0.4, "markov": 0.4, "personal": 0.2},
     "languages": ["en", "bg"],
+    "dual_buffer": {
+        "enabled": true,
+        "lock_threshold": 0.7,
+        "min_lock_chars": 2
+    },
     "tuning": {
         "cvm_initial_size": 1024,
         "cvm_max_size": 8192,
