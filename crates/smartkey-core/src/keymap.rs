@@ -1,9 +1,12 @@
 // Hardware scancode → character mapping for dual-buffer layout-agnostic input.
 //
-// Maps evdev scancodes (as delivered by IBus/XKB) to characters for both
-// EN QWERTY and BG Phonetic layouts. This enables the dual-buffer engine
-// to produce two interpretations of every physical keypress without
-// knowing which OS layout is active.
+// Maps evdev scancodes (raw hardware codes as delivered by IBus on Wayland)
+// to characters for both EN QWERTY and BG Phonetic layouts.  This enables
+// the dual-buffer engine to produce two interpretations of every physical
+// keypress without knowing which OS layout is active.
+//
+// NOTE: evdev codes, NOT XKB (XKB = evdev + 8).  The Python IBus adapter
+// normalises X11 keycodes (XKB) by subtracting 8 before calling Rust.
 
 /// Keyboard layout identity for scancode resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +40,7 @@ pub fn scancode_to_both(code: u16, shift: bool) -> Option<(char, char)> {
 pub fn is_alpha_scancode(code: u16) -> bool {
     matches!(
         code,
-        24..=33 | 38..=46 | 52..=58 // Q-P, A-L, Z-M rows
+        16..=25 | 30..=38 | 44..=50 // Q-P, A-L, Z-M rows (evdev)
     )
 }
 
@@ -47,12 +50,12 @@ pub fn is_alpha_scancode(code: u16) -> bool {
 /// `handle_key` logic (Tab, Backspace, Space, etc.) rather than the dual buffer.
 pub fn scancode_to_special(code: u16) -> Option<SpecialKey> {
     match code {
-        9 => Some(SpecialKey::Escape),
+        1 => Some(SpecialKey::Escape),
+        14 => Some(SpecialKey::Backspace),
         15 => Some(SpecialKey::Tab),
-        22 => Some(SpecialKey::Backspace),
-        36 => Some(SpecialKey::Return),
-        65 => Some(SpecialKey::Space),
-        114 => Some(SpecialKey::Right),
+        28 => Some(SpecialKey::Return),
+        57 => Some(SpecialKey::Space),
+        106 => Some(SpecialKey::Right),
         _ => None,
     }
 }
@@ -75,56 +78,56 @@ pub enum SpecialKey {
 fn en_qwerty(code: u16, shift: bool) -> Option<char> {
     let (lower, upper) = match code {
         // Number row
-        10 => ('1', '!'),
-        11 => ('2', '@'),
-        12 => ('3', '#'),
-        13 => ('4', '$'),
-        14 => ('5', '%'),
-        15 => ('6', '^'),
-        16 => ('7', '&'),
-        17 => ('8', '*'),
-        18 => ('9', '('),
-        19 => ('0', ')'),
-        20 => ('-', '_'),
-        21 => ('=', '+'),
+        2 => ('1', '!'),
+        3 => ('2', '@'),
+        4 => ('3', '#'),
+        5 => ('4', '$'),
+        6 => ('5', '%'),
+        7 => ('6', '^'),
+        8 => ('7', '&'),
+        9 => ('8', '*'),
+        10 => ('9', '('),
+        11 => ('0', ')'),
+        12 => ('-', '_'),
+        13 => ('=', '+'),
         // QWERTY row
-        24 => ('q', 'Q'),
-        25 => ('w', 'W'),
-        26 => ('e', 'E'),
-        27 => ('r', 'R'),
-        28 => ('t', 'T'),
-        29 => ('y', 'Y'),
-        30 => ('u', 'U'),
-        31 => ('i', 'I'),
-        32 => ('o', 'O'),
-        33 => ('p', 'P'),
-        34 => ('[', '{'),
-        35 => (']', '}'),
+        16 => ('q', 'Q'),
+        17 => ('w', 'W'),
+        18 => ('e', 'E'),
+        19 => ('r', 'R'),
+        20 => ('t', 'T'),
+        21 => ('y', 'Y'),
+        22 => ('u', 'U'),
+        23 => ('i', 'I'),
+        24 => ('o', 'O'),
+        25 => ('p', 'P'),
+        26 => ('[', '{'),
+        27 => (']', '}'),
         // Home row
-        38 => ('a', 'A'),
-        39 => ('s', 'S'),
-        40 => ('d', 'D'),
-        41 => ('f', 'F'),
-        42 => ('g', 'G'),
-        43 => ('h', 'H'),
-        44 => ('j', 'J'),
-        45 => ('k', 'K'),
-        46 => ('l', 'L'),
-        47 => (';', ':'),
-        48 => ('\'', '"'),
-        49 => ('`', '~'),
+        30 => ('a', 'A'),
+        31 => ('s', 'S'),
+        32 => ('d', 'D'),
+        33 => ('f', 'F'),
+        34 => ('g', 'G'),
+        35 => ('h', 'H'),
+        36 => ('j', 'J'),
+        37 => ('k', 'K'),
+        38 => ('l', 'L'),
+        39 => (';', ':'),
+        40 => ('\'', '"'),
+        41 => ('`', '~'),
         // Bottom row
-        51 => ('\\', '|'),
-        52 => ('z', 'Z'),
-        53 => ('x', 'X'),
-        54 => ('c', 'C'),
-        55 => ('v', 'V'),
-        56 => ('b', 'B'),
-        57 => ('n', 'N'),
-        58 => ('m', 'M'),
-        59 => (',', '<'),
-        60 => ('.', '>'),
-        61 => ('/', '?'),
+        43 => ('\\', '|'),
+        44 => ('z', 'Z'),
+        45 => ('x', 'X'),
+        46 => ('c', 'C'),
+        47 => ('v', 'V'),
+        48 => ('b', 'B'),
+        49 => ('n', 'N'),
+        50 => ('m', 'M'),
+        51 => (',', '<'),
+        52 => ('.', '>'),
+        53 => ('/', '?'),
         _ => return None,
     };
     Some(if shift { upper } else { lower })
@@ -142,56 +145,56 @@ fn en_qwerty(code: u16, shift: bool) -> Option<char> {
 fn bg_phonetic(code: u16, shift: bool) -> Option<char> {
     let (lower, upper) = match code {
         // Number row — same as EN QWERTY
-        10 => ('1', '!'),
-        11 => ('2', '@'),
-        12 => ('3', '#'),
-        13 => ('4', '$'),
-        14 => ('5', '%'),
-        15 => ('6', '^'),
-        16 => ('7', '&'),
-        17 => ('8', '*'),
-        18 => ('9', '('),
-        19 => ('0', ')'),
-        20 => ('-', '_'),
-        21 => ('=', '+'),
+        2 => ('1', '!'),
+        3 => ('2', '@'),
+        4 => ('3', '#'),
+        5 => ('4', '$'),
+        6 => ('5', '%'),
+        7 => ('6', '^'),
+        8 => ('7', '&'),
+        9 => ('8', '*'),
+        10 => ('9', '('),
+        11 => ('0', ')'),
+        12 => ('-', '_'),
+        13 => ('=', '+'),
         // QWERTY row → Cyrillic phonetic
-        24 => ('я', 'Я'), // q → я
-        25 => ('ш', 'Ш'), // w → ш
-        26 => ('е', 'Е'), // e → е
-        27 => ('р', 'Р'), // r → р
-        28 => ('т', 'Т'), // t → т
-        29 => ('ъ', 'Ъ'), // y → ъ
-        30 => ('у', 'У'), // u → у
-        31 => ('и', 'И'), // i → и
-        32 => ('о', 'О'), // o → о
-        33 => ('п', 'П'), // p → п
-        34 => ('[', '{'), // brackets — same as EN
-        35 => (']', '}'),
+        16 => ('я', 'Я'), // q → я
+        17 => ('ш', 'Ш'), // w → ш
+        18 => ('е', 'Е'), // e → е
+        19 => ('р', 'Р'), // r → р
+        20 => ('т', 'Т'), // t → т
+        21 => ('ъ', 'Ъ'), // y → ъ
+        22 => ('у', 'У'), // u → у
+        23 => ('и', 'И'), // i → и
+        24 => ('о', 'О'), // o → о
+        25 => ('п', 'П'), // p → п
+        26 => ('[', '{'), // brackets — same as EN
+        27 => (']', '}'),
         // Home row → Cyrillic phonetic
-        38 => ('а', 'А'), // a → а
-        39 => ('с', 'С'), // s → с
-        40 => ('д', 'Д'), // d → д
-        41 => ('ф', 'Ф'), // f → ф
-        42 => ('г', 'Г'), // g → г
-        43 => ('х', 'Х'), // h → х
-        44 => ('й', 'Й'), // j → й
-        45 => ('к', 'К'), // k → к
-        46 => ('л', 'Л'), // l → л
-        47 => (';', ':'), // punctuation — same as EN
-        48 => ('\'', '"'),
-        49 => ('`', '~'),
+        30 => ('а', 'А'), // a → а
+        31 => ('с', 'С'), // s → с
+        32 => ('д', 'Д'), // d → д
+        33 => ('ф', 'Ф'), // f → ф
+        34 => ('г', 'Г'), // g → г
+        35 => ('х', 'Х'), // h → х
+        36 => ('й', 'Й'), // j → й
+        37 => ('к', 'К'), // k → к
+        38 => ('л', 'Л'), // l → л
+        39 => (';', ':'), // punctuation — same as EN
+        40 => ('\'', '"'),
+        41 => ('`', '~'),
         // Bottom row → Cyrillic phonetic
-        51 => ('\\', '|'), // backslash — same as EN
-        52 => ('з', 'З'),  // z → з
-        53 => ('ь', 'Ь'),  // x → ь
-        54 => ('ц', 'Ц'),  // c → ц
-        55 => ('в', 'В'),  // v → в
-        56 => ('б', 'Б'),  // b → б
-        57 => ('н', 'Н'),  // n → н
-        58 => ('м', 'М'),  // m → м
-        59 => (',', '<'),  // comma — same as EN
-        60 => ('.', '>'),
-        61 => ('/', '?'),
+        43 => ('\\', '|'), // backslash — same as EN
+        44 => ('з', 'З'),  // z → з
+        45 => ('ь', 'Ь'),  // x → ь
+        46 => ('ц', 'Ц'),  // c → ц
+        47 => ('в', 'В'),  // v → в
+        48 => ('б', 'Б'),  // b → б
+        49 => ('н', 'Н'),  // n → н
+        50 => ('м', 'М'),  // m → м
+        51 => (',', '<'),  // comma — same as EN
+        52 => ('.', '>'),
+        53 => ('/', '?'),
         _ => return None,
     };
     Some(if shift { upper } else { lower })
@@ -207,24 +210,24 @@ mod tests {
 
     #[test]
     fn test_en_letters() {
-        assert_eq!(scancode_to_char(24, false, Layout::En), Some('q'));
-        assert_eq!(scancode_to_char(24, true, Layout::En), Some('Q'));
-        assert_eq!(scancode_to_char(38, false, Layout::En), Some('a'));
-        assert_eq!(scancode_to_char(52, false, Layout::En), Some('z'));
+        assert_eq!(scancode_to_char(16, false, Layout::En), Some('q'));
+        assert_eq!(scancode_to_char(16, true, Layout::En), Some('Q'));
+        assert_eq!(scancode_to_char(30, false, Layout::En), Some('a'));
+        assert_eq!(scancode_to_char(44, false, Layout::En), Some('z'));
     }
 
     #[test]
     fn test_bg_phonetic_letters() {
-        assert_eq!(scancode_to_char(24, false, Layout::Bg), Some('я'));
-        assert_eq!(scancode_to_char(24, true, Layout::Bg), Some('Я'));
-        assert_eq!(scancode_to_char(38, false, Layout::Bg), Some('а'));
-        assert_eq!(scancode_to_char(52, false, Layout::Bg), Some('з'));
-        assert_eq!(scancode_to_char(43, false, Layout::Bg), Some('х'));
+        assert_eq!(scancode_to_char(16, false, Layout::Bg), Some('я'));
+        assert_eq!(scancode_to_char(16, true, Layout::Bg), Some('Я'));
+        assert_eq!(scancode_to_char(30, false, Layout::Bg), Some('а'));
+        assert_eq!(scancode_to_char(44, false, Layout::Bg), Some('з'));
+        assert_eq!(scancode_to_char(35, false, Layout::Bg), Some('х'));
     }
 
     #[test]
     fn test_numbers_same_on_both() {
-        for code in 10..=19 {
+        for code in 2..=11 {
             let en = scancode_to_char(code, false, Layout::En);
             let bg = scancode_to_char(code, false, Layout::Bg);
             assert_eq!(
@@ -236,34 +239,34 @@ mod tests {
 
     #[test]
     fn test_scancode_to_both() {
-        let (en, bg) = scancode_to_both(43, false).unwrap(); // 'h' key
+        let (en, bg) = scancode_to_both(35, false).unwrap(); // 'h' key
         assert_eq!(en, 'h');
         assert_eq!(bg, 'х');
 
-        let (en, bg) = scancode_to_both(10, false).unwrap(); // '1' key
+        let (en, bg) = scancode_to_both(2, false).unwrap(); // '1' key
         assert_eq!(en, '1');
         assert_eq!(bg, '1');
     }
 
     #[test]
     fn test_is_alpha_scancode() {
-        assert!(is_alpha_scancode(24)); // Q
-        assert!(is_alpha_scancode(38)); // A
-        assert!(is_alpha_scancode(52)); // Z
-        assert!(!is_alpha_scancode(10)); // 1
-        assert!(!is_alpha_scancode(65)); // Space
-        assert!(!is_alpha_scancode(9)); // Escape
+        assert!(is_alpha_scancode(16)); // Q
+        assert!(is_alpha_scancode(30)); // A
+        assert!(is_alpha_scancode(44)); // Z
+        assert!(!is_alpha_scancode(2)); // 1
+        assert!(!is_alpha_scancode(57)); // Space
+        assert!(!is_alpha_scancode(1)); // Escape
     }
 
     #[test]
     fn test_scancode_to_special() {
-        assert_eq!(scancode_to_special(9), Some(SpecialKey::Escape));
+        assert_eq!(scancode_to_special(1), Some(SpecialKey::Escape));
         assert_eq!(scancode_to_special(15), Some(SpecialKey::Tab));
-        assert_eq!(scancode_to_special(22), Some(SpecialKey::Backspace));
-        assert_eq!(scancode_to_special(65), Some(SpecialKey::Space));
-        assert_eq!(scancode_to_special(36), Some(SpecialKey::Return));
-        assert_eq!(scancode_to_special(114), Some(SpecialKey::Right));
-        assert_eq!(scancode_to_special(24), None); // Q — not special
+        assert_eq!(scancode_to_special(14), Some(SpecialKey::Backspace));
+        assert_eq!(scancode_to_special(57), Some(SpecialKey::Space));
+        assert_eq!(scancode_to_special(28), Some(SpecialKey::Return));
+        assert_eq!(scancode_to_special(106), Some(SpecialKey::Right));
+        assert_eq!(scancode_to_special(16), None); // Q — not special
     }
 
     #[test]
@@ -276,32 +279,32 @@ mod tests {
     fn test_phonetic_consistency() {
         // Verify BG phonetic mapping matches lang_detect::phonetic_map for all letters.
         let letter_scancodes = [
-            (24, 'q', 'я'),
-            (25, 'w', 'ш'),
-            (26, 'e', 'е'),
-            (27, 'r', 'р'),
-            (28, 't', 'т'),
-            (29, 'y', 'ъ'),
-            (30, 'u', 'у'),
-            (31, 'i', 'и'),
-            (32, 'o', 'о'),
-            (33, 'p', 'п'),
-            (38, 'a', 'а'),
-            (39, 's', 'с'),
-            (40, 'd', 'д'),
-            (41, 'f', 'ф'),
-            (42, 'g', 'г'),
-            (43, 'h', 'х'),
-            (44, 'j', 'й'),
-            (45, 'k', 'к'),
-            (46, 'l', 'л'),
-            (52, 'z', 'з'),
-            (53, 'x', 'ь'),
-            (54, 'c', 'ц'),
-            (55, 'v', 'в'),
-            (56, 'b', 'б'),
-            (57, 'n', 'н'),
-            (58, 'm', 'м'),
+            (16, 'q', 'я'),
+            (17, 'w', 'ш'),
+            (18, 'e', 'е'),
+            (19, 'r', 'р'),
+            (20, 't', 'т'),
+            (21, 'y', 'ъ'),
+            (22, 'u', 'у'),
+            (23, 'i', 'и'),
+            (24, 'o', 'о'),
+            (25, 'p', 'п'),
+            (30, 'a', 'а'),
+            (31, 's', 'с'),
+            (32, 'd', 'д'),
+            (33, 'f', 'ф'),
+            (34, 'g', 'г'),
+            (35, 'h', 'х'),
+            (36, 'j', 'й'),
+            (37, 'k', 'к'),
+            (38, 'l', 'л'),
+            (44, 'z', 'з'),
+            (45, 'x', 'ь'),
+            (46, 'c', 'ц'),
+            (47, 'v', 'в'),
+            (48, 'b', 'б'),
+            (49, 'n', 'н'),
+            (50, 'm', 'м'),
         ];
         for (code, expected_en, expected_bg) in letter_scancodes {
             let en = scancode_to_char(code, false, Layout::En).unwrap();
@@ -313,8 +316,8 @@ mod tests {
 
     #[test]
     fn test_shift_variants_bg() {
-        assert_eq!(scancode_to_char(38, true, Layout::Bg), Some('А'));
-        assert_eq!(scancode_to_char(52, true, Layout::Bg), Some('З'));
-        assert_eq!(scancode_to_char(25, true, Layout::Bg), Some('Ш'));
+        assert_eq!(scancode_to_char(30, true, Layout::Bg), Some('А'));
+        assert_eq!(scancode_to_char(44, true, Layout::Bg), Some('З'));
+        assert_eq!(scancode_to_char(17, true, Layout::Bg), Some('Ш'));
     }
 }

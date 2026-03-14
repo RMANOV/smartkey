@@ -104,6 +104,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths & defaults.
 # ---------------------------------------------------------------------------
+_IS_WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
+
 _CONFIG_DIR = (
     Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "smartkey"
 )
@@ -251,8 +253,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)
 
         # v0.5.0: prefer raw scancode path for dual-buffer layout-agnostic input.
+        # Rust tables use evdev codes. On Wayland IBus sends evdev directly;
+        # on X11 IBus sends XKB (evdev + 8) — normalise to evdev.
         if keycode > 0 and _HAS_CORE:
-            actions = self._core.process_keycode(keycode, state)
+            evdev_keycode = keycode if _IS_WAYLAND else max(keycode - 8, 0)
+            actions = self._core.process_keycode(evdev_keycode, state)
             log.debug("actions (keycode): %s", actions)
             return self._execute_actions(actions)
 

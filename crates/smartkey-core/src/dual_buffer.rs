@@ -253,8 +253,8 @@ mod tests {
     #[test]
     fn test_push_keycode() {
         let mut b = db();
-        // Scancode 43 = 'h' / 'х'
-        let pair = b.push_keycode(43, false);
+        // Scancode 35 = 'h' / 'х' (evdev)
+        let pair = b.push_keycode(35, false);
         assert_eq!(pair, Some(('h', 'х')));
         assert_eq!(b.en_text(), "h");
         assert_eq!(b.bg_text(), "х");

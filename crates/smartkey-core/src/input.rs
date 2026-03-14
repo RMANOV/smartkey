@@ -1301,15 +1301,15 @@ mod tests {
     fn test_dual_buffer_en_wins() {
         // Type "he" via scancodes — strong EN word "he" (4.8M) vs weak BG "хе" (43K).
         let mut core = test_core_dual();
-        // Scancode 43 = 'h'/'х', 26 = 'e'/'е'
-        let actions = core.handle_key(press_raw(43));
+        // Scancode 35 = 'h'/'х', 18 = 'e'/'е' (evdev)
+        let actions = core.handle_key(press_raw(35));
         // First char committed.
         assert!(
             actions.iter().any(|a| matches!(a, Action::CommitText(_))),
             "should commit winner char"
         );
 
-        let actions = core.handle_key(press_raw(26));
+        let actions = core.handle_key(press_raw(18));
         assert!(
             actions.iter().any(|a| matches!(a, Action::CommitText(_))),
             "should commit second winner char"
@@ -1322,9 +1322,9 @@ mod tests {
     fn test_dual_buffer_bg_wins() {
         // Type "zd" via scancodes — weak EN "zd" (120) vs strong BG "зд" (162K).
         let mut core = test_core_dual();
-        // Scancode 52 = 'z'/'з', 40 = 'd'/'д'
-        core.handle_key(press_raw(52));
-        let actions = core.handle_key(press_raw(40));
+        // Scancode 44 = 'z'/'з', 32 = 'd'/'д' (evdev)
+        core.handle_key(press_raw(44));
+        let actions = core.handle_key(press_raw(32));
         assert!(
             actions.iter().any(|a| matches!(a, Action::CommitText(_))),
             "should commit winner char"
@@ -1338,9 +1338,9 @@ mod tests {
         // Tab via RawCode (scancode 15) should be resolved to Key::Tab.
         let mut core = test_core_dual();
         // First type something to have a ghost.
-        core.handle_key(press_raw(43)); // h
-        core.handle_key(press_raw(26)); // e
-        core.handle_key(press_raw(46)); // l
+        core.handle_key(press_raw(35)); // h
+        core.handle_key(press_raw(18)); // e
+        core.handle_key(press_raw(38)); // l
                                         // Now press Tab via RawCode.
         let actions = core.handle_key(press_raw(15));
         // Should either commit ghost or forward (depending on ghost presence).
@@ -1355,10 +1355,10 @@ mod tests {
     #[test]
     fn test_dual_buffer_space_clears() {
         let mut core = test_core_dual();
-        core.handle_key(press_raw(43)); // h
-        core.handle_key(press_raw(26)); // e
-                                        // Space via RawCode (scancode 65) commits word and clears dual buffer.
-        core.handle_key(press_raw(65));
+        core.handle_key(press_raw(35)); // h
+        core.handle_key(press_raw(18)); // e
+                                        // Space via RawCode (scancode 57) commits word and clears dual buffer.
+        core.handle_key(press_raw(57));
         assert_eq!(core.current_word(), "");
         assert!(core.dual_buffer.is_none());
     }
@@ -1368,8 +1368,8 @@ mod tests {
         // Number keys produce same char on both layouts → should go through
         // normal Key::Char path, not dual buffer.
         let mut core = test_core_dual();
-        let actions = core.handle_key(press_raw(10)); // '1'
-                                                      // Should forward (no dual buffer involvement for identical chars).
+        let actions = core.handle_key(press_raw(2)); // '1' (evdev)
+                                                     // Should forward (no dual buffer involvement for identical chars).
         assert!(
             actions.iter().any(|a| matches!(a, Action::ForwardKey)),
             "number key should be forwarded normally"
@@ -1380,16 +1380,16 @@ mod tests {
     #[test]
     fn test_dual_buffer_backspace() {
         let mut core = test_core_dual();
-        core.handle_key(press_raw(43)); // h
-        core.handle_key(press_raw(26)); // e
+        core.handle_key(press_raw(35)); // h
+        core.handle_key(press_raw(18)); // e
         assert_eq!(core.current_word().len(), 2);
 
-        // Backspace via RawCode.
-        core.handle_key(press_raw(22));
+        // Backspace via RawCode (evdev 14).
+        core.handle_key(press_raw(14));
         assert_eq!(core.current_word().len(), 1);
 
         // Backspace again — clears dual buffer.
-        core.handle_key(press_raw(22));
+        core.handle_key(press_raw(14));
         assert_eq!(core.current_word(), "");
         assert!(core.dual_buffer.is_none());
     }
@@ -1402,7 +1402,7 @@ mod tests {
         core.load_word("hello", 100);
 
         // RawCode with dual buffer disabled → should resolve to normal Char.
-        let actions = core.handle_key(press_raw(43)); // h → resolved to Key::Char('h')
+        let actions = core.handle_key(press_raw(35)); // h → resolved to Key::Char('h')
         assert!(
             actions.iter().any(|a| matches!(a, Action::ForwardKey)),
             "with dual buffer disabled, should forward key normally"
