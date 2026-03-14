@@ -265,8 +265,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             elif action_type == "hide":
                 self._clear_ghost()
             elif action_type == "commit":
+                self._clear_ghost()  # Prevent preedit leaking into committed text
                 self.commit_text(IBus.Text.new_from_string(payload))
             elif action_type == "replace":
+                self._clear_ghost()  # Same protection for replace
                 n_str, text = payload.split(":", 1)
                 replace_len = int(n_str)
                 if self._caps & 0x20:  # SURROUNDING_TEXT capability

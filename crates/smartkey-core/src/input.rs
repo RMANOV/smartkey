@@ -484,12 +484,13 @@ impl InputMethodCore {
                             self.dual_buffer = None;
                             self.current_word.clear();
                             // Delete the last committed char via ReplaceWord.
+                            // HideGhost first: clear preedit before replacing.
                             return vec![
+                                Action::HideGhost,
                                 Action::ReplaceWord {
                                     replace_len: 1,
                                     text: String::new(),
                                 },
-                                Action::HideGhost,
                             ];
                         }
                         // Re-score after removing a character.
@@ -502,6 +503,7 @@ impl InputMethodCore {
                             self.current_word = new_text.clone();
                             let ghost_action = self.update_predictions();
                             return vec![
+                                Action::HideGhost,
                                 Action::ReplaceWord {
                                     replace_len: old_len,
                                     text: new_text,
@@ -766,6 +768,7 @@ impl InputMethodCore {
 
             let ghost_action = self.update_predictions();
             return vec![
+                Action::HideGhost,
                 Action::ReplaceWord {
                     replace_len,
                     text: new_text,
@@ -789,7 +792,13 @@ impl InputMethodCore {
         let ghost_action = self.update_predictions();
 
         // Commit the winner character (consume the raw key — don't forward).
-        vec![Action::CommitText(winner_char.to_string()), ghost_action]
+        // HideGhost first: clear the old preedit so toolkits (Qt/KDE Wayland)
+        // don't auto-commit it alongside the new character (→ doubling).
+        vec![
+            Action::HideGhost,
+            Action::CommitText(winner_char.to_string()),
+            ghost_action,
+        ]
     }
 
     /// Check if the user is typing on the wrong keyboard layout.

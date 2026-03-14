@@ -79,6 +79,7 @@ impl VirtualTyper {
     // -- Typing helpers ---------------------------------------------------
 
     /// Send a single `KeyEvent` and return the resulting actions.
+    #[allow(dead_code)]
     fn send(&mut self, event: KeyEvent) -> Vec<Action> {
         self.core.handle_key(event)
     }
