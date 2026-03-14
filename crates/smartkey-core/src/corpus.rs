@@ -179,6 +179,8 @@ impl Corpus {
         }
 
         // Load BPE merge rules if present in corpus.
+        // When no merge rules are provided, generate character-pair merges from
+        // the most frequent words so BPE OOV fallback is functional out of the box.
         if !self.bpe_merges.is_empty() {
             let raw: Vec<(String, String, String)> = self
                 .bpe_merges
@@ -193,11 +195,60 @@ impl Corpus {
                 .map(|w| (w.word.clone(), w.frequency))
                 .collect();
             engine.set_bpe(BpeTokenizer::new(merge_rules, token_freqs));
+        } else if !self.words.is_empty() {
+            // No explicit merge rules: derive character-pair merges from the top-frequency
+            // words. This gives BPE OOV fallback a working vocabulary without a pre-trained
+            // merge table.
+            let merge_rules = derive_bpe_merges_from_words(&self.words, 200);
+            let token_freqs: HashMap<String, u32> = self
+                .words
+                .iter()
+                .map(|w| (w.word.clone(), w.frequency))
+                .collect();
+            engine.set_bpe(BpeTokenizer::new(merge_rules, token_freqs));
         }
 
         // Build Kneser-Ney scorer from loaded Markov data (if flag is set).
         engine.build_kneser_ney();
     }
+}
+
+/// Derive BPE merge rules from corpus word frequencies when no explicit merge
+/// table is available.
+///
+/// Strategy: count how often each adjacent character pair appears across all
+/// words (weighted by word frequency), then emit merge rules for the top `limit`
+/// pairs in descending frequency order. This produces a minimal but functional
+/// merge table for OOV subword suggestions.
+fn derive_bpe_merges_from_words(words: &[CorpusWord], limit: usize) -> Vec<crate::bpe::MergeRule> {
+    let mut pair_counts: HashMap<(String, String), u64> = HashMap::new();
+
+    for w in words {
+        let chars: Vec<String> = w.word.chars().map(|c| c.to_string()).collect();
+        if chars.len() < 2 {
+            continue;
+        }
+        let weight = w.frequency.max(1) as u64;
+        for i in 0..chars.len() - 1 {
+            *pair_counts
+                .entry((chars[i].clone(), chars[i + 1].clone()))
+                .or_insert(0) += weight;
+        }
+    }
+
+    // Sort pairs by count descending.
+    let mut pairs: Vec<((String, String), u64)> = pair_counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+
+    pairs
+        .into_iter()
+        .take(limit)
+        .map(|((a, b), _)| crate::bpe::MergeRule {
+            merged: format!("{}{}", a, b),
+            a,
+            b,
+        })
+        .collect()
 }
 
 #[cfg(test)]

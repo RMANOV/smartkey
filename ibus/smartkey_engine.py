@@ -112,6 +112,11 @@ _CONFIG_DIR = (
 _CONFIG_FILE = _CONFIG_DIR / "smartkey.json"
 _CORPUS_FILE = _CONFIG_DIR / "corpus.json"
 
+# Fallback corpus directory: repo root / corpus/ (sibling of ibus/).
+# An explicit _CORPUS_DIR env var overrides both _CONFIG_DIR and the repo path.
+_REPO_DIR = Path(__file__).resolve().parent.parent
+_REPO_CORPUS_DIR = _REPO_DIR / "corpus"
+
 
 def _load_json(path: Path, default: dict | list | None = None) -> dict | list | None:
     """Return parsed JSON from *path*, or *default* on any error."""
@@ -165,20 +170,60 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Corpus loading.
     # -----------------------------------------------------------------------
     def _load_corpus(self) -> None:
-        """Populate the engine with n-gram data from corpus files."""
+        """Populate the engine with n-gram data from corpus files.
+
+        Search order (first non-empty set of files wins for corpus_*.json/bin):
+        1. ``$_CORPUS_DIR`` environment variable override (explicit path).
+        2. ``_CONFIG_DIR`` (~/.config/smartkey/) — user config takes precedence.
+        3. ``_REPO_CORPUS_DIR`` — repo's corpus/ directory next to ibus/.
+        The legacy single-file ``corpus.json`` in _CONFIG_DIR is always appended
+        if present, regardless of which directory supplied the sharded files.
+        """
         corpus_files: list[Path] = []
-        corpus_files.extend(sorted(_CONFIG_DIR.glob("corpus_*.json")))
-        # Add .bin files only if no matching .json exists (Rust auto-caches
-        # .json → .bin, so loading both would double all n-gram counts).
-        json_stems = {p.stem for p in corpus_files}
-        corpus_files.extend(
-            p
-            for p in sorted(_CONFIG_DIR.glob("corpus_*.bin"))
-            if p.stem not in json_stems
-        )
+
+        # Determine which directories to scan, in priority order.
+        env_override = os.environ.get("_CORPUS_DIR")
+        search_dirs: list[Path] = []
+        if env_override:
+            search_dirs.append(Path(env_override).expanduser())
+        search_dirs.extend([_CONFIG_DIR, _REPO_CORPUS_DIR])
+
+        for search_dir in search_dirs:
+            json_files = sorted(search_dir.glob("corpus_*.json"))
+            if not json_files:
+                # Also check for pre-compiled .bin shards.
+                bin_files = sorted(search_dir.glob("corpus_*.bin"))
+                if bin_files:
+                    corpus_files.extend(bin_files)
+                    break
+                continue
+            corpus_files.extend(json_files)
+            # Add .bin files only if no matching .json exists (Rust auto-caches
+            # .json → .bin, so loading both would double all n-gram counts).
+            json_stems = {p.stem for p in json_files}
+            corpus_files.extend(
+                p
+                for p in sorted(search_dir.glob("corpus_*.bin"))
+                if p.stem not in json_stems
+            )
+            break  # found files — stop searching further dirs
+
         if _CORPUS_FILE.is_file():
             corpus_files.append(_CORPUS_FILE)
 
+        if not corpus_files:
+            log.warning(
+                "smartkey: no corpus files found in %s or %s",
+                _CONFIG_DIR,
+                _REPO_CORPUS_DIR,
+            )
+            return
+
+        log.info(
+            "smartkey: loading %d corpus file(s) from %s",
+            len(corpus_files),
+            corpus_files[0].parent,
+        )
         for path in corpus_files:
             try:
                 self._core.load_corpus_file(str(path))

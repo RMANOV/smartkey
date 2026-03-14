@@ -17,6 +17,8 @@ pub mod paths;
 pub mod personal;
 pub mod ppm;
 pub mod session_cache;
+pub mod tech_vocab;
+pub mod typing_regime;
 
 pub use ensemble::SmartKeyEngine;
 pub use input::InputMethodCore;

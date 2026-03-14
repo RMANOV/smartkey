@@ -16,6 +16,7 @@ use crate::keymap;
 use crate::lang_detect::{self, LangId, LanguageDetector};
 use crate::paths;
 use crate::personal;
+use crate::typing_regime::RegimeDetector;
 
 // ======================================================================
 // Key abstraction
@@ -141,8 +142,8 @@ impl Default for InputConfig {
             use_session_cache_lm: true,
             use_ppm: false,
             bpe_enabled: true,
-            use_kneser_ney: false,
-            use_hedge: false,
+            use_kneser_ney: true,
+            use_hedge: true,
             dual_buffer: DualBufferConfig::default(),
         }
     }
@@ -263,6 +264,10 @@ pub struct InputMethodCore {
     /// Dual-interpretation buffer for layout-agnostic input (v0.5.0).
     /// `Some` when active (after first `Key::RawCode` in a word), `None` otherwise.
     dual_buffer: Option<DualBuffer>,
+    /// Typing regime detector (v0.5+) — gates tech vocab δ weight in the ensemble.
+    regime_detector: RegimeDetector,
+    /// True when the current word triggered a dual-buffer layout flip (for regime detection).
+    current_word_had_flip: bool,
 }
 
 impl InputMethodCore {
@@ -280,6 +285,8 @@ impl InputMethodCore {
             last_predictions: Vec::new(),
             transliteration_active: false,
             dual_buffer: None,
+            regime_detector: RegimeDetector::new(),
+            current_word_had_flip: false,
         }
     }
 
@@ -445,9 +452,10 @@ impl InputMethodCore {
                 }
             }
 
-            // Escape: dismiss ghost text.
+            // Escape: dismiss ghost text and notify engine of rejection.
             Key::Escape => {
                 if !self.ghost.is_empty() {
+                    self.engine.on_prediction_rejected();
                     self.ghost.clear();
                     vec![Action::HideGhost]
                 } else {
@@ -682,16 +690,29 @@ impl InputMethodCore {
             self.engine.learn_online_markov(prev1, prev2, word);
 
             // Feed word to per-language CVM track + momentum.
-            if self.config.lang_detection {
-                let lang = self.lang_detector.detected().lang;
-                self.engine.learn_with_lang(word, lang);
-                self.lang_detector.record_commit(lang);
-            }
+            let lang = if self.config.lang_detection {
+                let l = self.lang_detector.detected().lang;
+                self.engine.learn_with_lang(word, l);
+                self.lang_detector.record_commit(l);
+                l
+            } else {
+                crate::lang_detect::LangId::En // Default when lang detection disabled
+            };
 
             // Feed word to session cache LM for burstiness tracking.
             if self.config.use_session_cache_lm {
                 self.engine.observe_session(word);
             }
+
+            // Feed word stats to regime detector (v0.5+).
+            // is_oov: word not found in the trie (zero prefix-search candidates).
+            let is_oov = self.engine.candidate_count(word, 1) == 0;
+            let is_flip = self.current_word_had_flip;
+            self.regime_detector
+                .observe_word(word.chars().count(), is_oov, is_flip, lang);
+            // Propagate the current regime to the engine so predict() can gate δ.
+            let (regime, _conf) = self.regime_detector.regime();
+            self.engine.set_regime(regime);
 
             if self.context.len() >= CONTEXT_SIZE {
                 self.context.pop_front();
@@ -706,6 +727,7 @@ impl InputMethodCore {
         self.last_predictions.clear();
         self.transliteration_active = false;
         self.dual_buffer = None;
+        self.current_word_had_flip = false;
     }
 
     // ── Dual buffer key handling (v0.5.0) ────────────────────────────
@@ -734,6 +756,8 @@ impl InputMethodCore {
             let new_text = db.winner_text().to_string();
             self.current_word = new_text.clone();
             db.clear_flip();
+            // Record the flip for regime detection.
+            self.current_word_had_flip = true;
 
             if self.config.lang_detection {
                 self.lang_detector

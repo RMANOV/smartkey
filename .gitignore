@@ -10,3 +10,4 @@ press-releases/
 .ruff_cache/
 .worktrees
 corpus/raw/
+corpus/*.bin

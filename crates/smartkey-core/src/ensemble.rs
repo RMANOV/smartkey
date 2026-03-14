@@ -16,6 +16,8 @@ use crate::ngram::{NgramTrie, WordEntry};
 use crate::personal::{extract_markov_snapshot, AdaptiveWeightsSnapshot, PersonalProfile};
 use crate::ppm::PpmModel;
 use crate::session_cache::SessionCacheLM;
+use crate::tech_vocab::TechVocab;
+use crate::typing_regime::TypingRegime;
 
 /// A single prediction with its ensemble score and UI confidence.
 #[derive(Debug, Clone)]
@@ -44,13 +46,15 @@ const SESSION_BLEND: f64 = 0.4;
 /// Boost factor for per-language CVM track scores (v0.4.1).
 const LANG_CVM_BOOST: f64 = 1.5;
 
-/// Unified prediction engine that blends three scoring signals:
+/// Unified prediction engine that blends four scoring signals:
 ///
 /// * **Corpus frequency** (α) — how common the word is in the language model trie.
 /// * **Markov context** (β) — bigram/trigram probability given recent words.
 /// * **Personal boost** (γ) — CVM-tracked frequency of words *this* user types.
+/// * **Tech vocabulary** (δ) — hardcoded tech terms; active only in FastCoding regime.
 ///
-/// The final score is `α·corpus + β·markov + γ·personal`.
+/// The final score is `α·corpus + β·markov + γ·personal + δ·tech`.
+/// When δ > 0, the other three weights are proportionally rescaled to keep the sum = 1.
 pub struct SmartKeyEngine {
     trie: NgramTrie,
     markov: MarkovChain,
@@ -85,6 +89,11 @@ pub struct SmartKeyEngine {
     kn_scorer: Option<KneserNeyScorer>,
     /// Hedge/Exp3 adaptive weight mixer (experimental, behind flag).
     hedge: Option<HedgeMixer>,
+    /// Tech vocabulary for FastCoding regime boost (v0.5+).
+    tech_vocab: TechVocab,
+    /// Current typing regime for tech-boost gating (v0.5+).
+    /// Updated by `InputMethodCore` on every word commit via `set_regime()`.
+    current_regime: Option<TypingRegime>,
     /// Feature flags snapshot from config.
     use_session_cache_lm: bool,
     bpe_enabled: bool,
@@ -131,6 +140,8 @@ impl SmartKeyEngine {
             bpe: None, // Loaded from corpus if bpe_enabled
             session_cache: SessionCacheLM::new(),
             kn_scorer: None, // Built lazily after corpus load when flag is set
+            tech_vocab: TechVocab::new(),
+            current_regime: None,
             hedge: if config.use_hedge {
                 Some(HedgeMixer::with_defaults(&[
                     config.weights.0,
@@ -300,6 +311,28 @@ impl SmartKeyEngine {
         self.cache.lock().unwrap().invalidate();
     }
 
+    /// Handle a prediction being rejected (Escape press) — penalise adaptive weights.
+    ///
+    /// When Hedge is active, applies a neutral update so decay-toward-defaults fires
+    /// on schedule (proportional to rejection events). EMA path is a no-op since EMA
+    /// only reacts to positive feedback (Tab).
+    pub fn on_prediction_rejected(&mut self) {
+        if self.use_hedge {
+            self.commit_count += 1;
+            if self.commit_count.is_multiple_of(DECAY_INTERVAL) {
+                if let Some(ref mut hedge) = self.hedge {
+                    // Neutral rewards: no signal gains; decay toward defaults fires.
+                    hedge.update(&[0.5, 0.5, 0.5]);
+                    let (a, b, g) = hedge.weights_triple();
+                    self.alpha = a;
+                    self.beta = b;
+                    self.gamma = g;
+                }
+            }
+            self.cache.lock().unwrap().invalidate();
+        }
+    }
+
     /// Export the full personal profile (CVM + Markov + weights + lang CVM).
     pub fn export_personal_profile(&self) -> PersonalProfile {
         let cvm = self.personal.to_snapshot();
@@ -378,6 +411,15 @@ impl SmartKeyEngine {
             .first()
             .map(|e| e.frequency)
             .unwrap_or(0)
+    }
+
+    /// Update the current typing regime (called by `InputMethodCore` after each word commit).
+    ///
+    /// The regime gates the tech vocabulary δ weight in `predict()`:
+    /// δ = 0.15 when `FastCoding`, 0.0 otherwise.
+    pub fn set_regime(&mut self, regime: TypingRegime) {
+        self.current_regime = Some(regime);
+        self.cache.lock().unwrap().invalidate();
     }
 
     /// Score two prefixes (EN and BG interpretations) for dual-buffer comparison.
@@ -486,7 +528,7 @@ impl SmartKeyEngine {
             (Vec::new(), HashMap::new())
         };
 
-        // If both exact and fuzzy are empty, try BPE fallback.
+        // If both exact and fuzzy are empty, try BPE fallback, then tech vocab fallback.
         if candidates.is_empty() && fuzzy_candidates.is_empty() {
             if self.bpe_enabled {
                 if let Some(ref bpe) = self.bpe {
@@ -510,6 +552,29 @@ impl SmartKeyEngine {
                     }
                 }
             }
+
+            // Tech vocab fallback: when corpus has zero matches but tech vocab does,
+            // return tech suggestions directly (activated regardless of regime —
+            // they are the only candidates available).
+            let tech_hits = self.tech_vocab.score(prefix, limit);
+            if !tech_hits.is_empty() {
+                let max_score = tech_hits.first().map(|(_, s)| *s).unwrap_or(1.0).max(1e-6);
+                let mut preds: Vec<Prediction> = tech_hits
+                    .into_iter()
+                    .map(|(word, score)| Prediction {
+                        word,
+                        score,
+                        confidence: score / max_score,
+                    })
+                    .collect();
+                preds.truncate(limit);
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .put(prefix, context, preds.clone());
+                return preds;
+            }
+
             return Vec::new();
         }
 
@@ -533,6 +598,20 @@ impl SmartKeyEngine {
             None
         };
 
+        // Tech vocab scores: build a word→score map once per predict() call.
+        // Only populated when regime is FastCoding (δ > 0.0), avoiding the
+        // HashMap allocation in the common case.
+        const TECH_DELTA: f64 = 0.15;
+        let is_fast_coding = matches!(self.current_regime, Some(TypingRegime::FastCoding));
+        let tech_score_map: HashMap<String, f64> = if is_fast_coding && !prefix.is_empty() {
+            self.tech_vocab
+                .score(prefix, candidate_pool)
+                .into_iter()
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         // Single pass: compute raw scores and track maxima simultaneously.
         // This avoids calling markov.score_with_backoff() and personal.frequency_score()
         // twice per candidate (was: once for max, once for scoring).
@@ -541,6 +620,7 @@ impl SmartKeyEngine {
             markov: f64,
             personal: f64,
             ppm: f64,
+            tech: f64,
         }
 
         // Stack-allocate for the common case (≤30 candidates; default limit*3=15).
@@ -550,6 +630,7 @@ impl SmartKeyEngine {
         let mut max_markov = 1e-6_f64;
         let mut max_personal = 1.0_f64;
         let mut max_ppm = 1e-6_f64;
+        let mut max_tech = 1e-6_f64;
         let use_stack = all_candidates.len() <= 30;
 
         for c in &all_candidates {
@@ -585,14 +666,21 @@ impl SmartKeyEngine {
             } else {
                 0.0
             };
+            // Tech vocab scoring (non-zero only in FastCoding regime).
+            let tech_score = tech_score_map
+                .get(&c.word.to_lowercase())
+                .copied()
+                .unwrap_or(0.0);
             max_markov = max_markov.max(m);
             max_personal = max_personal.max(p);
             max_ppm = max_ppm.max(ppm_score);
+            max_tech = max_tech.max(tech_score);
             let scores = RawScores {
                 corpus: c.frequency as f64,
                 markov: m,
                 personal: p,
                 ppm: ppm_score,
+                tech: tech_score,
             };
             if use_stack {
                 // SAFETY: use_stack guarantees len <= 30.
@@ -605,19 +693,58 @@ impl SmartKeyEngine {
         let raw: &[RawScores] = if use_stack { &raw_small } else { &raw_large };
 
         // Normalize and blend in a second pass (but no redundant score calls).
-        // When PPM is active, borrow δ weight from β (markov) for short prefixes.
-        let (eff_alpha, eff_beta, eff_gamma, eff_delta) = if self.ppm.is_some() && prefix.len() <= 1
-        {
-            // Short prefix: PPM gets 0.15 borrowed from markov.
-            let delta = 0.15_f64.min(self.beta * 0.5);
-            (self.alpha, self.beta - delta, self.gamma, delta)
-        } else if self.ppm.is_some() {
-            // Longer prefix: PPM gets a smaller share.
-            let delta = 0.05_f64.min(self.beta * 0.2);
-            (self.alpha, self.beta - delta, self.gamma, delta)
-        } else {
-            (self.alpha, self.beta, self.gamma, 0.0)
-        };
+        // When PPM is active, borrow a share from β (markov) for short prefixes.
+        // When FastCoding, tech gets δ = 0.15 borrowed proportionally from α, β, γ.
+        let (eff_alpha, eff_beta, eff_gamma, eff_delta, eff_tech) =
+            if self.ppm.is_some() && prefix.len() <= 1 {
+                // Short prefix: PPM gets 0.15 borrowed from markov.
+                let delta = 0.15_f64.min(self.beta * 0.5);
+                let (a, b, g) = (self.alpha, self.beta - delta, self.gamma);
+                if is_fast_coding {
+                    // Rescale (a, b, g) so that sum = 1 - TECH_DELTA.
+                    let base_sum = a + b + g;
+                    let scale = if base_sum > 0.0 {
+                        (1.0 - TECH_DELTA) / base_sum
+                    } else {
+                        1.0
+                    };
+                    (a * scale, b * scale, g * scale, delta * scale, TECH_DELTA)
+                } else {
+                    (a, b, g, delta, 0.0)
+                }
+            } else if self.ppm.is_some() {
+                // Longer prefix: PPM gets a smaller share.
+                let delta = 0.05_f64.min(self.beta * 0.2);
+                let (a, b, g) = (self.alpha, self.beta - delta, self.gamma);
+                if is_fast_coding {
+                    let base_sum = a + b + g;
+                    let scale = if base_sum > 0.0 {
+                        (1.0 - TECH_DELTA) / base_sum
+                    } else {
+                        1.0
+                    };
+                    (a * scale, b * scale, g * scale, delta * scale, TECH_DELTA)
+                } else {
+                    (a, b, g, delta, 0.0)
+                }
+            } else if is_fast_coding {
+                // No PPM, but FastCoding: tech gets TECH_DELTA, others rescaled.
+                let base_sum = self.alpha + self.beta + self.gamma;
+                let scale = if base_sum > 0.0 {
+                    (1.0 - TECH_DELTA) / base_sum
+                } else {
+                    1.0
+                };
+                (
+                    self.alpha * scale,
+                    self.beta * scale,
+                    self.gamma * scale,
+                    0.0,
+                    TECH_DELTA,
+                )
+            } else {
+                (self.alpha, self.beta, self.gamma, 0.0, 0.0)
+            };
 
         let mut scored: Vec<Prediction> = all_candidates
             .iter()
@@ -627,11 +754,17 @@ impl SmartKeyEngine {
                 let markov_score = r.markov / max_markov;
                 let personal_score = r.personal / max_personal;
                 let ppm_score = if max_ppm > 1e-6 { r.ppm / max_ppm } else { 0.0 };
+                let tech_score = if max_tech > 1e-6 {
+                    r.tech / max_tech
+                } else {
+                    0.0
+                };
 
                 let mut score = eff_alpha * corpus_score
                     + eff_beta * markov_score
                     + eff_gamma * personal_score
-                    + eff_delta * ppm_score;
+                    + eff_delta * ppm_score
+                    + eff_tech * tech_score;
 
                 // Apply fuzzy discount if this came from fuzzy matching.
                 if let Some(&discount) = discount_map.get(&entry.word) {
@@ -655,10 +788,12 @@ impl SmartKeyEngine {
         scored.truncate(limit);
 
         // Step 5: normalise confidence so the top candidate is ~1.0.
+        // `.clamp(0.0, 1.0)` guards against floating-point rounding producing
+        // values marginally outside [0, 1] (e.g. 1.0000000000000002).
         if let Some(top_score) = scored.first().map(|p| p.score) {
             if top_score > 0.0 {
                 for p in &mut scored {
-                    p.confidence = p.score / top_score;
+                    p.confidence = (p.score / top_score).clamp(0.0, 1.0);
                 }
             }
         }
