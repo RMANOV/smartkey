@@ -332,7 +332,7 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
         let has_ghost = core.has_ghost();
         let should_claim = match &key {
             Key::Tab | Key::Right | Key::Escape => has_ghost,
-            Key::Space | Key::Return | Key::Backspace | Key::Char(_) => true,
+            Key::Space | Key::Return | Key::Backspace | Key::Char(_) | Key::RawCode(_) => true,
             Key::Other(_) => false,
         };
         Ok(BOOL::from(should_claim))
