@@ -392,6 +392,17 @@ fn actions_to_c(actions: Vec<Action>) -> *mut CActionList {
                         .into_raw(),
                 }
             }
+            Action::ShowComposing { typed, ghost } => {
+                // Fallback: treat as ShowGhost with full text.
+                // TODO: implement styled composing for macOS IMK.
+                let full = format!("{}{}", typed, ghost);
+                CAction {
+                    action_type: 0,
+                    payload: CString::new(full.replace('\0', ""))
+                        .expect("null-free after replace")
+                        .into_raw(),
+                }
+            }
         })
         .collect();
 

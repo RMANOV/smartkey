@@ -253,6 +253,37 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         """Remove any displayed ghost text."""
         self.hide_preedit_text()
 
+    def _show_composing(self, typed: str, ghost: str) -> None:
+        """Display composing preedit: typed prefix (normal) + ghost suffix (grey)."""
+        full_text = typed + ghost
+        ibus_text = IBus.Text.new_from_string(full_text)
+        typed_bytes = len(typed.encode("utf-8"))
+        total_bytes = len(full_text.encode("utf-8"))
+        attrs = IBus.AttrList()
+        # Typed prefix: underline only (normal text color).
+        attrs.append(
+            IBus.Attribute.new(
+                IBus.ATTR_TYPE_UNDERLINE, IBus.ATTR_UNDERLINE_SINGLE, 0, typed_bytes
+            )
+        )
+        # Ghost suffix: grey + underline.
+        if ghost:
+            attrs.append(
+                IBus.Attribute.new(
+                    IBus.ATTR_TYPE_FOREGROUND, 0x888888, typed_bytes, total_bytes
+                )
+            )
+            attrs.append(
+                IBus.Attribute.new(
+                    IBus.ATTR_TYPE_UNDERLINE,
+                    IBus.ATTR_UNDERLINE_SINGLE,
+                    typed_bytes,
+                    total_bytes,
+                )
+            )
+        ibus_text.set_attributes(attrs)
+        self.update_preedit_text(ibus_text, typed_bytes, True)
+
     # -----------------------------------------------------------------------
     # Action dispatcher — translates Rust actions to IBus API calls.
     # -----------------------------------------------------------------------
@@ -279,6 +310,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     for _ in range(replace_len):
                         self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
                 self.commit_text(IBus.Text.new_from_string(text))
+            elif action_type == "composing":
+                typed, ghost = (
+                    payload.split("\x00", 1) if "\x00" in payload else (payload, "")
+                )
+                self._show_composing(typed, ghost)
             elif action_type == "forward":
                 consumed = False
         return consumed

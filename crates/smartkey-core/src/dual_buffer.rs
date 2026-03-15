@@ -25,7 +25,7 @@ impl Default for DualBufferConfig {
         Self {
             enabled: true,
             lock_threshold: 0.7,
-            min_lock_chars: 2,
+            min_lock_chars: 3,
         }
     }
 }
@@ -100,12 +100,9 @@ impl DualBuffer {
     pub fn pop(&mut self) {
         self.en_buf.pop();
         self.bg_buf.pop();
-        // Reset lock state if we drop below min_lock_chars.
-        if self.en_buf.len() < self.min_lock_chars {
-            self.locked = false;
-            self.locked_lang = None;
-            self.flip_detected = false;
-        }
+        // Lock is sticky — once locked, stays locked until clear().
+        // This prevents re-entering hypothesis phase after chars were
+        // committed to the application during the lock transition.
     }
 
     /// Update scores from corpus frequency data and determine the winner.
@@ -373,16 +370,16 @@ mod tests {
     }
 
     #[test]
-    fn test_pop_resets_lock_below_min() {
+    fn test_pop_keeps_lock_sticky() {
         let mut b = db();
         b.push('h', 'х');
         b.push('e', 'е');
         b.update_scores(4_897_788.0, 43_651.0);
         assert!(b.is_locked());
 
-        // Pop to 1 char → below min_lock_chars → lock resets.
+        // Pop to 1 char — lock stays (sticky, not reset on pop).
         b.pop();
-        assert!(!b.is_locked());
+        assert!(b.is_locked());
     }
 
     #[test]

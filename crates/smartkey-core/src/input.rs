@@ -78,6 +78,9 @@ pub enum Action {
     /// Replace `replace_len` characters before cursor with `text`.
     /// Used for transliteration: "zd" → "зд".
     ReplaceWord { replace_len: usize, text: String },
+    /// Composing preedit: typed prefix (normal color, underlined) +
+    /// predicted suffix (grey, underlined). Used during hypothesis phase.
+    ShowComposing { typed: String, ghost: String },
 }
 
 // ======================================================================
@@ -415,8 +418,18 @@ impl InputMethodCore {
             Key::Tab => {
                 if !self.ghost.is_empty() {
                     let full_word = format!("{}{}", self.current_word, self.ghost);
-                    // Commit only the ghost suffix — typed chars were already forwarded.
-                    let actions = vec![Action::CommitText(self.ghost.clone()), Action::HideGhost];
+                    // In hypothesis phase: prefix is in preedit, commit everything.
+                    // In locked/no-dual: prefix already in app, commit suffix only.
+                    let in_hypothesis = self
+                        .dual_buffer
+                        .as_ref()
+                        .map_or(false, |db| !db.is_locked());
+                    let commit_text = if in_hypothesis {
+                        full_word.clone()
+                    } else {
+                        self.ghost.clone()
+                    };
+                    let actions = vec![Action::HideGhost, Action::CommitText(commit_text)];
                     // Notify engine of accepted prediction for adaptive weight learning.
                     let ctx: Vec<&str> = self.context.iter().map(|s| s.as_str()).collect();
                     self.engine.on_prediction_accepted(&full_word, &ctx);
@@ -432,6 +445,21 @@ impl InputMethodCore {
                     self.commit_word_internal(&full_word, false);
                     self.reset_word();
                     actions
+                } else if self
+                    .dual_buffer
+                    .as_ref()
+                    .map_or(false, |db| !db.is_locked())
+                    && !self.current_word.is_empty()
+                {
+                    // Hypothesis phase, no ghost: commit preedit prefix + forward Tab.
+                    let prefix = self.current_word.clone();
+                    self.commit_word_internal(&prefix, true);
+                    self.reset_word();
+                    vec![
+                        Action::HideGhost,
+                        Action::CommitText(prefix),
+                        Action::ForwardKey,
+                    ]
                 } else {
                     vec![Action::ForwardKey]
                 }
@@ -442,7 +470,17 @@ impl InputMethodCore {
                 if !self.ghost.is_empty() {
                     let ch = self.ghost.remove(0);
                     self.current_word.push(ch);
-                    if self.ghost.is_empty() {
+                    if self
+                        .dual_buffer
+                        .as_ref()
+                        .map_or(false, |db| !db.is_locked())
+                    {
+                        // Hypothesis phase: everything stays in preedit.
+                        vec![Action::ShowComposing {
+                            typed: self.current_word.clone(),
+                            ghost: self.ghost.clone(),
+                        }]
+                    } else if self.ghost.is_empty() {
                         vec![Action::HideGhost]
                     } else {
                         vec![Action::ShowGhost(self.ghost.clone())]
@@ -454,7 +492,15 @@ impl InputMethodCore {
 
             // Escape: dismiss ghost text and notify engine of rejection.
             Key::Escape => {
-                if !self.ghost.is_empty() {
+                if self
+                    .dual_buffer
+                    .as_ref()
+                    .map_or(false, |db| !db.is_locked())
+                {
+                    // Hypothesis phase: cancel preedit, nothing was committed.
+                    self.reset_word();
+                    vec![Action::HideGhost]
+                } else if !self.ghost.is_empty() {
                     self.engine.on_prediction_rejected();
                     self.ghost.clear();
                     vec![Action::HideGhost]
@@ -465,6 +511,19 @@ impl InputMethodCore {
 
             // Space / Return: commit current word, delimit.
             Key::Space | Key::Return => {
+                if let Some(ref db) = self.dual_buffer {
+                    if !db.is_locked() && !self.current_word.is_empty() {
+                        // Hypothesis phase: commit preedit prefix before forwarding.
+                        let prefix = self.current_word.clone();
+                        self.commit_word_internal(&prefix, true);
+                        self.reset_word();
+                        return vec![
+                            Action::HideGhost,
+                            Action::CommitText(prefix),
+                            Action::ForwardKey,
+                        ];
+                    }
+                }
                 if !self.current_word.is_empty() {
                     let word = std::mem::take(&mut self.current_word);
                     self.commit_word_internal(&word, true);
@@ -477,43 +536,35 @@ impl InputMethodCore {
             Key::Backspace => {
                 if let Some(ref mut db) = self.dual_buffer {
                     if !db.is_empty() {
-                        let old_len = db.len();
-                        let old_winner = db.winner_lang();
+                        let was_locked = db.is_locked();
                         db.pop();
                         if db.is_empty() {
                             self.dual_buffer = None;
                             self.current_word.clear();
-                            // Delete the last committed char via ReplaceWord.
-                            // HideGhost first: clear preedit before replacing.
-                            return vec![
-                                Action::HideGhost,
-                                Action::ReplaceWord {
-                                    replace_len: 1,
-                                    text: String::new(),
-                                },
-                            ];
+                            self.ghost.clear();
+                            if was_locked {
+                                // Committed chars in app: forward backspace to delete last one.
+                                return vec![Action::HideGhost, Action::ForwardKey];
+                            } else {
+                                // Hypothesis: nothing in app, just clear preedit.
+                                return vec![Action::HideGhost];
+                            }
                         }
-                        // Re-score after removing a character.
-                        let (en_freq, bg_freq) = self.engine.score_both(db.en_text(), db.bg_text());
-                        db.update_scores(en_freq, bg_freq);
-
-                        if db.winner_lang() != old_winner {
-                            // Winner changed — replace all remaining chars.
-                            let new_text = db.winner_text().to_string();
-                            self.current_word = new_text.clone();
-                            let ghost_action = self.update_predictions();
-                            return vec![
-                                Action::HideGhost,
-                                Action::ReplaceWord {
-                                    replace_len: old_len,
-                                    text: new_text,
-                                },
-                                ghost_action,
-                            ];
+                        if !was_locked {
+                            // Hypothesis: re-score, update preedit.
+                            let (ef, bf) = self.engine.score_both(db.en_text(), db.bg_text());
+                            db.update_scores(ef, bf);
+                            self.current_word = db.winner_text().to_string();
+                            let ghost = self.compute_ghost_suffix();
+                            return vec![Action::ShowComposing {
+                                typed: self.current_word.clone(),
+                                ghost,
+                            }];
                         }
+                        // Locked: forward backspace to app + update ghost.
                         self.current_word = db.winner_text().to_string();
                         let ghost_action = self.update_predictions();
-                        return vec![ghost_action, Action::ForwardKey];
+                        return vec![Action::HideGhost, Action::ForwardKey, ghost_action];
                     }
                 }
                 if !self.current_word.is_empty() {
@@ -583,12 +634,20 @@ impl InputMethodCore {
 
     /// Called when the input field loses focus.
     pub fn focus_lost(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        // If in hypothesis phase, commit the preedit prefix to the app.
+        if let Some(ref db) = self.dual_buffer {
+            if !db.is_locked() && !self.current_word.is_empty() {
+                actions.push(Action::CommitText(self.current_word.clone()));
+            }
+        }
         if !self.current_word.is_empty() {
             let word = std::mem::take(&mut self.current_word);
             self.commit_word_internal(&word, true);
         }
         self.reset_word();
-        vec![Action::HideGhost]
+        actions.push(Action::HideGhost);
+        actions
     }
 
     /// Called when the input field gains focus.
@@ -746,54 +805,58 @@ impl InputMethodCore {
         }
 
         let db = self.dual_buffer.as_mut().unwrap();
+        let was_locked = db.is_locked();
         db.push(en_ch, bg_ch);
 
-        // Score both interpretations.
-        let (en_freq, bg_freq) = self.engine.score_both(db.en_text(), db.bg_text());
-        db.update_scores(en_freq, bg_freq);
+        // Score both interpretations (skip if already locked — perf win).
+        if !was_locked {
+            let (en_freq, bg_freq) = self.engine.score_both(db.en_text(), db.bg_text());
+            db.update_scores(en_freq, bg_freq);
+        }
 
-        // Check for confidence flip after lock.
-        if db.flip_detected() {
-            let replace_len = db.len() - 1; // Previous chars already in app.
-            let new_text = db.winner_text().to_string();
-            self.current_word = new_text.clone();
-            db.clear_flip();
-            // Record the flip for regime detection.
-            self.current_word_had_flip = true;
+        self.current_word = db.winner_text().to_string();
 
-            if self.config.lang_detection {
+        // Feed language detection.
+        if self.config.lang_detection {
+            let winner_char = match db.winner_lang() {
+                LangId::En => en_ch,
+                LangId::Bg | LangId::Tech => bg_ch,
+            };
+            self.lang_detector.feed_char_instant(winner_char);
+            if !was_locked {
                 self.lang_detector
                     .feed_dual_result(db.winner_lang(), db.confidence());
             }
+        }
 
+        if !db.is_locked() {
+            // ═══ HYPOTHESIS PHASE ═══
+            // Nothing committed. Everything in preedit.
+            let ghost_suffix = self.compute_ghost_suffix();
+            return vec![Action::ShowComposing {
+                typed: self.current_word.clone(),
+                ghost: ghost_suffix,
+            }];
+        }
+
+        if !was_locked {
+            // ═══ JUST LOCKED (transition) ═══
+            // Commit entire accumulated prefix at once.
             let ghost_action = self.update_predictions();
             return vec![
                 Action::HideGhost,
-                Action::ReplaceWord {
-                    replace_len,
-                    text: new_text,
-                },
+                Action::CommitText(self.current_word.clone()),
                 ghost_action,
             ];
         }
 
-        // Update current_word to the winner text.
-        self.current_word = db.winner_text().to_string();
-
-        // Feed the winner char to language detection.
+        // ═══ LOCKED PHASE ═══
+        // One char at a time, language already decided.
         let winner_char = match db.winner_lang() {
             LangId::En => en_ch,
             LangId::Bg | LangId::Tech => bg_ch,
         };
-        if self.config.lang_detection {
-            self.lang_detector.feed_char_instant(winner_char);
-        }
-
         let ghost_action = self.update_predictions();
-
-        // Commit the winner character (consume the raw key — don't forward).
-        // HideGhost first: clear the old preedit so toolkits (Qt/KDE Wayland)
-        // don't auto-commit it alongside the new character (→ doubling).
         vec![
             Action::HideGhost,
             Action::CommitText(winner_char.to_string()),
@@ -856,9 +919,9 @@ impl InputMethodCore {
         false
     }
 
-    fn update_predictions(&mut self) -> Action {
-        // When PPM is enabled, lower min_prefix_length to 1 so predictions
-        // start on the first character (PPM guides candidate generation).
+    /// Compute predictions and return ghost suffix string (empty if none).
+    /// Sets `self.ghost` and `self.last_predictions` as side effects.
+    fn compute_ghost_suffix(&mut self) -> String {
         let effective_min = if self.config.use_ppm {
             1
         } else {
@@ -867,7 +930,7 @@ impl InputMethodCore {
         if self.current_word.chars().count() < effective_min {
             self.ghost.clear();
             self.last_predictions.clear();
-            return Action::HideGhost;
+            return String::new();
         }
 
         let ctx_refs: arrayvec::ArrayVec<&str, 5> =
@@ -887,23 +950,27 @@ impl InputMethodCore {
         self.metrics.record_latency(t0.elapsed());
 
         if let Some(top) = self.last_predictions.first() {
-            // T8: Suppress ghost text if top score is below confidence threshold.
-            if top.score < self.config.ghost_text_min_confidence {
-                self.ghost.clear();
-                return Action::HideGhost;
-            }
-            let suffix = top
-                .word
-                .strip_prefix(self.current_word.as_str())
-                .unwrap_or("");
-            if !suffix.is_empty() && self.config.ghost_text {
-                self.ghost = suffix.to_string();
-                return Action::ShowGhost(self.ghost.clone());
+            if top.score >= self.config.ghost_text_min_confidence {
+                if let Some(suffix) = top.word.strip_prefix(self.current_word.as_str()) {
+                    if !suffix.is_empty() && self.config.ghost_text {
+                        self.ghost = suffix.to_string();
+                        return self.ghost.clone();
+                    }
+                }
             }
         }
 
         self.ghost.clear();
-        Action::HideGhost
+        String::new()
+    }
+
+    fn update_predictions(&mut self) -> Action {
+        let suffix = self.compute_ghost_suffix();
+        if suffix.is_empty() {
+            Action::HideGhost
+        } else {
+            Action::ShowGhost(suffix)
+        }
     }
 }
 
@@ -1333,19 +1400,23 @@ mod tests {
     #[test]
     fn test_dual_buffer_en_wins() {
         // Type "he" via scancodes — strong EN word "he" (4.8M) vs weak BG "хе" (43K).
+        // With min_lock_chars=3, both chars stay in hypothesis phase (ShowComposing).
         let mut core = test_core_dual();
         // Scancode 35 = 'h'/'х', 18 = 'e'/'е' (evdev)
         let actions = core.handle_key(press_raw(35));
-        // First char committed.
         assert!(
-            actions.iter().any(|a| matches!(a, Action::CommitText(_))),
-            "should commit winner char"
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ShowComposing { .. })),
+            "first char should produce ShowComposing (hypothesis phase)"
         );
 
         let actions = core.handle_key(press_raw(18));
         assert!(
-            actions.iter().any(|a| matches!(a, Action::CommitText(_))),
-            "should commit second winner char"
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ShowComposing { .. })),
+            "second char should produce ShowComposing (hypothesis phase)"
         );
         // EN should win — current_word should be "he".
         assert_eq!(core.current_word(), "he");
@@ -1354,13 +1425,16 @@ mod tests {
     #[test]
     fn test_dual_buffer_bg_wins() {
         // Type "zd" via scancodes — weak EN "zd" (120) vs strong BG "зд" (162K).
+        // With min_lock_chars=3, both chars stay in hypothesis phase (ShowComposing).
         let mut core = test_core_dual();
         // Scancode 44 = 'z'/'з', 32 = 'd'/'д' (evdev)
         core.handle_key(press_raw(44));
         let actions = core.handle_key(press_raw(32));
         assert!(
-            actions.iter().any(|a| matches!(a, Action::CommitText(_))),
-            "should commit winner char"
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ShowComposing { .. })),
+            "second char should produce ShowComposing (hypothesis phase)"
         );
         // BG should win — current_word should be Cyrillic "зд".
         assert_eq!(core.current_word(), "зд");

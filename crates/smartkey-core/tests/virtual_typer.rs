@@ -394,7 +394,10 @@ fn test_dual_buffer_replace_action_possible() {
     let has_dual_output = all_actions.iter().any(|a| {
         matches!(
             a,
-            Action::CommitText(_) | Action::ReplaceWord { .. } | Action::ShowGhost(_)
+            Action::CommitText(_)
+                | Action::ReplaceWord { .. }
+                | Action::ShowGhost(_)
+                | Action::ShowComposing { .. }
         )
     });
     assert!(
@@ -422,9 +425,12 @@ fn test_dual_buffer_flip_emits_replace_with_controlled_corpus() {
     // After typing a 7-char word with a BG-dominant corpus result, we expect
     // either a ReplaceWord (flip) or CommitText (per-char dual buffer output).
     // Both indicate the dual-buffer engine is running correctly.
-    let has_output = all_actions
-        .iter()
-        .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. }));
+    let has_output = all_actions.iter().any(|a| {
+        matches!(
+            a,
+            Action::CommitText(_) | Action::ReplaceWord { .. } | Action::ShowComposing { .. }
+        )
+    });
     assert!(
         has_output,
         "dual buffer should produce CommitText or ReplaceWord; got: {:?}",

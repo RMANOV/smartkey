@@ -116,6 +116,9 @@ fn action_to_tuple(action: &Action) -> (String, String) {
         Action::ReplaceWord { replace_len, text } => {
             ("replace".into(), format!("{replace_len}:{text}"))
         }
+        Action::ShowComposing { typed, ghost } => {
+            ("composing".into(), format!("{}\x00{}", typed, ghost))
+        }
     }
 }
 

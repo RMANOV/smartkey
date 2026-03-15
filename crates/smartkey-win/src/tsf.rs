@@ -200,6 +200,30 @@ impl SmartKeyTextService {
                     }
                     consumed = true;
                 }
+                Action::ShowComposing {
+                    ref typed,
+                    ref ghost,
+                } => {
+                    // Fallback: treat as regular ghost with full text.
+                    // TODO: implement styled composing for Windows TSF.
+                    let full = format!("{}{}", typed, ghost);
+                    let sink: Result<ITfCompositionSink> = unsafe { self.cast() };
+                    match sink {
+                        Ok(comp_sink) => {
+                            let op = EditOp::ShowGhost {
+                                text: full,
+                                composition: self.composition.clone(),
+                                comp_sink,
+                                ghost_attr_atom: self.ghost_attr_atom.get(),
+                            };
+                            if let Err(e) = edit_session::request_edit_session(context, cid, op) {
+                                eprintln!("smartkey: ShowComposing failed: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("smartkey: failed to get composition sink: {e}"),
+                    }
+                    consumed = true;
+                }
             }
         }
         consumed
