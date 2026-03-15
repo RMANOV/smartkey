@@ -420,7 +420,7 @@ impl InputMethodCore {
                     let full_word = format!("{}{}", self.current_word, self.ghost);
                     // In hypothesis phase: prefix is in preedit, commit everything.
                     // In locked/no-dual: prefix already in app, commit suffix only.
-                    let in_hypothesis = self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked());
+                    let in_hypothesis = self.in_hypothesis_phase();
                     let commit_text = if in_hypothesis {
                         full_word.clone()
                     } else {
@@ -442,9 +442,7 @@ impl InputMethodCore {
                     self.commit_word_internal(&full_word, false);
                     self.reset_word();
                     actions
-                } else if self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked())
-                    && !self.current_word.is_empty()
-                {
+                } else if self.in_hypothesis_phase() && !self.current_word.is_empty() {
                     // Hypothesis phase, no ghost: commit preedit prefix + forward Tab.
                     let prefix = self.current_word.clone();
                     self.commit_word_internal(&prefix, true);
@@ -464,7 +462,7 @@ impl InputMethodCore {
                 if !self.ghost.is_empty() {
                     let ch = self.ghost.remove(0);
                     self.current_word.push(ch);
-                    if self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked()) {
+                    if self.in_hypothesis_phase() {
                         // Hypothesis phase: everything stays in preedit.
                         vec![Action::ShowComposing {
                             typed: self.current_word.clone(),
@@ -482,7 +480,7 @@ impl InputMethodCore {
 
             // Escape: dismiss ghost text and notify engine of rejection.
             Key::Escape => {
-                if self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked()) {
+                if self.in_hypothesis_phase() {
                     // Hypothesis phase: cancel preedit, nothing was committed.
                     self.reset_word();
                     vec![Action::HideGhost]
@@ -614,6 +612,11 @@ impl InputMethodCore {
             // Unknown key: pass through.
             Key::Other(_) => vec![Action::ForwardKey],
         }
+    }
+
+    /// Whether the dual buffer is active but not yet locked (hypothesis phase).
+    fn in_hypothesis_phase(&self) -> bool {
+        self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked())
     }
 
     // -- focus / reset --------------------------------------------------
@@ -802,12 +805,14 @@ impl InputMethodCore {
 
         self.current_word = db.winner_text().to_string();
 
+        // Compute winner char once — reused for lang detection and locked-phase commit.
+        let winner_char = match db.winner_lang() {
+            LangId::En => en_ch,
+            LangId::Bg | LangId::Tech => bg_ch,
+        };
+
         // Feed language detection.
         if self.config.lang_detection {
-            let winner_char = match db.winner_lang() {
-                LangId::En => en_ch,
-                LangId::Bg | LangId::Tech => bg_ch,
-            };
             self.lang_detector.feed_char_instant(winner_char);
             if !was_locked {
                 self.lang_detector
@@ -838,10 +843,6 @@ impl InputMethodCore {
 
         // ═══ LOCKED PHASE ═══
         // One char at a time, language already decided.
-        let winner_char = match db.winner_lang() {
-            LangId::En => en_ch,
-            LangId::Bg | LangId::Tech => bg_ch,
-        };
         let ghost_action = self.update_predictions();
         vec![
             Action::HideGhost,
@@ -939,8 +940,9 @@ impl InputMethodCore {
             if top.score >= self.config.ghost_text_min_confidence {
                 if let Some(suffix) = top.word.strip_prefix(self.current_word.as_str()) {
                     if !suffix.is_empty() && self.config.ghost_text {
-                        self.ghost = suffix.to_string();
-                        return self.ghost.clone();
+                        let s = suffix.to_string();
+                        self.ghost.clone_from(&s);
+                        return s;
                     }
                 }
             }
