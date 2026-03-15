@@ -420,10 +420,7 @@ impl InputMethodCore {
                     let full_word = format!("{}{}", self.current_word, self.ghost);
                     // In hypothesis phase: prefix is in preedit, commit everything.
                     // In locked/no-dual: prefix already in app, commit suffix only.
-                    let in_hypothesis = self
-                        .dual_buffer
-                        .as_ref()
-                        .map_or(false, |db| !db.is_locked());
+                    let in_hypothesis = self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked());
                     let commit_text = if in_hypothesis {
                         full_word.clone()
                     } else {
@@ -445,10 +442,7 @@ impl InputMethodCore {
                     self.commit_word_internal(&full_word, false);
                     self.reset_word();
                     actions
-                } else if self
-                    .dual_buffer
-                    .as_ref()
-                    .map_or(false, |db| !db.is_locked())
+                } else if self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked())
                     && !self.current_word.is_empty()
                 {
                     // Hypothesis phase, no ghost: commit preedit prefix + forward Tab.
@@ -470,11 +464,7 @@ impl InputMethodCore {
                 if !self.ghost.is_empty() {
                     let ch = self.ghost.remove(0);
                     self.current_word.push(ch);
-                    if self
-                        .dual_buffer
-                        .as_ref()
-                        .map_or(false, |db| !db.is_locked())
-                    {
+                    if self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked()) {
                         // Hypothesis phase: everything stays in preedit.
                         vec![Action::ShowComposing {
                             typed: self.current_word.clone(),
@@ -492,11 +482,7 @@ impl InputMethodCore {
 
             // Escape: dismiss ghost text and notify engine of rejection.
             Key::Escape => {
-                if self
-                    .dual_buffer
-                    .as_ref()
-                    .map_or(false, |db| !db.is_locked())
-                {
+                if self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked()) {
                     // Hypothesis phase: cancel preedit, nothing was committed.
                     self.reset_word();
                     vec![Action::HideGhost]
