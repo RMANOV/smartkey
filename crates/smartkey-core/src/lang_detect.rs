@@ -2,7 +2,7 @@
 //
 // Classifies keystroke streams into Bg (Cyrillic), En (Latin), or Tech
 // (digits/symbols). Uses pre-computed trigram log-probabilities per language.
-// The EMA smoothing (α = 0.15) prevents rapid oscillation during mixed input.
+// The EMA smoothing (α = 0.30) prevents rapid oscillation during mixed input.
 
 use std::collections::VecDeque;
 
@@ -26,7 +26,7 @@ pub struct DetectedLanguage {
 pub struct LanguageDetector {
     /// Running EMA of cross-entropy per language [Bg, En, Tech].
     ema_scores: [f64; 3],
-    /// EMA smoothing factor: 0.15 → ~7 chars to 50% confidence.
+    /// EMA smoothing factor: 0.30 → ~3 chars to 50% confidence.
     ema_alpha: f64,
     /// Recent characters for trigram computation.
     char_buffer: VecDeque<char>,
@@ -37,11 +37,11 @@ pub struct LanguageDetector {
 }
 
 impl LanguageDetector {
-    /// Create a new detector with default EMA alpha (0.15).
+    /// Create a new detector with default EMA alpha (0.30).
     pub fn new() -> Self {
         Self {
             ema_scores: [0.0; 3],
-            ema_alpha: 0.15,
+            ema_alpha: 0.30,
             char_buffer: VecDeque::with_capacity(3),
             detected: DetectedLanguage {
                 lang: LangId::En,
@@ -60,6 +60,23 @@ impl LanguageDetector {
 
         // Compute per-language scores from character properties.
         let scores = self.score_char(ch);
+
+        // Hard reset on script change: if the incoming character's Unicode
+        // block differs from the current EMA winner, reset EMA to 50/50
+        // instead of gradual shift. This eliminates cross-contamination lag.
+        if let Some(incoming_lang) = Self::instant_classify(ch) {
+            let current_winner = self.detected.lang;
+            let winner_is_different = matches!(
+                (current_winner, incoming_lang),
+                (LangId::Bg, LangId::En) | (LangId::En, LangId::Bg)
+            );
+            if winner_is_different && self.detected.confidence > 0.3 {
+                let n = self.ema_scores.len() as f64;
+                for ema in self.ema_scores.iter_mut() {
+                    *ema = 1.0 / n;
+                }
+            }
+        }
 
         // EMA update: score[i] = (1-α) * old + α * new
         for (ema, &s) in self.ema_scores.iter_mut().zip(scores.iter()) {
@@ -536,5 +553,24 @@ mod tests {
     fn test_transliterate() {
         assert_eq!(transliterate("zdrave"), "здраве");
         assert_eq!(transliterate("Hello"), "Хелло");
+    }
+
+    #[test]
+    fn switch_en_to_bg_detected_within_3_chars() {
+        let mut d = LanguageDetector::new();
+        // Establish EN detection.
+        for ch in "hello".chars() {
+            d.feed_char(ch);
+        }
+        assert_eq!(d.detected().lang, LangId::En);
+        // Switch to Cyrillic — with hard reset + α=0.30, must flip within 3 chars.
+        for ch in "здр".chars() {
+            d.feed_char(ch);
+        }
+        assert_eq!(
+            d.detected().lang,
+            LangId::Bg,
+            "should detect Bg within 3 Cyrillic chars after hard reset"
+        );
     }
 }

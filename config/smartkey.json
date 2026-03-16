@@ -3,19 +3,19 @@
     "ghost_text": true,
     "max_candidates": 5,
     "min_prefix_length": 2,
-    "ghost_text_min_confidence": 0.15,
+    "ghost_text_min_confidence": 0.35,
     "kill_switch": "Super+Escape",
-    "weights": {"corpus": 0.4, "markov": 0.4, "personal": 0.2},
+    "weights": {"corpus": 0.50, "markov": 0.30, "personal": 0.20},
     "languages": ["en", "bg"],
     "dual_buffer": {
         "enabled": true,
-        "lock_threshold": 0.7,
-        "min_lock_chars": 2
+        "lock_threshold": 0.85,
+        "min_lock_chars": 4
     },
     "tuning": {
-        "cvm_initial_size": 1024,
+        "cvm_initial_size": 2048,
         "cvm_max_size": 8192,
-        "cvm_decay_lambda": 0.001,
+        "cvm_decay_lambda": 0.0005,
         "fuzzy_max_edits": 1,
         "fuzzy_discounts": [1.0, 0.7, 0.4],
         "markov_lambdas": [0.6, 0.3, 0.1]

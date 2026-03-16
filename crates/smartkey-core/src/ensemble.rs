@@ -41,10 +41,10 @@ const DECAY_INTERVAL: u32 = 20;
 const DECAY_RATE: f64 = 0.1;
 
 /// Session cache blend factor: personal_score = max(cvm, session_cache * BLEND).
-const SESSION_BLEND: f64 = 0.4;
+const SESSION_BLEND: f64 = 0.5; // Previous: 0.4 — rollback if recent words dominate too much
 
 /// Boost factor for per-language CVM track scores (v0.4.1).
-const LANG_CVM_BOOST: f64 = 1.5;
+const LANG_CVM_BOOST: f64 = 1.2; // Previous: 1.5 — rollback if language-specific boost is too weak
 
 /// Unified prediction engine that blends four scoring signals:
 ///
@@ -102,7 +102,7 @@ pub struct SmartKeyEngine {
 }
 
 impl SmartKeyEngine {
-    /// Create a new engine with default weights `(0.4, 0.4, 0.2)` and a
+    /// Create a new engine with default weights `(0.50, 0.30, 0.20)` and a
     /// CVM counter sized `(500, 5000)`.
     pub fn new() -> Self {
         Self::from_config(&InputConfig::default())
@@ -1134,5 +1134,54 @@ mod tests {
                 bp.score
             );
         }
+    }
+    #[test]
+    fn common_english_completions() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("the", 100_000);
+        engine.load_word("that", 60_000);
+        engine.load_word("this", 55_000);
+        engine.load_word("what", 70_000);
+        engine.load_word("when", 65_000);
+        engine.load_word("which", 50_000);
+        let th = engine.predict("th", &[], 3, None);
+        let wh = engine.predict("wh", &[], 3, None);
+        let the_ok = th.iter().any(|p| p.word == "the");
+        let wh_ok = wh
+            .iter()
+            .any(|p| p.word == "what" || p.word == "when" || p.word == "which");
+        if !the_ok {
+            panic!("th should predict the");
+        }
+        if !wh_ok {
+            panic!("wh should predict what/when/which");
+        }
+    }
+
+    #[test]
+    fn session_blend_boosts_recent_words() {
+        let mut engine = SmartKeyEngine::new();
+        // Keep corpus frequencies close so personal learning can tip the balance.
+        // With corpus weight=0.50, a large frequency gap resists personal boost.
+        engine.load_word("algorithm", 3_000);
+        engine.load_word("algebra", 4_000);
+        engine.load_word("although", 5_000);
+        for _ in 0..30 {
+            engine.learn("algorithm");
+        }
+        engine.observe_session("algorithm");
+        let preds = engine.predict("alg", &[], 5, None);
+        assert!(!preds.is_empty(), "alg should produce predictions");
+        let rank = preds
+            .iter()
+            .position(|p| p.word == "algorithm")
+            .expect("algorithm missing from alg predictions");
+        // Session blend + personal learning should boost "algorithm" into top 2
+        // despite not having the highest corpus frequency.
+        assert!(
+            rank <= 1,
+            "algorithm should be in top 2 after session learning, got rank {}",
+            rank
+        );
     }
 }

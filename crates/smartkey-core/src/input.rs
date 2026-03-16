@@ -133,14 +133,14 @@ impl Default for InputConfig {
             ghost_text: true,
             max_candidates: 5,
             min_prefix_length: 2,
-            weights: (0.4, 0.4, 0.2),
+            weights: (0.50, 0.30, 0.20), // Previous: (0.4, 0.4, 0.2) — rollback if corpus-heavy weighting hurts one language
             cvm_initial_size: 500,
             cvm_max_size: 5000,
             cvm_decay_lambda: 0.001,
             fuzzy_max_edits: 2,
             fuzzy_discounts: [1.0, 0.7, 0.4],
             markov_lambdas: [0.6, 0.3, 0.1],
-            ghost_text_min_confidence: 0.15,
+            ghost_text_min_confidence: 0.35,
             lang_detection: true,
             use_session_cache_lm: true,
             use_ppm: false,
@@ -923,7 +923,14 @@ impl InputMethodCore {
         let ctx_refs: arrayvec::ArrayVec<&str, 5> =
             self.context.iter().map(|s| s.as_str()).collect();
         let lang = if self.config.lang_detection {
-            Some(self.lang_detector.detected().lang)
+            let det = self.lang_detector.detected();
+            // Confidence gate: don't pass language hint when detection is uncertain.
+            // This prevents LANG_CVM_BOOST from amplifying wrong-language vocabulary.
+            if det.confidence >= 0.6 {
+                Some(det.lang)
+            } else {
+                None
+            }
         } else {
             None
         };

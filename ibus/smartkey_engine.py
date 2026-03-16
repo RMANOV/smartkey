@@ -106,6 +106,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 _IS_WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
 
+_DEBUG = os.environ.get("SMARTKEY_DEBUG") == "1"
+_PRED_LOG = None
+if _DEBUG:
+    import pathlib
+    _log_dir = pathlib.Path.home() / ".local" / "share" / "smartkey"
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _PRED_LOG = (_log_dir / "predictions.log").open("a", buffering=1)
+
 _CONFIG_DIR = (
     Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "smartkey"
 )
@@ -162,6 +170,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         # IBus client capabilities (set by do_set_capabilities callback).
         self._caps: int = 0
+
+        # Preedit lifecycle tracking: True while a preedit window is visible.
+        # Used by _safe_commit() to guarantee preedit is hidden before commit,
+        # and by backspace handling to consume the key when preedit is active.
+        self._preedit_active: bool = False
 
         # Load corpus.
         self._load_corpus()
@@ -248,10 +261,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         )
         ibus_text.set_attributes(attrs)
         self.update_preedit_text(ibus_text, byte_len, True)
+        self._preedit_active = True
 
     def _clear_ghost(self) -> None:
         """Remove any displayed ghost text."""
         self.hide_preedit_text()
+        self._preedit_active = False
 
     def _show_composing(self, typed: str, ghost: str) -> None:
         """Display composing preedit: typed prefix (normal) + ghost suffix (grey)."""
@@ -283,6 +298,23 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             )
         ibus_text.set_attributes(attrs)
         self.update_preedit_text(ibus_text, typed_bytes, True)
+        self._preedit_active = True
+
+    # -----------------------------------------------------------------------
+    # Qt-safe commit helper.
+    # -----------------------------------------------------------------------
+    def _safe_commit(self, text: str) -> None:
+        """Qt-safe commit: hide preedit BEFORE committing text.
+
+        On some Qt versions, committing text while a preedit window is visible
+        causes the preedit content to be inserted twice (doubling bug).
+        _clear_ghost() calls hide_preedit_text() which is sufficient; do NOT
+        add an extra update_preedit_text("", 0, False) here as that triggers
+        double preedit events on certain Qt versions.
+        """
+        if self._preedit_active:
+            self._clear_ghost()
+        self.commit_text(IBus.Text.new_from_string(text))
 
     # -----------------------------------------------------------------------
     # Action dispatcher — translates Rust actions to IBus API calls.
@@ -293,13 +325,28 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         for action_type, payload in actions:
             if action_type == "ghost":
                 self._show_ghost(payload)
+                if _PRED_LOG:
+                    preds = self._core.predictions()
+                    top3 = preds[:3]
+                    pts = [str(time.time()), "ghost:" + payload]
+                    pts.extend(
+                        p[0] + ":" + "{:.3f}".format(p[1]) for p in top3
+                    )
+                    pts.append("shown")
+                    _PRED_LOG.write(" | ".join(pts) + "\n")
+                    _PRED_LOG.flush()
             elif action_type == "hide":
                 self._clear_ghost()
             elif action_type == "commit":
-                self._clear_ghost()  # Prevent preedit leaking into committed text
-                self.commit_text(IBus.Text.new_from_string(payload))
+                self._safe_commit(payload)
+                if _PRED_LOG:
+                    _PRED_LOG.write(
+                        str(time.time()) + " | TAB_ACCEPT | " + payload + "\n"
+                    )
+                    _PRED_LOG.flush()
             elif action_type == "replace":
-                self._clear_ghost()  # Same protection for replace
+                if self._preedit_active:
+                    self._clear_ghost()
                 n_str, text = payload.split(":", 1)
                 replace_len = int(n_str)
                 if self._caps & 0x20:  # SURROUNDING_TEXT capability
@@ -309,12 +356,22 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     # surrounding text support (GTK4 Wayland, Electron, etc.)
                     for _ in range(replace_len):
                         self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
-                self.commit_text(IBus.Text.new_from_string(text))
+                self._safe_commit(text)
             elif action_type == "composing":
                 typed, ghost = (
                     payload.split("\x00", 1) if "\x00" in payload else (payload, "")
                 )
                 self._show_composing(typed, ghost)
+                if _PRED_LOG:
+                    preds2 = self._core.predictions()
+                    top3 = preds2[:3]
+                    pts2 = [str(time.time()), "composing:" + typed]
+                    pts2.extend(
+                        p[0] + ":" + "{:.3f}".format(p[1]) for p in top3
+                    )
+                    pts2.append("shown")
+                    _PRED_LOG.write(" | ".join(pts2) + "\n")
+                    _PRED_LOG.flush()
             elif action_type == "forward":
                 consumed = False
         return consumed
@@ -335,14 +392,25 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         """
         log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)
 
+        # Track backspace so we can consume it when preedit is active,
+        # preventing the key from also deleting committed text in the app.
+        is_backspace = keyval == IBus.KEY_BackSpace
+        key_release = bool(state & (1 << 30))  # IBUS_RELEASE_MASK
+
         # v0.5.0: prefer raw scancode path for dual-buffer layout-agnostic input.
         # Rust tables use evdev codes. On Wayland IBus sends evdev directly;
         # on X11 IBus sends XKB (evdev + 8) — normalise to evdev.
         if keycode > 0 and _HAS_CORE:
             evdev_keycode = keycode if _IS_WAYLAND else max(keycode - 8, 0)
+            preedit_was_active = self._preedit_active
             actions = self._core.process_keycode(evdev_keycode, state)
             log.debug("actions (keycode): %s", actions)
-            return self._execute_actions(actions)
+            result = self._execute_actions(actions)
+            # Consume backspace key-press when preedit was active so it does
+            # not reach the application.  Key-release is always forwarded.
+            if is_backspace and not key_release and preedit_was_active:
+                return True
+            return result
 
         # Fallback: keyval path (backward compat, or when keycode is 0).
         orig_keyval = keyval
@@ -363,9 +431,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             log.debug(
                 "keysym converted: 0x%04X → 0x%04X (%s)", orig_keyval, keyval, ch_repr
             )
+        preedit_was_active = self._preedit_active
         actions = self._core.handle_key(keyval, state)
         log.debug("actions: %s", actions)
-        return self._execute_actions(actions)
+        result = self._execute_actions(actions)
+        # Consume backspace key-press when preedit was active so it does
+        # not reach the application.  Key-release is always forwarded.
+        if is_backspace and not key_release and preedit_was_active:
+            return True
+        return result
 
     # -----------------------------------------------------------------------
     # IBus lifecycle callbacks.

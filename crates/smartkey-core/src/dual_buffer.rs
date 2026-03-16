@@ -24,8 +24,8 @@ impl Default for DualBufferConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            lock_threshold: 0.7,
-            min_lock_chars: 3,
+            lock_threshold: 0.85,
+            min_lock_chars: 4,
         }
     }
 }
@@ -392,5 +392,42 @@ mod tests {
 
         b.update_scores(10.0, 1_000_000.0); // BG wins
         assert_eq!(b.last_winner_char(), Some('е'));
+    }
+
+    #[test]
+    fn lock_requires_4_chars() {
+        // With min_lock_chars=4, locking must not happen before char 4
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('h', 'х');
+        b.update_scores(1_000_000.0, 1.0);
+        assert!(!b.is_locked(), "should not lock at 1 char");
+        b.push('e', 'е');
+        b.update_scores(1_000_000.0, 1.0);
+        assert!(!b.is_locked(), "should not lock at 2 chars");
+        b.push('l', 'л');
+        b.update_scores(1_000_000.0, 1.0);
+        assert!(!b.is_locked(), "should not lock at 3 chars");
+        b.push('l', 'л');
+        b.update_scores(1_000_000.0, 1.0);
+        assert!(b.is_locked(), "should lock at 4 chars with high confidence");
+        assert_eq!(b.winner_lang(), LangId::En);
+    }
+
+    #[test]
+    fn bg_locks_by_char_4() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('z', 'з');
+        b.update_scores(1.0, 1_000_000.0);
+        assert!(!b.is_locked(), "no lock at 1 char");
+        b.push('d', 'д');
+        b.update_scores(1.0, 1_000_000.0);
+        assert!(!b.is_locked(), "no lock at 2 chars");
+        b.push('r', 'р');
+        b.update_scores(1.0, 1_000_000.0);
+        assert!(!b.is_locked(), "no lock at 3 chars");
+        b.push('a', 'а');
+        b.update_scores(1.0, 1_000_000.0);
+        assert!(b.is_locked(), "should lock BG at 4 chars");
+        assert_eq!(b.winner_lang(), LangId::Bg);
     }
 }
