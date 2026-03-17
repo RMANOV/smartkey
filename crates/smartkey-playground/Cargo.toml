@@ -1,0 +1,15 @@
+[package]
+name = "smartkey-playground"
+version = "0.1.0"
+edition = "2021"
+description = "Closed-loop simulation harness for SmartKey prediction quality evaluation"
+
+[dependencies]
+smartkey-core = { path = "../smartkey-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "smartkey-eval"
+path = "src/bin/smartkey_eval.rs"

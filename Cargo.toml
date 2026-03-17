@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/smartkey-core", "crates/smartkey-py", "crates/smartkey-win", "crates/smartkey-mac"]
+members = ["crates/smartkey-core", "crates/smartkey-py", "crates/smartkey-win", "crates/smartkey-mac", "crates/smartkey-playground"]
 
 [workspace.dependencies]
 bitflags = "2"

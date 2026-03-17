@@ -672,6 +672,11 @@ impl InputMethodCore {
         !self.ghost.is_empty()
     }
 
+    /// The current ghost text (completion suffix), or empty if none.
+    pub fn ghost_text(&self) -> &str {
+        &self.ghost
+    }
+
     // -- personal profile persistence -----------------------------------
 
     /// Save the personal profile (CVM + Markov + weights) to the given path.

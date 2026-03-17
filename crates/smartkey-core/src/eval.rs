@@ -31,7 +31,7 @@ pub struct PredictionMetrics {
 }
 
 /// Snapshot of metrics for logging / export.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MetricsSummary {
     pub total_commits: u64,
     pub accepted_predictions: u64,
