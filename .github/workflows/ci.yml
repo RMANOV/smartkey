@@ -20,6 +20,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p smartkey-core
       - run: cargo test -p smartkey-mac
+      - run: cargo test -p smartkey-playground
       - run: cargo check -p smartkey-py
 
   build-windows:
@@ -56,7 +57,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p smartkey-core -p smartkey-mac -- -D warnings
+      - run: cargo clippy -p smartkey-core -p smartkey-mac -p smartkey-playground -- -D warnings
       - run: cargo clippy -p smartkey-py -- -D warnings
 
   fmt:
