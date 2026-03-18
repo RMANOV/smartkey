@@ -121,9 +121,8 @@ impl KneserNeyScorer {
         let discount = self.discount(count);
         let discounted = ((count as f64) - discount).max(0.0) / total as f64;
 
-        // Interpolation weight: proportional to total discount mass.
-        let n_types = followers.len() as f64;
-        let lambda = (discount * n_types) / total as f64;
+        // Interpolation weight: sum of discounts across ALL followers of this context.
+        let lambda = self.discount_mass(followers) / total as f64;
 
         discounted + lambda * self.continuation_prob(word)
     }
@@ -145,8 +144,7 @@ impl KneserNeyScorer {
         let discount = self.discount(count);
         let discounted = ((count as f64) - discount).max(0.0) / total as f64;
 
-        let n_types = followers.len() as f64;
-        let lambda = (discount * n_types) / total as f64;
+        let lambda = self.discount_mass(followers) / total as f64;
 
         discounted + lambda * self.bigram_kn(word, w2)
     }
@@ -158,6 +156,11 @@ impl KneserNeyScorer {
         }
         let cont = self.continuation_count.get(word).copied().unwrap_or(0) as f64;
         (cont / self.total_bigram_types as f64).max(KN_FLOOR)
+    }
+
+    /// Total discount mass for a set of followers: sum(D(count_i)) for all followers.
+    fn discount_mass(&self, followers: &HashMap<String, u32>) -> f64 {
+        followers.values().map(|&c| self.discount(c)).sum()
     }
 
     /// Modified KN discount: D1, D2, or D3+ depending on count.
@@ -250,6 +253,19 @@ mod tests {
         assert!(
             score > KN_FLOOR,
             "bigram context should boost score above floor"
+        );
+    }
+
+    #[test]
+    fn test_kn_scores_are_bounded() {
+        let scorer = test_scorer();
+        let score = scorer.score("rust", Some("love"), Some("i"));
+        assert!(score >= 0.0, "KN score must be non-negative, got {}", score);
+        let cont = scorer.continuation_prob("rust");
+        assert!(
+            cont >= 0.0,
+            "continuation prob must be non-negative, got {}",
+            cont
         );
     }
 }

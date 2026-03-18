@@ -114,7 +114,8 @@ fn action_to_tuple(action: &Action) -> (String, String) {
         Action::CommitText(text) => ("commit".into(), text.clone()),
         Action::ForwardKey => ("forward".into(), String::new()),
         Action::ReplaceWord { replace_len, text } => {
-            ("replace".into(), format!("{replace_len}:{text}"))
+            // \x1F = Unit Separator — avoids ambiguity if text contains colons
+            ("replace".into(), format!("{replace_len}\x1F{text}"))
         }
         Action::ShowComposing { typed, ghost } => {
             ("composing".into(), format!("{}\x00{}", typed, ghost))

@@ -534,15 +534,20 @@ impl SmartKeyEngine {
                 if let Some(ref bpe) = self.bpe {
                     let bpe_suggestions = bpe.suggest_completions(prefix, limit);
                     if !bpe_suggestions.is_empty() {
-                        let max_score = bpe_suggestions[0].1.max(1e-6);
                         let mut preds: Vec<Prediction> = bpe_suggestions
                             .into_iter()
                             .map(|(word, score)| Prediction {
                                 word,
                                 score,
-                                confidence: score / max_score,
+                                confidence: 0.0,
                             })
                             .collect();
+                        let score_sum: f64 = preds.iter().map(|p| p.score).sum();
+                        if score_sum > 0.0 {
+                            for p in &mut preds {
+                                p.confidence = (p.score / score_sum).clamp(0.0, 1.0);
+                            }
+                        }
                         preds.truncate(limit);
                         self.cache
                             .lock()
@@ -558,15 +563,20 @@ impl SmartKeyEngine {
             // they are the only candidates available).
             let tech_hits = self.tech_vocab.score(prefix, limit);
             if !tech_hits.is_empty() {
-                let max_score = tech_hits.first().map(|(_, s)| *s).unwrap_or(1.0).max(1e-6);
                 let mut preds: Vec<Prediction> = tech_hits
                     .into_iter()
                     .map(|(word, score)| Prediction {
                         word,
                         score,
-                        confidence: score / max_score,
+                        confidence: 0.0,
                     })
                     .collect();
+                let score_sum: f64 = preds.iter().map(|p| p.score).sum();
+                if score_sum > 0.0 {
+                    for p in &mut preds {
+                        p.confidence = (p.score / score_sum).clamp(0.0, 1.0);
+                    }
+                }
                 preds.truncate(limit);
                 self.cache
                     .lock()
@@ -787,14 +797,14 @@ impl SmartKeyEngine {
         });
         scored.truncate(limit);
 
-        // Step 5: normalise confidence so the top candidate is ~1.0.
+        // Step 5: normalise confidence via score-sum (softmax-style) so confidences
+        // reflect each candidate's fractional share of total score mass.
         // `.clamp(0.0, 1.0)` guards against floating-point rounding producing
         // values marginally outside [0, 1] (e.g. 1.0000000000000002).
-        if let Some(top_score) = scored.first().map(|p| p.score) {
-            if top_score > 0.0 {
-                for p in &mut scored {
-                    p.confidence = (p.score / top_score).clamp(0.0, 1.0);
-                }
+        let score_sum: f64 = scored.iter().map(|p| p.score).sum();
+        if score_sum > 0.0 {
+            for p in &mut scored {
+                p.confidence = (p.score / score_sum).clamp(0.0, 1.0);
             }
         }
 
@@ -867,10 +877,10 @@ mod tests {
             "'hello' should rank before 'help'"
         );
 
-        // Top candidate should have confidence ~1.0.
+        // Top candidate should have a valid confidence in (0, 1].
         assert!(
-            (preds[0].confidence - 1.0).abs() < 1e-9,
-            "top prediction confidence should be ~1.0, got {}",
+            preds[0].confidence > 0.0 && preds[0].confidence <= 1.0,
+            "confidence should be in (0, 1], got {}",
             preds[0].confidence
         );
 

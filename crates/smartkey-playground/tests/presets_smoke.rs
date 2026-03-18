@@ -60,7 +60,7 @@ fn english_prose_has_some_acceptance() {
     // With real corpus loaded, we expect at least some predictions to be accepted.
     // Use a very low bar — even 1 accepted word means the engine is producing useful ghosts.
     assert!(
-        report.words_predicted > 0 || report.accept_rate >= 0.0,
+        report.words_predicted > 0,
         "english prose should have measurable acceptance (got {} predicted out of {})",
         report.words_predicted,
         report.words_total

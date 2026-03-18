@@ -7,8 +7,6 @@ pub enum RejectReason {
     Mismatch,
     /// Confidence below the acceptance threshold.
     LowConfidence,
-    /// No ghost text was shown by the engine.
-    NoGhost,
 }
 
 /// A single recorded event during a simulation session.

@@ -140,7 +140,7 @@ impl Default for InputConfig {
             fuzzy_max_edits: 2,
             fuzzy_discounts: [1.0, 0.7, 0.4],
             markov_lambdas: [0.6, 0.3, 0.1],
-            ghost_text_min_confidence: 0.35,
+            ghost_text_min_confidence: 0.15,
             lang_detection: true,
             use_session_cache_lm: true,
             use_ppm: false,
@@ -437,8 +437,11 @@ impl InputMethodCore {
                         .position(|p| p.word == full_word)
                         .map(|i| i + 1) // 1-based
                         .unwrap_or(1);
-                    self.metrics
-                        .record_acceptance(rank, self.ghost.len(), full_word.len());
+                    self.metrics.record_acceptance(
+                        rank,
+                        self.ghost.chars().count(),
+                        full_word.chars().count(),
+                    );
                     self.commit_word_internal(&full_word, false);
                     self.reset_word();
                     actions
@@ -469,9 +472,12 @@ impl InputMethodCore {
                             ghost: self.ghost.clone(),
                         }]
                     } else if self.ghost.is_empty() {
-                        vec![Action::HideGhost]
+                        vec![Action::CommitText(ch.to_string()), Action::HideGhost]
                     } else {
-                        vec![Action::ShowGhost(self.ghost.clone())]
+                        vec![
+                            Action::CommitText(ch.to_string()),
+                            Action::ShowGhost(self.ghost.clone()),
+                        ]
                     }
                 } else {
                     vec![Action::ForwardKey]
@@ -583,7 +589,7 @@ impl InputMethodCore {
 
                 // Check for wrong layout on 2nd+ Latin char.
                 if !self.transliteration_active
-                    && self.current_word.len() >= 2
+                    && self.current_word.chars().count() >= 2
                     && self.check_wrong_layout()
                 {
                     self.transliteration_active = true;
@@ -591,7 +597,7 @@ impl InputMethodCore {
                     // Only previously-forwarded chars are in the application text.
                     // The current char that triggered detection was consumed (not forwarded),
                     // so subtract 1.
-                    let replace_len = self.current_word.len() - 1;
+                    let replace_len = self.current_word.chars().count() - 1;
                     self.current_word = transliterated;
                     let ghost_action = self.update_predictions();
                     return vec![
@@ -729,8 +735,9 @@ impl InputMethodCore {
     /// words (already recorded via `record_acceptance`).
     fn commit_word_internal(&mut self, word: &str, record_commit_metric: bool) {
         if !word.is_empty() {
+            let word_char_len = word.chars().count();
             if record_commit_metric {
-                self.metrics.record_commit(word.len());
+                self.metrics.record_commit(word_char_len);
             }
 
             // Extract context BEFORE pushing new word (for online Markov training).
@@ -764,7 +771,7 @@ impl InputMethodCore {
             let is_oov = self.engine.candidate_count(word, 1) == 0;
             let is_flip = self.current_word_had_flip;
             self.regime_detector
-                .observe_word(word.chars().count(), is_oov, is_flip, lang);
+                .observe_word(word_char_len, is_oov, is_flip, lang);
             // Propagate the current regime to the engine so predict() can gate δ.
             let (regime, _conf) = self.regime_detector.regime();
             self.engine.set_regime(regime);
@@ -863,7 +870,7 @@ impl InputMethodCore {
     /// comparison is far more discriminative than candidate counts (which
     /// saturate at small limits with 100K+ word corpora).
     fn check_wrong_layout(&self) -> bool {
-        if self.current_word.len() < 2 || !self.config.lang_detection {
+        if self.current_word.chars().count() < 2 || !self.config.lang_detection {
             return false;
         }
         // Only check all-ASCII-alpha prefixes.
@@ -949,7 +956,7 @@ impl InputMethodCore {
         self.metrics.record_latency(t0.elapsed());
 
         if let Some(top) = self.last_predictions.first() {
-            if top.score >= self.config.ghost_text_min_confidence {
+            if top.confidence >= self.config.ghost_text_min_confidence {
                 if let Some(suffix) = top.word.strip_prefix(self.current_word.as_str()) {
                     if !suffix.is_empty() && self.config.ghost_text {
                         let s = suffix.to_string();
@@ -1069,6 +1076,7 @@ mod tests {
         // Right arrow again → accept 'o', ghost gone.
         let actions = core.handle_key(press(Key::Right));
         assert!(has_action(&actions, &Action::HideGhost));
+        assert!(has_action(&actions, &Action::CommitText("o".to_string())));
         assert_eq!(core.current_word(), "hello");
     }
 

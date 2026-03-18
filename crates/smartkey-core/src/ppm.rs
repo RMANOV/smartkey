@@ -151,7 +151,7 @@ impl PpmModel {
             node = child;
         }
         // Insert target character.
-        node.total += 1;
+        node.total = node.total.saturating_add(1);
         let entry = node
             .children
             .entry(target)
@@ -159,7 +159,7 @@ impl PpmModel {
         if entry.1 == 0 {
             node.distinct += 1;
         }
-        entry.1 += 1;
+        entry.1 = entry.1.saturating_add(1);
     }
 
     fn find_node(&self, context: &[char]) -> Option<&PpmNode> {
@@ -185,7 +185,7 @@ impl PpmModel {
                     if let Some((_, count)) = node.children.get(&target) {
                         if *count > 0 {
                             // Method D: P = (2*count - 1) / (2 * total)
-                            return (2 * count - 1) as f64 / (2 * node.total) as f64;
+                            return (2.0 * *count as f64 - 1.0) / (2.0 * node.total as f64);
                         }
                     }
                     // Escape: continue to lower order
@@ -328,5 +328,18 @@ mod tests {
             !ranked.is_empty(),
             "should rank next chars for Cyrillic prefix"
         );
+    }
+
+    #[test]
+    fn test_ppm_no_overflow_on_heavy_training() {
+        let mut model = PpmModel::new(5);
+        let word = "overflow";
+        for _ in 0..10_000 {
+            model.train_word(word);
+        }
+        let scores = model.rank_next_chars("overflo", 10);
+        let w_score = scores.iter().find(|(c, _)| *c == 'w');
+        assert!(w_score.is_some(), "should have score for 'w'");
+        assert!(w_score.unwrap().1 > 0.0, "score must be positive");
     }
 }

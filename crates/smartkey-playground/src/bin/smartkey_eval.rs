@@ -22,8 +22,8 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Acceptance confidence threshold (default: 0.5)
-    #[arg(long, default_value_t = 0.5)]
+    /// Acceptance confidence threshold (default: 0.3)
+    #[arg(long, default_value_t = 0.3)]
     threshold: f64,
 
     /// Path to corpus directory

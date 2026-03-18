@@ -28,7 +28,7 @@ impl Playground {
         Self {
             corpus_dir: default_corpus,
             scenarios: Vec::new(),
-            threshold: 0.5,
+            threshold: 0.3,
         }
     }
 
@@ -44,7 +44,7 @@ impl Playground {
         self
     }
 
-    /// Set the acceptance confidence threshold (default: 0.5).
+    /// Set the acceptance confidence threshold (default: 0.3).
     pub fn accept_threshold(mut self, threshold: f64) -> Self {
         self.threshold = threshold;
         self

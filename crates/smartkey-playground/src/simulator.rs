@@ -73,7 +73,7 @@ impl SessionSimulator {
             while event_idx < events_by_offset.len()
                 && events_by_offset[event_idx].char_offset() <= cursor
             {
-                self.fire_event(events_by_offset[event_idx], cursor);
+                self.fire_event(events_by_offset[event_idx], cursor, &chars);
                 event_idx += 1;
             }
 
@@ -136,10 +136,11 @@ impl SessionSimulator {
 
             if self.user.should_accept(&ghost, &word_remaining, confidence) {
                 // Accept: send Tab
+                let ghost_char_len = ghost.chars().count();
                 self.timeline.push(TimelineEvent::PredictionAccepted {
                     offset: cursor,
                     ghost: ghost.clone(),
-                    chars_saved: ghost.chars().count(),
+                    chars_saved: ghost_char_len,
                 });
                 self.timeline.push(TimelineEvent::PredictionShown {
                     offset: cursor,
@@ -147,8 +148,6 @@ impl SessionSimulator {
                     confidence,
                     accepted: true,
                 });
-
-                let ghost_char_len = ghost.chars().count();
                 self.chars_saved += ghost_char_len;
                 self.send_key(Key::Tab);
                 self.total_keystrokes += 1;
@@ -156,9 +155,7 @@ impl SessionSimulator {
                 current_word_predicted = true;
             } else {
                 // Reject: record why
-                let reason = if ghost.is_empty() {
-                    RejectReason::NoGhost
-                } else if confidence < self.user.threshold {
+                let reason = if confidence < self.user.threshold {
                     RejectReason::LowConfidence
                 } else {
                     RejectReason::Mismatch
@@ -217,7 +214,7 @@ impl SessionSimulator {
         })
     }
 
-    fn fire_event(&mut self, event: &ScheduledEvent, cursor: usize) {
+    fn fire_event(&mut self, event: &ScheduledEvent, cursor: usize, chars: &[char]) {
         match event {
             ScheduledEvent::SwitchLanguage { lang, .. } => {
                 let from = format!("{:?}", self.core.detected_language());
@@ -230,11 +227,7 @@ impl SessionSimulator {
                 });
             }
             ScheduledEvent::InjectTypo { wrong_char, .. } => {
-                let correct_char = if cursor < self.core.current_word().len() {
-                    self.core.current_word().chars().last().unwrap_or('?')
-                } else {
-                    '?'
-                };
+                let correct_char = chars.get(cursor).copied().unwrap_or('?');
                 // Type wrong char, then backspace
                 self.send_key(Key::Char(*wrong_char));
                 self.total_keystrokes += 1;

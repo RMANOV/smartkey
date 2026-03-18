@@ -332,6 +332,17 @@ fn mac_keycode_to_key(keycode: c_uint) -> Key {
                 0x07 => 'x',
                 0x10 => 'y',
                 0x06 => 'z',
+                // Punctuation keys
+                0x29 => ';',  // kVK_ANSI_Semicolon
+                0x2B => ',',  // kVK_ANSI_Comma
+                0x2F => '.',  // kVK_ANSI_Period
+                0x2C => '/',  // kVK_ANSI_Slash
+                0x27 => '\'', // kVK_ANSI_Quote
+                0x2A => '\\', // kVK_ANSI_Backslash
+                0x1B => '-',  // kVK_ANSI_Minus
+                0x18 => '=',  // kVK_ANSI_Equal
+                0x21 => '[',  // kVK_ANSI_LeftBracket
+                0x1E => ']',  // kVK_ANSI_RightBracket
                 _ => return Key::Other(k),
             };
             Key::Char(ch)
@@ -384,7 +395,8 @@ fn actions_to_c(actions: Vec<Action>) -> *mut CActionList {
                 payload: ptr::null_mut(),
             },
             Action::ReplaceWord { replace_len, text } => {
-                let payload = format!("{replace_len}:{text}");
+                // \x1F = Unit Separator — avoids ambiguity if text contains colons
+                let payload = format!("{replace_len}\x1F{text}");
                 CAction {
                     action_type: 4,
                     payload: CString::new(payload.replace('\0', ""))
@@ -428,6 +440,9 @@ mod tests {
         assert_eq!(mac_keycode_to_key(0x35), Key::Escape);
         assert_eq!(mac_keycode_to_key(0x00), Key::Char('a'));
         assert_eq!(mac_keycode_to_key(0x04), Key::Char('h'));
+        assert_eq!(mac_keycode_to_key(0x29), Key::Char(';'));
+        assert_eq!(mac_keycode_to_key(0x2B), Key::Char(','));
+        assert_eq!(mac_keycode_to_key(0x2F), Key::Char('.'));
     }
 
     #[test]
