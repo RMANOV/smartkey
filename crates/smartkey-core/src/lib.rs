@@ -5,6 +5,7 @@ pub mod cvm;
 pub mod dual_buffer;
 pub mod ensemble;
 pub mod eval;
+pub mod ffi_protocol;
 pub mod hedge;
 pub mod input;
 pub mod keymap;

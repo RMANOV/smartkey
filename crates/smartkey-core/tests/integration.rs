@@ -34,6 +34,15 @@ fn ghost_text(actions: &[Action]) -> Option<String> {
     })
 }
 
+/// Test config with separation margin disabled — integration tests use small
+/// vocabularies where close frequencies would trigger the ambiguity gate.
+fn test_config() -> InputConfig {
+    InputConfig {
+        ghost_text_separation_margin: 0.0,
+        ..InputConfig::default()
+    }
+}
+
 fn type_string(core: &mut InputMethodCore, s: &str) {
     for ch in s.chars() {
         core.handle_key(press(Key::Char(ch)));
@@ -60,7 +69,7 @@ fn load_json_corpus(core: &mut InputMethodCore, json: &str) {
 
 #[test]
 fn full_pipeline_predict_and_ghost() {
-    let mut core = InputMethodCore::new(InputConfig::default());
+    let mut core = InputMethodCore::new(test_config());
 
     let corpus = r#"{
         "unigrams": {"hello": 100, "help": 80, "hero": 60, "world": 90},
@@ -90,7 +99,7 @@ fn full_pipeline_predict_and_ghost() {
 
 #[test]
 fn tab_acceptance_then_bigram_boost() {
-    let mut core = InputMethodCore::new(InputConfig::default());
+    let mut core = InputMethodCore::new(test_config());
 
     let corpus = r#"{
         "unigrams": {"hello": 100, "help": 80, "world": 90, "worry": 90},
@@ -237,7 +246,7 @@ fn kill_switch_disables_and_reenables() {
 fn multi_language_latin_and_cyrillic() {
     let mut core = InputMethodCore::new(InputConfig {
         min_prefix_length: 2,
-        ..InputConfig::default()
+        ..test_config()
     });
 
     // English words.

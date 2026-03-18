@@ -1194,4 +1194,143 @@ mod tests {
             rank
         );
     }
+
+    // ==================================================================
+    // Confidence normalization tests
+    // ==================================================================
+
+    #[test]
+    fn confidence_single_candidate_is_one() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("unique", 50);
+        let preds = engine.predict("uniq", &[], 5, None);
+        assert_eq!(preds.len(), 1, "should produce exactly one prediction");
+        assert!(
+            (preds[0].confidence - 1.0).abs() < 1e-9,
+            "single candidate confidence should be 1.0, got {}",
+            preds[0].confidence
+        );
+    }
+
+    #[test]
+    fn confidence_two_equal_scores_split_evenly() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("apple", 100);
+        engine.load_word("apply", 100);
+        let preds = engine.predict("appl", &[], 5, None);
+        assert!(preds.len() >= 2, "should produce at least two predictions");
+        let c0 = preds[0].confidence;
+        let c1 = preds[1].confidence;
+        assert!(
+            (c0 - c1).abs() < 0.05,
+            "two equal-score candidates should have similar confidence: {} vs {}",
+            c0,
+            c1
+        );
+    }
+
+    #[test]
+    fn confidence_sum_equals_one() {
+        let engine = test_engine();
+        let preds = engine.predict("hel", &[], 5, None);
+        assert!(!preds.is_empty());
+        let sum: f64 = preds.iter().map(|p| p.confidence).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "sum of all confidences should be 1.0, got {}",
+            sum
+        );
+    }
+
+    #[test]
+    fn confidence_ordering_matches_score_ordering() {
+        let engine = test_engine();
+        let preds = engine.predict("hel", &[], 5, None);
+        assert!(preds.len() >= 2);
+        for w in preds.windows(2) {
+            assert!(
+                w[0].confidence >= w[1].confidence,
+                "confidence ordering should match score ordering: {} >= {} failed \
+                 (words: {:?} vs {:?})",
+                w[0].confidence,
+                w[1].confidence,
+                w[0].word,
+                w[1].word
+            );
+        }
+    }
+
+    #[test]
+    fn confidence_all_in_unit_range() {
+        let engine = test_engine();
+        let preds = engine.predict("hel", &["i"], 5, None);
+        for p in &preds {
+            assert!(
+                p.confidence >= 0.0 && p.confidence <= 1.0,
+                "confidence should be in [0.0, 1.0], got {} for {:?}",
+                p.confidence,
+                p.word
+            );
+        }
+    }
+
+    #[test]
+    fn confidence_no_results_no_panic() {
+        let engine = test_engine();
+        let preds = engine.predict("zzzzzzz", &[], 5, None);
+        assert!(preds.is_empty());
+    }
+
+    #[test]
+    fn confidence_three_candidates_proportional() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("xalpha", 400);
+        engine.load_word("xbeta", 200);
+        engine.load_word("xgamma", 100);
+        let preds = engine.predict("x", &[], 3, None);
+        assert_eq!(preds.len(), 3, "should produce exactly three predictions");
+        assert!(
+            preds[0].confidence > preds[1].confidence,
+            "xalpha should have higher confidence than xbeta"
+        );
+        assert!(
+            preds[1].confidence > preds[2].confidence,
+            "xbeta should have higher confidence than xgamma"
+        );
+        let ratio = preds[0].confidence / preds[2].confidence;
+        assert!(
+            ratio > 1.5,
+            "confidence ratio (top/bottom) should reflect score ratio, got {:.2}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn confidence_single_garbage_score_gets_full_confidence() {
+        // REGRESSION MARKER: A single candidate with a very low score still gets
+        // confidence = 1.0 because softmax normalization (score/score_sum) doesn't
+        // consider absolute score quality. This is the known weakness that
+        // ghost_text_min_score addresses at the input layer.
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("zqxjk", 1);
+        let preds = engine.predict("zqxj", &[], 5, None);
+        assert_eq!(preds.len(), 1);
+        assert!(
+            (preds[0].confidence - 1.0).abs() < 1e-9,
+            "even a garbage single candidate gets confidence 1.0 \
+             (expected — score floor handles it at the input layer)"
+        );
+    }
+
+    #[test]
+    fn confidence_limit_one_returns_full_confidence() {
+        let engine = test_engine();
+        let preds = engine.predict("hel", &[], 1, None);
+        assert_eq!(preds.len(), 1);
+        assert!(
+            (preds[0].confidence - 1.0).abs() < 1e-9,
+            "limit=1 should yield confidence 1.0, got {}",
+            preds[0].confidence
+        );
+    }
 }

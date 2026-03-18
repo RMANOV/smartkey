@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use smartkey_playground::report::print_summary_table;
+use smartkey_playground::report::{confidence_histogram, print_histogram, print_summary_table};
 use smartkey_playground::{Playground, Scenario};
 
 #[derive(Parser)]
@@ -17,6 +17,10 @@ struct Cli {
     /// Print full event timeline
     #[arg(long)]
     verbose: bool,
+
+    /// Print confidence histogram (calibration view)
+    #[arg(long)]
+    histogram: bool,
 
     /// Output JSON instead of human-readable text
     #[arg(long)]
@@ -76,6 +80,10 @@ fn main() {
 
         for report in &reports {
             report.print_summary();
+            if cli.histogram {
+                let hist = confidence_histogram(&report.timeline);
+                print_histogram(&report.scenario_name, &hist);
+            }
             if cli.verbose {
                 report.print_timeline();
             }

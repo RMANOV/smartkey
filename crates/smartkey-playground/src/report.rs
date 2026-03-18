@@ -163,6 +163,96 @@ impl TypingReport {
     }
 }
 
+// ── Confidence Histogram ───────────────────────────────────────────
+
+/// A single bucket in the confidence histogram.
+pub struct ConfidenceBucket {
+    pub range: (f64, f64),
+    pub shown: usize,
+    pub accepted: usize,
+}
+
+/// Ten-bucket confidence histogram built from timeline events.
+pub struct ConfidenceHistogram {
+    pub buckets: Vec<ConfidenceBucket>,
+}
+
+/// Build a confidence histogram from timeline events.
+///
+/// Buckets: [0.0, 0.1), [0.1, 0.2), ..., [0.8, 0.9), [0.9, 1.0].
+/// The last bucket is inclusive on both ends to capture confidence = 1.0.
+pub fn confidence_histogram(events: &[TimelineEvent]) -> ConfidenceHistogram {
+    let mut buckets: Vec<ConfidenceBucket> = (0..10)
+        .map(|i| {
+            let lo = i as f64 * 0.1;
+            let hi = (i + 1) as f64 * 0.1;
+            ConfidenceBucket {
+                range: (lo, hi),
+                shown: 0,
+                accepted: 0,
+            }
+        })
+        .collect();
+
+    for event in events {
+        if let TimelineEvent::PredictionShown {
+            confidence,
+            accepted,
+            ..
+        } = event
+        {
+            let idx = ((*confidence * 10.0).floor() as usize).min(9);
+            buckets[idx].shown += 1;
+            if *accepted {
+                buckets[idx].accepted += 1;
+            }
+        }
+    }
+
+    ConfidenceHistogram { buckets }
+}
+
+/// Print an ASCII bar chart of the confidence histogram.
+pub fn print_histogram(scenario_name: &str, hist: &ConfidenceHistogram) {
+    println!("Confidence Histogram ({})", scenario_name);
+    println!();
+
+    let max_shown = hist
+        .buckets
+        .iter()
+        .map(|b| b.shown)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    for bucket in &hist.buckets {
+        let bar_len = (bucket.shown as f64 / max_shown as f64 * 40.0).round() as usize;
+        let bar: String = "\u{2588}".repeat(bar_len);
+        let accept_pct = if bucket.shown > 0 {
+            bucket.accepted as f64 / bucket.shown as f64 * 100.0
+        } else {
+            0.0
+        };
+        let end_bracket = if (bucket.range.1 - 1.0).abs() < 1e-9 {
+            "]"
+        } else {
+            ")"
+        };
+        println!(
+            "[{:.1}, {:.1}{}  {:<40}  {:>4}  (accepted: {}/{} = {:.0}%)",
+            bucket.range.0,
+            bucket.range.1,
+            end_bracket,
+            bar,
+            bucket.shown,
+            bucket.accepted,
+            bucket.shown,
+            accept_pct,
+        );
+    }
+    println!();
+}
+
 /// Print a summary table for multiple reports.
 pub fn print_summary_table(reports: &[TypingReport]) {
     println!(

@@ -108,6 +108,14 @@ pub struct InputConfig {
     /// Minimum absolute score for the top prediction to show ghost text.
     /// Predictions below this threshold are suppressed.
     pub ghost_text_min_confidence: f64,
+    /// Minimum gap between top and runner-up confidence for ghost text.
+    /// If the margin is smaller, the prediction is too ambiguous to show.
+    /// Default: 0.10 (top must beat runner-up by 10 percentage points).
+    pub ghost_text_separation_margin: f64,
+    /// Minimum absolute score for the top prediction to show ghost text.
+    /// Disabled when 0.0 (default). Set > 0 to reject low-quality predictions
+    /// even when they have high confidence (e.g. single garbage candidate).
+    pub ghost_text_min_score: f64,
     // ── Feature flags (v0.4.0) ──────────────────────────────────
     /// Enable language detection and per-language CVM tracks.
     pub lang_detection: bool,
@@ -141,6 +149,8 @@ impl Default for InputConfig {
             fuzzy_discounts: [1.0, 0.7, 0.4],
             markov_lambdas: [0.6, 0.3, 0.1],
             ghost_text_min_confidence: 0.15,
+            ghost_text_separation_margin: 0.10,
+            ghost_text_min_score: 0.0,
             lang_detection: true,
             use_session_cache_lm: true,
             use_ppm: false,
@@ -173,6 +183,15 @@ impl InputConfig {
             }
             if let Some(f) = v.get("ghost_text_min_confidence").and_then(|v| v.as_f64()) {
                 config.ghost_text_min_confidence = f;
+            }
+            if let Some(f) = v
+                .get("ghost_text_separation_margin")
+                .and_then(|v| v.as_f64())
+            {
+                config.ghost_text_separation_margin = f;
+            }
+            if let Some(f) = v.get("ghost_text_min_score").and_then(|v| v.as_f64()) {
+                config.ghost_text_min_score = f;
             }
             if let Some(w) = v.get("weights").and_then(|v| v.as_object()) {
                 let a = w
@@ -956,12 +975,27 @@ impl InputMethodCore {
         self.metrics.record_latency(t0.elapsed());
 
         if let Some(top) = self.last_predictions.first() {
+            // Gate 1: absolute confidence threshold (existing).
             if top.confidence >= self.config.ghost_text_min_confidence {
-                if let Some(suffix) = top.word.strip_prefix(self.current_word.as_str()) {
-                    if !suffix.is_empty() && self.config.ghost_text {
-                        let s = suffix.to_string();
-                        self.ghost.clone_from(&s);
-                        return s;
+                // Gate 2: separation margin — top must beat runner-up by enough.
+                let second_conf = self
+                    .last_predictions
+                    .get(1)
+                    .map(|p| p.confidence)
+                    .unwrap_or(0.0);
+                let margin_ok =
+                    top.confidence - second_conf >= self.config.ghost_text_separation_margin;
+
+                // Gate 3: absolute score floor — reject garbage even at high confidence.
+                let score_ok = top.score >= self.config.ghost_text_min_score;
+
+                if margin_ok && score_ok {
+                    if let Some(suffix) = top.word.strip_prefix(self.current_word.as_str()) {
+                        if !suffix.is_empty() && self.config.ghost_text {
+                            let s = suffix.to_string();
+                            self.ghost.clone_from(&s);
+                            return s;
+                        }
                     }
                 }
             }
@@ -990,8 +1024,13 @@ mod tests {
     use super::*;
 
     /// Build a test engine with a small vocabulary.
+    /// Uses margin=0 so I/O-mechanics tests aren't affected by confidence gating.
     fn test_core() -> InputMethodCore {
-        let mut core = InputMethodCore::new(InputConfig::default());
+        let config = InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
         core.load_word("hello", 100);
         core.load_word("help", 80);
         core.load_word("hero", 60);
@@ -1539,5 +1578,85 @@ mod tests {
         assert!(config.dual_buffer.enabled);
         assert!((config.dual_buffer.lock_threshold - 0.8).abs() < 1e-9);
         assert_eq!(config.dual_buffer.min_lock_chars, 3);
+    }
+
+    // ── Ghost text gating tests (separation margin + score floor) ──
+
+    #[test]
+    fn ghost_gate_default_separation_margin() {
+        let config = InputConfig::default();
+        assert!(
+            (config.ghost_text_separation_margin - 0.10).abs() < 1e-9,
+            "default separation margin should be 0.10"
+        );
+    }
+
+    #[test]
+    fn ghost_gate_default_min_score_disabled() {
+        let config = InputConfig::default();
+        assert_eq!(
+            config.ghost_text_min_score, 0.0,
+            "default min_score should be 0.0 (disabled)"
+        );
+    }
+
+    #[test]
+    fn ghost_gate_json_override_separation_margin() {
+        let json = r#"{"ghost_text_separation_margin": 0.25}"#;
+        let config = InputConfig::from_json(json);
+        assert!(
+            (config.ghost_text_separation_margin - 0.25).abs() < 1e-9,
+            "JSON should override separation margin"
+        );
+    }
+
+    #[test]
+    fn ghost_gate_json_override_min_score() {
+        let json = r#"{"ghost_text_min_score": 10.0}"#;
+        let config = InputConfig::from_json(json);
+        assert!(
+            (config.ghost_text_min_score - 10.0).abs() < 1e-9,
+            "JSON should override min_score"
+        );
+    }
+
+    #[test]
+    fn ghost_gate_score_floor_suppresses_ghost() {
+        // With a high score floor, even a clear winner should be suppressed.
+        let config = InputConfig {
+            ghost_text_min_score: 999_999.0,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
+        core.load_word("hello", 100);
+        core.handle_key(press(Key::Char('h')));
+        core.handle_key(press(Key::Char('e')));
+        let actions = core.handle_key(press(Key::Char('l')));
+        assert!(
+            ghost_text(&actions).is_none() || has_action(&actions, &Action::HideGhost),
+            "high score floor should suppress ghost text"
+        );
+    }
+
+    #[test]
+    fn ghost_gate_single_candidate_passes_margin() {
+        // Single candidate: margin = confidence(~1.0) - 0.0 = ~1.0 >= 0.10.
+        let config = InputConfig {
+            ghost_text_separation_margin: 0.10,
+            ghost_text_min_score: 0.0,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
+        core.load_word("unique", 100);
+        core.handle_key(press(Key::Char('u')));
+        core.handle_key(press(Key::Char('n')));
+        let actions = core.handle_key(press(Key::Char('i')));
+        let g = ghost_text(&actions);
+        assert!(
+            g.is_some() && !g.as_ref().unwrap().is_empty(),
+            "single candidate should pass margin check: got {:?}",
+            g
+        );
     }
 }
