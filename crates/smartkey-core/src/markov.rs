@@ -59,8 +59,8 @@ impl MarkovChain {
             .entry(context.to_owned())
             .or_insert_with(|| (HashMap::new(), 0));
         let entry = followers.entry(word.to_owned()).or_insert(0);
-        *entry += count;
-        *total += count;
+        *entry = entry.saturating_add(count);
+        *total = total.saturating_add(count);
         self.vocab.insert(word.to_owned());
     }
 
@@ -73,8 +73,8 @@ impl MarkovChain {
             .entry(w2.to_owned())
             .or_insert_with(|| (HashMap::new(), 0));
         let entry = followers.entry(word.to_owned()).or_insert(0);
-        *entry += count;
-        *total += count;
+        *entry = entry.saturating_add(count);
+        *total = total.saturating_add(count);
         self.vocab.insert(word.to_owned());
     }
 

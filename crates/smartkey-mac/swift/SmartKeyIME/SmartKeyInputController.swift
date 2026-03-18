@@ -124,6 +124,21 @@ class SmartKeyInputController: IMKInputController {
             case 3: // ForwardKey
                 consumed = false
 
+            case 4: // ReplaceWord — payload: "{replace_len}\x1F{text}"
+                if let payload = action.payload {
+                    let raw = String(cString: payload)
+                    let parts = raw.split(separator: "\u{1F}", maxSplits: 1)
+                    if parts.count == 2, let n = Int(parts[parts.startIndex]) {
+                        let text = String(parts[parts.index(after: parts.startIndex)])
+                        let cursor = client.selectedRange().location
+                        if cursor != NSNotFound && cursor >= n {
+                            // Replace preceding n characters with new text
+                            client.insertText(text, replacementRange: NSRange(
+                                location: cursor - n, length: n))
+                        }
+                    }
+                }
+
             default:
                 break
             }

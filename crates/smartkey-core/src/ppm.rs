@@ -157,7 +157,7 @@ impl PpmModel {
             .entry(target)
             .or_insert_with(|| (Box::new(PpmNode::default()), 0));
         if entry.1 == 0 {
-            node.distinct += 1;
+            node.distinct = node.distinct.saturating_add(1);
         }
         entry.1 = entry.1.saturating_add(1);
     }
