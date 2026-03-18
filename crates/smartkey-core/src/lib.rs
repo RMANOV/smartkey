@@ -1,5 +1,6 @@
 pub mod bpe;
 pub mod cache;
+pub mod caps;
 pub mod corpus;
 pub mod cvm;
 pub mod dual_buffer;
@@ -12,6 +13,7 @@ pub mod keymap;
 pub mod kneser_ney;
 pub mod lang_cvm;
 pub mod lang_detect;
+pub mod lang_model;
 pub mod markov;
 pub mod ngram;
 pub mod paths;

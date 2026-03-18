@@ -15,6 +15,8 @@ pub struct SessionSimulator {
     chars_saved: usize,
     words_total: usize,
     words_predicted: usize,
+    predictions_shown: usize,
+    predictions_accepted: usize,
 }
 
 impl SessionSimulator {
@@ -28,6 +30,8 @@ impl SessionSimulator {
             chars_saved: 0,
             words_total: 0,
             words_predicted: 0,
+            predictions_shown: 0,
+            predictions_accepted: 0,
         }
     }
 
@@ -148,6 +152,8 @@ impl SessionSimulator {
                     confidence,
                     accepted: true,
                 });
+                self.predictions_shown += 1;
+                self.predictions_accepted += 1;
                 self.chars_saved += ghost_char_len;
                 self.send_key(Key::Tab);
                 self.total_keystrokes += 1;
@@ -166,6 +172,7 @@ impl SessionSimulator {
                     confidence,
                     accepted: false,
                 });
+                self.predictions_shown += 1;
                 self.timeline.push(TimelineEvent::PredictionRejected {
                     offset: cursor,
                     ghost,
@@ -201,6 +208,8 @@ impl SessionSimulator {
             words_total: self.words_total,
             words_predicted: self.words_predicted,
             chars_saved: self.chars_saved,
+            predictions_shown: self.predictions_shown,
+            predictions_accepted: self.predictions_accepted,
             duration,
             p50_latency_us: metrics.p50_latency.as_micros() as u64,
             p99_latency_us: metrics.p99_latency.as_micros() as u64,
@@ -257,6 +266,8 @@ pub struct SimulationResult {
     pub words_total: usize,
     pub words_predicted: usize,
     pub chars_saved: usize,
+    pub predictions_shown: usize,
+    pub predictions_accepted: usize,
     pub duration: std::time::Duration,
     pub p50_latency_us: u64,
     pub p99_latency_us: u64,

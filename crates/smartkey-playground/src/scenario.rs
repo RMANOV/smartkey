@@ -164,6 +164,76 @@ impl Scenario {
         }
     }
 
+    /// English text with proper nouns and sentence-start capitals.
+    pub fn capitalization_prose() -> Self {
+        Self {
+            name: "Capitalization Prose".into(),
+            text: concat!(
+                "London is a beautiful city in the United Kingdom. ",
+                "Sarah and Michael went to the park yesterday. ",
+                "The United States declared independence in July. ",
+                "Professor Smith teaches at Oxford University. ",
+                "Amazon and Google are major technology companies. ",
+                "The Eiffel Tower is located in Paris France.",
+            )
+            .into(),
+            events: vec![],
+        }
+    }
+
+    /// All-caps technical text.
+    pub fn all_caps_typing() -> Self {
+        Self {
+            name: "All Caps Typing".into(),
+            text: concat!(
+                "HTTP REQUEST FAILED WITH ERROR CODE. ",
+                "WARNING DO NOT DELETE THIS FILE. ",
+                "API KEY MUST BE SET BEFORE RUNNING. ",
+                "DNS LOOKUP TIMEOUT AFTER RETRY. ",
+                "SSL CERTIFICATE EXPIRED ON SERVER.",
+            )
+            .into(),
+            events: vec![],
+        }
+    }
+
+    /// Mixed EN/BG text WITHOUT explicit SwitchLanguage events.
+    /// Tests auto language detection from character input.
+    pub fn auto_language_detection() -> Self {
+        Self {
+            name: "Auto Language Detection".into(),
+            text: concat!(
+                "Hello how are you doing today. ",
+                "Здравей много добре съм благодаря. ",
+                "The weather is really nice outside. ",
+                "Искам да отида на разходка в парка. ",
+                "Let us meet tomorrow for coffee. ",
+                "Добре ще се видим утре сутринта.",
+            )
+            .into(),
+            events: vec![], // No language switch events — purely auto-detected
+        }
+    }
+
+    /// Long-form common English sentences for high precision measurement.
+    pub fn high_precision_english() -> Self {
+        Self {
+            name: "High Precision English".into(),
+            text: concat!(
+                "I have been working on this project for several months now. ",
+                "The results show a significant improvement in performance. ",
+                "We need to schedule a meeting to discuss the next steps. ",
+                "Please review the document and provide your feedback. ",
+                "The team has made excellent progress this quarter. ",
+                "Our goal is to deliver the final version by next month. ",
+                "Thank you for your continued support and dedication. ",
+                "The new feature will be available in the next release.",
+            )
+            .into(),
+            events: vec![],
+        }
+    }
+
     /// All preset scenarios.
     pub fn all_presets() -> Vec<Self> {
         vec![
@@ -172,6 +242,10 @@ impl Scenario {
             Self::mixed_language(),
             Self::code_sprint(),
             Self::stress_test(),
+            Self::capitalization_prose(),
+            Self::all_caps_typing(),
+            Self::auto_language_detection(),
+            Self::high_precision_english(),
         ]
     }
 }

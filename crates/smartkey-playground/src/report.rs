@@ -15,6 +15,7 @@ pub struct TypingReport {
     pub words_predicted: usize,
     pub chars_saved: usize,
     pub accept_rate: f64,
+    pub precision: f64,
     pub keystroke_savings: f64,
     pub p50_latency_us: u64,
     pub p99_latency_us: u64,
@@ -36,6 +37,11 @@ impl TypingReport {
         } else {
             0.0
         };
+        let precision = if result.predictions_shown > 0 {
+            result.predictions_accepted as f64 / result.predictions_shown as f64
+        } else {
+            0.0
+        };
         let keystroke_savings = if result.total_chars > 0 {
             result.chars_saved as f64 / result.total_chars as f64
         } else {
@@ -50,6 +56,7 @@ impl TypingReport {
             words_predicted: result.words_predicted,
             chars_saved: result.chars_saved,
             accept_rate,
+            precision,
             keystroke_savings,
             p50_latency_us: result.p50_latency_us,
             p99_latency_us: result.p99_latency_us,
@@ -76,6 +83,10 @@ impl TypingReport {
             self.accept_rate * 100.0,
             self.words_predicted,
             self.words_total
+        );
+        println!(
+            "  Precision:         {:.1}%  (accepted/shown predictions)",
+            self.precision * 100.0
         );
         println!(
             "  Keystroke savings: {:.1}%",
@@ -256,10 +267,10 @@ pub fn print_histogram(scenario_name: &str, hist: &ConfidenceHistogram) {
 /// Print a summary table for multiple reports.
 pub fn print_summary_table(reports: &[TypingReport]) {
     println!(
-        "{:<20} {:>6} {:>6} {:>10} {:>12} {:>8}",
-        "Scenario", "Words", "Chars", "Accept %", "KS Savings %", "Status"
+        "{:<25} {:>6} {:>6} {:>10} {:>12} {:>12} {:>8}",
+        "Scenario", "Words", "Chars", "Accept %", "Precision %", "KS Savings %", "Status"
     );
-    println!("{}", "-".repeat(70));
+    println!("{}", "-".repeat(87));
     for r in reports {
         let status = if r.accept_rate >= 0.30 {
             "PASS"
@@ -267,11 +278,12 @@ pub fn print_summary_table(reports: &[TypingReport]) {
             "FAIL"
         };
         println!(
-            "{:<20} {:>6} {:>6} {:>9.1}% {:>11.1}% {:>8}",
+            "{:<25} {:>6} {:>6} {:>9.1}% {:>11.1}% {:>11.1}% {:>8}",
             r.scenario_name,
             r.words_total,
             r.total_chars,
             r.accept_rate * 100.0,
+            r.precision * 100.0,
             r.keystroke_savings * 100.0,
             status,
         );

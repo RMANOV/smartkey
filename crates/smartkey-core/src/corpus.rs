@@ -163,7 +163,41 @@ impl Corpus {
         bincode::deserialize(bytes).map_err(|e| e.to_string())
     }
 
-    /// Load this corpus into a SmartKeyEngine.
+    /// Parse proper nouns from a JSON corpus string (optional `"proper_nouns"` array).
+    pub fn parse_proper_nouns(json_str: &str) -> Vec<String> {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+            if let Some(arr) = v.get("proper_nouns").and_then(|v| v.as_array()) {
+                return arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Load this corpus into a SmartKeyEngine with explicit language routing.
+    ///
+    /// Also loads BPE merge rules (if present) and builds the Kneser-Ney
+    /// scorer (if the flag is enabled).
+    pub fn load_into_engine_lang(
+        &self,
+        engine: &mut SmartKeyEngine,
+        lang: crate::lang_detect::LangId,
+    ) {
+        for w in &self.words {
+            engine.load_word_lang(&w.word, w.frequency, lang);
+        }
+        for b in &self.bigrams {
+            engine.load_bigram_lang(&b.ctx, &b.word, b.count, lang);
+        }
+        for t in &self.trigrams {
+            engine.load_trigram_lang(&t.w1, &t.w2, &t.word, t.count, lang);
+        }
+        self.load_bpe_and_kn(engine);
+    }
+
+    /// Load this corpus into a SmartKeyEngine (auto-detects language per word).
     ///
     /// Also loads BPE merge rules (if present) and builds the Kneser-Ney
     /// scorer (if the flag is enabled).
@@ -177,7 +211,11 @@ impl Corpus {
         for t in &self.trigrams {
             engine.load_trigram(&t.w1, &t.w2, &t.word, t.count);
         }
+        self.load_bpe_and_kn(engine);
+    }
 
+    /// Shared BPE + KN loading logic.
+    fn load_bpe_and_kn(&self, engine: &mut SmartKeyEngine) {
         // Load BPE merge rules if present in corpus.
         // When no merge rules are provided, generate character-pair merges from
         // the most frequent words so BPE OOV fallback is functional out of the box.

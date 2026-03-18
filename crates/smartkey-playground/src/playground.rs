@@ -28,7 +28,7 @@ impl Playground {
         Self {
             corpus_dir: default_corpus,
             scenarios: Vec::new(),
-            threshold: 0.3,
+            threshold: 0.2,
         }
     }
 

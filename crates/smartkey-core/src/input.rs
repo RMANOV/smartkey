@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::time::Instant;
 
+use crate::caps::{CapsEngine, CapsRegime};
 use crate::dual_buffer::{DualBuffer, DualBufferConfig};
 use crate::ensemble::{Prediction, SmartKeyEngine};
 use crate::eval::PredictionMetrics;
@@ -148,8 +149,8 @@ impl Default for InputConfig {
             fuzzy_max_edits: 2,
             fuzzy_discounts: [1.0, 0.7, 0.4],
             markov_lambdas: [0.6, 0.3, 0.1],
-            ghost_text_min_confidence: 0.15,
-            ghost_text_separation_margin: 0.10,
+            ghost_text_min_confidence: 0.20,
+            ghost_text_separation_margin: 0.05,
             ghost_text_min_score: 0.0,
             lang_detection: true,
             use_session_cache_lm: true,
@@ -290,6 +291,10 @@ pub struct InputMethodCore {
     regime_detector: RegimeDetector,
     /// True when the current word triggered a dual-buffer layout flip (for regime detection).
     current_word_had_flip: bool,
+    /// Smart caps engine — detects capitalization regime and applies to predictions.
+    caps_engine: CapsEngine,
+    /// True when the next word starts a new sentence (after `.`, `?`, `!`, `\n`).
+    sentence_start: bool,
 }
 
 impl InputMethodCore {
@@ -309,6 +314,8 @@ impl InputMethodCore {
             dual_buffer: None,
             regime_detector: RegimeDetector::new(),
             current_word_had_flip: false,
+            caps_engine: CapsEngine::new(),
+            sentence_start: true, // First word of session is typically capitalized.
         }
     }
 
@@ -326,24 +333,53 @@ impl InputMethodCore {
         self.engine.load_trigram(w1, w2, word, count);
     }
 
+    pub fn load_word_lang(&mut self, word: &str, freq: u32, lang: LangId) {
+        self.engine.load_word_lang(word, freq, lang);
+    }
+
+    pub fn load_bigram_lang(&mut self, ctx: &str, word: &str, count: u32, lang: LangId) {
+        self.engine.load_bigram_lang(ctx, word, count, lang);
+    }
+
+    pub fn load_trigram_lang(&mut self, w1: &str, w2: &str, word: &str, count: u32, lang: LangId) {
+        self.engine.load_trigram_lang(w1, w2, word, count, lang);
+    }
+
     // -- corpus file loading ---------------------------------------------
+
+    /// Extract language from corpus filename: `corpus_en.json` → `Some(En)`.
+    fn lang_from_filename(path: &Path) -> Option<LangId> {
+        let stem = path.file_stem()?.to_str()?;
+        if stem.ends_with("_en") {
+            Some(LangId::En)
+        } else if stem.ends_with("_bg") {
+            Some(LangId::Bg)
+        } else if stem.ends_with("_tech") {
+            Some(LangId::Tech)
+        } else {
+            None
+        }
+    }
 
     /// Load a corpus file (JSON or bincode) and feed it into the engine.
     ///
     /// Auto-detects format by extension (`.bin` = bincode, anything else = JSON).
+    /// Extracts language from filename (e.g. `corpus_en.json` → English model).
     /// On JSON load, writes a `.bin` cache alongside (best-effort, ignores write errors).
     pub fn load_corpus_file(&mut self, path: &Path) -> Result<(), String> {
         use crate::corpus::Corpus;
 
+        let lang = Self::lang_from_filename(path);
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let corpus = match ext {
+
+        let (corpus, json_str) = match ext {
             "bin" => {
                 let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-                Corpus::from_bincode(&bytes)?
+                (Corpus::from_bincode(&bytes)?, None)
             }
             _ => {
-                let json_str = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-                let (corpus, warnings) = Corpus::from_json_with_warnings(&json_str)?;
+                let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+                let (corpus, warnings) = Corpus::from_json_with_warnings(&data)?;
                 if warnings.dropped_bigrams > 0 || warnings.dropped_trigrams > 0 {
                     eprintln!(
                         "smartkey: corpus {}: dropped {} bigrams, {} trigrams (malformed entries)",
@@ -357,10 +393,23 @@ impl InputMethodCore {
                 if let Ok(bytes) = corpus.to_bincode() {
                     let _ = std::fs::write(&bin_path, bytes);
                 }
-                corpus
+                (corpus, Some(data))
             }
         };
-        corpus.load_into_engine(&mut self.engine);
+
+        // Load proper nouns into caps engine (from JSON only).
+        if let Some(ref json) = json_str {
+            for noun in Corpus::parse_proper_nouns(json) {
+                self.caps_engine.register_proper_noun(&noun);
+            }
+        }
+
+        // Route corpus data to the correct language model.
+        if let Some(lang) = lang {
+            corpus.load_into_engine_lang(&mut self.engine, lang);
+        } else {
+            corpus.load_into_engine(&mut self.engine);
+        }
         Ok(())
     }
 
@@ -767,13 +816,14 @@ impl InputMethodCore {
                 None
             };
 
-            self.engine.learn(word);
-            self.engine.learn_online_markov(prev1, prev2, word);
+            let word_lower = word.to_lowercase();
+            self.engine.learn(&word_lower);
+            self.engine.learn_online_markov(prev1, prev2, &word_lower);
 
             // Feed word to per-language CVM track + momentum.
             let lang = if self.config.lang_detection {
                 let l = self.lang_detector.detected().lang;
-                self.engine.learn_with_lang(word, l);
+                self.engine.learn_with_lang(&word_lower, l);
                 self.lang_detector.record_commit(l);
                 l
             } else {
@@ -782,7 +832,7 @@ impl InputMethodCore {
 
             // Feed word to session cache LM for burstiness tracking.
             if self.config.use_session_cache_lm {
-                self.engine.observe_session(word);
+                self.engine.observe_session(&word_lower);
             }
 
             // Feed word stats to regime detector (v0.5+).
@@ -798,7 +848,11 @@ impl InputMethodCore {
             if self.context.len() >= CONTEXT_SIZE {
                 self.context.pop_front();
             }
-            self.context.push_back(word.to_string());
+            // Store lowercase for Markov context matching (corpus trained lowercase).
+            self.context.push_back(word.to_lowercase());
+
+            // Track sentence boundary for caps detection.
+            self.sentence_start = word.ends_with('.') || word.ends_with('?') || word.ends_with('!');
         }
     }
 
@@ -939,6 +993,9 @@ impl InputMethodCore {
 
     /// Compute predictions and return ghost suffix string (empty if none).
     /// Sets `self.ghost` and `self.last_predictions` as side effects.
+    ///
+    /// Smart caps: searches with lowercase prefix (so trie always matches),
+    /// then applies the user's capitalization pattern to predictions.
     fn compute_ghost_suffix(&mut self) -> String {
         let effective_min = if self.config.use_ppm {
             1
@@ -965,14 +1022,36 @@ impl InputMethodCore {
         } else {
             None
         };
+
+        // Smart caps: search with lowercase prefix so trie always matches.
+        let search_prefix = self.current_word.to_lowercase();
+
         let t0 = Instant::now();
-        self.last_predictions = self.engine.predict(
-            &self.current_word,
-            &ctx_refs,
-            self.config.max_candidates,
-            lang,
-        );
+        self.last_predictions =
+            self.engine
+                .predict(&search_prefix, &ctx_refs, self.config.max_candidates, lang);
         self.metrics.record_latency(t0.elapsed());
+
+        // Apply capitalization regime to predictions so they match user's casing.
+        let regime = CapsEngine::detect_regime(&self.current_word);
+        let first_char_upper = self
+            .current_word
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false);
+
+        for pred in &mut self.last_predictions {
+            pred.word = CapsEngine::apply_caps(&pred.word, regime);
+            // For Normal regime with uppercase first char (sentence-start, proper noun).
+            if regime == CapsRegime::Normal && first_char_upper {
+                pred.word = CapsEngine::capitalize_first(&pred.word);
+            }
+            // Always capitalize known proper nouns.
+            if self.caps_engine.is_proper_noun(&pred.word) {
+                pred.word = CapsEngine::capitalize_first(&pred.word);
+            }
+        }
 
         if let Some(top) = self.last_predictions.first() {
             // Gate 1: absolute confidence threshold (existing).
@@ -990,6 +1069,7 @@ impl InputMethodCore {
                 let score_ok = top.score >= self.config.ghost_text_min_score;
 
                 if margin_ok && score_ok {
+                    // Match against user's ORIGINAL casing (predictions are now cased).
                     if let Some(suffix) = top.word.strip_prefix(self.current_word.as_str()) {
                         if !suffix.is_empty() && self.config.ghost_text {
                             let s = suffix.to_string();
@@ -1070,15 +1150,11 @@ mod tests {
     fn test_basic_predict_cycle() {
         let mut core = test_core();
 
-        // Type "h" — below min_prefix_length (2), no ghost.
+        // Type "h" — at min_prefix_length (1), may get ghost.
         let actions = core.handle_key(press(Key::Char('h')));
-        assert!(
-            has_action(&actions, &Action::HideGhost)
-                || ghost_text(&actions).is_none()
-                || ghost_text(&actions) == Some(String::new())
-        );
+        // With min_prefix_length=1, "h" is enough for predictions.
 
-        // Type "e" → "he" — now above threshold, should get ghost.
+        // Type "e" → "he" — should get ghost.
         let actions = core.handle_key(press(Key::Char('e')));
         // "hello" is top by frequency → ghost should be "llo"
         assert!(has_action(&actions, &Action::ForwardKey));
@@ -1207,13 +1283,22 @@ mod tests {
 
     #[test]
     fn test_min_prefix_length() {
-        let mut core = test_core();
+        // Explicitly test min_prefix_length=2 gating (PPM disabled to respect it).
+        let config = InputConfig {
+            ghost_text_separation_margin: 0.0,
+            min_prefix_length: 2,
+            use_ppm: false,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
+        core.load_word("hello", 100);
+        core.load_word("help", 80);
 
         // Single char → no ghost (min_prefix_length = 2).
         let actions = core.handle_key(press(Key::Char('h')));
         assert!(
             !has_action(&actions, &Action::ShowGhost("ello".into())),
-            "should not show ghost for single char"
+            "should not show ghost for single char with min_prefix_length=2"
         );
     }
 
@@ -1586,8 +1671,8 @@ mod tests {
     fn ghost_gate_default_separation_margin() {
         let config = InputConfig::default();
         assert!(
-            (config.ghost_text_separation_margin - 0.10).abs() < 1e-9,
-            "default separation margin should be 0.10"
+            (config.ghost_text_separation_margin - 0.05).abs() < 1e-9,
+            "default separation margin should be 0.05"
         );
     }
 

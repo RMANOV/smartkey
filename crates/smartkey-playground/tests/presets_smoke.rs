@@ -48,7 +48,7 @@ fn smoke_stress_test() {
 #[test]
 fn smoke_run_all_presets() {
     let reports = Playground::run_all_presets();
-    assert_eq!(reports.len(), 5, "should have 5 preset reports");
+    assert_eq!(reports.len(), 9, "should have 9 preset reports");
     for r in &reports {
         assert!(r.words_total > 0, "{}: should have words", r.scenario_name);
     }

@@ -10,7 +10,7 @@ use smartkey_playground::{Playground, Scenario};
     about = "SmartKey prediction quality evaluator"
 )]
 struct Cli {
-    /// Run only this preset (english-prose, bulgarian-chat, mixed-language, code-sprint, stress-test)
+    /// Run only this preset (english-prose, bulgarian-chat, mixed-language, code-sprint, stress-test, capitalization-prose, all-caps-typing, auto-language-detection, high-precision-english)
     #[arg(long)]
     preset: Option<String>,
 
@@ -26,8 +26,8 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Acceptance confidence threshold (default: 0.3)
-    #[arg(long, default_value_t = 0.3)]
+    /// Acceptance confidence threshold (default: 0.2)
+    #[arg(long, default_value_t = 0.2)]
     threshold: f64,
 
     /// Path to corpus directory
@@ -45,10 +45,15 @@ fn main() {
             "mixed-language" => vec![Scenario::mixed_language()],
             "code-sprint" => vec![Scenario::code_sprint()],
             "stress-test" => vec![Scenario::stress_test()],
+            "capitalization-prose" => vec![Scenario::capitalization_prose()],
+            "all-caps-typing" => vec![Scenario::all_caps_typing()],
+            "auto-language-detection" => vec![Scenario::auto_language_detection()],
+            "high-precision-english" => vec![Scenario::high_precision_english()],
             other => {
                 eprintln!(
                     "Unknown preset: {:?}. Available: english-prose, bulgarian-chat, \
-                     mixed-language, code-sprint, stress-test",
+                     mixed-language, code-sprint, stress-test, capitalization-prose, \
+                     all-caps-typing, auto-language-detection, high-precision-english",
                     other
                 );
                 std::process::exit(1);
