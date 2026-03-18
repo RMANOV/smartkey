@@ -1151,7 +1151,7 @@ mod tests {
         let mut core = test_core();
 
         // Type "h" — at min_prefix_length (1), may get ghost.
-        let actions = core.handle_key(press(Key::Char('h')));
+        core.handle_key(press(Key::Char('h')));
         // With min_prefix_length=1, "h" is enough for predictions.
 
         // Type "e" → "he" — should get ghost.
