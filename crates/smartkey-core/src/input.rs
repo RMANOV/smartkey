@@ -569,6 +569,26 @@ impl InputMethodCore {
 
             // Space / Return: commit current word, delimit.
             Key::Space | Key::Return => {
+                let is_space = matches!(key, Key::Space);
+                
+                // Aggressive Space-Commit (Goal 3): Auto-commit unique top prediction on Space.
+                if is_space && !self.current_word.is_empty() && self.last_predictions.len() == 1 {
+                    let best_match = self.last_predictions[0].word.clone();
+                    // Don't auto-commit if they typed the exact word already
+                    if best_match.to_lowercase() != self.current_word.to_lowercase() {
+                        let mut actions = vec![Action::HideGhost];
+                        let typed_len = self.current_word.chars().count();
+                        self.commit_word_internal(&best_match, true);
+                        self.reset_word();
+                        actions.push(Action::ReplaceWord {
+                            len: typed_len,
+                            text: best_match,
+                        });
+                        actions.push(Action::ForwardKey);
+                        return actions;
+                    }
+                }
+
                 if let Some(ref db) = self.dual_buffer {
                     if !db.is_locked() && !self.current_word.is_empty() {
                         // Hypothesis phase: commit preedit prefix before forwarding.
@@ -1041,9 +1061,15 @@ impl InputMethodCore {
             .map(|c| c.is_uppercase())
             .unwrap_or(false);
 
+        let prev_token = ctx_refs.last().copied().unwrap_or("");
+        let force_sentence_start = CapsEngine::requires_capitalization(prev_token);
+
         for pred in &mut self.last_predictions {
             pred.word = CapsEngine::apply_caps(&pred.word, regime);
-            // For Normal regime with uppercase first char (sentence-start, proper noun).
+            // For Normal regime with uppercase first char (sentence-start, proper noun) or lazy typing.
+            if regime == CapsRegime::Normal && (first_char_upper || force_sentence_start) {
+                pred.word = CapsEngine::capitalize_first(&pred.word);
+            }
             if regime == CapsRegime::Normal && first_char_upper {
                 pred.word = CapsEngine::capitalize_first(&pred.word);
             }

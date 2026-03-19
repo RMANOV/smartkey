@@ -28,6 +28,16 @@ impl CapsEngine {
         }
     }
 
+    /// Determine if word requires capitalization based on the previous token.
+    pub fn requires_capitalization(prev_token: &str) -> bool {
+        let trimmed = prev_token.trim();
+        if trimmed.is_empty() {
+            return true; // Start of input
+        }
+        let last_char = trimmed.chars().last().unwrap_or(' ');
+        matches!(last_char, '.' | '!' | '?' | '\n')
+    }
+
     /// Detect caps regime from the typed prefix.
     ///
     /// Returns `Normal` for empty strings, all-lowercase, or single uppercase
