@@ -89,9 +89,10 @@ impl CapsEngine {
         match regime {
             CapsRegime::Normal => word.to_string(),
             CapsRegime::AllCaps => word.to_uppercase(),
-            CapsRegime::PascalCase | CapsRegime::CamelCase => {
-                // For camel/pascal, the trie stores lowercase. Since the
-                // user's prefix already encodes the pattern, return as-is.
+            CapsRegime::PascalCase => CapsEngine::capitalize_first(word),
+            CapsRegime::CamelCase => {
+                // CamelCase can't be auto-applied without word boundary knowledge.
+                // The user's prefix encodes the casing; suffix stays lowercase.
                 word.to_string()
             }
         }

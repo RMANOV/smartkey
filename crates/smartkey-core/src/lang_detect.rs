@@ -75,6 +75,7 @@ impl LanguageDetector {
                 for ema in self.ema_scores.iter_mut() {
                     *ema = 1.0 / n;
                 }
+                self.momentum.clear();
             }
         }
 

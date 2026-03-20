@@ -903,6 +903,12 @@ impl InputMethodCore {
             db.update_scores(en_freq, bg_freq);
         }
 
+        // Propagate flip detection from dual buffer to regime detector flag.
+        if db.flip_detected() {
+            self.current_word_had_flip = true;
+            db.clear_flip();
+        }
+
         self.current_word = db.winner_text().to_string();
 
         // Compute winner char once — reused for lang detection and locked-phase commit.
@@ -1090,7 +1096,7 @@ impl InputMethodCore {
                     // Unicode-safe case-insensitive prefix match: predictions may be
                     // capitalized by CapsEngine while typed text is lowercase.
                     // `to_lowercase()` handles all scripts (Cyrillic, Turkish, etc.).
-                    let prefix_matches = top.word.len() >= self.current_word.len()
+                    let prefix_matches = top.word.chars().count() >= self.current_word.chars().count()
                         && top
                             .word
                             .to_lowercase()
