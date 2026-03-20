@@ -293,8 +293,6 @@ pub struct InputMethodCore {
     current_word_had_flip: bool,
     /// Smart caps engine — detects capitalization regime and applies to predictions.
     caps_engine: CapsEngine,
-    /// True when the next word starts a new sentence (after `.`, `?`, `!`, `\n`).
-    sentence_start: bool,
 }
 
 impl InputMethodCore {
@@ -315,7 +313,6 @@ impl InputMethodCore {
             regime_detector: RegimeDetector::new(),
             current_word_had_flip: false,
             caps_engine: CapsEngine::new(),
-            sentence_start: true, // First word of session is typically capitalized.
         }
     }
 
@@ -871,8 +868,6 @@ impl InputMethodCore {
             // Store lowercase for Markov context matching (corpus trained lowercase).
             self.context.push_back(word.to_lowercase());
 
-            // Track sentence boundary for caps detection.
-            self.sentence_start = word.ends_with('.') || word.ends_with('?') || word.ends_with('!');
         }
     }
 
@@ -1000,8 +995,8 @@ impl InputMethodCore {
         }
 
         // Trigger when BG frequency dominates EN by ≥50x (or EN has zero).
-        // Momentum guard above already blocked EN momentum; here we allow
-        // None (cold start) and Some(Bg) — that's what `!= Some(En)` achieves.
+        // The early return above already blocks EN momentum, so only
+        // None (cold start) and Some(Bg) reach this point.
         // Conservative: "ok" (4.8x), "vs" (28x), "da" (32x) don't trigger.
         // Clear wrong-layout: "zd" (1351x), "mn" (550x), "ka" (224x) do.
         if bg_freq > 0 && ratio >= 50.0 {
@@ -1092,17 +1087,22 @@ impl InputMethodCore {
                 let score_ok = top.score >= self.config.ghost_text_min_score;
 
                 if margin_ok && score_ok {
-                    // Case-insensitive prefix match: predictions may be
+                    // Unicode-safe case-insensitive prefix match: predictions may be
                     // capitalized by CapsEngine while typed text is lowercase.
-                    let typed_len = self.current_word.len();
-                    let prefix_matches = top.word.len() >= typed_len
-                        && top.word[..typed_len].eq_ignore_ascii_case(&self.current_word);
+                    // `to_lowercase()` handles all scripts (Cyrillic, Turkish, etc.).
+                    let prefix_matches = top.word.len() >= self.current_word.len()
+                        && top
+                            .word
+                            .to_lowercase()
+                            .starts_with(&self.current_word.to_lowercase());
                     if prefix_matches {
-                        let suffix = &top.word[typed_len..];
+                        // Use char count for suffix extraction — byte offsets can
+                        // differ between uppercase and lowercase in some scripts.
+                        let typed_chars = self.current_word.chars().count();
+                        let suffix: String = top.word.chars().skip(typed_chars).collect();
                         if !suffix.is_empty() && self.config.ghost_text {
-                            let s = suffix.to_string();
-                            self.ghost.clone_from(&s);
-                            return s;
+                            self.ghost.clone_from(&suffix);
+                            return suffix;
                         }
                     }
                 }
