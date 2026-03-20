@@ -25,6 +25,11 @@ pub struct MarkovChain {
     vocab: HashSet<String>,
     /// Interpolation weights: [trigram, bigram, unigram].
     lambda: [f64; 3],
+    /// Per-word unigram frequency counts for frequency-weighted backoff.
+    /// Populated via `train_unigram()` during corpus loading.
+    unigram_counts: HashMap<String, u32>,
+    /// Sum of all unigram counts (cached for fast normalisation).
+    total_unigram_count: u64,
 }
 
 impl MarkovChain {
@@ -35,6 +40,8 @@ impl MarkovChain {
             trigrams: HashMap::new(),
             vocab: HashSet::new(),
             lambda: [0.6, 0.3, 0.1],
+            unigram_counts: HashMap::new(),
+            total_unigram_count: 0,
         }
     }
 
@@ -45,12 +52,28 @@ impl MarkovChain {
             trigrams: HashMap::new(),
             vocab: HashSet::new(),
             lambda,
+            unigram_counts: HashMap::new(),
+            total_unigram_count: 0,
         }
     }
 
     // ------------------------------------------------------------------
     // Training
     // ------------------------------------------------------------------
+
+    /// Record unigram frequency for a word (from corpus loading).
+    ///
+    /// This enables frequency-weighted unigram backoff: `P₁(w) = count(w) / total`
+    /// instead of the uniform `1 / vocab_size`. Words like "the" get much higher
+    /// unigram probability than "xylophone", dramatically improving prediction
+    /// quality when backoff to unigram is needed (short context, rare bigrams).
+    pub fn train_unigram(&mut self, word: &str, count: u32) {
+        let entry = self.unigram_counts.entry(word.to_owned()).or_insert(0);
+        let old = *entry;
+        *entry = entry.saturating_add(count);
+        self.total_unigram_count += (*entry - old) as u64;
+        self.vocab.insert(word.to_owned());
+    }
 
     /// Record `count` observations of the bigram `context → word`.
     pub fn train_bigram(&mut self, context: &str, word: &str, count: u32) {
@@ -118,10 +141,20 @@ impl MarkovChain {
         count as f64 / total as f64
     }
 
-    /// Uniform unigram probability: `1 / vocab_size`.
+    /// Frequency-weighted unigram probability: `count(word) / total_count`.
     ///
-    /// Falls back to `UNSEEN_FLOOR` when the vocabulary is empty.
-    fn unigram_prob(&self) -> f64 {
+    /// When unigram counts are available (populated via `train_unigram()`),
+    /// returns the corpus-based frequency. Falls back to uniform `1/vocab_size`
+    /// when no unigram counts have been loaded (backward compatibility).
+    fn unigram_prob(&self, word: &str) -> f64 {
+        if self.total_unigram_count > 0 {
+            let count = self.unigram_counts.get(word).copied().unwrap_or(0) as f64;
+            if count > 0.0 {
+                return count / self.total_unigram_count as f64;
+            }
+            return UNSEEN_FLOOR;
+        }
+        // Fallback: uniform distribution when no unigram data loaded.
         if self.vocab.is_empty() {
             return UNSEEN_FLOOR;
         }
@@ -143,7 +176,7 @@ impl MarkovChain {
     ///
     /// The score is clamped to at least `UNSEEN_FLOOR`.
     pub fn score_with_backoff(&self, word: &str, recent: Option<&str>, older: Option<&str>) -> f64 {
-        let p_uni = self.unigram_prob();
+        let p_uni = self.unigram_prob(word);
 
         let score = match (older, recent) {
             (Some(w1), Some(w2)) => {
@@ -197,6 +230,16 @@ impl MarkovChain {
     /// Raw trigram data access (for serialization).
     pub fn trigrams_raw(&self) -> &TrigramData {
         &self.trigrams
+    }
+
+    /// Raw unigram counts (for collocation PMI computation).
+    pub fn unigram_counts_raw(&self) -> &HashMap<String, u32> {
+        &self.unigram_counts
+    }
+
+    /// Total unigram count (for collocation PMI computation).
+    pub fn total_unigram_count(&self) -> u64 {
+        self.total_unigram_count
     }
 }
 
@@ -347,6 +390,51 @@ mod tests {
         assert!(
             (score - expected).abs() < 1e-9,
             "expected {expected}, got {score}"
+        );
+    }
+
+    #[test]
+    fn frequency_weighted_unigram() {
+        let mut m = MarkovChain::new();
+        // Train unigrams with realistic frequencies.
+        m.train_unigram("the", 1000);
+        m.train_unigram("a", 500);
+        m.train_unigram("xylophone", 1);
+        // Total = 1501
+        let p_the = m.unigram_prob("the");
+        let p_xylo = m.unigram_prob("xylophone");
+        // "the" should have ~666x higher probability than "xylophone".
+        assert!(
+            p_the > p_xylo * 100.0,
+            "'the' ({p_the}) should be much more probable than 'xylophone' ({p_xylo})"
+        );
+        // Exact values.
+        assert!(
+            (p_the - 1000.0 / 1501.0).abs() < 1e-9,
+            "expected {}, got {p_the}",
+            1000.0 / 1501.0
+        );
+        // Unseen word gets UNSEEN_FLOOR.
+        assert_eq!(m.unigram_prob("zzzzz"), UNSEEN_FLOOR);
+    }
+
+    #[test]
+    fn frequency_weighted_backoff_uses_unigram_counts() {
+        let mut m = MarkovChain::new();
+        m.train_unigram("hello", 100);
+        m.train_unigram("world", 10);
+        // No bigrams/trigrams — score_with_backoff falls to unigram only.
+        let s_hello = m.score_with_backoff("hello", None, None);
+        let s_world = m.score_with_backoff("world", None, None);
+        assert!(
+            s_hello > s_world,
+            "higher-frequency 'hello' ({s_hello}) should score above 'world' ({s_world})"
+        );
+        // Ratio should reflect corpus frequency.
+        let ratio = s_hello / s_world;
+        assert!(
+            (ratio - 10.0).abs() < 1e-6,
+            "ratio should be ~10, got {ratio}"
         );
     }
 

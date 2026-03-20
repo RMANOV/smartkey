@@ -251,42 +251,78 @@ impl Corpus {
     }
 }
 
-/// Derive BPE merge rules from corpus word frequencies when no explicit merge
-/// table is available.
+/// Derive BPE merge rules from corpus word frequencies using iterative BPE (F13).
 ///
-/// Strategy: count how often each adjacent character pair appears across all
-/// words (weighted by word frequency), then emit merge rules for the top `limit`
-/// pairs in descending frequency order. This produces a minimal but functional
-/// merge table for OOV subword suggestions.
+/// Proper BPE algorithm:
+/// 1. Start with words split into individual characters (weighted by frequency).
+/// 2. Count all adjacent token pairs across all words.
+/// 3. Merge the most frequent pair → emit a merge rule.
+/// 4. Apply the merge to all words (updating token sequences).
+/// 5. Repeat until `limit` rules are generated.
+///
+/// This produces better subword units than single-pass pair counting because
+/// later merges build on earlier ones (e.g., "th" + "e" → "the").
 fn derive_bpe_merges_from_words(words: &[CorpusWord], limit: usize) -> Vec<crate::bpe::MergeRule> {
-    let mut pair_counts: HashMap<(String, String), u64> = HashMap::new();
+    if words.is_empty() || limit == 0 {
+        return Vec::new();
+    }
 
-    for w in words {
-        let chars: Vec<String> = w.word.chars().map(|c| c.to_string()).collect();
-        if chars.len() < 2 {
-            continue;
+    // Represent each word as a sequence of tokens (start with chars).
+    // Use only the top-frequency words to keep the iteration fast.
+    let max_words = 10_000;
+    let mut word_tokens: Vec<(Vec<String>, u64)> = words
+        .iter()
+        .take(max_words)
+        .filter(|w| w.word.chars().count() >= 2)
+        .map(|w| {
+            let tokens: Vec<String> = w.word.chars().map(|c| c.to_string()).collect();
+            (tokens, w.frequency.max(1) as u64)
+        })
+        .collect();
+
+    let mut rules = Vec::with_capacity(limit);
+
+    for _ in 0..limit {
+        // Count all adjacent pairs.
+        let mut pair_counts: HashMap<(String, String), u64> = HashMap::new();
+        for (tokens, weight) in &word_tokens {
+            for i in 0..tokens.len().saturating_sub(1) {
+                *pair_counts
+                    .entry((tokens[i].clone(), tokens[i + 1].clone()))
+                    .or_insert(0) += weight;
+            }
         }
-        let weight = w.frequency.max(1) as u64;
-        for i in 0..chars.len() - 1 {
-            *pair_counts
-                .entry((chars[i].clone(), chars[i + 1].clone()))
-                .or_insert(0) += weight;
+
+        // Find the most frequent pair.
+        let best = pair_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count);
+
+        let Some(((a, b), _)) = best else { break };
+        let merged = format!("{}{}", a, b);
+
+        rules.push(crate::bpe::MergeRule {
+            a: a.clone(),
+            b: b.clone(),
+            merged: merged.clone(),
+        });
+
+        // Apply this merge to all word token sequences.
+        for (tokens, _) in &mut word_tokens {
+            let mut i = 0;
+            while i + 1 < tokens.len() {
+                if tokens[i] == a && tokens[i + 1] == b {
+                    tokens[i] = merged.clone();
+                    tokens.remove(i + 1);
+                    // Don't increment — check if merged can merge with next.
+                } else {
+                    i += 1;
+                }
+            }
         }
     }
 
-    // Sort pairs by count descending.
-    let mut pairs: Vec<((String, String), u64)> = pair_counts.into_iter().collect();
-    pairs.sort_by(|a, b| b.1.cmp(&a.1));
-
-    pairs
-        .into_iter()
-        .take(limit)
-        .map(|((a, b), _)| crate::bpe::MergeRule {
-            merged: format!("{}{}", a, b),
-            a,
-            b,
-        })
-        .collect()
+    rules
 }
 
 #[cfg(test)]

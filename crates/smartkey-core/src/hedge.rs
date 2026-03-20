@@ -81,6 +81,22 @@ impl HedgeMixer {
         )
     }
 
+    /// Get weights as a 5-tuple (F16: extended signals — corpus, markov, personal, PPM, tech).
+    pub fn weights_five(&self) -> (f64, f64, f64, f64, f64) {
+        (
+            self.weights.first().copied().unwrap_or(0.0),
+            self.weights.get(1).copied().unwrap_or(0.0),
+            self.weights.get(2).copied().unwrap_or(0.0),
+            self.weights.get(3).copied().unwrap_or(0.0),
+            self.weights.get(4).copied().unwrap_or(0.0),
+        )
+    }
+
+    /// Number of signals this mixer tracks.
+    pub fn signal_count(&self) -> usize {
+        self.weights.len()
+    }
+
     /// Update weights based on per-signal rewards.
     ///
     /// `rewards[i]` should be higher for signals that contributed to

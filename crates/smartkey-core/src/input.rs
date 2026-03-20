@@ -154,7 +154,7 @@ impl Default for InputConfig {
             ghost_text_min_score: 0.0,
             lang_detection: true,
             use_session_cache_lm: true,
-            use_ppm: false,
+            use_ppm: true,
             bpe_enabled: true,
             use_kneser_ney: true,
             use_hedge: true,
@@ -499,32 +499,43 @@ impl InputMethodCore {
             // Tab: accept entire ghost text.
             Key::Tab => {
                 if !self.ghost.is_empty() {
-                    let full_word = format!("{}{}", self.current_word, self.ghost);
+                    let full_text = format!("{}{}", self.current_word, self.ghost);
+                    // F8: multi-word ghost may contain spaces — split into words.
+                    let words: Vec<&str> = full_text.split_whitespace().collect();
+                    let first_word = words.first().copied().unwrap_or(&full_text);
+
                     // In hypothesis phase: prefix is in preedit, commit everything.
                     // In locked/no-dual: prefix already in app, commit suffix only.
                     let in_hypothesis = self.in_hypothesis_phase();
                     let commit_text = if in_hypothesis {
-                        full_word.clone()
+                        full_text.clone()
                     } else {
                         self.ghost.clone()
                     };
                     let actions = vec![Action::HideGhost, Action::CommitText(commit_text)];
                     // Notify engine of accepted prediction for adaptive weight learning.
                     let ctx: Vec<&str> = self.context.iter().map(|s| s.as_str()).collect();
-                    self.engine.on_prediction_accepted(&full_word, &ctx);
+                    // F6: calibration observation — top prediction was accepted.
+                    if let Some(top) = self.last_predictions.first() {
+                        self.engine.observe_calibration(top.confidence, true);
+                    }
+                    self.engine.on_prediction_accepted(first_word, &ctx);
                     // Record acceptance metrics: find rank in last_predictions.
                     let rank = self
                         .last_predictions
                         .iter()
-                        .position(|p| p.word == full_word)
+                        .position(|p| p.word == first_word)
                         .map(|i| i + 1) // 1-based
                         .unwrap_or(1);
                     self.metrics.record_acceptance(
                         rank,
                         self.ghost.chars().count(),
-                        full_word.chars().count(),
+                        full_text.chars().count(),
                     );
-                    self.commit_word_internal(&full_word, false);
+                    // Commit each word separately for correct context/Markov tracking.
+                    for word in &words {
+                        self.commit_word_internal(word, false);
+                    }
                     self.reset_word();
                     actions
                 } else if self.in_hypothesis_phase() && !self.current_word.is_empty() {
@@ -573,6 +584,10 @@ impl InputMethodCore {
                     self.reset_word();
                     vec![Action::HideGhost]
                 } else if !self.ghost.is_empty() {
+                    // F6: calibration observation — top prediction was rejected.
+                    if let Some(top) = self.last_predictions.first() {
+                        self.engine.observe_calibration(top.confidence, false);
+                    }
                     self.engine.on_prediction_rejected();
                     self.ghost.clear();
                     vec![Action::HideGhost]
@@ -883,6 +898,14 @@ impl InputMethodCore {
             // Feed word stats to regime detector (v0.5+).
             // is_oov: word not found in the trie (zero prefix-search candidates).
             let is_oov = self.engine.candidate_count(word, 1) == 0;
+
+            // F11: Online corpus expansion — add OOV words to the trie so they
+            // appear in future predictions. Only for words ≥ 3 chars to avoid
+            // noise from typos and abbreviations.
+            if is_oov && word_char_len >= 3 {
+                self.engine.learn_oov_word(&word_lower, lang);
+            }
+
             let is_flip = self.current_word_had_flip;
             self.regime_detector
                 .observe_word(word_char_len, is_oov, is_flip, lang);
@@ -1039,6 +1062,46 @@ impl InputMethodCore {
         false
     }
 
+    /// Minimum confidence for the next-word in multi-word prediction.
+    /// Higher threshold = fewer multi-word ghosts but higher precision.
+    const MULTI_WORD_MIN_CONFIDENCE: f64 = 0.40;
+
+    /// Attempt to extend a single-word ghost into a 2-word phrase (F8).
+    ///
+    /// Queries the prediction engine for the most likely word following
+    /// `predicted_word`. If the top next-word has confidence ≥ threshold,
+    /// returns `suffix + " " + next_word`; otherwise returns `suffix` unchanged.
+    fn try_multi_word_extension(
+        &self,
+        predicted_word: &str,
+        context: &[&str],
+        lang: Option<LangId>,
+        suffix: &str,
+    ) -> String {
+        // Build extended context: append the predicted word to the context.
+        let mut ext_ctx: Vec<&str> = context.to_vec();
+        ext_ctx.push(predicted_word);
+        // Truncate to last CONTEXT_SIZE entries.
+        if ext_ctx.len() > CONTEXT_SIZE {
+            ext_ctx.drain(..ext_ctx.len() - CONTEXT_SIZE);
+        }
+
+        // Query for next-word candidates (empty prefix = any word).
+        // Use a small candidate pool to keep latency low.
+        let next_preds = self.engine.predict("", &ext_ctx, 3, lang);
+
+        if let Some(top_next) = next_preds.first() {
+            if top_next.confidence >= Self::MULTI_WORD_MIN_CONFIDENCE
+                && !top_next.word.is_empty()
+                && top_next.word.chars().count() >= 2
+            {
+                return format!("{} {}", suffix, top_next.word);
+            }
+        }
+
+        suffix.to_string()
+    }
+
     /// Compute predictions and return ghost suffix string (empty if none).
     /// Sets `self.ghost` and `self.last_predictions` as side effects.
     ///
@@ -1120,8 +1183,15 @@ impl InputMethodCore {
                 .unwrap_or(0.0);
             let effective_confidence = top.confidence + confidence_boost;
 
-            // Gate 1: absolute confidence threshold (existing).
-            if effective_confidence >= self.config.ghost_text_min_confidence {
+            // Gate 1: absolute confidence threshold.
+            // Use adaptive floor from LightProfile (F14) when available,
+            // falling back to static config value.
+            let min_confidence = self
+                .active_hints
+                .as_ref()
+                .and_then(|h| h.confidence_floor)
+                .unwrap_or(self.config.ghost_text_min_confidence);
+            if effective_confidence >= min_confidence {
                 // Gate 2: separation margin — top must beat runner-up by enough.
                 let second_conf = self
                     .last_predictions
@@ -1150,8 +1220,12 @@ impl InputMethodCore {
                         let typed_chars = self.current_word.chars().count();
                         let suffix: String = top.word.chars().skip(typed_chars).collect();
                         if !suffix.is_empty() && self.config.ghost_text {
-                            self.ghost.clone_from(&suffix);
-                            return suffix;
+                            // F8: Multi-word prediction — attempt to extend ghost
+                            // with the most likely next word (2-word lookahead).
+                            let multi_suffix =
+                                self.try_multi_word_extension(&top.word, &ctx_refs, lang, &suffix);
+                            self.ghost.clone_from(&multi_suffix);
+                            return multi_suffix;
                         }
                     }
                 }

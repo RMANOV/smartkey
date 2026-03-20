@@ -42,6 +42,9 @@ pub struct Hints {
     pub suppress_ghost: bool,
     /// Extra confidence added to ghost threshold (positive = more lenient).
     pub confidence_boost: f64,
+    /// Adaptive confidence floor from LightProfile (overrides config min_confidence).
+    /// `None` = use the static config value.
+    pub confidence_floor: Option<f64>,
 }
 
 impl Default for Hints {
@@ -50,6 +53,7 @@ impl Default for Hints {
             lang_prior: None,
             suppress_ghost: false,
             confidence_boost: 0.0,
+            confidence_floor: None,
         }
     }
 }
@@ -315,6 +319,11 @@ impl MasterLoop {
         // Low accept rate → negative boost (be stricter).
         hints.confidence_boost = (self.light_profile.ghost_accept_rate - 0.50) * 0.10;
 
+        // 5. Adaptive confidence floor from LightProfile (F14).
+        // Overrides the static config `ghost_text_min_confidence` with a
+        // value that auto-tunes based on rolling accept/reject ratio.
+        hints.confidence_floor = Some(self.light_profile.confidence_floor);
+
         hints
     }
 
@@ -338,8 +347,12 @@ impl MasterLoop {
                 }
             }
             FrustrationSignal::RapidDelete { severity, .. } => {
+                self.light_profile.record_reject();
                 // Suppress ghost temporarily.
                 self.suppress_countdown = (severity * 2.0).ceil() as u8;
+                // Record negative example: if ghost was showing, the top prediction
+                // was wrong for this context — teach correction memory.
+                self.record_ghost_as_negative();
             }
             FrustrationSignal::Retype { severity, prefix } => {
                 // Wrong language detected — boost opposite language prior.
@@ -350,11 +363,32 @@ impl MasterLoop {
                 for _ in 0..observations {
                     self.light_profile.observe_lang(correct_lang);
                 }
+                // Record negative example for the wrong-language prediction.
+                self.record_ghost_as_negative();
             }
             FrustrationSignal::Abandon { .. } => {
                 self.light_profile.record_reject();
                 self.suppress_countdown = 1;
+                // Escape + manual typing = explicit rejection of the ghost.
+                self.record_ghost_as_negative();
             }
+        }
+    }
+
+    /// Record the current top prediction as a negative example in correction memory.
+    ///
+    /// Called when frustration signals indicate the ghost was unwanted. The user's
+    /// current (manually typed) word becomes the "correct" replacement, teaching
+    /// the system to suppress that prediction in similar contexts.
+    fn record_ghost_as_negative(&mut self) {
+        let current = self.core.current_word();
+        if current.is_empty() {
+            return;
+        }
+        // Use the top prediction as the "predicted_prefix" to suppress.
+        if let Some(top) = self.core.predictions().first() {
+            let ctx_hash = self.current_context_hash();
+            self.corrections.record(ctx_hash, &top.word, current);
         }
     }
 

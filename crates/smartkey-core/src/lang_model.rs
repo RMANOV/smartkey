@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 
+use crate::bg_morphology::BgMorphology;
+use crate::collocation::CollocationDetector;
 use crate::kneser_ney::KneserNeyScorer;
 use crate::lang_detect::LangId;
 use crate::markov::MarkovChain;
@@ -17,6 +19,11 @@ pub struct LanguageModel {
     pub ppm: Option<PpmModel>,
     /// Interpolated Kneser-Ney scorer (built lazily after corpus load).
     pub kn_scorer: Option<KneserNeyScorer>,
+    /// Collocation detector (F9): PMI-based phrase boosting.
+    pub collocation: CollocationDetector,
+    /// BG morphological grouping (F10): suffix stemmer + frequency pooling.
+    /// Only populated for BG language models.
+    pub morphology: BgMorphology,
 }
 
 impl LanguageModel {
@@ -31,6 +38,8 @@ impl LanguageModel {
                 None
             },
             kn_scorer: None,
+            collocation: CollocationDetector::new(),
+            morphology: BgMorphology::new(),
         }
     }
 }
@@ -90,6 +99,8 @@ impl LanguageModelBank {
     pub fn load_word(&mut self, word: &str, freq: u32, lang: LangId) {
         let model = self.get_mut_or_create(lang);
         model.trie.insert(word, freq);
+        // Feed corpus frequency into Markov unigram for frequency-weighted backoff (F1).
+        model.markov.train_unigram(word, freq);
         if let Some(ref mut ppm) = model.ppm {
             ppm.train_word(word);
         }

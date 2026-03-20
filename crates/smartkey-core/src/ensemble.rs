@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use crate::bpe::BpeTokenizer;
 use crate::cache::PredictionCache;
+use crate::calibration::ConfidenceCalibrator;
 use crate::cvm::{CvmCounter, CvmSnapshot};
 use crate::hedge::HedgeMixer;
 use crate::input::InputConfig;
@@ -94,6 +95,9 @@ pub struct SmartKeyEngine {
     bpe_enabled: bool,
     use_kneser_ney: bool,
     use_hedge: bool,
+    /// Confidence calibrator (F6): maps raw score ratios to calibrated probabilities.
+    /// Behind Mutex because `predict()` takes `&self` but calibration needs mutation.
+    calibrator: Mutex<ConfidenceCalibrator>,
 }
 
 impl SmartKeyEngine {
@@ -131,10 +135,17 @@ impl SmartKeyEngine {
             tech_vocab: TechVocab::new(),
             current_regime: None,
             hedge: if config.use_hedge {
+                // F16: 5-signal Hedge mixer (corpus, markov, personal, PPM, tech).
+                // PPM and tech start with small default weights.
+                let ppm_default = if config.use_ppm { 0.05 } else { 0.0 };
+                let tech_default = 0.03;
+                let base_scale = 1.0 - ppm_default - tech_default;
                 Some(HedgeMixer::with_defaults(&[
-                    config.weights.0,
-                    config.weights.1,
-                    config.weights.2,
+                    config.weights.0 * base_scale,
+                    config.weights.1 * base_scale,
+                    config.weights.2 * base_scale,
+                    ppm_default,
+                    tech_default,
                 ]))
             } else {
                 None
@@ -143,6 +154,7 @@ impl SmartKeyEngine {
             bpe_enabled: config.bpe_enabled,
             use_kneser_ney: config.use_kneser_ney,
             use_hedge: config.use_hedge,
+            calibrator: Mutex::new(ConfidenceCalibrator::new()),
         }
     }
 
@@ -211,23 +223,63 @@ impl SmartKeyEngine {
         self.session_cache.observe(word);
     }
 
+    /// Learn an OOV word by adding it to the language model trie (F11).
+    ///
+    /// When the user types a word not in the corpus, add it with a low
+    /// initial frequency so it appears in future prefix searches. Also
+    /// trains the Markov unigram for frequency-weighted backoff.
+    pub fn learn_oov_word(&mut self, word: &str, lang: LangId) {
+        // Use a modest initial frequency — enough to appear in candidates
+        // but not dominate corpus words. Will grow via CVM learning.
+        const OOV_INITIAL_FREQ: u32 = 5;
+        self.lang_models.load_word(word, OOV_INITIAL_FREQ, lang);
+        self.cache.lock().unwrap().invalidate();
+    }
+
     /// Clear the session cache (e.g. on session restart).
     pub fn clear_session_cache(&mut self) {
         self.session_cache.clear();
     }
 
-    /// Build the Kneser-Ney scorer from the currently loaded Markov data.
+    /// Build the Kneser-Ney scorer and collocation detector from loaded Markov data.
     ///
-    /// Call after corpus loading is complete. Only effective when `use_kneser_ney`
-    /// flag is set; otherwise a no-op. Builds per-language KN scorers.
+    /// Call after corpus loading is complete. Builds per-language KN scorers
+    /// (when `use_kneser_ney` flag is set) and collocation detectors (F9).
     pub fn build_kneser_ney(&mut self) {
-        if self.use_kneser_ney {
-            use crate::kneser_ney::KneserNeyScorer;
-            for model in self.lang_models.models_mut() {
+        for model in self.lang_models.models_mut() {
+            // Build KN scorer if enabled.
+            if self.use_kneser_ney {
+                use crate::kneser_ney::KneserNeyScorer;
                 model.kn_scorer = Some(KneserNeyScorer::from_markov_data(
                     model.markov.bigrams_raw(),
                     model.markov.trigrams_raw(),
                 ));
+            }
+
+            // Build collocation detector (F9) from bigram + unigram data.
+            let bigram_flat: std::collections::HashMap<String, std::collections::HashMap<String, u32>> =
+                model
+                    .markov
+                    .bigrams_raw()
+                    .iter()
+                    .map(|(ctx, (followers, _))| (ctx.clone(), followers.clone()))
+                    .collect();
+            let total_bi: u64 = bigram_flat
+                .values()
+                .flat_map(|f| f.values())
+                .map(|&c| c as u64)
+                .sum();
+            model.collocation = crate::collocation::CollocationDetector::build(
+                &bigram_flat,
+                model.markov.unigram_counts_raw(),
+                total_bi,
+                model.markov.total_unigram_count(),
+            );
+
+            // Build BG morphological grouping (F10) for BG models.
+            if model.lang == crate::lang_detect::LangId::Bg {
+                model.morphology =
+                    crate::bg_morphology::BgMorphology::build(model.markov.unigram_counts_raw());
             }
         }
     }
@@ -243,6 +295,14 @@ impl SmartKeyEngine {
             self.personal_markov.train_trigram(w1, w2, word, 1);
         }
         self.cache.lock().unwrap().invalidate();
+    }
+
+    /// Record a calibration observation (F6).
+    ///
+    /// `confidence`: raw confidence of the top prediction at accept/reject time.
+    /// `accepted`: whether the user accepted it (Tab) or rejected (Escape/typing).
+    pub fn observe_calibration(&self, confidence: f64, accepted: bool) {
+        self.calibrator.lock().unwrap().observe(confidence, accepted);
     }
 
     /// Handle a prediction being accepted (Tab press) — update adaptive weights.
@@ -276,20 +336,60 @@ impl SmartKeyEngine {
         let personal_score = self.personal.frequency_score(word);
 
         if self.use_hedge {
-            // Hedge/Exp3 multiplicative weights update.
+            // F16: Hedge/Exp3 multiplicative weights update with 5 signals.
+            // Compute PPM and tech scores for the accepted word.
+            let ppm_score = self
+                .lang_models
+                .all_models()
+                .filter_map(|m| m.ppm.as_ref())
+                .map(|ppm| ppm.score_candidate("", word))
+                .fold(0.0_f64, f64::max);
+            let tech_score = self.tech_vocab.score(word, 1)
+                .first()
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0);
+
             // Normalize raw scores to [0,1] rewards.
-            let max_s = corpus_score.max(markov_score).max(personal_score).max(1e-6);
-            let rewards = [
-                corpus_score / max_s,
-                markov_score / max_s,
-                personal_score / max_s,
-            ];
+            let max_s = corpus_score
+                .max(markov_score)
+                .max(personal_score)
+                .max(ppm_score)
+                .max(tech_score)
+                .max(1e-6);
+
             if let Some(ref mut hedge) = self.hedge {
-                hedge.update(&rewards);
-                let (a, b, g) = hedge.weights_triple();
-                self.alpha = a;
-                self.beta = b;
-                self.gamma = g;
+                if hedge.signal_count() == 5 {
+                    let rewards = [
+                        corpus_score / max_s,
+                        markov_score / max_s,
+                        personal_score / max_s,
+                        ppm_score / max_s,
+                        tech_score / max_s,
+                    ];
+                    hedge.update(&rewards);
+                    // Extract updated weights — only use the first 3 for α/β/γ
+                    // (PPM and tech are applied in the scoring pipeline directly).
+                    let (a, b, g, _, _) = hedge.weights_five();
+                    // Renormalize the first 3 to sum ≈ 1.0 for compatibility.
+                    let sum3 = a + b + g;
+                    if sum3 > 0.0 {
+                        self.alpha = a / sum3;
+                        self.beta = b / sum3;
+                        self.gamma = g / sum3;
+                    }
+                } else {
+                    // Backward compat: 3-signal hedge.
+                    let rewards = [
+                        corpus_score / max_s,
+                        markov_score / max_s,
+                        personal_score / max_s,
+                    ];
+                    hedge.update(&rewards);
+                    let (a, b, g) = hedge.weights_triple();
+                    self.alpha = a;
+                    self.beta = b;
+                    self.gamma = g;
+                }
             }
         } else {
             // EMA update toward dominant component.
@@ -439,11 +539,28 @@ impl SmartKeyEngine {
 
     /// Update the current typing regime (called by `InputMethodCore` after each word commit).
     ///
-    /// The regime gates the tech vocabulary δ weight in `predict()`:
-    /// δ = 0.15 when `FastCoding`, 0.0 otherwise.
+    /// The regime gates tech vocabulary δ weight and applies regime-specific
+    /// weight adjustments in `predict()`:
+    /// - **FastCoding:** δ=0.15 (tech vocab), α-0.05, β-0.05 (rescaled)
+    /// - **DeliberateProse:** α+0.10 (favor corpus for careful writing)
+    /// - **NewTopic:** γ+0.10 (lean on personal vocab in unknown domains)
+    /// - **MixedLanguage/LanguageSwitch:** no weight change (handled by lang detection)
     pub fn set_regime(&mut self, regime: TypingRegime) {
         self.current_regime = Some(regime);
         self.cache.lock().unwrap().invalidate();
+    }
+
+    /// Returns (Δα, Δβ, Δγ) weight adjustments for the current regime.
+    ///
+    /// Applied additively in `predict()` before normalisation.
+    fn regime_weight_deltas(&self) -> (f64, f64, f64) {
+        match self.current_regime {
+            Some(TypingRegime::DeliberateProse) => (0.10, -0.05, -0.05),
+            Some(TypingRegime::NewTopic) => (-0.05, -0.05, 0.10),
+            // FastCoding is handled separately via TECH_DELTA.
+            // MixedLanguage and LanguageSwitch don't need weight shifts.
+            _ => (0.0, 0.0, 0.0),
+        }
     }
 
     /// Score two prefixes (EN and BG interpretations) for dual-buffer comparison.
@@ -757,14 +874,32 @@ impl SmartKeyEngine {
         let raw: &[RawScores] = if use_stack { &raw_small } else { &raw_large };
 
         // Normalize and blend in a second pass (but no redundant score calls).
+        //
+        // Apply regime-specific weight adjustments (F4), then PPM/tech borrowing.
+        let (da, db, dg) = self.regime_weight_deltas();
+        let base_alpha = (self.alpha + da).max(0.05);
+        let base_beta = (self.beta + db).max(0.05);
+        let base_gamma = (self.gamma + dg).max(0.05);
+        // Renormalize base weights to sum = 1.0 after regime deltas.
+        let base_sum_raw = base_alpha + base_beta + base_gamma;
+        let (base_alpha, base_beta, base_gamma) = if base_sum_raw > 0.0 {
+            (
+                base_alpha / base_sum_raw,
+                base_beta / base_sum_raw,
+                base_gamma / base_sum_raw,
+            )
+        } else {
+            (self.alpha, self.beta, self.gamma)
+        };
+
         // When PPM is active, borrow a share from β (markov) for short prefixes.
         // When FastCoding, tech gets δ = 0.15 borrowed proportionally from α, β, γ.
         let has_ppm = models.iter().any(|m| m.ppm.is_some());
         let (eff_alpha, eff_beta, eff_gamma, eff_delta, eff_tech) = if has_ppm && prefix.len() <= 1
         {
             // Short prefix: PPM gets 0.15 borrowed from markov.
-            let delta = 0.15_f64.min(self.beta * 0.5);
-            let (a, b, g) = (self.alpha, self.beta - delta, self.gamma);
+            let delta = 0.15_f64.min(base_beta * 0.5);
+            let (a, b, g) = (base_alpha, base_beta - delta, base_gamma);
             if is_fast_coding {
                 // Rescale (a, b, g) so that sum = 1 - TECH_DELTA.
                 let base_sum = a + b + g;
@@ -779,8 +914,8 @@ impl SmartKeyEngine {
             }
         } else if has_ppm {
             // Longer prefix: PPM gets a smaller share.
-            let delta = 0.05_f64.min(self.beta * 0.2);
-            let (a, b, g) = (self.alpha, self.beta - delta, self.gamma);
+            let delta = 0.05_f64.min(base_beta * 0.2);
+            let (a, b, g) = (base_alpha, base_beta - delta, base_gamma);
             if is_fast_coding {
                 let base_sum = a + b + g;
                 let scale = if base_sum > 0.0 {
@@ -794,21 +929,21 @@ impl SmartKeyEngine {
             }
         } else if is_fast_coding {
             // No PPM, but FastCoding: tech gets TECH_DELTA, others rescaled.
-            let base_sum = self.alpha + self.beta + self.gamma;
-            let scale = if base_sum > 0.0 {
-                (1.0 - TECH_DELTA) / base_sum
+            let sum3 = base_alpha + base_beta + base_gamma;
+            let scale = if sum3 > 0.0 {
+                (1.0 - TECH_DELTA) / sum3
             } else {
                 1.0
             };
             (
-                self.alpha * scale,
-                self.beta * scale,
-                self.gamma * scale,
+                base_alpha * scale,
+                base_beta * scale,
+                base_gamma * scale,
                 0.0,
                 TECH_DELTA,
             )
         } else {
-            (self.alpha, self.beta, self.gamma, 0.0, 0.0)
+            (base_alpha, base_beta, base_gamma, 0.0, 0.0)
         };
 
         let mut scored: Vec<Prediction> = all_candidates
@@ -830,6 +965,22 @@ impl SmartKeyEngine {
                     + eff_gamma * personal_score
                     + eff_delta * ppm_score
                     + eff_tech * tech_score;
+
+                // F9: Collocation boost — multiply score by PMI-derived factor
+                // if (context, word) is a known collocation.
+                let collocation_boost = models
+                    .iter()
+                    .map(|m| m.collocation.boost(&entry.word, prev1))
+                    .fold(1.0_f64, f64::max);
+                score *= collocation_boost;
+
+                // F10: BG morphological frequency boost — rare inflections of
+                // common stems get a frequency pooling boost.
+                let morph_boost = models
+                    .iter()
+                    .map(|m| m.morphology.frequency_boost(&entry.word, entry.frequency))
+                    .fold(1.0_f64, f64::max);
+                score *= morph_boost;
 
                 // Apply fuzzy discount if this came from fuzzy matching.
                 if let Some(&discount) = discount_map.get(&entry.word) {
@@ -859,7 +1010,15 @@ impl SmartKeyEngine {
         let score_sum: f64 = scored.iter().map(|p| p.score).sum();
         if score_sum > 0.0 {
             for p in &mut scored {
-                p.confidence = (p.score / score_sum).clamp(0.0, 1.0);
+                let raw = (p.score / score_sum).clamp(0.0, 1.0);
+                // Step 6 (F6): apply isotonic calibration when ready.
+                // Maps raw score ratio → calibrated acceptance probability.
+                p.confidence = self
+                    .calibrator
+                    .lock()
+                    .unwrap()
+                    .calibrate(raw)
+                    .unwrap_or(raw);
             }
         }
 
