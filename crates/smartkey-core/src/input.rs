@@ -569,8 +569,8 @@ impl InputMethodCore {
 
             // Space / Return: commit current word, delimit.
             Key::Space | Key::Return => {
-                let is_space = matches!(key, Key::Space);
-                
+                let is_space = matches!(event.key, Key::Space);
+
                 // Aggressive Space-Commit (Goal 3): Auto-commit unique top prediction on Space.
                 if is_space && !self.current_word.is_empty() && self.last_predictions.len() == 1 {
                     let best_match = self.last_predictions[0].word.clone();
@@ -581,7 +581,7 @@ impl InputMethodCore {
                         self.commit_word_internal(&best_match, true);
                         self.reset_word();
                         actions.push(Action::ReplaceWord {
-                            len: typed_len,
+                            replace_len: typed_len,
                             text: best_match,
                         });
                         actions.push(Action::ForwardKey);
@@ -1070,9 +1070,6 @@ impl InputMethodCore {
             if regime == CapsRegime::Normal && (first_char_upper || force_sentence_start) {
                 pred.word = CapsEngine::capitalize_first(&pred.word);
             }
-            if regime == CapsRegime::Normal && first_char_upper {
-                pred.word = CapsEngine::capitalize_first(&pred.word);
-            }
             // Always capitalize known proper nouns.
             if self.caps_engine.is_proper_noun(&pred.word) {
                 pred.word = CapsEngine::capitalize_first(&pred.word);
@@ -1095,8 +1092,13 @@ impl InputMethodCore {
                 let score_ok = top.score >= self.config.ghost_text_min_score;
 
                 if margin_ok && score_ok {
-                    // Match against user's ORIGINAL casing (predictions are now cased).
-                    if let Some(suffix) = top.word.strip_prefix(self.current_word.as_str()) {
+                    // Case-insensitive prefix match: predictions may be
+                    // capitalized by CapsEngine while typed text is lowercase.
+                    let typed_len = self.current_word.len();
+                    let prefix_matches = top.word.len() >= typed_len
+                        && top.word[..typed_len].eq_ignore_ascii_case(&self.current_word);
+                    if prefix_matches {
+                        let suffix = &top.word[typed_len..];
                         if !suffix.is_empty() && self.config.ghost_text {
                             let s = suffix.to_string();
                             self.ghost.clone_from(&s);
