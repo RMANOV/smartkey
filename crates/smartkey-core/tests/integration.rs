@@ -90,7 +90,11 @@ fn full_pipeline_predict_and_ghost() {
     // Verify "hello" is top prediction.
     let preds = core.predictions();
     assert!(!preds.is_empty());
-    assert_eq!(preds[0].word, "hello");
+    assert!(
+        preds[0].word.eq_ignore_ascii_case("hello"),
+        "top prediction should be 'hello' (possibly capitalized by CapsEngine), got: {:?}",
+        preds[0].word
+    );
 }
 
 // ======================================================================
@@ -170,7 +174,7 @@ fn personal_round_trip_persists_boost() {
     );
     let help_rank_without_profile = baseline_preds
         .iter()
-        .position(|p| p.word == "help")
+        .position(|p| p.word.eq_ignore_ascii_case("help"))
         .expect("'help' should appear in baseline predictions");
 
     // Engine 3: same corpus, WITH loaded profile — personal CVM boost should elevate "help".
@@ -185,12 +189,12 @@ fn personal_round_trip_persists_boost() {
     type_string(&mut core3, "hel");
     let preds = core3.predictions();
     assert!(
-        preds.iter().any(|p| p.word == "help"),
+        preds.iter().any(|p| p.word.eq_ignore_ascii_case("help")),
         "loaded profile should include learned word in predictions"
     );
     let help_rank_with_profile = preds
         .iter()
-        .position(|p| p.word == "help")
+        .position(|p| p.word.eq_ignore_ascii_case("help"))
         .expect("'help' should appear in predictions after loading personal profile");
 
     assert!(
@@ -261,7 +265,7 @@ fn multi_language_latin_and_cyrillic() {
     type_string(&mut core, "hel");
     let preds = core.predictions();
     assert!(
-        preds.iter().any(|p| p.word == "hello"),
+        preds.iter().any(|p| p.word.eq_ignore_ascii_case("hello")),
         "Latin prefix 'hel' should yield English predictions"
     );
     assert!(
@@ -285,7 +289,7 @@ fn multi_language_latin_and_cyrillic() {
         "2 Cyrillic chars should be enough for predictions (char-aware prefix length)"
     );
     assert!(
-        preds.iter().any(|p| p.word.starts_with("здрав")),
+        preds.iter().any(|p| p.word.to_lowercase().starts_with("здрав")),
         "Cyrillic prefix 'зд' should yield Bulgarian predictions, got: {:?}",
         preds.iter().map(|p| &p.word).collect::<Vec<_>>()
     );
