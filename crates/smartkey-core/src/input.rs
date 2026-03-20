@@ -785,6 +785,17 @@ impl InputMethodCore {
         &self.ghost
     }
 
+    /// The last two committed words (prev1, prev2) for context hashing.
+    pub fn context_words(&self) -> (Option<&str>, Option<&str>) {
+        let prev1 = self.context.back().map(|s| s.as_str());
+        let prev2 = if self.context.len() >= 2 {
+            Some(self.context[self.context.len() - 2].as_str())
+        } else {
+            None
+        };
+        (prev1, prev2)
+    }
+
     // -- personal profile persistence -----------------------------------
 
     /// Save the personal profile (CVM + Markov + weights) to the given path.
@@ -884,7 +895,6 @@ impl InputMethodCore {
             }
             // Store lowercase for Markov context matching (corpus trained lowercase).
             self.context.push_back(word.to_lowercase());
-
         }
     }
 
@@ -1036,11 +1046,7 @@ impl InputMethodCore {
     /// then applies the user's capitalization pattern to predictions.
     fn compute_ghost_suffix(&mut self) -> String {
         // MasterLoop hint: suppress ghost entirely.
-        if self
-            .active_hints
-            .as_ref()
-            .is_some_and(|h| h.suppress_ghost)
-        {
+        if self.active_hints.as_ref().is_some_and(|h| h.suppress_ghost) {
             self.ghost.clear();
             self.last_predictions.clear();
             return String::new();
@@ -1123,7 +1129,7 @@ impl InputMethodCore {
                     .map(|p| p.confidence)
                     .unwrap_or(0.0);
                 let margin_ok =
-                    top.confidence - second_conf >= self.config.ghost_text_separation_margin;
+                    effective_confidence - second_conf >= self.config.ghost_text_separation_margin;
 
                 // Gate 3: absolute score floor — reject garbage even at high confidence.
                 let score_ok = top.score >= self.config.ghost_text_min_score;
@@ -1132,7 +1138,8 @@ impl InputMethodCore {
                     // Unicode-safe case-insensitive prefix match: predictions may be
                     // capitalized by CapsEngine while typed text is lowercase.
                     // `to_lowercase()` handles all scripts (Cyrillic, Turkish, etc.).
-                    let prefix_matches = top.word.chars().count() >= self.current_word.chars().count()
+                    let prefix_matches = top.word.chars().count()
+                        >= self.current_word.chars().count()
                         && top
                             .word
                             .to_lowercase()

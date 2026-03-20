@@ -202,7 +202,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&profile).unwrap();
         let restored = load_personal_json(&json).unwrap();
 
-        assert_eq!(restored.version, 3);
+        assert_eq!(restored.version, 4);
         assert_eq!(restored.markov_bigrams.len(), 1);
         assert_eq!(restored.markov_trigrams.len(), 1);
         assert!(restored.weights.is_some());

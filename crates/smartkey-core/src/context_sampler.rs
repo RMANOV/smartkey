@@ -29,8 +29,6 @@ pub struct ContextAnalysis {
     pub lang: Option<LangId>,
     /// Recent words extracted from surrounding text.
     pub recent_words: Vec<String>,
-    /// Whether the text appears formal or informal.
-    pub formal: bool,
 }
 
 /// Analyze surrounding text for language and context cues.
@@ -57,17 +55,5 @@ pub fn analyze_surrounding(text: &str) -> ContextAnalysis {
         .map(|s| s.to_lowercase())
         .collect();
 
-    // Simple formality heuristic: formal if no contractions and avg word length > 5.
-    let avg_len = if recent_words.is_empty() {
-        0.0
-    } else {
-        recent_words.iter().map(|w| w.len() as f64).sum::<f64>() / recent_words.len() as f64
-    };
-    let formal = avg_len > 5.0 && !text.contains('\'');
-
-    ContextAnalysis {
-        lang,
-        recent_words,
-        formal,
-    }
+    ContextAnalysis { lang, recent_words }
 }

@@ -207,12 +207,12 @@ impl LanguageDetector {
                 if let Some(prior_lang) = self.prior {
                     self.detected = DetectedLanguage {
                         lang: prior_lang,
-                        confidence: 0.55,
+                        confidence: 0.65,
                     };
                 } else if let Some(mom_lang) = self.momentum_lang() {
                     self.detected = DetectedLanguage {
                         lang: mom_lang,
-                        confidence: 0.6,
+                        confidence: 0.55,
                     };
                 }
             }

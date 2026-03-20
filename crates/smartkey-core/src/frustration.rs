@@ -8,7 +8,6 @@
 //
 // Severity scores are [0.0, 1.0] — higher means stronger frustration signal.
 
-use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::input::Key;
@@ -26,18 +25,8 @@ pub enum FrustrationSignal {
     Abandon { severity: f64 },
 }
 
-/// Timestamped key for the sliding window.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct TimedKey {
-    key: Key,
-    time: Instant,
-}
-
 /// Detects frustration patterns from keystroke streams.
 pub struct FrustrationDetector {
-    /// Sliding window of recent keys (last 20).
-    window: VecDeque<TimedKey>,
     /// Word prefix before a deletion sequence (for RETYPE detection).
     word_prefix_before_delete: Option<String>,
     /// Whether Escape was seen during this word (for ABANDON detection).
@@ -51,7 +40,6 @@ pub struct FrustrationDetector {
 impl FrustrationDetector {
     pub fn new() -> Self {
         Self {
-            window: VecDeque::with_capacity(20),
             word_prefix_before_delete: None,
             escape_seen: false,
             consecutive_bs: 0,
@@ -71,15 +59,6 @@ impl FrustrationDetector {
     ) -> Option<FrustrationSignal> {
         let now = Instant::now();
 
-        // Record in sliding window.
-        self.window.push_back(TimedKey {
-            key: key.clone(),
-            time: now,
-        });
-        if self.window.len() > 20 {
-            self.window.pop_front();
-        }
-
         match key {
             Key::Backspace => {
                 // Track consecutive backspaces for burst detection.
@@ -91,7 +70,7 @@ impl FrustrationDetector {
                         self.word_prefix_before_delete = Some(current_word.to_string());
                     }
                 }
-                self.consecutive_bs += 1;
+                self.consecutive_bs = self.consecutive_bs.saturating_add(1);
 
                 // REJECT: Backspace within 500ms of Tab accept.
                 if let Some(tab_time) = last_tab_accept {
@@ -109,8 +88,7 @@ impl FrustrationDetector {
                     if let Some(start) = self.burst_start {
                         let burst_duration = now.duration_since(start);
                         if burst_duration.as_millis() < 1000 {
-                            let severity =
-                                (self.consecutive_bs as f64 / 8.0).clamp(0.3, 1.0);
+                            let severity = (self.consecutive_bs as f64 / 8.0).clamp(0.3, 1.0);
                             return Some(FrustrationSignal::RapidDelete {
                                 severity,
                                 count: self.consecutive_bs,
@@ -130,26 +108,25 @@ impl FrustrationDetector {
 
             Key::Char(ch) => {
                 // RETYPE: After deleting, user retypes with different script.
-                if let Some(ref old_prefix) = self.word_prefix_before_delete.clone() {
-                    if self.consecutive_bs > 0
-                        && !current_word.is_empty()
-                        && old_prefix.len() >= 3
-                    {
+                if let Some(old_prefix) = self.word_prefix_before_delete.take() {
+                    let char_count = old_prefix.chars().count();
+                    if self.consecutive_bs > 0 && !current_word.is_empty() && char_count >= 3 {
                         let old_is_latin = old_prefix.chars().all(|c| c.is_ascii_alphabetic());
                         let new_is_cyrillic = is_cyrillic(*ch);
                         let old_is_cyrillic = old_prefix.chars().all(is_cyrillic);
                         let new_is_latin = ch.is_ascii_alphabetic();
 
                         if (old_is_latin && new_is_cyrillic) || (old_is_cyrillic && new_is_latin) {
-                            let severity = (old_prefix.len() as f64 / 10.0).clamp(0.4, 1.0);
-                            self.word_prefix_before_delete = None;
+                            let severity = (char_count as f64 / 10.0).clamp(0.4, 1.0);
                             self.reset_bs_burst();
                             return Some(FrustrationSignal::Retype {
                                 severity,
-                                prefix: old_prefix.clone(),
+                                prefix: old_prefix,
                             });
                         }
                     }
+                    // Not a script switch — put the prefix back.
+                    self.word_prefix_before_delete = Some(old_prefix);
                 }
 
                 // ABANDON: Escape was seen, now typing manually.

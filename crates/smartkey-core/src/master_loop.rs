@@ -11,7 +11,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::caps::CapsRegime;
 use crate::context_sampler::{self, ContextSampler, NullContextSampler};
 use crate::correction_memory::CorrectionMemory;
 use crate::ensemble::Prediction;
@@ -39,24 +38,18 @@ pub enum Phase {
 pub struct Hints {
     /// Predicted language for the upcoming word.
     pub lang_prior: Option<LangId>,
-    /// Predicted capitalization regime.
-    pub caps_hint: Option<CapsRegime>,
     /// Whether to suppress ghost text entirely (after frustration).
     pub suppress_ghost: bool,
     /// Extra confidence added to ghost threshold (positive = more lenient).
     pub confidence_boost: f64,
-    /// Correction overrides: (predicted_prefix, replacement).
-    pub correction_overrides: Vec<(String, String)>,
 }
 
 impl Default for Hints {
     fn default() -> Self {
         Self {
             lang_prior: None,
-            caps_hint: None,
             suppress_ghost: false,
             confidence_boost: 0.0,
-            correction_overrides: Vec::new(),
         }
     }
 }
@@ -79,8 +72,8 @@ pub struct MasterLoop {
     last_tab_accept: Option<Instant>,
     /// The prediction that was last accepted via Tab.
     last_accepted_prediction: Option<String>,
-    /// Total word commits in this session.
-    session_commits: u32,
+    /// Last known commit count from metrics (for change detection).
+    last_known_commits: usize,
     /// Whether anticipation was already run for the current word.
     anticipated: bool,
 }
@@ -97,7 +90,7 @@ impl MasterLoop {
             suppress_countdown: 0,
             last_tab_accept: None,
             last_accepted_prediction: None,
-            session_commits: 0,
+            last_known_commits: 0,
             anticipated: false,
         }
     }
@@ -127,23 +120,25 @@ impl MasterLoop {
 
         // ── Phase 2: DELEGATE to core ────────────────────────────────
         let is_tab = matches!(event.key, crate::input::Key::Tab);
+        // Capture prediction BEFORE delegation — handle_key(Tab) clears
+        // last_predictions via reset_word(), so reading after is always None.
+        let pre_tab_prediction = if is_tab {
+            self.core.predictions().first().map(|p| p.word.clone())
+        } else {
+            None
+        };
         let actions = self.core.handle_key(event.clone());
 
         // Track Tab acceptance time for REJECT detection.
         if is_tab && self.core.current_word().is_empty() {
-            // Tab committed a word — record the time.
             self.last_tab_accept = Some(Instant::now());
-            if let Some(pred) = self.core.predictions().first() {
-                self.last_accepted_prediction = Some(pred.word.clone());
-            }
+            self.last_accepted_prediction = pre_tab_prediction;
         }
 
         // ── Phase 3: EVALUATE ────────────────────────────────────────
-        let signal = self.frustration.feed(
-            &event.key,
-            self.core.current_word(),
-            self.last_tab_accept,
-        );
+        let signal =
+            self.frustration
+                .feed(&event.key, self.core.current_word(), self.last_tab_accept);
 
         if let Some(ref signal) = signal {
             self.phase = Phase::Correcting;
@@ -334,7 +329,7 @@ impl MasterLoop {
                 // Suppress ghost for 1-3 words based on severity.
                 self.suppress_countdown = (severity * 3.0).ceil() as u8;
                 // Record in correction memory if we know what was accepted.
-                if let Some(ref accepted) = self.last_accepted_prediction.clone() {
+                if let Some(accepted) = &self.last_accepted_prediction {
                     let ctx_hash = self.current_context_hash();
                     let current = self.core.current_word();
                     if !current.is_empty() {
@@ -368,7 +363,7 @@ impl MasterLoop {
     // ======================================================================
 
     fn learn_from_commit(&mut self) {
-        self.session_commits += 1;
+        self.last_known_commits = self.core.metrics().commit_count();
 
         // Update language prior from detection.
         let lang = self.core.detected_language().lang;
@@ -379,18 +374,11 @@ impl MasterLoop {
     }
 
     fn session_commits_changed(&self) -> bool {
-        // Heuristic: metrics commit count tracks total commits in the core.
-        // If it increased, a word was committed.
-        self.core.metrics().commit_count() > self.session_commits as usize
+        self.core.metrics().commit_count() != self.last_known_commits
     }
 
     fn current_context_hash(&self) -> u64 {
-        // Use the core's context for hash. Access via predictions as proxy.
-        // Simple hash from detected language + session commits as entropy.
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.session_commits.hash(&mut hasher);
-        self.core.detected_language().lang.hash(&mut hasher);
-        hasher.finish()
+        let (prev1, prev2) = self.core.context_words();
+        CorrectionMemory::context_hash(prev1, prev2)
     }
 }
