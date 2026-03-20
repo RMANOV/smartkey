@@ -5,8 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::correction_memory::CorrectionSnapshot;
 use crate::cvm::CvmSnapshot;
 use crate::lang_cvm::LangCvmSnapshot;
+use crate::light_profile::LightProfile;
 
 /// Versioned personal profile containing all learned state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +26,12 @@ pub struct PersonalProfile {
     /// Per-language CVM tracks (v3, optional for backward compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang_cvm: Option<LangCvmSnapshot>,
+    /// Correction memory snapshot (v4, optional for backward compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrections: Option<CorrectionSnapshot>,
+    /// Light profile snapshot (v4, optional for backward compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_profile: Option<LightProfile>,
 }
 
 /// Snapshot of adaptive ensemble weights for persistence.
@@ -49,23 +57,25 @@ pub struct PersonalMarkovSnapshot {
 }
 
 impl PersonalProfile {
-    /// Create a v3 profile from components.
+    /// Create a v4 profile from components.
     pub fn new(
         cvm: CvmSnapshot,
         markov: PersonalMarkovSnapshot,
         weights: Option<AdaptiveWeightsSnapshot>,
     ) -> Self {
         Self {
-            version: 3,
+            version: 4,
             cvm,
             markov_bigrams: markov.bigrams,
             markov_trigrams: markov.trigrams,
             weights,
             lang_cvm: None,
+            corrections: None,
+            light_profile: None,
         }
     }
 
-    /// Create a v3 profile with per-language CVM tracks.
+    /// Create a v4 profile with per-language CVM tracks.
     pub fn with_lang_cvm(
         cvm: CvmSnapshot,
         markov: PersonalMarkovSnapshot,
@@ -73,12 +83,14 @@ impl PersonalProfile {
         lang_cvm: LangCvmSnapshot,
     ) -> Self {
         Self {
-            version: 3,
+            version: 4,
             cvm,
             markov_bigrams: markov.bigrams,
             markov_trigrams: markov.trigrams,
             weights,
             lang_cvm: Some(lang_cvm),
+            corrections: None,
+            light_profile: None,
         }
     }
 
@@ -113,6 +125,8 @@ pub fn load_personal_json(json_str: &str) -> Result<PersonalProfile, String> {
         markov_trigrams: Vec::new(),
         weights: None,
         lang_cvm: None,
+        corrections: None,
+        light_profile: None,
     })
 }
 

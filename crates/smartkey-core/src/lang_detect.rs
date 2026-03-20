@@ -34,6 +34,9 @@ pub struct LanguageDetector {
     detected: DetectedLanguage,
     /// Context momentum — tracks language of recently committed words.
     momentum: VecDeque<LangId>,
+    /// External language prior (set by MasterLoop). Used as tiebreaker
+    /// when EMA confidence is low.
+    prior: Option<LangId>,
 }
 
 impl LanguageDetector {
@@ -48,6 +51,7 @@ impl LanguageDetector {
                 confidence: 0.0,
             },
             momentum: VecDeque::with_capacity(5),
+            prior: None,
         }
     }
 
@@ -108,6 +112,17 @@ impl LanguageDetector {
         self.detected
     }
 
+    /// Set a language prior as tiebreaker when confidence is low.
+    /// Used by MasterLoop to inject context-based predictions.
+    pub fn set_prior(&mut self, lang: LangId) {
+        self.prior = Some(lang);
+    }
+
+    /// Clear any language prior.
+    pub fn clear_prior(&mut self) {
+        self.prior = None;
+    }
+
     /// Get the current detection without feeding a new character.
     pub fn detected(&self) -> DetectedLanguage {
         self.detected
@@ -122,6 +137,7 @@ impl LanguageDetector {
             confidence: 0.0,
         };
         self.momentum.clear();
+        self.prior = None;
     }
 
     // ── Instant detection (v0.4.1) ─────────────────────────────────
@@ -186,9 +202,14 @@ impl LanguageDetector {
                 lang,
                 confidence: if total > 0.0 { best_score / total } else { 0.0 },
             };
-            // Low confidence: fall back to momentum.
+            // Low confidence: fall back to prior, then momentum.
             if self.detected.confidence < 0.5 {
-                if let Some(mom_lang) = self.momentum_lang() {
+                if let Some(prior_lang) = self.prior {
+                    self.detected = DetectedLanguage {
+                        lang: prior_lang,
+                        confidence: 0.55,
+                    };
+                } else if let Some(mom_lang) = self.momentum_lang() {
                     self.detected = DetectedLanguage {
                         lang: mom_lang,
                         confidence: 0.6,

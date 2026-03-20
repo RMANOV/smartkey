@@ -17,7 +17,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
-use smartkey_core::input::{Action, InputConfig, InputMethodCore, Key, KeyEvent, Modifiers};
+use smartkey_core::input::{Action, InputConfig, Key, KeyEvent, Modifiers};
+use smartkey_core::MasterLoop;
 
 use crate::dll::OBJECT_COUNT;
 
@@ -42,7 +43,7 @@ use windows::Win32::UI::TextServices::*;
     ITfDisplayAttributeProvider
 )]
 pub struct SmartKeyTextService {
-    core: RefCell<InputMethodCore>,
+    core: RefCell<MasterLoop>,
     thread_mgr: RefCell<Option<ITfThreadMgr>>,
     client_id: std::cell::Cell<u32>,
     /// Active ghost text composition. Shared with edit sessions via Rc.
@@ -63,7 +64,7 @@ impl Default for SmartKeyTextService {
 impl SmartKeyTextService {
     pub fn new() -> Self {
         Self {
-            core: RefCell::new(InputMethodCore::new(InputConfig::default())),
+            core: RefCell::new(MasterLoop::new(InputConfig::default())),
             thread_mgr: RefCell::new(None),
             client_id: std::cell::Cell::new(0),
             composition: Rc::new(RefCell::new(None)),
@@ -297,7 +298,7 @@ impl ITfTextInputProcessorEx_Impl for SmartKeyTextService_Impl {
             } else {
                 InputConfig::default()
             };
-            *self.core.borrow_mut() = InputMethodCore::new(input_config);
+            *self.core.borrow_mut() = MasterLoop::new(input_config);
 
             // Register ghost attribute GUID → get TfGuidAtom for SetValue.
             let cat_mgr: std::result::Result<ITfCategoryMgr, _> =

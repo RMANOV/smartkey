@@ -293,6 +293,8 @@ pub struct InputMethodCore {
     current_word_had_flip: bool,
     /// Smart caps engine — detects capitalization regime and applies to predictions.
     caps_engine: CapsEngine,
+    /// Hints injected by MasterLoop (v0.6: proactive anticipation).
+    active_hints: Option<crate::master_loop::Hints>,
 }
 
 impl InputMethodCore {
@@ -313,7 +315,22 @@ impl InputMethodCore {
             regime_detector: RegimeDetector::new(),
             current_word_had_flip: false,
             caps_engine: CapsEngine::new(),
+            active_hints: None,
         }
+    }
+
+    /// Apply hints from MasterLoop to bias predictions.
+    pub fn apply_hints(&mut self, hints: &crate::master_loop::Hints) {
+        if let Some(lang) = hints.lang_prior {
+            self.lang_detector.set_prior(lang);
+        }
+        self.active_hints = Some(hints.clone());
+    }
+
+    /// Clear any active hints (on word boundary).
+    pub fn clear_hints(&mut self) {
+        self.active_hints = None;
+        self.lang_detector.clear_prior();
     }
 
     // -- corpus loading (delegate to engine) ----------------------------
@@ -1018,6 +1035,17 @@ impl InputMethodCore {
     /// Smart caps: searches with lowercase prefix (so trie always matches),
     /// then applies the user's capitalization pattern to predictions.
     fn compute_ghost_suffix(&mut self) -> String {
+        // MasterLoop hint: suppress ghost entirely.
+        if self
+            .active_hints
+            .as_ref()
+            .is_some_and(|h| h.suppress_ghost)
+        {
+            self.ghost.clear();
+            self.last_predictions.clear();
+            return String::new();
+        }
+
         let effective_min = if self.config.use_ppm {
             1
         } else {
@@ -1078,8 +1106,16 @@ impl InputMethodCore {
         }
 
         if let Some(top) = self.last_predictions.first() {
+            // MasterLoop hint: boost confidence threshold.
+            let confidence_boost = self
+                .active_hints
+                .as_ref()
+                .map(|h| h.confidence_boost)
+                .unwrap_or(0.0);
+            let effective_confidence = top.confidence + confidence_boost;
+
             // Gate 1: absolute confidence threshold (existing).
-            if top.confidence >= self.config.ghost_text_min_confidence {
+            if effective_confidence >= self.config.ghost_text_min_confidence {
                 // Gate 2: separation margin — top must beat runner-up by enough.
                 let second_conf = self
                     .last_predictions

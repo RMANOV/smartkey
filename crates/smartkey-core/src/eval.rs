@@ -89,6 +89,11 @@ impl PredictionMetrics {
     }
 
     /// Record a `predict()` call latency sample.
+    /// Total number of word commits recorded.
+    pub fn commit_count(&self) -> usize {
+        self.total_commits as usize
+    }
+
     pub fn record_latency(&mut self, duration: Duration) {
         if self.latency_samples.len() >= LATENCY_WINDOW {
             self.latency_samples.pop_front();
