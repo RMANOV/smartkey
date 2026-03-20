@@ -289,7 +289,9 @@ fn multi_language_latin_and_cyrillic() {
         "2 Cyrillic chars should be enough for predictions (char-aware prefix length)"
     );
     assert!(
-        preds.iter().any(|p| p.word.to_lowercase().starts_with("здрав")),
+        preds
+            .iter()
+            .any(|p| p.word.to_lowercase().starts_with("здрав")),
         "Cyrillic prefix 'зд' should yield Bulgarian predictions, got: {:?}",
         preds.iter().map(|p| &p.word).collect::<Vec<_>>()
     );

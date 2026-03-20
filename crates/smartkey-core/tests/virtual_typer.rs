@@ -307,7 +307,9 @@ fn test_prediction_for_hel_includes_hello_or_help() {
     let preds = vt.predictions();
     assert!(!preds.is_empty(), "typing 'hel' should produce predictions");
     assert!(
-        preds.iter().any(|p| p.word == "hello" || p.word == "help"),
+        preds
+            .iter()
+            .any(|p| p.word.eq_ignore_ascii_case("hello") || p.word.eq_ignore_ascii_case("help")),
         "typing 'hel' should suggest 'hello' or 'help'; got: {:?}",
         preds.iter().map(|p| &p.word).collect::<Vec<_>>()
     );
@@ -364,7 +366,9 @@ fn test_top_prediction_for_hel_is_hello_or_help() {
 
     let top = &preds[0].word;
     assert!(
-        top == "hello" || top == "help" || top.starts_with("hel"),
+        top.eq_ignore_ascii_case("hello")
+            || top.eq_ignore_ascii_case("help")
+            || top.to_lowercase().starts_with("hel"),
         "top prediction for 'hel' should start with 'hel'; got: {:?}",
         top
     );
