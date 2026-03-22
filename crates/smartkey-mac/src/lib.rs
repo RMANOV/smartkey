@@ -78,7 +78,9 @@ pub unsafe extern "C" fn smartkey_free_string(s: *mut c_char) {
 /// Free an action list returned by the C API.
 ///
 /// # Safety
-/// `list` must be a valid pointer from `smartkey_handle_key` etc., or NULL.
+/// `list` must be a valid pointer returned by `smartkey_handle_key` (or NULL).
+/// The caller must NOT construct `CActionList` manually — only lists produced
+/// by `actions_to_c()` have the correct heap layout for deallocation.
 #[no_mangle]
 pub unsafe extern "C" fn smartkey_free_actions(list: *mut CActionList) {
     if list.is_null() {

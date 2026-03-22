@@ -27,7 +27,7 @@ fn main() {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Registration failed: {e}");
+                        log::error!("Registration failed: {e}");
                         uninit_com();
                         std::process::exit(1);
                     }
@@ -47,7 +47,7 @@ fn main() {
                 match smartkey_win::registration::unregister() {
                     Ok(()) => println!("SmartKey IME unregistered successfully."),
                     Err(e) => {
-                        eprintln!("Unregistration failed: {e}");
+                        log::error!("Unregistration failed: {e}");
                         uninit_com();
                         std::process::exit(1);
                     }
@@ -59,7 +59,7 @@ fn main() {
             println!("(dry run — not on Windows)");
         }
         _ => {
-            eprintln!("Usage: smartkey-register [--install | --uninstall]");
+            log::error!("Usage: smartkey-register [--install | --uninstall]");
             std::process::exit(1);
         }
     }
@@ -82,7 +82,7 @@ fn init_com() {
         )
     };
     if hr.is_err() {
-        eprintln!("COM initialization failed: {hr:?}");
+        log::error!("COM initialization failed: {hr:?}");
         std::process::exit(1);
     }
 }

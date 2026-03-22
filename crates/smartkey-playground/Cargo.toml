@@ -9,6 +9,7 @@ smartkey-core = { path = "../smartkey-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+log = { workspace = true }
 
 [[bin]]
 name = "smartkey-eval"

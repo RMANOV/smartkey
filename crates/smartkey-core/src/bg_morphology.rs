@@ -134,29 +134,13 @@ fn stem_word(word: &str) -> Option<String> {
 /// ~50 rules covering ~90% of productive BG inflection.
 static BG_SUFFIXES: &[&str] = &[
     // 4+ char suffixes (most specific)
-    "ваме", "вате", "ваха", "вали", "вана", "вано",
-    "ията", "ието",
-    "ните", "ната", "ното",
-    "ески", "ишки",
-    // 3-char suffixes
-    "ваш", "вам", "ват", "вах",
-    "иш", "ите", "ила", "ило",
-    "аме", "ате", "аха", "ахе",
-    "ена", "ено", "ени",
-    "ост", "ист",
-    "ята", "ято",
-    "ска", "ско", "ски",
-    "ния", "ние",
+    "ваме", "вате", "ваха", "вали", "вана", "вано", "ията", "ието", "ните", "ната", "ното", "ески",
+    "ишки", // 3-char suffixes
+    "ваш", "вам", "ват", "вах", "иш", "ите", "ила", "ило", "аме", "ате", "аха", "ахе", "ена",
+    "ено", "ени", "ост", "ист", "ята", "ято", "ска", "ско", "ски", "ния", "ние",
     // 2-char suffixes (productive inflection)
-    "ам", "аш", "ат",
-    "им", "иш", "ит",
-    "ем", "еш", "ет",
-    "ях", "ях",
-    "те", "та", "то",
-    "ът", "ат",
-    "ен", "на", "но", "ни",
-    "ия", "ие",
-    // 1-char suffixes (definiteness, gender)
+    "ам", "аш", "ат", "им", "иш", "ит", "ем", "еш", "ет", "ях", "ях", "те", "та", "то", "ът", "ат",
+    "ен", "на", "но", "ни", "ия", "ие", // 1-char suffixes (definiteness, gender)
     "а", "о", "е", "и",
 ];
 
@@ -196,10 +180,7 @@ mod tests {
 
         // "работиш" should get a boost from the pooled stem frequency.
         let boost = morph.frequency_boost("работиш", 5);
-        assert!(
-            boost > 1.0,
-            "rare inflection should get a boost: {boost}"
-        );
+        assert!(boost > 1.0, "rare inflection should get a boost: {boost}");
 
         // "работя" shouldn't get much boost (it's already high-frequency).
         let boost_common = morph.frequency_boost("работя", 500);

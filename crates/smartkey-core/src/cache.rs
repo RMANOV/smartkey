@@ -128,8 +128,7 @@ impl PredictionCache {
     /// Useful for targeted invalidation when a specific word is learned without
     /// affecting unrelated cached predictions.
     pub fn invalidate_prefix(&mut self, prefix: &str) {
-        self.entries
-            .retain(|e| !e.key.prefix.starts_with(prefix));
+        self.entries.retain(|e| !e.key.prefix.starts_with(prefix));
     }
 
     /// Number of cached entries (including potentially stale ones).

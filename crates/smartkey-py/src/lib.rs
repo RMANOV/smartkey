@@ -1,3 +1,9 @@
+// PyO3's #[pyclass] macro generates code referencing the struct by name; when
+// the struct is marked #[deprecated] those macro-expanded references trigger
+// deprecation warnings that can't be suppressed per-item.  Suppress them here
+// at the module level so external callers still see the deprecation.
+#![allow(deprecated)]
+
 use pyo3::prelude::*;
 use smartkey_core::cvm::CvmSnapshot;
 use smartkey_core::ensemble::SmartKeyEngine;
@@ -7,11 +13,16 @@ use smartkey_core::input::{Action, InputConfig, InputMethodCore, Key, KeyEvent, 
 // Legacy API — kept for backward compatibility with existing IBus engine.
 // ======================================================================
 
-#[pyclass]
+#[deprecated(since = "0.5.0", note = "Use PyInputMethodCore instead")]
+/// unsendable: SmartKeyEngine contains RefCell (not Send).
+/// IBus runs single-threaded under the GIL — this is correct and safe.
+#[pyclass(unsendable)]
+#[allow(deprecated)]
 struct PySmartKeyEngine {
     inner: SmartKeyEngine,
 }
 
+#[allow(deprecated)]
 #[pymethods]
 impl PySmartKeyEngine {
     #[new]
@@ -39,8 +50,8 @@ impl PySmartKeyEngine {
     /// and per-language CVM data. Use `PyInputMethodCore.export_personal()` instead
     /// for full profile persistence.
     fn export_personal(&self, path: &str) -> PyResult<()> {
-        eprintln!(
-            "smartkey: WARNING: PySmartKeyEngine.export_personal() is deprecated — \
+        log::warn!(
+            "smartkey: PySmartKeyEngine.export_personal() is deprecated — \
                    use PyInputMethodCore.export_personal() for full profile persistence"
         );
         let snap = self.inner.export_personal();
@@ -101,7 +112,9 @@ impl PySmartKeyEngine {
 // Platform adapters call handle_key() and execute the returned actions.
 // ======================================================================
 
-#[pyclass]
+/// unsendable: InputMethodCore contains SmartKeyEngine (which contains RefCell, not Send).
+/// IBus runs single-threaded under the GIL — this is correct and safe.
+#[pyclass(unsendable)]
 struct PyInputMethodCore {
     inner: InputMethodCore,
 }
@@ -298,6 +311,7 @@ impl PyInputMethodCore {
 
 #[pymodule]
 fn smartkey_py(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[allow(deprecated)]
     m.add_class::<PySmartKeyEngine>()?;
     m.add_class::<PyInputMethodCore>()?;
     Ok(())

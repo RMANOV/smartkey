@@ -1,7 +1,7 @@
 // Ensemble scorer — combines corpus frequency, Markov context, and CVM personal boost.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 
 use crate::bpe::BpeTokenizer;
 use crate::cache::PredictionCache;
@@ -76,9 +76,10 @@ pub struct SmartKeyEngine {
     commit_count: u32,
     fuzzy_max_edits: u8,
     fuzzy_discounts: [f64; 3],
-    /// Prediction cache (Mutex: predict takes &self but cache needs mutation;
-    /// Mutex instead of RefCell for Send+Sync required by PyO3).
-    cache: Mutex<PredictionCache>,
+    /// Prediction cache (RefCell: predict takes &self but cache needs mutation;
+    /// RefCell is safe here because SmartKeyEngine is single-threaded — IBus
+    /// runs under the GIL and PySmartKeyEngine is marked `#[pyclass(unsendable)]`).
+    cache: RefCell<PredictionCache>,
     /// BPE tokenizer for OOV fallback (v0.4.0).
     bpe: Option<BpeTokenizer>,
     /// Session cache LM for burstiness tracking (v0.4.0).
@@ -96,8 +97,9 @@ pub struct SmartKeyEngine {
     use_kneser_ney: bool,
     use_hedge: bool,
     /// Confidence calibrator (F6): maps raw score ratios to calibrated probabilities.
-    /// Behind Mutex because `predict()` takes `&self` but calibration needs mutation.
-    calibrator: Mutex<ConfidenceCalibrator>,
+    /// RefCell: `predict()` takes `&self` but calibration needs mutation; safe because
+    /// SmartKeyEngine is single-threaded (see `cache` field comment above).
+    calibrator: RefCell<ConfidenceCalibrator>,
 }
 
 impl SmartKeyEngine {
@@ -129,7 +131,7 @@ impl SmartKeyEngine {
             commit_count: 0,
             fuzzy_max_edits: config.fuzzy_max_edits,
             fuzzy_discounts: config.fuzzy_discounts,
-            cache: Mutex::new(PredictionCache::new()),
+            cache: RefCell::new(PredictionCache::new()),
             bpe: None, // Loaded from corpus if bpe_enabled
             session_cache: SessionCacheLM::new(),
             tech_vocab: TechVocab::new(),
@@ -154,7 +156,7 @@ impl SmartKeyEngine {
             bpe_enabled: config.bpe_enabled,
             use_kneser_ney: config.use_kneser_ney,
             use_hedge: config.use_hedge,
-            calibrator: Mutex::new(ConfidenceCalibrator::new()),
+            calibrator: RefCell::new(ConfidenceCalibrator::new()),
         }
     }
 
@@ -204,13 +206,13 @@ impl SmartKeyEngine {
     /// Feed a word into the personal CVM layer (call when the user types a word).
     pub fn learn(&mut self, word: &str) {
         self.personal.process(word);
-        self.cache.lock().unwrap().invalidate();
+        self.cache.borrow_mut().invalidate();
     }
 
     /// Feed a word into the per-language CVM track.
     pub fn learn_with_lang(&mut self, word: &str, lang: LangId) {
         self.personal_tracks.learn(word, lang);
-        self.cache.lock().unwrap().invalidate();
+        self.cache.borrow_mut().invalidate();
     }
 
     /// Set the BPE tokenizer (loaded from corpus).
@@ -233,7 +235,7 @@ impl SmartKeyEngine {
         // but not dominate corpus words. Will grow via CVM learning.
         const OOV_INITIAL_FREQ: u32 = 5;
         self.lang_models.load_word(word, OOV_INITIAL_FREQ, lang);
-        self.cache.lock().unwrap().invalidate();
+        self.cache.borrow_mut().invalidate();
     }
 
     /// Clear the session cache (e.g. on session restart).
@@ -257,13 +259,15 @@ impl SmartKeyEngine {
             }
 
             // Build collocation detector (F9) from bigram + unigram data.
-            let bigram_flat: std::collections::HashMap<String, std::collections::HashMap<String, u32>> =
-                model
-                    .markov
-                    .bigrams_raw()
-                    .iter()
-                    .map(|(ctx, (followers, _))| (ctx.clone(), followers.clone()))
-                    .collect();
+            let bigram_flat: std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, u32>,
+            > = model
+                .markov
+                .bigrams_raw()
+                .iter()
+                .map(|(ctx, (followers, _))| (ctx.clone(), followers.clone()))
+                .collect();
             let total_bi: u64 = bigram_flat
                 .values()
                 .flat_map(|f| f.values())
@@ -294,7 +298,7 @@ impl SmartKeyEngine {
         if let (Some(w1), Some(w2)) = (prev2, prev1) {
             self.personal_markov.train_trigram(w1, w2, word, 1);
         }
-        self.cache.lock().unwrap().invalidate();
+        self.cache.borrow_mut().invalidate();
     }
 
     /// Record a calibration observation (F6).
@@ -302,7 +306,7 @@ impl SmartKeyEngine {
     /// `confidence`: raw confidence of the top prediction at accept/reject time.
     /// `accepted`: whether the user accepted it (Tab) or rejected (Escape/typing).
     pub fn observe_calibration(&self, confidence: f64, accepted: bool) {
-        self.calibrator.lock().unwrap().observe(confidence, accepted);
+        self.calibrator.borrow_mut().observe(confidence, accepted);
     }
 
     /// Handle a prediction being accepted (Tab press) — update adaptive weights.
@@ -344,7 +348,9 @@ impl SmartKeyEngine {
                 .filter_map(|m| m.ppm.as_ref())
                 .map(|ppm| ppm.score_candidate("", word))
                 .fold(0.0_f64, f64::max);
-            let tech_score = self.tech_vocab.score(word, 1)
+            let tech_score = self
+                .tech_vocab
+                .score(word, 1)
                 .first()
                 .map(|(_, s)| *s)
                 .unwrap_or(0.0);
@@ -432,7 +438,7 @@ impl SmartKeyEngine {
             }
         }
 
-        self.cache.lock().unwrap().invalidate();
+        self.cache.borrow_mut().invalidate();
     }
 
     /// Handle a prediction being rejected (Escape press) — penalise adaptive weights.
@@ -453,7 +459,7 @@ impl SmartKeyEngine {
                     self.gamma = g;
                 }
             }
-            self.cache.lock().unwrap().invalidate();
+            self.cache.borrow_mut().invalidate();
         }
     }
 
@@ -502,7 +508,7 @@ impl SmartKeyEngine {
             self.commit_count = w.commit_count;
         }
 
-        self.cache.lock().unwrap().invalidate();
+        self.cache.borrow_mut().invalidate();
     }
 
     /// Export the personal CVM layer as a portable snapshot (backward compat).
@@ -513,7 +519,7 @@ impl SmartKeyEngine {
     /// Replace the personal CVM layer from a snapshot (backward compat).
     pub fn import_personal(&mut self, snapshot: &CvmSnapshot) {
         self.personal = CvmCounter::from_snapshot(snapshot);
-        self.cache.lock().unwrap().invalidate();
+        self.cache.borrow_mut().invalidate();
     }
 
     /// Fast candidate count for a prefix (without full scoring).
@@ -547,7 +553,7 @@ impl SmartKeyEngine {
     /// - **MixedLanguage/LanguageSwitch:** no weight change (handled by lang detection)
     pub fn set_regime(&mut self, regime: TypingRegime) {
         self.current_regime = Some(regime);
-        self.cache.lock().unwrap().invalidate();
+        self.cache.borrow_mut().invalidate();
     }
 
     /// Returns (Δα, Δβ, Δγ) weight adjustments for the current regime.
@@ -617,7 +623,7 @@ impl SmartKeyEngine {
         }
 
         // Check cache first.
-        if let Some(cached) = self.cache.lock().unwrap().get(prefix, context) {
+        if let Some(cached) = self.cache.borrow_mut().get(prefix, context) {
             return cached;
         }
 
@@ -714,10 +720,7 @@ impl SmartKeyEngine {
                             }
                         }
                         preds.truncate(limit);
-                        self.cache
-                            .lock()
-                            .unwrap()
-                            .put(prefix, context, preds.clone());
+                        self.cache.borrow_mut().put(prefix, context, preds.clone());
                         return preds;
                     }
                 }
@@ -743,10 +746,7 @@ impl SmartKeyEngine {
                     }
                 }
                 preds.truncate(limit);
-                self.cache
-                    .lock()
-                    .unwrap()
-                    .put(prefix, context, preds.clone());
+                self.cache.borrow_mut().put(prefix, context, preds.clone());
                 return preds;
             }
 
@@ -882,7 +882,8 @@ impl SmartKeyEngine {
         let base_gamma = (self.gamma + dg).max(0.05);
         // Renormalize base weights to sum = 1.0 after regime deltas.
         let base_sum_raw = base_alpha + base_beta + base_gamma;
-        let (base_alpha, base_beta, base_gamma) = if base_sum_raw > 0.0 {
+        let (base_alpha, base_beta, base_gamma) = if base_sum_raw.is_finite() && base_sum_raw > 0.0
+        {
             (
                 base_alpha / base_sum_raw,
                 base_beta / base_sum_raw,
@@ -1013,20 +1014,12 @@ impl SmartKeyEngine {
                 let raw = (p.score / score_sum).clamp(0.0, 1.0);
                 // Step 6 (F6): apply isotonic calibration when ready.
                 // Maps raw score ratio → calibrated acceptance probability.
-                p.confidence = self
-                    .calibrator
-                    .lock()
-                    .unwrap()
-                    .calibrate(raw)
-                    .unwrap_or(raw);
+                p.confidence = self.calibrator.borrow_mut().calibrate(raw).unwrap_or(raw);
             }
         }
 
         // Store in cache before returning.
-        self.cache
-            .lock()
-            .unwrap()
-            .put(prefix, context, scored.clone());
+        self.cache.borrow_mut().put(prefix, context, scored.clone());
 
         scored
     }

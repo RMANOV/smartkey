@@ -294,9 +294,7 @@ fn derive_bpe_merges_from_words(words: &[CorpusWord], limit: usize) -> Vec<crate
         }
 
         // Find the most frequent pair.
-        let best = pair_counts
-            .into_iter()
-            .max_by_key(|(_, count)| *count);
+        let best = pair_counts.into_iter().max_by_key(|(_, count)| *count);
 
         let Some(((a, b), _)) = best else { break };
         let merged = format!("{}{}", a, b);

@@ -127,10 +127,7 @@ impl VirtualTyper {
     /// punctuation characters are supported; unrecognised characters are
     /// silently skipped.
     fn type_word_en(&mut self, word: &str) -> Vec<Vec<Action>> {
-        let codes: Vec<(u16, bool)> = word
-            .chars()
-            .filter_map(|ch| ascii_to_scancode(ch))
-            .collect();
+        let codes: Vec<(u16, bool)> = word.chars().filter_map(ascii_to_scancode).collect();
         self.type_scancodes(&codes)
     }
 
@@ -243,7 +240,7 @@ fn test_hello_detected_as_english() {
         "current_word should be non-empty after typing 'hello' via scancodes"
     );
     assert!(
-        word.chars().all(|c| c.is_ascii()),
+        word.is_ascii(),
         "typing 'hello' should yield an ASCII winner (EN corpus dominates); got: {:?}",
         word
     );
@@ -524,7 +521,7 @@ fn test_en_then_cyrillic_char_input() {
             p.word
                 .chars()
                 .any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
-                || p.word.chars().all(|c| c.is_ascii()),
+                || p.word.is_ascii(),
             "prediction after Cyrillic prefix should be Cyrillic or ASCII, not mixed; got: {:?}",
             p.word
         );

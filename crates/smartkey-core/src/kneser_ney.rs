@@ -338,11 +338,7 @@ mod tests {
         // D2 = 2 - 3*0.5*(30/50) = 2 - 0.9 = 1.1
         // D3+ = 3 - 4*0.5*(20/30) = 3 - 1.333 = 1.667
         assert!((d.d1 - 0.5).abs() < 1e-6, "D1 should be ~0.5, got {}", d.d1);
-        assert!(
-            (d.d2 - 1.1).abs() < 1e-6,
-            "D2 should be ~1.1, got {}",
-            d.d2
-        );
+        assert!((d.d2 - 1.1).abs() < 1e-6, "D2 should be ~1.1, got {}", d.d2);
         assert!(
             (d.d3_plus - 5.0 / 3.0).abs() < 1e-6,
             "D3+ should be ~1.667, got {}",

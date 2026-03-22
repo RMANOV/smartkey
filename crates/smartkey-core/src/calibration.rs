@@ -67,6 +67,9 @@ impl ConfidenceCalibrator {
     /// `confidence`: the raw confidence from ensemble scoring (0.0..1.0).
     /// `accepted`: true if the user accepted this prediction (Tab press).
     pub fn observe(&mut self, confidence: f64, accepted: bool) {
+        if !confidence.is_finite() {
+            return;
+        }
         let sample = CalibrationSample {
             confidence,
             accepted,
@@ -103,13 +106,18 @@ impl ConfidenceCalibrator {
             return None;
         }
 
-        // Binary search for the bin containing raw_confidence.
+        // Linear scan for the bin containing raw_confidence.
         let calibrated = self
             .bins
             .iter()
             .find(|b| raw_confidence <= b.upper)
             .map(|b| b.calibrated)
-            .unwrap_or_else(|| self.bins.last().map(|b| b.calibrated).unwrap_or(raw_confidence));
+            .unwrap_or_else(|| {
+                self.bins
+                    .last()
+                    .map(|b| b.calibrated)
+                    .unwrap_or(raw_confidence)
+            });
 
         Some(calibrated.clamp(0.0, 1.0))
     }
@@ -160,18 +168,15 @@ impl ConfidenceCalibrator {
 
         // Pool Adjacent Violators: enforce monotone non-decreasing.
         // Merge adjacent bins where calibrated probability decreases.
-        let mut pav: Vec<(f64, f64, usize)> = bins
-            .iter()
-            .map(|b| (b.upper, b.calibrated, 1))
-            .collect();
+        let mut pav: Vec<(f64, f64, usize)> =
+            bins.iter().map(|b| (b.upper, b.calibrated, 1)).collect();
 
         let mut i = 0;
         while i < pav.len() - 1 {
             if pav[i].1 > pav[i + 1].1 {
                 // Pool: merge bins i and i+1.
                 let total_weight = pav[i].2 + pav[i + 1].2;
-                let merged_val = (pav[i].1 * pav[i].2 as f64
-                    + pav[i + 1].1 * pav[i + 1].2 as f64)
+                let merged_val = (pav[i].1 * pav[i].2 as f64 + pav[i + 1].1 * pav[i + 1].2 as f64)
                     / total_weight as f64;
                 let merged_upper = pav[i + 1].0;
                 pav[i] = (merged_upper, merged_val, total_weight);
@@ -266,7 +271,7 @@ mod tests {
         for step in 0..100 {
             let conf = step as f64 / 100.0;
             if let Some(val) = cal.calibrate(conf) {
-                assert!(val >= 0.0 && val <= 1.0, "out of bounds: {val}");
+                assert!((0.0..=1.0).contains(&val), "out of bounds: {val}");
             }
         }
     }

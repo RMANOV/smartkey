@@ -336,7 +336,7 @@ impl MasterLoop {
             FrustrationSignal::Reject { severity } => {
                 self.light_profile.record_reject();
                 // Suppress ghost for 1-3 words based on severity.
-                self.suppress_countdown = (severity * 3.0).ceil() as u8;
+                self.suppress_countdown = (severity * 3.0).min(255.0).ceil() as u8;
                 // Record in correction memory if we know what was accepted.
                 if let Some(accepted) = &self.last_accepted_prediction {
                     let ctx_hash = self.current_context_hash();
@@ -349,7 +349,7 @@ impl MasterLoop {
             FrustrationSignal::RapidDelete { severity, .. } => {
                 self.light_profile.record_reject();
                 // Suppress ghost temporarily.
-                self.suppress_countdown = (severity * 2.0).ceil() as u8;
+                self.suppress_countdown = (severity * 2.0).min(255.0).ceil() as u8;
                 // Record negative example: if ghost was showing, the top prediction
                 // was wrong for this context — teach correction memory.
                 self.record_ghost_as_negative();

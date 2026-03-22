@@ -177,7 +177,7 @@ impl InputConfig {
                 config.ghost_text = b;
             }
             if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
-                config.max_candidates = n as usize;
+                config.max_candidates = (n as usize).max(1);
             }
             if let Some(n) = v.get("min_prefix_length").and_then(|v| v.as_u64()) {
                 config.min_prefix_length = n as usize;
@@ -211,7 +211,7 @@ impl InputConfig {
                 if (sum - 1.0).abs() < 1e-6 {
                     config.weights = (a, b, c);
                 } else {
-                    eprintln!("smartkey: weights sum to {sum:.3}, expected 1.0 — using defaults");
+                    log::warn!("smartkey: weights sum to {sum:.3}, expected 1.0 — using defaults");
                 }
             }
             if let Some(db) = v.get("dual_buffer").and_then(|v| v.as_object()) {
@@ -236,7 +236,7 @@ impl InputConfig {
                     config.cvm_decay_lambda = f;
                 }
                 if let Some(n) = t.get("fuzzy_max_edits").and_then(|v| v.as_u64()) {
-                    config.fuzzy_max_edits = n as u8;
+                    config.fuzzy_max_edits = n.min(3) as u8;
                 }
                 if let Some(arr) = t.get("fuzzy_discounts").and_then(|v| v.as_array()) {
                     if arr.len() == 3 {
@@ -257,8 +257,131 @@ impl InputConfig {
                     }
                 }
             }
+        } else {
+            log::warn!("smartkey: invalid config JSON, using defaults");
         }
         config
+    }
+
+    /// Parse and validate a JSON config string.
+    ///
+    /// Unlike [`from_json`], this method returns `Err` on JSON parse failure
+    /// and validates field values for logical correctness.
+    pub fn try_from_json(json_str: &str) -> Result<Self, String> {
+        let v = serde_json::from_str::<serde_json::Value>(json_str)
+            .map_err(|e| format!("smartkey: invalid config JSON: {e}"))?;
+
+        let mut config = Self::default();
+
+        if let Some(b) = v.get("enabled").and_then(|v| v.as_bool()) {
+            config.enabled = b;
+        }
+        if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
+            config.ghost_text = b;
+        }
+        if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
+            if n < 1 {
+                return Err("smartkey: max_candidates must be >= 1".to_string());
+            }
+            config.max_candidates = n as usize;
+        }
+        if let Some(n) = v.get("min_prefix_length").and_then(|v| v.as_u64()) {
+            if n < 1 {
+                return Err("smartkey: min_prefix_length must be >= 1".to_string());
+            }
+            config.min_prefix_length = n as usize;
+        }
+        if let Some(f) = v.get("ghost_text_min_confidence").and_then(|v| v.as_f64()) {
+            if !(0.0..=1.0).contains(&f) {
+                return Err(format!(
+                    "smartkey: ghost_text_min_confidence must be in [0.0, 1.0], got {f}"
+                ));
+            }
+            config.ghost_text_min_confidence = f;
+        }
+        if let Some(f) = v
+            .get("ghost_text_separation_margin")
+            .and_then(|v| v.as_f64())
+        {
+            if f < 0.0 {
+                return Err(format!(
+                    "smartkey: ghost_text_separation_margin must be >= 0.0, got {f}"
+                ));
+            }
+            config.ghost_text_separation_margin = f;
+        }
+        if let Some(f) = v.get("ghost_text_min_score").and_then(|v| v.as_f64()) {
+            if f < 0.0 {
+                return Err(format!(
+                    "smartkey: ghost_text_min_score must be >= 0.0, got {f}"
+                ));
+            }
+            config.ghost_text_min_score = f;
+        }
+        if let Some(w) = v.get("weights").and_then(|v| v.as_object()) {
+            let a = w
+                .get("corpus")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(config.weights.0);
+            let b = w
+                .get("markov")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(config.weights.1);
+            let c = w
+                .get("personal")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(config.weights.2);
+            let sum = a + b + c;
+            if (sum - 1.0).abs() >= 1e-6 {
+                return Err(format!("smartkey: weights sum to {sum:.6}, expected 1.0"));
+            }
+            config.weights = (a, b, c);
+        }
+        if let Some(db) = v.get("dual_buffer").and_then(|v| v.as_object()) {
+            if let Some(b) = db.get("enabled").and_then(|v| v.as_bool()) {
+                config.dual_buffer.enabled = b;
+            }
+            if let Some(f) = db.get("lock_threshold").and_then(|v| v.as_f64()) {
+                config.dual_buffer.lock_threshold = f;
+            }
+            if let Some(n) = db.get("min_lock_chars").and_then(|v| v.as_u64()) {
+                config.dual_buffer.min_lock_chars = n as usize;
+            }
+        }
+        if let Some(t) = v.get("tuning").and_then(|v| v.as_object()) {
+            if let Some(n) = t.get("cvm_initial_size").and_then(|v| v.as_u64()) {
+                config.cvm_initial_size = n as usize;
+            }
+            if let Some(n) = t.get("cvm_max_size").and_then(|v| v.as_u64()) {
+                config.cvm_max_size = n as usize;
+            }
+            if let Some(f) = t.get("cvm_decay_lambda").and_then(|v| v.as_f64()) {
+                config.cvm_decay_lambda = f;
+            }
+            if let Some(n) = t.get("fuzzy_max_edits").and_then(|v| v.as_u64()) {
+                config.fuzzy_max_edits = n as u8;
+            }
+            if let Some(arr) = t.get("fuzzy_discounts").and_then(|v| v.as_array()) {
+                if arr.len() == 3 {
+                    if let (Some(a), Some(b), Some(c)) =
+                        (arr[0].as_f64(), arr[1].as_f64(), arr[2].as_f64())
+                    {
+                        config.fuzzy_discounts = [a, b, c];
+                    }
+                }
+            }
+            if let Some(arr) = t.get("markov_lambdas").and_then(|v| v.as_array()) {
+                if arr.len() == 3 {
+                    if let (Some(a), Some(b), Some(c)) =
+                        (arr[0].as_f64(), arr[1].as_f64(), arr[2].as_f64())
+                    {
+                        config.markov_lambdas = [a, b, c];
+                    }
+                }
+            }
+        }
+
+        Ok(config)
     }
 }
 
@@ -395,7 +518,7 @@ impl InputMethodCore {
                 let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
                 let (corpus, warnings) = Corpus::from_json_with_warnings(&data)?;
                 if warnings.dropped_bigrams > 0 || warnings.dropped_trigrams > 0 {
-                    eprintln!(
+                    log::warn!(
                         "smartkey: corpus {}: dropped {} bigrams, {} trigrams (malformed entries)",
                         path.display(),
                         warnings.dropped_bigrams,
@@ -943,7 +1066,9 @@ impl InputMethodCore {
             self.dual_buffer = Some(DualBuffer::from_config(&self.config.dual_buffer));
         }
 
-        let db = self.dual_buffer.as_mut().unwrap();
+        let Some(db) = self.dual_buffer.as_mut() else {
+            return vec![Action::ForwardKey];
+        };
         let was_locked = db.is_locked();
         db.push(en_ch, bg_ch);
 
@@ -1034,8 +1159,7 @@ impl InputMethodCore {
             0.0
         };
 
-        #[cfg(debug_assertions)]
-        eprintln!(
+        log::debug!(
             "smartkey: check_wrong_layout: '{}' → '{}' | en_freq={} bg_freq={} ratio={:.1} momentum={:?}",
             self.current_word,
             bg_prefix,
@@ -1894,5 +2018,52 @@ mod tests {
             "single candidate should pass margin check: got {:?}",
             g
         );
+    }
+
+    // ── Config parsing hardening tests ─────────────────────────────────
+
+    #[test]
+    fn test_config_from_json_invalid_still_returns_defaults() {
+        let config = InputConfig::from_json("not valid json {{{");
+        let defaults = InputConfig::default();
+        assert_eq!(config.max_candidates, defaults.max_candidates);
+        assert_eq!(config.min_prefix_length, defaults.min_prefix_length);
+        assert_eq!(config.enabled, defaults.enabled);
+        assert_eq!(config.ghost_text, defaults.ghost_text);
+    }
+
+    #[test]
+    fn test_try_from_json_returns_error_on_invalid() {
+        let result = InputConfig::try_from_json("not valid json {{{");
+        assert!(result.is_err(), "garbage JSON should return Err");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("invalid config JSON"),
+            "error message should mention invalid config JSON, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_fields() {
+        // max_candidates = 0 should be rejected
+        let result = InputConfig::try_from_json(r#"{"max_candidates": 0}"#);
+        assert!(result.is_err(), "max_candidates=0 should be rejected");
+
+        // min_prefix_length = 0 should be rejected
+        let result = InputConfig::try_from_json(r#"{"min_prefix_length": 0}"#);
+        assert!(result.is_err(), "min_prefix_length=0 should be rejected");
+
+        // weights that don't sum to 1.0 should be rejected
+        let result = InputConfig::try_from_json(
+            r#"{"weights": {"corpus": 0.5, "markov": 0.5, "personal": 0.5}}"#,
+        );
+        assert!(result.is_err(), "weights summing to 1.5 should be rejected");
+
+        // valid config should succeed
+        let result = InputConfig::try_from_json(r#"{"max_candidates": 3, "min_prefix_length": 2}"#);
+        assert!(result.is_ok(), "valid config should return Ok");
+        let config = result.unwrap();
+        assert_eq!(config.max_candidates, 3);
+        assert_eq!(config.min_prefix_length, 2);
     }
 }

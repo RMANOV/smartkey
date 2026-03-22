@@ -16,6 +16,7 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 arrayvec = { workspace = true }
+log = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

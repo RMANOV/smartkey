@@ -770,6 +770,7 @@ dependencies = [
  "bincode",
  "bitflags",
  "criterion",
+ "log",
  "rand",
  "serde",
  "serde_json",
@@ -789,6 +790,7 @@ name = "smartkey-playground"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "log",
  "serde",
  "serde_json",
  "smartkey-core",
@@ -798,6 +800,7 @@ dependencies = [
 name = "smartkey-py"
 version = "0.5.0"
 dependencies = [
+ "log",
  "pyo3",
  "serde_json",
  "smartkey-core",
@@ -807,6 +810,7 @@ dependencies = [
 name = "smartkey-win"
 version = "0.5.0"
 dependencies = [
+ "log",
  "smartkey-core",
  "windows",
  "windows-core",

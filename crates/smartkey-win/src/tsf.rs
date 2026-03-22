@@ -150,10 +150,10 @@ impl SmartKeyTextService {
                                 ghost_attr_atom: self.ghost_attr_atom.get(),
                             };
                             if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                                eprintln!("smartkey: ShowGhost failed: {e}");
+                                log::error!("smartkey: ShowGhost failed: {e}");
                             }
                         }
-                        Err(e) => eprintln!("smartkey: failed to get composition sink: {e}"),
+                        Err(e) => log::error!("smartkey: failed to get composition sink: {e}"),
                     }
                     consumed = true;
                 }
@@ -162,7 +162,7 @@ impl SmartKeyTextService {
                         composition: self.composition.clone(),
                     };
                     if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                        eprintln!("smartkey: HideGhost failed: {e}");
+                        log::error!("smartkey: HideGhost failed: {e}");
                     }
                     consumed = true;
                 }
@@ -172,7 +172,7 @@ impl SmartKeyTextService {
                         composition: self.composition.clone(),
                     };
                     if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                        eprintln!("smartkey: CommitText failed: {e}");
+                        log::error!("smartkey: CommitText failed: {e}");
                     }
                     consumed = true;
                 }
@@ -197,7 +197,7 @@ impl SmartKeyTextService {
                         composition: self.composition.clone(),
                     };
                     if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                        eprintln!("smartkey: ReplaceWord failed: {e}");
+                        log::error!("smartkey: ReplaceWord failed: {e}");
                     }
                     consumed = true;
                 }
@@ -218,10 +218,10 @@ impl SmartKeyTextService {
                                 ghost_attr_atom: self.ghost_attr_atom.get(),
                             };
                             if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                                eprintln!("smartkey: ShowComposing failed: {e}");
+                                log::error!("smartkey: ShowComposing failed: {e}");
                             }
                         }
-                        Err(e) => eprintln!("smartkey: failed to get composition sink: {e}"),
+                        Err(e) => log::error!("smartkey: failed to get composition sink: {e}"),
                     }
                     consumed = true;
                 }
@@ -291,7 +291,7 @@ impl ITfTextInputProcessorEx_Impl for SmartKeyTextService_Impl {
                 match std::fs::read_to_string(&win_config.config_file) {
                     Ok(json) => InputConfig::from_json(&json),
                     Err(e) => {
-                        eprintln!("smartkey: config read error: {e}");
+                        log::warn!("smartkey: config read error: {e}");
                         InputConfig::default()
                     }
                 }
@@ -306,19 +306,19 @@ impl ITfTextInputProcessorEx_Impl for SmartKeyTextService_Impl {
             match cat_mgr {
                 Ok(mgr) => match unsafe { mgr.RegisterGUID(&GUID_GHOST_ATTR) } {
                     Ok(atom) => self.ghost_attr_atom.set(atom),
-                    Err(e) => eprintln!("smartkey: RegisterGUID failed: {e}"),
+                    Err(e) => log::error!("smartkey: RegisterGUID failed: {e}"),
                 },
-                Err(e) => eprintln!("smartkey: ITfCategoryMgr creation failed: {e}"),
+                Err(e) => log::error!("smartkey: ITfCategoryMgr creation failed: {e}"),
             }
 
             let mut core = self.core.borrow_mut();
             for path in &win_config.corpus_files {
                 if let Err(e) = core.load_corpus_file(path) {
-                    eprintln!("smartkey: failed to load corpus {}: {e}", path.display());
+                    log::error!("smartkey: failed to load corpus {}: {e}", path.display());
                 }
             }
             if let Err(e) = core.load_personal_default() {
-                eprintln!("smartkey: failed to load personal profile: {e}");
+                log::warn!("smartkey: failed to load personal profile: {e}");
             }
             self.corpus_loaded.set(true);
         }

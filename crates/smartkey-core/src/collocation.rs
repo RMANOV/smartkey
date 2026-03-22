@@ -138,12 +138,14 @@ impl Default for CollocationDetector {
 mod tests {
     use super::*;
 
-    fn test_data() -> (
+    type TestData = (
         HashMap<String, HashMap<String, u32>>,
         HashMap<String, u32>,
         u64,
         u64,
-    ) {
+    );
+
+    fn test_data() -> TestData {
         let mut bigrams: HashMap<String, HashMap<String, u32>> = HashMap::new();
         let mut unigrams: HashMap<String, u32> = HashMap::new();
 
@@ -169,7 +171,11 @@ mod tests {
         unigrams.insert("the".into(), 1000);
         unigrams.insert("world".into(), 300);
 
-        let total_bi: u64 = bigrams.values().flat_map(|f| f.values()).map(|&c| c as u64).sum();
+        let total_bi: u64 = bigrams
+            .values()
+            .flat_map(|f| f.values())
+            .map(|&c| c as u64)
+            .sum();
         let total_uni: u64 = unigrams.values().map(|&c| c as u64).sum();
 
         (bigrams, unigrams, total_bi, total_uni)

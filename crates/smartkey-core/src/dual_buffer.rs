@@ -158,8 +158,8 @@ impl DualBuffer {
     /// The text of the winning interpretation.
     pub fn winner_text(&self) -> &str {
         match self.winner {
-            LangId::En => &self.en_buf,
-            LangId::Bg | LangId::Tech => &self.bg_buf,
+            LangId::En | LangId::Tech => &self.en_buf,
+            LangId::Bg => &self.bg_buf,
         }
     }
 

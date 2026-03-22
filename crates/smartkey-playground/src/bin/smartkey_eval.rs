@@ -50,7 +50,7 @@ fn main() {
             "auto-language-detection" => vec![Scenario::auto_language_detection()],
             "high-precision-english" => vec![Scenario::high_precision_english()],
             other => {
-                eprintln!(
+                log::error!(
                     "Unknown preset: {:?}. Available: english-prose, bulgarian-chat, \
                      mixed-language, code-sprint, stress-test, capitalization-prose, \
                      all-caps-typing, auto-language-detection, high-precision-english",

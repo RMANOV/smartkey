@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 smartkey-core = { path = "../smartkey-core" }
+log = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.58"
