@@ -2043,6 +2043,68 @@ mod tests {
         );
     }
 
+    // ==================================================================
+    // Config clamping edge-case tests
+    // ==================================================================
+
+    #[test]
+    fn config_from_json_fuzzy_max_edits_above_3_clamped() {
+        // from_json path uses n.min(3) — value 10 must become 3.
+        let json = r#"{"tuning": {"fuzzy_max_edits": 10}}"#;
+        let config = InputConfig::from_json(json);
+        assert_eq!(
+            config.fuzzy_max_edits, 3,
+            "fuzzy_max_edits > 3 should be clamped to 3, got {}",
+            config.fuzzy_max_edits
+        );
+    }
+
+    #[test]
+    fn config_from_json_max_candidates_zero_clamped_to_one() {
+        // from_json path uses (n as usize).max(1) — value 0 must become 1.
+        let json = r#"{"max_candidates": 0}"#;
+        let config = InputConfig::from_json(json);
+        assert_eq!(
+            config.max_candidates, 1,
+            "max_candidates=0 should be clamped to 1, got {}",
+            config.max_candidates
+        );
+    }
+
+    #[test]
+    fn config_try_from_json_ghost_text_min_confidence_above_1_rejected() {
+        // try_from_json validates range [0.0, 1.0].
+        let json = r#"{"ghost_text_min_confidence": 1.5}"#;
+        let result = InputConfig::try_from_json(json);
+        assert!(
+            result.is_err(),
+            "ghost_text_min_confidence > 1.0 should be rejected"
+        );
+    }
+
+    #[test]
+    fn config_try_from_json_ghost_text_min_confidence_below_0_rejected() {
+        let json = r#"{"ghost_text_min_confidence": -0.1}"#;
+        let result = InputConfig::try_from_json(json);
+        assert!(
+            result.is_err(),
+            "ghost_text_min_confidence < 0.0 should be rejected"
+        );
+    }
+
+    #[test]
+    fn config_from_json_ghost_text_min_confidence_stored_unclamped() {
+        // from_json silently stores without validation — it's the caller's choice.
+        // This test documents the actual behavior.
+        let json = r#"{"ghost_text_min_confidence": 0.75}"#;
+        let config = InputConfig::from_json(json);
+        assert!(
+            (config.ghost_text_min_confidence - 0.75).abs() < 1e-9,
+            "valid confidence 0.75 should be accepted, got {}",
+            config.ghost_text_min_confidence
+        );
+    }
+
     #[test]
     fn test_config_validation_fields() {
         // max_candidates = 0 should be rejected

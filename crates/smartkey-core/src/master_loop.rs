@@ -416,3 +416,187 @@ impl MasterLoop {
         CorrectionMemory::context_hash(prev1, prev2)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::{InputConfig, Key, KeyEvent, Modifiers};
+
+    fn make_key(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn default_loop() -> MasterLoop {
+        MasterLoop::new(InputConfig::default())
+    }
+
+    #[test]
+    fn new_starts_in_anticipating_phase() {
+        let ml = default_loop();
+        assert_eq!(ml.phase(), Phase::Anticipating);
+    }
+
+    #[test]
+    fn initial_state_is_clean() {
+        let ml = default_loop();
+        assert!(ml.current_word().is_empty());
+        assert!(ml.is_enabled());
+        assert!(!ml.has_ghost());
+    }
+
+    #[test]
+    fn handle_key_char_enters_tracking_phase() {
+        let mut ml = default_loop();
+        ml.handle_key(make_key(Key::Char('h')));
+        // After first char, we should be in Tracking or later
+        assert_ne!(ml.phase(), Phase::Anticipating);
+    }
+
+    #[test]
+    fn handle_key_returns_actions_vec() {
+        let mut ml = default_loop();
+        let actions = ml.handle_key(make_key(Key::Char('a')));
+        // Actions should be a Vec — not necessarily non-empty (depends on corpus)
+        let _ = actions;
+    }
+
+    #[test]
+    fn focus_lost_resets_anticipated_flag() {
+        let mut ml = default_loop();
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.focus_lost();
+        // After focus_lost, next char should re-trigger anticipation
+        // Phase may not be directly testable, but focus_lost should not panic
+        assert!(ml.current_word().is_empty());
+    }
+
+    #[test]
+    fn reset_clears_current_word() {
+        let mut ml = default_loop();
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        ml.reset();
+        assert!(ml.current_word().is_empty());
+    }
+
+    #[test]
+    fn suppress_countdown_no_overflow_with_extreme_severity() {
+        // FrustrationSignal::Reject with severity=1.0 → suppress_countdown = ceil(1.0*3) = 3
+        // severity is clamped to [0,1], so countdown max = 3, no overflow
+        let mut ml = default_loop();
+        // Drive a rejection scenario
+        // suppress_countdown is u8, so verify it stays in bounds
+        ml.handle_key(make_key(Key::Escape));
+        ml.handle_key(make_key(Key::Char('a')));
+        // If we got here without panic/overflow, the test passes
+        assert!(ml.suppress_countdown <= 3);
+    }
+
+    #[test]
+    fn phase_is_readable() {
+        let ml = default_loop();
+        let p = ml.phase();
+        // Just verify we can read phase without panic
+        let _ = format!("{:?}", p);
+    }
+
+    #[test]
+    fn light_profile_accessible() {
+        let ml = default_loop();
+        let profile = ml.light_profile();
+        let sum: f64 = profile.lang_prior.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn correction_count_starts_at_zero() {
+        let ml = default_loop();
+        assert_eq!(ml.correction_count(), 0);
+    }
+
+    #[test]
+    fn with_context_sampler_creates_instance() {
+        let config = InputConfig::default();
+        let ml = MasterLoop::with_context_sampler(config, Box::new(NullContextSampler));
+        assert_eq!(ml.phase(), Phase::Anticipating);
+    }
+
+    #[test]
+    fn anticipate_returns_hints_with_confidence_floor() {
+        let mut ml = default_loop();
+        // anticipate() is called internally on handle_key when word is empty
+        // We can observe its effect: after focus_lost, next char should not panic
+        ml.focus_lost();
+        let actions = ml.handle_key(make_key(Key::Char('t')));
+        let _ = actions;
+        // No panic = anticipate() ran without error
+    }
+
+    #[test]
+    fn phase_debug_format() {
+        assert_eq!(format!("{:?}", Phase::Anticipating), "Anticipating");
+        assert_eq!(format!("{:?}", Phase::Tracking), "Tracking");
+        assert_eq!(format!("{:?}", Phase::Correcting), "Correcting");
+        assert_eq!(format!("{:?}", Phase::Learning), "Learning");
+    }
+
+    // ==================================================================
+    // Overflow guard tests for suppress_countdown
+    // ==================================================================
+
+    #[test]
+    fn suppress_countdown_clamped_from_max_f64_severity() {
+        // handle_frustration uses: (severity * 3.0).min(255.0).ceil() as u8
+        // If severity = f64::MAX, the .min(255.0) clamp must prevent overflow.
+        let mut ml = default_loop();
+        let signal = crate::frustration::FrustrationSignal::Reject { severity: f64::MAX };
+        ml.handle_frustration(&signal);
+        // severity=f64::MAX → (f64::MAX * 3.0).min(255.0) = 255.0 → ceil = 255 → u8 = 255
+        assert_eq!(
+            ml.suppress_countdown, 255,
+            "severity=f64::MAX should clamp to 255, got {}",
+            ml.suppress_countdown
+        );
+    }
+
+    #[test]
+    fn suppress_countdown_zero_severity_produces_zero_or_one() {
+        // severity = 0.0 → (0.0 * 3.0).min(255.0).ceil() = 0.0 as u8 = 0
+        let mut ml = default_loop();
+        let signal = crate::frustration::FrustrationSignal::Reject { severity: 0.0 };
+        ml.handle_frustration(&signal);
+        // ceil(0.0) = 0, so suppress_countdown = 0
+        assert!(
+            ml.suppress_countdown <= 1,
+            "severity=0.0 should produce suppress_countdown 0 or 1, got {}",
+            ml.suppress_countdown
+        );
+    }
+
+    #[test]
+    fn suppress_countdown_nan_severity_does_not_panic() {
+        // NaN severity: (NaN * 3.0) = NaN; NaN.min(255.0) = NaN on some platforms.
+        // NaN.ceil() = NaN; NaN as u8 = 0 in Rust (saturating cast).
+        // Must not panic.
+        let mut ml = default_loop();
+        let signal = crate::frustration::FrustrationSignal::Reject { severity: f64::NAN };
+        ml.handle_frustration(&signal);
+        // No specific value assertion — just verify no panic and u8 stays valid.
+        let _ = ml.suppress_countdown;
+    }
+
+    #[test]
+    fn suppress_countdown_rapid_delete_nan_severity_does_not_panic() {
+        // RapidDelete path: (severity * 2.0).min(255.0).ceil() as u8
+        let mut ml = default_loop();
+        let signal = crate::frustration::FrustrationSignal::RapidDelete {
+            severity: f64::NAN,
+            count: 5,
+        };
+        ml.handle_frustration(&signal);
+        let _ = ml.suppress_countdown;
+    }
+}

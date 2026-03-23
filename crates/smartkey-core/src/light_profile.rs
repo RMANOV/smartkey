@@ -90,3 +90,123 @@ impl LightProfile {
         self.confidence_floor = (0.50 - 0.35 * self.ghost_accept_rate).max(0.15);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_values_are_sane() {
+        let p = LightProfile::default();
+        // lang_prior sums to ~1.0
+        let sum: f64 = p.lang_prior.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9);
+        // accept rate starts at 0.5
+        assert!((p.ghost_accept_rate - 0.50).abs() < 1e-9);
+        // no suppression initially
+        assert_eq!(p.suppress_after_reject, 0);
+        // confidence floor at default
+        assert!((p.confidence_floor - 0.325).abs() < 1e-6);
+    }
+
+    #[test]
+    fn observe_lang_shifts_prior_toward_observed() {
+        let mut p = LightProfile::default();
+        let initial_bg = p.lang_prior[0];
+        // Observe Bg multiple times
+        for _ in 0..20 {
+            p.observe_lang(LangId::Bg);
+        }
+        assert!(p.lang_prior[0] > initial_bg, "Bg prior should increase");
+    }
+
+    #[test]
+    fn observe_lang_prior_sums_to_one() {
+        let mut p = LightProfile::default();
+        for _ in 0..10 {
+            p.observe_lang(LangId::En);
+        }
+        let sum: f64 = p.lang_prior.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_reject_lowers_accept_rate() {
+        let mut p = LightProfile::default();
+        let initial = p.ghost_accept_rate;
+        p.record_reject();
+        assert!(p.ghost_accept_rate < initial);
+    }
+
+    #[test]
+    fn record_reject_sets_suppression() {
+        let mut p = LightProfile::default();
+        p.record_reject();
+        assert_eq!(p.suppress_after_reject, 2);
+    }
+
+    #[test]
+    fn record_accept_raises_accept_rate() {
+        let mut p = LightProfile::default();
+        p.record_reject(); // first lower it
+        let after_reject = p.ghost_accept_rate;
+        p.record_accept(LangId::En);
+        assert!(p.ghost_accept_rate > after_reject);
+    }
+
+    #[test]
+    fn record_accept_clears_suppression() {
+        let mut p = LightProfile::default();
+        p.record_reject();
+        assert!(p.suppress_after_reject > 0);
+        p.record_accept(LangId::En);
+        assert_eq!(p.suppress_after_reject, 0);
+    }
+
+    #[test]
+    fn tick_suppression_decrements_and_returns_true() {
+        let mut p = LightProfile::default();
+        p.record_reject(); // sets suppress_after_reject = 2
+        let suppressed = p.tick_suppression();
+        assert!(suppressed);
+        assert_eq!(p.suppress_after_reject, 1);
+    }
+
+    #[test]
+    fn tick_suppression_returns_false_when_zero() {
+        let mut p = LightProfile::default();
+        assert_eq!(p.suppress_after_reject, 0);
+        let suppressed = p.tick_suppression();
+        assert!(!suppressed);
+    }
+
+    #[test]
+    fn tick_suppression_exhausts_counter() {
+        let mut p = LightProfile::default();
+        p.record_reject(); // suppress_after_reject = 2
+        assert!(p.tick_suppression()); // → 1, returns true
+        assert!(p.tick_suppression()); // → 0, returns true
+        assert!(!p.tick_suppression()); // → 0, returns false
+    }
+
+    #[test]
+    fn confidence_floor_adapts_with_accept_rate() {
+        let mut p = LightProfile::default();
+        // Drive accept rate high with many accepts
+        for _ in 0..50 {
+            p.record_accept(LangId::En);
+        }
+        let high_accept_floor = p.confidence_floor;
+        // Reset and drive accept rate low
+        let mut p2 = LightProfile::default();
+        for _ in 0..50 {
+            p2.record_reject();
+        }
+        let low_accept_floor = p2.confidence_floor;
+        // Higher accept rate → lower confidence floor (show more ghosts)
+        assert!(high_accept_floor < low_accept_floor);
+        // Floor is always >= 0.15
+        assert!(high_accept_floor >= 0.15);
+        assert!(low_accept_floor >= 0.15);
+    }
+}

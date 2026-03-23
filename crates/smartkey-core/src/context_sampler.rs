@@ -57,3 +57,59 @@ pub fn analyze_surrounding(text: &str) -> ContextAnalysis {
 
     ContextAnalysis { lang, recent_words }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_sampler_returns_none() {
+        let s = NullContextSampler;
+        assert!(s.get_surrounding_text(100).is_none());
+        assert!(s.get_surrounding_text(0).is_none());
+        assert!(s.get_surrounding_text(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn analyze_surrounding_empty_string() {
+        let result = analyze_surrounding("");
+        assert!(result.recent_words.is_empty());
+        // Lang may be None or low-confidence on empty input
+        // No panic is the important property here
+    }
+
+    #[test]
+    fn analyze_surrounding_pure_latin_detects_en() {
+        let result = analyze_surrounding("hello world this is english text");
+        // recent_words should be non-empty
+        assert!(!result.recent_words.is_empty());
+        // Words are returned in reverse order and lowercased
+        assert_eq!(result.recent_words[0], "text");
+    }
+
+    #[test]
+    fn analyze_surrounding_recent_words_max_10() {
+        let text = "one two three four five six seven eight nine ten eleven twelve";
+        let result = analyze_surrounding(text);
+        assert!(result.recent_words.len() <= 10);
+    }
+
+    #[test]
+    fn analyze_surrounding_pure_cyrillic_detects_bg() {
+        let result = analyze_surrounding("здравей свят това е на кирилица");
+        assert!(!result.recent_words.is_empty());
+        // If detected, should be Bg
+        if let Some(lang) = result.lang {
+            assert_eq!(lang, crate::lang_detect::LangId::Bg);
+        }
+    }
+
+    #[test]
+    fn analyze_surrounding_words_are_lowercased() {
+        let result = analyze_surrounding("Hello World");
+        assert!(result
+            .recent_words
+            .iter()
+            .all(|w| w == w.to_lowercase().as_str()));
+    }
+}

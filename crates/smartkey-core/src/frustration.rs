@@ -169,3 +169,160 @@ impl Default for FrustrationDetector {
 fn is_cyrillic(ch: char) -> bool {
     ('\u{0400}'..='\u{04FF}').contains(&ch)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_tab() -> Option<Instant> {
+        None
+    }
+
+    #[test]
+    fn new_detector_has_clean_state() {
+        let d = FrustrationDetector::new();
+        assert!(!d.escape_seen);
+        assert_eq!(d.consecutive_bs, 0);
+        assert!(d.burst_start.is_none());
+        assert!(d.word_prefix_before_delete.is_none());
+    }
+
+    #[test]
+    fn single_backspace_no_signal() {
+        let mut d = FrustrationDetector::new();
+        let result = d.feed(&Key::Backspace, "hel", no_tab());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn rapid_delete_three_backspaces() {
+        let mut d = FrustrationDetector::new();
+        d.feed(&Key::Backspace, "hell", no_tab());
+        d.feed(&Key::Backspace, "hel", no_tab());
+        let result = d.feed(&Key::Backspace, "he", no_tab());
+        // Third backspace within burst window should trigger RapidDelete
+        match result {
+            Some(FrustrationSignal::RapidDelete { severity, count }) => {
+                assert_eq!(count, 3);
+                assert!((0.3..=1.0).contains(&severity));
+            }
+            _ => panic!("Expected RapidDelete signal, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn reject_signal_backspace_after_tab_accept() {
+        let mut d = FrustrationDetector::new();
+        // Simulate a very recent Tab accept
+        let recent_tab = Instant::now();
+        let result = d.feed(&Key::Backspace, "hel", Some(recent_tab));
+        match result {
+            Some(FrustrationSignal::Reject { severity }) => {
+                assert!(severity > 0.0 && severity <= 1.0);
+            }
+            _ => panic!("Expected Reject signal, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn no_reject_when_tab_accept_old() {
+        let mut d = FrustrationDetector::new();
+        // Simulate a Tab accept from far in the past (>500ms)
+        // We can't go back in time with Instant, so we test that
+        // a None tab produces no Reject
+        let result = d.feed(&Key::Backspace, "hel", no_tab());
+        assert!(!matches!(result, Some(FrustrationSignal::Reject { .. })));
+    }
+
+    #[test]
+    fn abandon_signal_escape_then_char() {
+        let mut d = FrustrationDetector::new();
+        d.feed(&Key::Escape, "", no_tab());
+        let result = d.feed(&Key::Char('a'), "a", no_tab());
+        match result {
+            Some(FrustrationSignal::Abandon { severity }) => {
+                assert!((severity - 0.6).abs() < 1e-9);
+            }
+            _ => panic!("Expected Abandon signal, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn no_abandon_without_escape() {
+        let mut d = FrustrationDetector::new();
+        let result = d.feed(&Key::Char('a'), "a", no_tab());
+        assert!(!matches!(result, Some(FrustrationSignal::Abandon { .. })));
+    }
+
+    #[test]
+    fn retype_latin_to_cyrillic() {
+        let mut d = FrustrationDetector::new();
+        // Set up: user typed "hello" (Latin), now deletes
+        d.feed(&Key::Backspace, "hell", no_tab()); // sets word_prefix_before_delete = "hell"
+                                                   // Simulate having deleted enough chars — manually set consecutive_bs
+        d.consecutive_bs = 3;
+        // Now type a Cyrillic character — should detect Retype
+        let result = d.feed(&Key::Char('а'), "а", no_tab()); // Cyrillic 'а'
+                                                             // The old_prefix "hell" is Latin, new char is Cyrillic → Retype
+        match result {
+            Some(FrustrationSignal::Retype { severity, prefix }) => {
+                assert!(!prefix.is_empty());
+                assert!((0.4..=1.0).contains(&severity));
+            }
+            // If old_prefix had < 3 chars or conditions not met, None is also acceptable
+            None => {}
+            other => panic!("Unexpected signal: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reset_word_clears_all_state() {
+        let mut d = FrustrationDetector::new();
+        d.feed(&Key::Escape, "", no_tab());
+        d.feed(&Key::Backspace, "hel", no_tab());
+        d.reset_word();
+        assert!(!d.escape_seen);
+        assert_eq!(d.consecutive_bs, 0);
+        assert!(d.burst_start.is_none());
+        assert!(d.word_prefix_before_delete.is_none());
+    }
+
+    #[test]
+    fn escape_key_sets_escape_seen() {
+        let mut d = FrustrationDetector::new();
+        d.feed(&Key::Escape, "", no_tab());
+        assert!(d.escape_seen);
+    }
+
+    #[test]
+    fn non_backspace_char_resets_burst() {
+        let mut d = FrustrationDetector::new();
+        d.feed(&Key::Backspace, "hel", no_tab());
+        d.feed(&Key::Char('x'), "helx", no_tab());
+        assert_eq!(d.consecutive_bs, 0);
+        assert!(d.burst_start.is_none());
+    }
+
+    #[test]
+    fn rapid_delete_severity_scales_with_count() {
+        let mut d = FrustrationDetector::new();
+        for _ in 0..8 {
+            d.feed(&Key::Backspace, "word", no_tab());
+        }
+        // With 8 backspaces: severity = (8/8).clamp(0.3, 1.0) = 1.0
+        // Check the last emitted signal has max severity
+        // Re-feed one more to get a fresh signal
+        let result = d.feed(&Key::Backspace, "word", no_tab());
+        if let Some(FrustrationSignal::RapidDelete { severity, .. }) = result {
+            assert!((0.3..=1.0).contains(&severity));
+        }
+    }
+
+    #[test]
+    fn default_is_same_as_new() {
+        let d1 = FrustrationDetector::new();
+        let d2 = FrustrationDetector::default();
+        assert_eq!(d1.consecutive_bs, d2.consecutive_bs);
+        assert_eq!(d1.escape_seen, d2.escape_seen);
+    }
+}

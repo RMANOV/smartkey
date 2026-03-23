@@ -126,3 +126,104 @@ impl Default for CorrectionMemory {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_and_check_below_threshold() {
+        let mut mem = CorrectionMemory::new();
+        let hash = CorrectionMemory::context_hash(Some("the"), Some("quick"));
+        mem.record(hash, "fox", "cat");
+        mem.record(hash, "fox", "cat");
+        // Only 2 corrections — threshold is 3, should not suppress yet
+        assert!(mem.check(hash, "fox").is_none());
+    }
+
+    #[test]
+    fn record_and_check_at_threshold() {
+        let mut mem = CorrectionMemory::new();
+        let hash = CorrectionMemory::context_hash(Some("the"), Some("quick"));
+        mem.record(hash, "fox", "cat");
+        mem.record(hash, "fox", "cat");
+        mem.record(hash, "fox", "cat");
+        // 3 corrections — should now suppress
+        let result = mem.check(hash, "fox");
+        assert_eq!(result, Some("cat".to_string()));
+    }
+
+    #[test]
+    fn context_hash_is_deterministic() {
+        let h1 = CorrectionMemory::context_hash(Some("hello"), Some("world"));
+        let h2 = CorrectionMemory::context_hash(Some("hello"), Some("world"));
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn context_hash_differs_for_different_context() {
+        let h1 = CorrectionMemory::context_hash(Some("hello"), Some("world"));
+        let h2 = CorrectionMemory::context_hash(Some("foo"), Some("bar"));
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn context_hash_none_context() {
+        let h1 = CorrectionMemory::context_hash(None, None);
+        let h2 = CorrectionMemory::context_hash(None, None);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn different_predicted_prefixes_tracked_independently() {
+        let mut mem = CorrectionMemory::new();
+        let hash = CorrectionMemory::context_hash(Some("the"), None);
+        for _ in 0..3 {
+            mem.record(hash, "wrong1", "right");
+        }
+        // "wrong2" has zero corrections — should not suppress
+        assert!(mem.check(hash, "wrong2").is_none());
+        // "wrong1" has 3 corrections — should suppress
+        assert!(mem.check(hash, "wrong1").is_some());
+    }
+
+    #[test]
+    fn actual_updates_on_new_correction() {
+        let mut mem = CorrectionMemory::new();
+        let hash = CorrectionMemory::context_hash(Some("a"), Some("b"));
+        mem.record(hash, "pred", "first");
+        mem.record(hash, "pred", "first");
+        // Update "actual" to something different on the 3rd correction
+        mem.record(hash, "pred", "second");
+        let result = mem.check(hash, "pred");
+        assert_eq!(result, Some("second".to_string()));
+    }
+
+    #[test]
+    fn snapshot_round_trip() {
+        let mut mem = CorrectionMemory::new();
+        let hash = CorrectionMemory::context_hash(Some("x"), Some("y"));
+        for _ in 0..3 {
+            mem.record(hash, "bad", "good");
+        }
+        let snapshot = mem.to_snapshot();
+        assert_eq!(snapshot.entries.len(), 1);
+        let restored = CorrectionMemory::from_snapshot(&snapshot);
+        let snap2 = restored.to_snapshot();
+        assert_eq!(snap2.entries.len(), 1);
+        assert_eq!(snap2.entries[0].count, 3);
+    }
+
+    #[test]
+    fn lru_eviction_keeps_within_capacity() {
+        // Use a small capacity by manually filling
+        let mut mem = CorrectionMemory::new();
+        // Fill to just above max_entries (500)
+        for i in 0..502u64 {
+            let hash = i;
+            mem.record(hash, "pred", "actual");
+        }
+        // After eviction, entries should be <= max_entries
+        assert!(mem.entries.len() <= 500);
+    }
+}

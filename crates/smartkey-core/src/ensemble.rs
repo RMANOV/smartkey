@@ -1543,4 +1543,89 @@ mod tests {
             preds[0].confidence
         );
     }
+
+    // ==================================================================
+    // NaN/Inf edge-case tests
+    // ==================================================================
+
+    #[test]
+    fn predict_no_panic_with_nan_weights() {
+        // Set alpha/beta/gamma to NaN and verify predict() doesn't panic.
+        // We can't set internal fields directly, so we use adaptive weight
+        // update: load a word and call predict with corrupt alpha via
+        // from_config with NaN weights — InputConfig doesn't validate weights
+        // in from_config path (only try_from_json does).
+        let config = crate::input::InputConfig {
+            weights: (f64::NAN, f64::NAN, f64::NAN),
+            ..crate::input::InputConfig::default()
+        };
+        let mut engine = SmartKeyEngine::from_config(&config);
+        engine.load_word("hello", 100);
+        // Must not panic even with NaN weights.
+        let preds = engine.predict("hel", &[], 5, None);
+        // Confidences must be finite (clamped or zeroed).
+        for p in &preds {
+            assert!(
+                p.confidence.is_finite(),
+                "confidence must be finite even with NaN weights, got {}",
+                p.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn predict_no_panic_with_inf_weights() {
+        let config = crate::input::InputConfig {
+            weights: (f64::INFINITY, f64::NEG_INFINITY, 0.0),
+            ..crate::input::InputConfig::default()
+        };
+        let mut engine = SmartKeyEngine::from_config(&config);
+        engine.load_word("test", 50);
+        engine.load_word("team", 40);
+        // Must not panic with Inf weights.
+        let preds = engine.predict("te", &[], 5, None);
+        for p in &preds {
+            assert!(
+                p.confidence.is_finite(),
+                "confidence must be finite with Inf weights, got {}",
+                p.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn predict_zero_score_sum_produces_no_confidence_panic() {
+        // When all candidates have score 0 (e.g., zero weights), score_sum = 0.0
+        // and the normalization branch is skipped. Confidences remain 0.0.
+        let config = crate::input::InputConfig {
+            weights: (0.0, 0.0, 0.0),
+            ..crate::input::InputConfig::default()
+        };
+        let mut engine = SmartKeyEngine::from_config(&config);
+        engine.load_word("hello", 100);
+        // Must not panic; confidences should be 0.0 (no normalization applied).
+        let preds = engine.predict("hel", &[], 5, None);
+        for p in &preds {
+            assert!(
+                p.confidence >= 0.0 && p.confidence <= 1.0,
+                "confidence out of [0,1] with zero weights: {}",
+                p.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn confidence_single_garbage_score_does_not_nan() {
+        // Single word with very small but positive frequency.
+        // score_sum = that small score; ratio = 1.0; clamp keeps it in range.
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("zz", 1);
+        let preds = engine.predict("zz", &[], 5, None);
+        assert!(!preds.is_empty());
+        assert!(
+            preds[0].confidence.is_finite() && preds[0].confidence >= 0.0,
+            "single garbage word confidence must be finite non-negative, got {}",
+            preds[0].confidence
+        );
+    }
 }

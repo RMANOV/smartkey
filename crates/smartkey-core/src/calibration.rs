@@ -275,4 +275,77 @@ mod tests {
             }
         }
     }
+
+    // ==================================================================
+    // NaN/Inf guard tests
+    // ==================================================================
+
+    #[test]
+    fn observe_nan_is_silently_ignored() {
+        let mut cal = ConfidenceCalibrator::new();
+        let before = cal.buffer.len();
+        cal.observe(f64::NAN, true);
+        assert_eq!(
+            cal.buffer.len(),
+            before,
+            "observe(NaN) should not grow the buffer"
+        );
+        assert_eq!(
+            cal.total_observations, 0,
+            "NaN should not count as observation"
+        );
+    }
+
+    #[test]
+    fn observe_infinity_is_silently_ignored() {
+        let mut cal = ConfidenceCalibrator::new();
+        cal.observe(f64::INFINITY, true);
+        assert_eq!(
+            cal.total_observations, 0,
+            "observe(+Inf) should not count as observation"
+        );
+        assert!(cal.buffer.is_empty(), "+Inf should not be pushed to buffer");
+    }
+
+    #[test]
+    fn observe_neg_infinity_is_silently_ignored() {
+        let mut cal = ConfidenceCalibrator::new();
+        cal.observe(f64::NEG_INFINITY, false);
+        assert_eq!(
+            cal.total_observations, 0,
+            "observe(-Inf) should not count as observation"
+        );
+        assert!(cal.buffer.is_empty(), "-Inf should not be pushed to buffer");
+    }
+
+    #[test]
+    fn calibrate_still_works_after_nan_observations_are_filtered() {
+        let mut cal = ConfidenceCalibrator::new();
+        // Mix NaN observations with valid ones.
+        for i in 0..50 {
+            cal.observe(f64::NAN, i > 25); // all ignored
+            cal.observe(i as f64 / 50.0, i > 25); // valid
+        }
+        // Only valid observations should count (50 total).
+        assert_eq!(
+            cal.total_observations, 50,
+            "only finite observations should be counted, got {}",
+            cal.total_observations
+        );
+        assert!(
+            cal.is_ready(),
+            "calibrator should be ready after 50 valid observations"
+        );
+        let result = cal.calibrate(0.7);
+        assert!(
+            result.is_some(),
+            "calibrate() should work after NaN filtering"
+        );
+        let val = result.unwrap();
+        assert!(
+            (0.0..=1.0).contains(&val),
+            "calibrated value out of range: {}",
+            val
+        );
+    }
 }
