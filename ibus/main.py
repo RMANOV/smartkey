@@ -35,8 +35,13 @@ try:
 except (ValueError, ImportError):
     _HAS_IBUS = False
 
-# Engine class import (side-effect: registers the GType).
-from smartkey_engine import SmartKeyEngine  # noqa: E402, F401
+# Engine module import (side-effect: registers the GType).
+try:
+    from . import smartkey_engine as _smartkey_engine  # type: ignore[attr-defined]
+except ImportError:
+    import smartkey_engine as _smartkey_engine  # type: ignore[import-not-found]
+
+_ENGINE_MODULE = _smartkey_engine
 
 # ---------------------------------------------------------------------------
 # Constants.
