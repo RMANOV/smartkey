@@ -431,7 +431,10 @@ impl MasterLoop {
         };
 
         if let Some(idx) = actions.iter().position(|action| {
-            matches!(action, Action::ShowGhost(_) | Action::ShowComposing { .. } | Action::HideGhost)
+            matches!(
+                action,
+                Action::ShowGhost(_) | Action::ShowComposing { .. } | Action::HideGhost
+            )
         }) {
             actions[idx] = override_action;
         } else {
@@ -720,6 +723,9 @@ mod tests {
 
         assert_eq!(ghost_text(&actions).as_deref(), Some("p"));
         assert_eq!(ml.ghost_text(), "p");
-        assert_eq!(ml.predictions().first().map(|p| p.word.as_str()), Some("help"));
+        assert_eq!(
+            ml.predictions().first().map(|p| p.word.as_str()),
+            Some("help")
+        );
     }
 }
