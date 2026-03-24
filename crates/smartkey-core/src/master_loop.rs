@@ -471,7 +471,11 @@ impl MasterLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::correction_memory::CorrectionMemory;
+    use crate::cvm::CvmSnapshot;
     use crate::input::{InputConfig, Key, KeyEvent, Modifiers};
+    use crate::personal::{PersonalMarkovSnapshot, PersonalProfile};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_key(key: Key) -> KeyEvent {
         KeyEvent {
@@ -482,6 +486,29 @@ mod tests {
 
     fn default_loop() -> MasterLoop {
         MasterLoop::new(InputConfig::default())
+    }
+
+    fn test_cvm_snapshot() -> CvmSnapshot {
+        CvmSnapshot {
+            version: 1,
+            saved_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_secs_f64(),
+            capacity: 500,
+            max_capacity: 5000,
+            round: 0,
+            decay_lambda: 0.001,
+            words: vec![],
+            age_secs: Default::default(),
+        }
+    }
+
+    fn ghost_text(actions: &[Action]) -> Option<String> {
+        actions.iter().find_map(|action| match action {
+            Action::ShowGhost(text) => Some(text.clone()),
+            _ => None,
+        })
     }
 
     #[test]
@@ -649,5 +676,50 @@ mod tests {
         };
         ml.handle_frustration(&signal);
         let _ = ml.suppress_countdown;
+    }
+
+    #[test]
+    fn persisted_correction_overrides_ghost_prediction() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let profile_path = dir.path().join("master_loop_profile.json");
+
+        let mut corrections = CorrectionMemory::new();
+        let ctx_hash = CorrectionMemory::context_hash(None, None);
+        corrections.record(ctx_hash, "hello", "help");
+        corrections.record(ctx_hash, "hello", "help");
+        corrections.record(ctx_hash, "hello", "help");
+
+        let mut profile = PersonalProfile::new(
+            test_cvm_snapshot(),
+            PersonalMarkovSnapshot {
+                bigrams: vec![],
+                trigrams: vec![],
+            },
+            None,
+        );
+        profile.corrections = Some(corrections.to_snapshot());
+
+        std::fs::write(
+            &profile_path,
+            serde_json::to_string_pretty(&profile).expect("profile should serialize"),
+        )
+        .expect("profile should write");
+
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 100);
+        ml.load_word("help", 80);
+        ml.load_personal(&profile_path)
+            .expect("profile should load into master loop");
+
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        let actions = ml.handle_key(make_key(Key::Char('l')));
+
+        assert_eq!(ghost_text(&actions).as_deref(), Some("p"));
+        assert_eq!(ml.ghost_text(), "p");
+        assert_eq!(ml.predictions().first().map(|p| p.word.as_str()), Some("help"));
     }
 }

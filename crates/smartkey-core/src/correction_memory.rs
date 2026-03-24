@@ -51,11 +51,11 @@ impl CorrectionMemory {
     /// Record that (context, predicted) was corrected to actual.
     pub fn record(&mut self, context_hash: u64, predicted_prefix: &str, actual: &str) {
         self.access_counter += 1;
-        let key = (context_hash, predicted_prefix.to_string());
+        let key = (context_hash, predicted_prefix.to_lowercase());
 
         let entry = self.entries.entry(key).or_insert_with(|| CorrectionEntry {
             context_hash,
-            predicted_prefix: predicted_prefix.to_string(),
+            predicted_prefix: predicted_prefix.to_lowercase(),
             actual: actual.to_string(),
             count: 0,
             access_order: self.access_counter,
@@ -74,7 +74,7 @@ impl CorrectionMemory {
     /// Returns Some(replacement) if the predicted prefix has been corrected
     /// at least `suppression_threshold` times in this context.
     pub fn check(&mut self, context_hash: u64, predicted_prefix: &str) -> Option<String> {
-        let key = (context_hash, predicted_prefix.to_string());
+        let key = (context_hash, predicted_prefix.to_lowercase());
         if let Some(entry) = self.entries.get_mut(&key) {
             if entry.count >= self.suppression_threshold {
                 self.access_counter += 1;
@@ -103,8 +103,10 @@ impl CorrectionMemory {
     pub fn from_snapshot(snapshot: &CorrectionSnapshot) -> Self {
         let mut mem = Self::new();
         for entry in &snapshot.entries {
-            let key = (entry.context_hash, entry.predicted_prefix.clone());
-            mem.entries.insert(key, entry.clone());
+            let mut normalized = entry.clone();
+            normalized.predicted_prefix = normalized.predicted_prefix.to_lowercase();
+            let key = (normalized.context_hash, normalized.predicted_prefix.clone());
+            mem.entries.insert(key, normalized);
         }
         mem
     }

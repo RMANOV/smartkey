@@ -2,7 +2,8 @@
 
 This module implements the IBus.Engine subclass that drives SmartKey.
 All key event logic, ghost text lifecycle, and prediction state live in the
-Rust ``InputMethodCore`` — this Python layer is a thin IBus adapter.
+Rust ``MasterLoop``/``InputMethodCore`` stack — this Python layer is a thin
+IBus adapter.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import json
 import logging
 import os
 import time
+from json import JSONDecodeError
 from pathlib import Path
 
 log = logging.getLogger("smartkey")
@@ -40,7 +42,7 @@ except (ValueError, ImportError):
 
         class Text:
             @staticmethod
-            def new_from_string(s: str) -> "_FakeIBus.Text":
+            def new_from_string(_s: str) -> "_FakeIBus.Text":
                 return _FakeIBus.Text()
 
         class Attribute:
@@ -75,30 +77,50 @@ except ImportError:
     class PyInputMethodCore:  # type: ignore[no-redef]
         """Stub when the native extension is not available."""
 
-        def __init__(self, config_json: str | None = None) -> None: ...
-        def load_word(self, word: str, freq: int) -> None: ...
-        def load_bigram(self, ctx: str, word: str, count: int) -> None: ...
-        def load_trigram(self, w1: str, w2: str, word: str, count: int) -> None: ...
-        def load_corpus_file(self, path: str) -> None: ...
-        def handle_key(self, keyval: int, modifiers: int) -> list[tuple[str, str]]:
+        def __init__(self, _config_json: str | None = None) -> None:
+            return None
+
+        def load_word(self, _word: str, _freq: int) -> None:
+            return None
+
+        def load_bigram(self, _ctx: str, _word: str, _count: int) -> None:
+            return None
+
+        def load_trigram(self, _w1: str, _w2: str, _word: str, _count: int) -> None:
+            return None
+
+        def load_corpus_file(self, _path: str) -> None:
+            return None
+
+        def handle_key(self, _keyval: int, _modifiers: int) -> list[tuple[str, str]]:
             return [("forward", "")]
 
         def process_keycode(
-            self, keycode: int, modifiers: int
+            self, _keycode: int, _modifiers: int
         ) -> list[tuple[str, str]]:
             return [("forward", "")]
 
         def focus_lost(self) -> list[tuple[str, str]]:
             return []
 
-        def focus_gained(self) -> None: ...
+        def focus_gained(self) -> None:
+            return None
+
         def reset(self) -> list[tuple[str, str]]:
             return []
 
-        def save_personal(self) -> None: ...
-        def load_personal(self) -> None: ...
-        def export_personal(self, path: str) -> None: ...
-        def import_personal(self, path: str) -> None: ...
+        def save_personal(self) -> None:
+            return None
+
+        def load_personal(self) -> None:
+            return None
+
+        def export_personal(self, _path: str) -> None:
+            return None
+
+        def import_personal(self, _path: str) -> None:
+            return None
+
         def predictions(self) -> list[tuple[str, float, float]]:
             return []
 
@@ -158,7 +180,7 @@ def _load_json(path: Path, default: dict | list | None = None) -> dict | list | 
     """Return parsed JSON from *path*, or *default* on any error."""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, UnicodeDecodeError, JSONDecodeError):
         return default
 
 
@@ -190,7 +212,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # Load personal profile (learned words from previous sessions).
         try:
             self._core.load_personal()
-        except Exception:
+        except OSError:
             log.debug("smartkey: no personal profile loaded (first run?)")
 
         # Debounce timer for auto-save on focus-out (60s cooldown).
@@ -268,7 +290,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         for path in corpus_files:
             try:
                 self._core.load_corpus_file(str(path))
-            except Exception:
+            except OSError:
                 log.warning("Failed to load corpus %s", path, exc_info=True)
 
     # -----------------------------------------------------------------------
@@ -480,7 +502,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             try:
                 self._core.save_personal()
                 self._last_save = now
-            except Exception:
+            except OSError:
                 log.warning("Failed to save personal profile", exc_info=True)
 
     def do_reset(self) -> None:
@@ -496,5 +518,5 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # Save personal profile on engine disable (session end).
         try:
             self._core.save_personal()
-        except Exception:
+        except OSError:
             log.warning("Failed to save personal profile", exc_info=True)
