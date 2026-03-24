@@ -223,8 +223,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # Load personal profile (learned words from previous sessions).
         try:
             self._core.load_personal()
-        except OSError:
+        except FileNotFoundError:
             log.debug("smartkey: no personal profile loaded (first run?)")
+        except OSError:
+            log.warning("smartkey: failed to load personal profile", exc_info=True)
 
         # Debounce timer for auto-save on focus-out (60s cooldown).
         self._last_save: float = 0.0
@@ -514,7 +516,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 self._core.save_personal()
                 self._last_save = now
             except OSError:
-                log.warning("Failed to save personal profile", exc_info=True)
+                log.warning("smartkey: failed to save personal profile", exc_info=True)
 
     def do_reset(self) -> None:
         actions = self._core.reset()
@@ -530,4 +532,4 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         try:
             self._core.save_personal()
         except OSError:
-            log.warning("Failed to save personal profile", exc_info=True)
+            log.warning("smartkey: failed to save personal profile", exc_info=True)
