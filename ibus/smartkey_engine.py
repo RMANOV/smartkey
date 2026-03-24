@@ -180,7 +180,13 @@ def _load_json(path: Path, default: dict | list | None = None) -> dict | list | 
     """Return parsed JSON from *path*, or *default* on any error."""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, JSONDecodeError):
+    except FileNotFoundError:
+        return default
+    except (UnicodeDecodeError, JSONDecodeError) as exc:
+        log.warning("smartkey: invalid JSON in %s (%s) — using defaults", path, exc)
+        return default
+    except OSError as exc:
+        log.warning("smartkey: cannot read %s (%s) — using defaults", path, exc)
         return default
 
 
@@ -201,6 +207,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     def __init__(self) -> None:
         super().__init__()
+
+        if not _HAS_CORE:
+            raise RuntimeError(
+                "smartkey_py native extension is unavailable; SmartKey cannot start"
+            )
 
         # Load user config — Rust core handles defaults, we only pass overrides.
         user_cfg = _load_json(_CONFIG_FILE)
