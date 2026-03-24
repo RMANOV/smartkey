@@ -68,11 +68,21 @@ except (ValueError, ImportError):
 # Rust prediction engine via PyO3.
 # ---------------------------------------------------------------------------
 try:
-    from smartkey_py import PyInputMethodCore  # type: ignore[import-untyped]
+    from smartkey_py import (  # type: ignore[import-untyped]
+        PyInputMethodCore,
+        ffi_decode_composing_payload,
+        ffi_decode_replace_payload,
+    )
 
     _HAS_CORE = True
 except ImportError:
     _HAS_CORE = False
+
+    def ffi_decode_replace_payload(_payload: str) -> tuple[int, str] | None:
+        return None
+
+    def ffi_decode_composing_payload(_payload: str) -> tuple[str, str] | None:
+        return None
 
     class PyInputMethodCore:  # type: ignore[no-redef]
         """Stub when the native extension is not available."""
@@ -149,31 +159,6 @@ _CORPUS_FILE = _CONFIG_DIR / "corpus.json"
 # An explicit _CORPUS_DIR env var overrides both _CONFIG_DIR and the repo path.
 _REPO_DIR = Path(__file__).resolve().parent.parent
 _REPO_CORPUS_DIR = _REPO_DIR / "corpus"
-
-
-def _decode_replace_payload(payload: str) -> tuple[int, str] | None:
-    """Parse a ReplaceWord payload defensively."""
-    try:
-        n_str, text = payload.split("\x1f", 1)
-        replace_len = int(n_str)
-    except (TypeError, ValueError):
-        log.warning("smartkey: malformed replace payload %r", payload)
-        return None
-    if replace_len < 0:
-        log.warning("smartkey: negative replace length in payload %r", payload)
-        return None
-    return replace_len, text
-
-
-def _decode_composing_payload(payload: str) -> tuple[str, str]:
-    """Parse a ShowComposing payload defensively."""
-    try:
-        if "\x00" in payload:
-            return payload.split("\x00", 1)
-    except TypeError:
-        log.warning("smartkey: malformed composing payload %r", payload)
-        return "", ""
-    return payload, ""
 
 
 def _load_json(path: Path, default: dict | list | None = None) -> dict | list | None:
@@ -408,8 +393,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             elif action_type == "replace":
                 if self._preedit_active:
                     self._clear_ghost()
-                decoded = _decode_replace_payload(payload)
+                decoded = ffi_decode_replace_payload(payload)
                 if decoded is None:
+                    log.warning("smartkey: malformed replace payload %r", payload)
                     continue
                 replace_len, text = decoded
                 if self._caps & 0x20:  # SURROUNDING_TEXT capability
@@ -421,7 +407,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                         self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
                 self._safe_commit(text)
             elif action_type == "composing":
-                typed, ghost = _decode_composing_payload(payload)
+                decoded = ffi_decode_composing_payload(payload)
+                if decoded is None:
+                    log.warning("smartkey: malformed composing payload %r", payload)
+                    continue
+                typed, ghost = decoded
                 self._show_composing(typed, ghost)
                 if _PRED_LOG:
                     preds2 = self._core.predictions()

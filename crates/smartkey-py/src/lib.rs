@@ -1,112 +1,10 @@
-// PyO3's #[pyclass] macro generates code referencing the struct by name; when
-// the struct is marked #[deprecated] those macro-expanded references trigger
-// deprecation warnings that can't be suppressed per-item.  Suppress them here
-// at the module level so external callers still see the deprecation.
-#![allow(deprecated)]
-
 use pyo3::prelude::*;
-use smartkey_core::cvm::CvmSnapshot;
-use smartkey_core::ensemble::SmartKeyEngine;
+use smartkey_core::ffi_protocol::{
+    decode_composing_payload, decode_replace_payload, encode_composing_payload,
+    encode_replace_payload,
+};
 use smartkey_core::input::{Action, InputConfig, Key, KeyEvent, Modifiers};
 use smartkey_core::MasterLoop;
-
-// ======================================================================
-// Legacy API — kept for backward compatibility with existing IBus engine.
-// ======================================================================
-
-#[deprecated(since = "0.5.0", note = "Use PyInputMethodCore instead")]
-/// unsendable: SmartKeyEngine contains RefCell (not Send).
-/// IBus runs single-threaded under the GIL — this is correct and safe.
-#[pyclass(unsendable)]
-#[allow(deprecated)]
-struct PySmartKeyEngine {
-    inner: SmartKeyEngine,
-}
-
-#[allow(deprecated)]
-#[pymethods]
-impl PySmartKeyEngine {
-    #[new]
-    fn new() -> Self {
-        Self {
-            inner: SmartKeyEngine::new(),
-        }
-    }
-
-    /// Create an engine from a JSON config string (weights, tuning, etc.).
-    #[staticmethod]
-    fn from_config(config_json: &str) -> PyResult<Self> {
-        serde_json::from_str::<serde_json::Value>(config_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Invalid config JSON: {e}"))
-        })?;
-        let config = InputConfig::from_json(config_json);
-        Ok(Self {
-            inner: SmartKeyEngine::from_config(&config),
-        })
-    }
-
-    /// Export the personal CVM profile to a JSON file.
-    ///
-    /// **Deprecated:** This exports only the CVM snapshot, losing Markov chain
-    /// and per-language CVM data. Use `PyInputMethodCore.export_personal()` instead
-    /// for full profile persistence.
-    fn export_personal(&self, path: &str) -> PyResult<()> {
-        log::warn!(
-            "smartkey: PySmartKeyEngine.export_personal() is deprecated — \
-                   use PyInputMethodCore.export_personal() for full profile persistence"
-        );
-        let snap = self.inner.export_personal();
-        let json = serde_json::to_string_pretty(&snap).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to serialize personal profile: {e}"
-            ))
-        })?;
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        }
-        std::fs::write(path, json).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
-    }
-
-    /// Import the personal CVM profile from a JSON file (no-op if missing).
-    fn import_personal(&mut self, path: &str) -> PyResult<()> {
-        let p = std::path::Path::new(path);
-        if !p.is_file() {
-            return Ok(());
-        }
-        let data = std::fs::read_to_string(p)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let snap: CvmSnapshot = serde_json::from_str(&data)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        self.inner.import_personal(&snap);
-        Ok(())
-    }
-
-    fn load_word(&mut self, word: &str, frequency: u32) {
-        self.inner.load_word(word, frequency);
-    }
-
-    fn load_bigram(&mut self, context: &str, word: &str, count: u32) {
-        self.inner.load_bigram(context, word, count);
-    }
-
-    fn load_trigram(&mut self, w1: &str, w2: &str, word: &str, count: u32) {
-        self.inner.load_trigram(w1, w2, word, count);
-    }
-
-    fn learn(&mut self, word: &str) {
-        self.inner.learn(word);
-    }
-
-    fn predict(&self, prefix: &str, context: Vec<String>, limit: usize) -> Vec<(String, f64, f64)> {
-        let ctx_refs: Vec<&str> = context.iter().map(|s| s.as_str()).collect();
-        self.inner
-            .predict(prefix, &ctx_refs, limit, None)
-            .into_iter()
-            .map(|p| (p.word, p.score, p.confidence))
-            .collect()
-    }
-}
 
 // ======================================================================
 // New API — InputMethodCore with full state machine.
@@ -128,13 +26,22 @@ fn action_to_tuple(action: &Action) -> (String, String) {
         Action::CommitText(text) => ("commit".into(), text.clone()),
         Action::ForwardKey => ("forward".into(), String::new()),
         Action::ReplaceWord { replace_len, text } => {
-            // \x1F = Unit Separator — avoids ambiguity if text contains colons
-            ("replace".into(), format!("{replace_len}\x1F{text}"))
+            ("replace".into(), encode_replace_payload(*replace_len, text))
         }
         Action::ShowComposing { typed, ghost } => {
-            ("composing".into(), format!("{}\x00{}", typed, ghost))
+            ("composing".into(), encode_composing_payload(typed, ghost))
         }
     }
+}
+
+#[pyfunction]
+fn ffi_decode_replace_payload(payload: &str) -> Option<(usize, String)> {
+    decode_replace_payload(payload).map(|(replace_len, text)| (replace_len, text.to_owned()))
+}
+
+#[pyfunction]
+fn ffi_decode_composing_payload(payload: &str) -> Option<(String, String)> {
+    decode_composing_payload(payload).map(|(typed, ghost)| (typed.to_owned(), ghost.to_owned()))
 }
 
 /// Translate a raw keyval (IBus / X11 keysym or Unicode codepoint) into a `Key`.
@@ -312,8 +219,8 @@ impl PyInputMethodCore {
 
 #[pymodule]
 fn smartkey_py(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    #[allow(deprecated)]
-    m.add_class::<PySmartKeyEngine>()?;
     m.add_class::<PyInputMethodCore>()?;
+    m.add_function(wrap_pyfunction!(ffi_decode_replace_payload, m)?)?;
+    m.add_function(wrap_pyfunction!(ffi_decode_composing_payload, m)?)?;
     Ok(())
 }

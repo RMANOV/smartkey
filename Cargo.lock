@@ -800,9 +800,7 @@ dependencies = [
 name = "smartkey-py"
 version = "0.5.0"
 dependencies = [
- "log",
  "pyo3",
- "serde_json",
  "smartkey-core",
 ]
 

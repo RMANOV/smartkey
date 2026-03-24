@@ -77,8 +77,8 @@ pub struct SmartKeyEngine {
     fuzzy_max_edits: u8,
     fuzzy_discounts: [f64; 3],
     /// Prediction cache (RefCell: predict takes &self but cache needs mutation;
-    /// RefCell is safe here because SmartKeyEngine is single-threaded — IBus
-    /// runs under the GIL and PySmartKeyEngine is marked `#[pyclass(unsendable)]`).
+    /// RefCell is safe here because the Linux PyO3 bridge is single-threaded
+    /// under the GIL and exposes unsendable classes).
     cache: RefCell<PredictionCache>,
     /// BPE tokenizer for OOV fallback (v0.4.0).
     bpe: Option<BpeTokenizer>,
