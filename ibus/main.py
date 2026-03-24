@@ -44,6 +44,10 @@ from smartkey_engine import SmartKeyEngine  # noqa: E402, F401
 _BUS_NAME = "org.freedesktop.IBus.SmartKey"
 _OBJECT_PATH = "/org/freedesktop/IBus/Engine/SmartKey"
 _ENGINE_NAME = "smartkey"
+_ENGINE_VERSION = "0.5.0"
+_ENGINE_LICENSE = "GPL-3.0-only"
+_ENGINE_AUTHOR = "SmartKey Contributors"
+_ENGINE_DESCRIPTION = "Predictive text input with ghost text completion"
 
 
 # ---------------------------------------------------------------------------
@@ -57,20 +61,20 @@ def main() -> None:
             "<component>\n"
             f"  <name>{_BUS_NAME}</name>\n"
             "  <description>SmartKey Predictive Input</description>\n"
-            "  <version>0.1.0</version>\n"
-            "  <license>MIT</license>\n"
-            "  <author>SmartKey Contributors</author>\n"
+            f"  <version>{_ENGINE_VERSION}</version>\n"
+            f"  <license>{_ENGINE_LICENSE}</license>\n"
+            f"  <author>{_ENGINE_AUTHOR}</author>\n"
             "  <homepage>https://github.com/RMANOV/smartkey</homepage>\n"
             "  <engines>\n"
             "    <engine>\n"
             f"      <name>{_ENGINE_NAME}</name>\n"
             "      <language>en</language>\n"
-            "      <license>MIT</license>\n"
-            "      <author>SmartKey Contributors</author>\n"
+            f"      <license>{_ENGINE_LICENSE}</license>\n"
+            f"      <author>{_ENGINE_AUTHOR}</author>\n"
             "      <icon>preferences-desktop-keyboard</icon>\n"
             "      <layout>default</layout>\n"
             "      <longname>SmartKey Predictive Input</longname>\n"
-            "      <description>Predictive text input with ghost text</description>\n"
+            f"      <description>{_ENGINE_DESCRIPTION}</description>\n"
             "      <rank>80</rank>\n"
             "      <symbol>SK</symbol>\n"
             "    </engine>\n"
@@ -128,9 +132,9 @@ def main() -> None:
         component = IBus.Component.new(
             _BUS_NAME,
             "SmartKey Predictive Input",
-            "0.1.0",
-            "MIT",
-            "SmartKey Contributors",
+            _ENGINE_VERSION,
+            _ENGINE_LICENSE,
+            _ENGINE_AUTHOR,
             "https://github.com/RMANOV/smartkey",
             "",
             "smartkey",
@@ -138,10 +142,10 @@ def main() -> None:
         engine_desc = IBus.EngineDesc.new(
             _ENGINE_NAME,
             "SmartKey Predictive Input",
-            "Predictive text input with ghost text completion",
+            _ENGINE_DESCRIPTION,
             "en",
-            "MIT",
-            "SmartKey Contributors",
+            _ENGINE_LICENSE,
+            _ENGINE_AUTHOR,
             "preferences-desktop-keyboard",
             "default",
         )

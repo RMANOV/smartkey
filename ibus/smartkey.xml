@@ -3,9 +3,9 @@
     <name>org.freedesktop.IBus.SmartKey</name>
     <description>SmartKey Predictive Input</description>
     <exec>/usr/lib/ibus-smartkey/ibus-engine-smartkey --ibus</exec>
-    <version>0.1.0</version>
+    <version>0.5.0</version>
     <author>SmartKey Contributors</author>
-    <license>MIT</license>
+    <license>GPL-3.0-only</license>
     <homepage>https://github.com/RMANOV/smartkey</homepage>
     <textdomain>ibus-smartkey</textdomain>
 
@@ -13,7 +13,7 @@
         <engine>
             <name>smartkey</name>
             <language>en</language>
-            <license>MIT</license>
+            <license>GPL-3.0-only</license>
             <author>SmartKey Contributors</author>
             <icon>preferences-desktop-keyboard</icon>
             <layout>default</layout>

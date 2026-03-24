@@ -7,7 +7,8 @@
 use pyo3::prelude::*;
 use smartkey_core::cvm::CvmSnapshot;
 use smartkey_core::ensemble::SmartKeyEngine;
-use smartkey_core::input::{Action, InputConfig, InputMethodCore, Key, KeyEvent, Modifiers};
+use smartkey_core::input::{Action, InputConfig, Key, KeyEvent, Modifiers};
+use smartkey_core::MasterLoop;
 
 // ======================================================================
 // Legacy API — kept for backward compatibility with existing IBus engine.
@@ -116,7 +117,7 @@ impl PySmartKeyEngine {
 /// IBus runs single-threaded under the GIL — this is correct and safe.
 #[pyclass(unsendable)]
 struct PyInputMethodCore {
-    inner: InputMethodCore,
+    inner: MasterLoop,
 }
 
 /// Convert an `Action` to a Python-friendly `(type, payload)` tuple.
@@ -192,7 +193,7 @@ impl PyInputMethodCore {
             None => InputConfig::default(),
         };
         Self {
-            inner: InputMethodCore::new(config),
+            inner: MasterLoop::new(config),
         }
     }
 

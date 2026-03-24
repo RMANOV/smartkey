@@ -131,7 +131,8 @@ impl MasterLoop {
         } else {
             None
         };
-        let actions = self.core.handle_key(event.clone());
+        let mut actions = self.core.handle_key(event.clone());
+        self.apply_correction_override(&mut actions);
 
         // Track Tab acceptance time for REJECT detection.
         if is_tab && self.core.current_word().is_empty() {
@@ -205,11 +206,34 @@ impl MasterLoop {
     }
 
     pub fn save_personal(&self, path: &Path) -> Result<(), String> {
-        self.core.save_personal(path)
+        let mut profile = self.core.export_personal_profile();
+        profile.corrections = Some(self.corrections.to_snapshot());
+        profile.light_profile = Some(self.light_profile.clone());
+
+        let json = serde_json::to_string_pretty(&profile).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, json).map_err(|e| e.to_string())
     }
 
     pub fn load_personal(&mut self, path: &Path) -> Result<(), String> {
-        self.core.load_personal(path)
+        if !path.is_file() {
+            return Ok(());
+        }
+
+        let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let profile = crate::personal::load_personal_json(&data)?;
+
+        self.core.import_personal_profile(&profile);
+        self.corrections = profile
+            .corrections
+            .as_ref()
+            .map(CorrectionMemory::from_snapshot)
+            .unwrap_or_default();
+        self.light_profile = profile.light_profile.clone().unwrap_or_default();
+
+        Ok(())
     }
 
     pub fn save_personal_default(&self) -> Result<(), String> {
@@ -392,6 +416,29 @@ impl MasterLoop {
         }
     }
 
+    fn apply_correction_override(&mut self, actions: &mut Vec<Action>) {
+        let Some(top_word) = self.core.predictions().first().map(|p| p.word.clone()) else {
+            return;
+        };
+
+        let ctx_hash = self.current_context_hash();
+        let Some(replacement) = self.corrections.check(ctx_hash, &top_word) else {
+            return;
+        };
+
+        let Some(override_action) = self.core.apply_prediction_override(&replacement) else {
+            return;
+        };
+
+        if let Some(idx) = actions.iter().position(|action| {
+            matches!(action, Action::ShowGhost(_) | Action::ShowComposing { .. } | Action::HideGhost)
+        }) {
+            actions[idx] = override_action;
+        } else {
+            actions.push(override_action);
+        }
+    }
+
     // ======================================================================
     // Internal: Learning
     // ======================================================================
@@ -401,7 +448,11 @@ impl MasterLoop {
 
         // Update language prior from detection.
         let lang = self.core.detected_language().lang;
-        self.light_profile.observe_lang(lang);
+        if self.last_accepted_prediction.is_some() {
+            self.light_profile.record_accept(lang);
+        } else {
+            self.light_profile.observe_lang(lang);
+        }
 
         // Clear the accepted prediction tracker.
         self.last_accepted_prediction = None;

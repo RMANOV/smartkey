@@ -980,6 +980,62 @@ impl InputMethodCore {
         self.lang_detector.detected()
     }
 
+    /// Export the full personal profile without writing it to disk.
+    pub fn export_personal_profile(&self) -> personal::PersonalProfile {
+        self.engine.export_personal_profile()
+    }
+
+    /// Import the full personal profile without reading it from disk.
+    pub fn import_personal_profile(&mut self, profile: &personal::PersonalProfile) {
+        self.engine.import_personal_profile(profile);
+    }
+
+    /// Override the currently selected prediction with a corrected word.
+    ///
+    /// Returns a replacement display action when the correction can be shown
+    /// for the current prefix; otherwise leaves state unchanged.
+    pub fn apply_prediction_override(&mut self, replacement: &str) -> Option<Action> {
+        if self.current_word.is_empty() {
+            return None;
+        }
+
+        let replacement_lower = replacement.to_lowercase();
+        let current_lower = self.current_word.to_lowercase();
+        if !replacement_lower.starts_with(&current_lower) {
+            return None;
+        }
+
+        let typed_chars = self.current_word.chars().count();
+        let suffix: String = replacement.chars().skip(typed_chars).collect();
+        if suffix.is_empty() || !self.config.ghost_text {
+            return None;
+        }
+
+        if let Some(top) = self.last_predictions.first_mut() {
+            top.word = replacement.to_string();
+        } else {
+            self.last_predictions.insert(
+                0,
+                Prediction {
+                    word: replacement.to_string(),
+                    score: 1.0,
+                    confidence: 1.0,
+                },
+            );
+        }
+
+        self.ghost.clone_from(&suffix);
+
+        if self.in_hypothesis_phase() {
+            Some(Action::ShowComposing {
+                typed: self.current_word.clone(),
+                ghost: suffix,
+            })
+        } else {
+            Some(Action::ShowGhost(suffix))
+        }
+    }
+
     // -- internal helpers -----------------------------------------------
 
     /// Shared commit logic. `record_commit_metric` is false for Tab-accepted

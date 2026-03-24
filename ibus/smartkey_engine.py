@@ -83,7 +83,9 @@ except ImportError:
         def handle_key(self, keyval: int, modifiers: int) -> list[tuple[str, str]]:
             return [("forward", "")]
 
-        def process_keycode(self, keycode: int, modifiers: int) -> list[tuple[str, str]]:
+        def process_keycode(
+            self, keycode: int, modifiers: int
+        ) -> list[tuple[str, str]]:
             return [("forward", "")]
 
         def focus_lost(self) -> list[tuple[str, str]]:
@@ -110,6 +112,7 @@ _DEBUG = os.environ.get("SMARTKEY_DEBUG") == "1"
 _PRED_LOG = None
 if _DEBUG:
     import pathlib
+
     _log_dir = pathlib.Path.home() / ".local" / "share" / "smartkey"
     _log_dir.mkdir(parents=True, exist_ok=True)
     _PRED_LOG = (_log_dir / "predictions.log").open("a", buffering=1)
@@ -124,6 +127,31 @@ _CORPUS_FILE = _CONFIG_DIR / "corpus.json"
 # An explicit _CORPUS_DIR env var overrides both _CONFIG_DIR and the repo path.
 _REPO_DIR = Path(__file__).resolve().parent.parent
 _REPO_CORPUS_DIR = _REPO_DIR / "corpus"
+
+
+def _decode_replace_payload(payload: str) -> tuple[int, str] | None:
+    """Parse a ReplaceWord payload defensively."""
+    try:
+        n_str, text = payload.split("\x1f", 1)
+        replace_len = int(n_str)
+    except (TypeError, ValueError):
+        log.warning("smartkey: malformed replace payload %r", payload)
+        return None
+    if replace_len < 0:
+        log.warning("smartkey: negative replace length in payload %r", payload)
+        return None
+    return replace_len, text
+
+
+def _decode_composing_payload(payload: str) -> tuple[str, str]:
+    """Parse a ShowComposing payload defensively."""
+    try:
+        if "\x00" in payload:
+            return payload.split("\x00", 1)
+    except TypeError:
+        log.warning("smartkey: malformed composing payload %r", payload)
+        return "", ""
+    return payload, ""
 
 
 def _load_json(path: Path, default: dict | list | None = None) -> dict | list | None:
@@ -329,9 +357,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     preds = self._core.predictions()
                     top3 = preds[:3]
                     pts = [str(time.time()), "ghost:" + payload]
-                    pts.extend(
-                        p[0] + ":" + "{:.3f}".format(p[1]) for p in top3
-                    )
+                    pts.extend(p[0] + ":" + "{:.3f}".format(p[1]) for p in top3)
                     pts.append("shown")
                     _PRED_LOG.write(" | ".join(pts) + "\n")
                     _PRED_LOG.flush()
@@ -347,8 +373,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             elif action_type == "replace":
                 if self._preedit_active:
                     self._clear_ghost()
-                n_str, text = payload.split("\x1F", 1)  # Unit Separator
-                replace_len = int(n_str)
+                decoded = _decode_replace_payload(payload)
+                if decoded is None:
+                    continue
+                replace_len, text = decoded
                 if self._caps & 0x20:  # SURROUNDING_TEXT capability
                     self.delete_surrounding_text(-replace_len, replace_len)
                 else:
@@ -358,17 +386,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                         self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
                 self._safe_commit(text)
             elif action_type == "composing":
-                typed, ghost = (
-                    payload.split("\x00", 1) if "\x00" in payload else (payload, "")
-                )
+                typed, ghost = _decode_composing_payload(payload)
                 self._show_composing(typed, ghost)
                 if _PRED_LOG:
                     preds2 = self._core.predictions()
                     top3 = preds2[:3]
                     pts2 = [str(time.time()), "composing:" + typed]
-                    pts2.extend(
-                        p[0] + ":" + "{:.3f}".format(p[1]) for p in top3
-                    )
+                    pts2.extend(p[0] + ":" + "{:.3f}".format(p[1]) for p in top3)
                     pts2.append("shown")
                     _PRED_LOG.write(" | ".join(pts2) + "\n")
                     _PRED_LOG.flush()
