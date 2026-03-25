@@ -357,6 +357,13 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
         let has_ghost = core.has_ghost();
         let should_claim = match &key {
             Key::Tab | Key::Right | Key::Escape => has_ghost,
+            Key::Left
+            | Key::Up
+            | Key::Down
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown => false,
             Key::Space | Key::Return | Key::Backspace | Key::Char(_) | Key::RawCode(_) => true,
             Key::Other(_) => false,
         };

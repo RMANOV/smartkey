@@ -716,7 +716,13 @@ impl InputMethodCore {
                 }
             }
 
-            Key::Left | Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp | Key::PageDown => {
+            Key::Left
+            | Key::Up
+            | Key::Down
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown => {
                 let mut actions = self.cursor_moved();
                 actions.push(Action::ForwardKey);
                 actions
@@ -1358,7 +1364,12 @@ impl InputMethodCore {
             return String::new();
         }
 
-        let ctx_refs = self.prediction_context();
+        let ctx_words: Vec<String> = self
+            .prediction_context()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let ctx_refs: Vec<&str> = ctx_words.iter().map(|word| word.as_str()).collect();
         let lang = if self.config.lang_detection {
             let det = self.lang_detector.detected();
             // Confidence gate: don't pass language hint when detection is uncertain.
@@ -2149,7 +2160,9 @@ mod tests {
 
         assert_eq!(ghost_text(&actions).as_deref(), Some("rld"));
         assert_eq!(
-            core.predictions().first().map(|prediction| prediction.word.as_str()),
+            core.predictions()
+                .first()
+                .map(|prediction| prediction.word.as_str()),
             Some("world")
         );
     }
@@ -2159,7 +2172,10 @@ mod tests {
         let mut core = test_core();
         core.handle_key(press(Key::Char('h')));
         core.handle_key(press(Key::Char('e')));
-        assert!(core.has_ghost(), "typing should create a ghost before navigation");
+        assert!(
+            core.has_ghost(),
+            "typing should create a ghost before navigation"
+        );
 
         let actions = core.handle_key(press(Key::Left));
 

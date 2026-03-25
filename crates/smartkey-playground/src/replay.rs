@@ -252,12 +252,7 @@ pub fn print_calibration_report(report: &CalibrationReport) {
         } else {
             println!(
                 "{:<24} {:>8} {:>8} {:>10} {:>12} {:>10}",
-                session.session,
-                session.total_samples,
-                session.accepted_samples,
-                "-",
-                "-",
-                "-",
+                session.session, session.total_samples, session.accepted_samples, "-", "-", "-",
             );
         }
     }

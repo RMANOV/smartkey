@@ -131,7 +131,8 @@ impl MasterLoop {
                 | crate::input::Key::End
                 | crate::input::Key::PageUp
                 | crate::input::Key::PageDown
-        ) || (matches!(event.key, crate::input::Key::Right) && !self.core.has_ghost());
+        ) || (matches!(event.key, crate::input::Key::Right)
+            && !self.core.has_ghost());
 
         // ── Phase 1: ANTICIPATE (on word start) ──────────────────────
         if !self.anticipated && self.core.current_word().is_empty() {
@@ -833,7 +834,9 @@ mod tests {
 
         assert_eq!(ghost_text(&actions).as_deref(), Some("rld"));
         assert_eq!(
-            ml.predictions().first().map(|prediction| prediction.word.as_str()),
+            ml.predictions()
+                .first()
+                .map(|prediction| prediction.word.as_str()),
             Some("world")
         );
     }
@@ -845,11 +848,15 @@ mod tests {
         assert_eq!(ml.phase(), Phase::Tracking);
 
         let actions = ml.handle_key(make_key(Key::Left));
-        assert!(actions.iter().any(|action| matches!(action, Action::HideGhost)));
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, Action::HideGhost)));
         assert_eq!(ml.phase(), Phase::Anticipating);
 
         let next_actions = ml.handle_key(make_key(Key::Char('e')));
-        assert!(next_actions.iter().any(|action| matches!(action, Action::ForwardKey)));
+        assert!(next_actions
+            .iter()
+            .any(|action| matches!(action, Action::ForwardKey)));
         assert_eq!(ml.phase(), Phase::Tracking);
     }
 }
