@@ -2172,10 +2172,18 @@ mod tests {
         let mut core = test_core();
         core.handle_key(press(Key::Char('h')));
         core.handle_key(press(Key::Char('e')));
-        assert!(
-            core.has_ghost(),
-            "typing should create a ghost before navigation"
-        );
+        core.handle_key(press(Key::Char('l')));
+        let accept_actions = core.handle_key(press(Key::Tab));
+        assert!(has_action(
+            &accept_actions,
+            &Action::CommitText("lo".into())
+        ));
+        assert_eq!(core.context_words(), (Some("hello"), None));
+
+        core.handle_key(press(Key::Char('w')));
+        let predict_actions = core.handle_key(press(Key::Char('o')));
+        assert_eq!(ghost_text(&predict_actions).as_deref(), Some("rld"));
+        assert_eq!(core.current_word(), "wo");
 
         let actions = core.handle_key(press(Key::Left));
 
