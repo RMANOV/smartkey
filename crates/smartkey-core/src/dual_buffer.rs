@@ -148,6 +148,28 @@ impl DualBuffer {
         }
     }
 
+    /// Use a surrounding-language prior to allow an earlier lock when the
+    /// corpus winner already agrees with the surrounding context.
+    pub fn apply_prior_lock_hint(&mut self, prior: Option<LangId>) {
+        if self.locked {
+            return;
+        }
+
+        let Some(prior_lang) = prior else {
+            return;
+        };
+        if !matches!(prior_lang, LangId::En | LangId::Bg) || prior_lang != self.winner {
+            return;
+        }
+
+        let relaxed_threshold = (self.lock_threshold - 0.15).max(0.55);
+        let relaxed_min_chars = self.min_lock_chars.saturating_sub(1).max(1);
+        if self.confidence >= relaxed_threshold && self.en_buf.len() >= relaxed_min_chars {
+            self.locked = true;
+            self.locked_lang = Some(self.winner);
+        }
+    }
+
     // -- Accessors ---------------------------------------------------------
 
     /// The currently winning language.
@@ -411,6 +433,34 @@ mod tests {
         b.update_scores(1_000_000.0, 1.0);
         assert!(b.is_locked(), "should lock at 4 chars with high confidence");
         assert_eq!(b.winner_lang(), LangId::En);
+    }
+
+    #[test]
+    fn prior_match_can_lock_one_char_earlier() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('h', 'х');
+        b.push('e', 'е');
+        b.push('l', 'л');
+        b.update_scores(850.0, 150.0); // confidence = 0.85, but len=3 < 4
+        assert!(!b.is_locked(), "base lock should still require 4 chars");
+
+        b.apply_prior_lock_hint(Some(LangId::En));
+        assert!(b.is_locked(), "matching prior should allow earlier lock");
+        assert_eq!(b.winner_lang(), LangId::En);
+    }
+
+    #[test]
+    fn prior_mismatch_does_not_early_lock() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('h', 'х');
+        b.push('e', 'е');
+        b.push('l', 'л');
+        b.update_scores(850.0, 150.0); // confidence = 0.85, but len=3 < 4
+        b.apply_prior_lock_hint(Some(LangId::Bg));
+        assert!(
+            !b.is_locked(),
+            "mismatching prior must not force an early lock"
+        );
     }
 
     #[test]

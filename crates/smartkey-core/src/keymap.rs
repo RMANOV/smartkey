@@ -55,7 +55,14 @@ pub fn scancode_to_special(code: u16) -> Option<SpecialKey> {
         15 => Some(SpecialKey::Tab),
         28 => Some(SpecialKey::Return),
         57 => Some(SpecialKey::Space),
+        102 => Some(SpecialKey::Home),
+        103 => Some(SpecialKey::Up),
+        104 => Some(SpecialKey::PageUp),
+        105 => Some(SpecialKey::Left),
         106 => Some(SpecialKey::Right),
+        107 => Some(SpecialKey::End),
+        108 => Some(SpecialKey::Down),
+        109 => Some(SpecialKey::PageDown),
         _ => None,
     }
 }
@@ -68,7 +75,14 @@ pub enum SpecialKey {
     Backspace,
     Return,
     Space,
+    Left,
     Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
 }
 
 // ======================================================================
@@ -265,7 +279,14 @@ mod tests {
         assert_eq!(scancode_to_special(14), Some(SpecialKey::Backspace));
         assert_eq!(scancode_to_special(57), Some(SpecialKey::Space));
         assert_eq!(scancode_to_special(28), Some(SpecialKey::Return));
+        assert_eq!(scancode_to_special(102), Some(SpecialKey::Home));
+        assert_eq!(scancode_to_special(103), Some(SpecialKey::Up));
+        assert_eq!(scancode_to_special(104), Some(SpecialKey::PageUp));
+        assert_eq!(scancode_to_special(105), Some(SpecialKey::Left));
         assert_eq!(scancode_to_special(106), Some(SpecialKey::Right));
+        assert_eq!(scancode_to_special(107), Some(SpecialKey::End));
+        assert_eq!(scancode_to_special(108), Some(SpecialKey::Down));
+        assert_eq!(scancode_to_special(109), Some(SpecialKey::PageDown));
         assert_eq!(scancode_to_special(16), None); // Q — not special
     }
 

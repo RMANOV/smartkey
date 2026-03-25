@@ -52,7 +52,14 @@ except (ValueError, ImportError):
 
         KEY_Tab = 0xFF09
         KEY_Escape = 0xFF1B
+        KEY_Home = 0xFF50
+        KEY_Left = 0xFF51
+        KEY_Up = 0xFF52
         KEY_Right = 0xFF53
+        KEY_Down = 0xFF54
+        KEY_Page_Up = 0xFF55
+        KEY_Page_Down = 0xFF56
+        KEY_End = 0xFF57
         KEY_BackSpace = 0xFF08
         KEY_space = 0x0020
         KEY_Return = 0xFF0D
@@ -147,12 +154,14 @@ _IS_WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
 
 _DEBUG = os.environ.get("SMARTKEY_DEBUG") == "1"
 _PRED_LOG = None
+_REPLAY_LOG = None
 if _DEBUG:
     import pathlib
 
     _log_dir = pathlib.Path.home() / ".local" / "share" / "smartkey"
     _log_dir.mkdir(parents=True, exist_ok=True)
     _PRED_LOG = (_log_dir / "predictions.log").open("a", buffering=1)
+    _REPLAY_LOG = (_log_dir / "replay.jsonl").open("a", buffering=1)
 
 _CONFIG_DIR = (
     Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "smartkey"
@@ -233,6 +242,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._preedit_active: bool = False
         self._surrounding_text: str | None = None
         self._surrounding_cursor_pos: int | None = None
+        self._session_id = f"{int(time.time() * 1000)}-{os.getpid()}"
+        self._prediction_seq = 0
+        self._active_prediction: dict[str, object] | None = None
 
         # Load corpus.
         self._load_corpus()
@@ -351,6 +363,145 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             cursor_pos,
         )
 
+    def _log_replay_event(self, event: str, **payload: object) -> None:
+        if not _REPLAY_LOG:
+            return
+        record = {
+            "ts": time.time(),
+            "session": self._session_id,
+            "event": event,
+        }
+        record.update(
+            {key: value for key, value in payload.items() if value is not None}
+        )
+        _REPLAY_LOG.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _REPLAY_LOG.flush()
+
+    def _track_prediction_shown(self, ghost: str) -> None:
+        preds = self._core.predictions()
+        if not ghost or not preds:
+            self._active_prediction = None
+            return
+
+        top_word, top_score, top_confidence = preds[0]
+        self._prediction_seq += 1
+        self._active_prediction = {
+            "prediction_id": self._prediction_seq,
+            "word": top_word,
+            "ghost": ghost,
+            "score": top_score,
+            "confidence": top_confidence,
+        }
+        self._log_replay_event(
+            "shown",
+            prediction_id=self._prediction_seq,
+            word=top_word,
+            ghost=ghost,
+            score=round(top_score, 6),
+            confidence=round(top_confidence, 6),
+        )
+
+    @staticmethod
+    def _is_navigation_key(keyval: int) -> bool:
+        return keyval in {
+            IBus.KEY_Left,
+            IBus.KEY_Up,
+            IBus.KEY_Down,
+            IBus.KEY_Home,
+            IBus.KEY_End,
+            IBus.KEY_Page_Up,
+            IBus.KEY_Page_Down,
+        }
+
+    @staticmethod
+    def _is_printable_keyval(keyval: int) -> bool:
+        if keyval in (IBus.KEY_space, IBus.KEY_Return):
+            return True
+        if 0x21 <= keyval <= 0x7E:
+            return True
+        if _HAS_IBUS and hasattr(IBus, "keyval_to_unicode"):
+            uni = IBus.keyval_to_unicode(keyval)
+            if uni and uni != "\0":
+                return uni.isprintable()
+        if 0x80 <= keyval <= 0xEFFF:
+            try:
+                return chr(keyval).isprintable()
+            except (ValueError, OverflowError):
+                return False
+        if 0x01000000 <= keyval <= 0x0110FFFF:
+            try:
+                return chr(keyval & 0x00FFFFFF).isprintable()
+            except (ValueError, OverflowError):
+                return False
+        return False
+
+    def _should_log_reject(self, keyval: int, key_release: bool) -> bool:
+        if key_release or keyval in (IBus.KEY_Tab, IBus.KEY_Right):
+            return False
+        if keyval in (IBus.KEY_Escape, IBus.KEY_BackSpace):
+            return True
+        if self._is_navigation_key(keyval):
+            return True
+        return self._is_printable_keyval(keyval)
+
+    def _clear_active_prediction_if(self, prediction_id: int) -> None:
+        if (
+            self._active_prediction
+            and self._active_prediction.get("prediction_id") == prediction_id
+        ):
+            self._active_prediction = None
+
+    def _finalize_prediction_outcome(
+        self,
+        keyval: int,
+        key_release: bool,
+        actions: list[tuple[str, str]],
+        pending_prediction: dict[str, object] | None,
+    ) -> None:
+        if not pending_prediction:
+            return
+
+        prediction_id = int(pending_prediction["prediction_id"])
+        action_types = {action_type for action_type, _ in actions}
+        accepted = keyval == IBus.KEY_Tab and "commit" in action_types
+        auto_accepted = keyval == IBus.KEY_space and "replace" in action_types
+
+        if accepted or auto_accepted:
+            self._log_replay_event(
+                "accepted",
+                prediction_id=prediction_id,
+                word=pending_prediction.get("word"),
+                ghost=pending_prediction.get("ghost"),
+                confidence=pending_prediction.get("confidence"),
+                reason="tab" if accepted else "space_autocommit",
+            )
+            self._clear_active_prediction_if(prediction_id)
+            return
+
+        if not self._should_log_reject(keyval, key_release):
+            return
+
+        if keyval == IBus.KEY_Escape:
+            reason = "escape"
+        elif self._is_navigation_key(keyval):
+            reason = "navigation"
+        elif keyval == IBus.KEY_BackSpace:
+            reason = "backspace"
+        elif keyval in (IBus.KEY_space, IBus.KEY_Return):
+            reason = "word_boundary"
+        else:
+            reason = "continued_typing"
+
+        self._log_replay_event(
+            "rejected",
+            prediction_id=prediction_id,
+            word=pending_prediction.get("word"),
+            ghost=pending_prediction.get("ghost"),
+            confidence=pending_prediction.get("confidence"),
+            reason=reason,
+        )
+        self._clear_active_prediction_if(prediction_id)
+
     # -----------------------------------------------------------------------
     # Ghost text display (IBus-specific).
     # -----------------------------------------------------------------------
@@ -433,11 +584,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         for action_type, payload in actions:
             if action_type == "ghost":
                 self._show_ghost(payload)
+                self._track_prediction_shown(payload)
                 if _PRED_LOG:
                     preds = self._core.predictions()
                     top3 = preds[:3]
                     pts = [str(time.time()), "ghost:" + payload]
-                    pts.extend(p[0] + ":" + "{:.3f}".format(p[1]) for p in top3)
+                    pts.extend(
+                        p[0] + ":" + "{:.3f}".format(p[1]) + ":" + "{:.3f}".format(p[2])
+                        for p in top3
+                    )
                     pts.append("shown")
                     _PRED_LOG.write(" | ".join(pts) + "\n")
                     _PRED_LOG.flush()
@@ -473,11 +628,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     continue
                 typed, ghost = decoded
                 self._show_composing(typed, ghost)
+                self._track_prediction_shown(ghost)
                 if _PRED_LOG:
                     preds2 = self._core.predictions()
                     top3 = preds2[:3]
                     pts2 = [str(time.time()), "composing:" + typed]
-                    pts2.extend(p[0] + ":" + "{:.3f}".format(p[1]) for p in top3)
+                    pts2.extend(
+                        p[0] + ":" + "{:.3f}".format(p[1]) + ":" + "{:.3f}".format(p[2])
+                        for p in top3
+                    )
                     pts2.append("shown")
                     _PRED_LOG.write(" | ".join(pts2) + "\n")
                     _PRED_LOG.flush()
@@ -514,6 +673,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # preventing the key from also deleting committed text in the app.
         is_backspace = keyval == IBus.KEY_BackSpace
         key_release = bool(state & (1 << 30))  # IBUS_RELEASE_MASK
+        pending_prediction = (
+            dict(self._active_prediction)
+            if self._active_prediction is not None
+            else None
+        )
         if not key_release:
             self._refresh_surrounding_text()
 
@@ -526,6 +690,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             actions = self._core.process_keycode(evdev_keycode, state)
             log.debug("actions (keycode): %s", actions)
             result = self._execute_actions(actions)
+            self._finalize_prediction_outcome(
+                keyval, key_release, actions, pending_prediction
+            )
             # Consume backspace key-press when preedit was active so it does
             # not reach the application.  Key-release is always forwarded.
             if is_backspace and not key_release and preedit_was_active:
@@ -555,6 +722,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         actions = self._core.handle_key(keyval, state)
         log.debug("actions: %s", actions)
         result = self._execute_actions(actions)
+        self._finalize_prediction_outcome(
+            keyval, key_release, actions, pending_prediction
+        )
         # Consume backspace key-press when preedit was active so it does
         # not reach the application.  Key-release is always forwarded.
         if is_backspace and not key_release and preedit_was_active:
@@ -571,6 +741,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_focus_out(self) -> None:
         actions = self._core.focus_lost()
         self._execute_actions(actions)
+        self._active_prediction = None
         self._sync_surrounding_text(None, None)
         # Debounced auto-save: persist personal profile at most once per 60s.
         now = time.monotonic()
@@ -584,6 +755,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_reset(self) -> None:
         actions = self._core.reset()
         self._execute_actions(actions)
+        self._active_prediction = None
         self._sync_surrounding_text(None, None)
 
     def do_enable(self) -> None:
@@ -592,6 +764,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_disable(self) -> None:
         actions = self._core.reset()
         self._execute_actions(actions)
+        self._active_prediction = None
         self._sync_surrounding_text(None, None)
         # Save personal profile on engine disable (session end).
         try:

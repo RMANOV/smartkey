@@ -42,7 +42,14 @@ pub enum Key {
     Char(char),
     Tab,
     Escape,
+    Left,
     Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
     Backspace,
     Space,
     Return,
@@ -595,7 +602,14 @@ impl InputMethodCore {
                     keymap::SpecialKey::Backspace => Key::Backspace,
                     keymap::SpecialKey::Return => Key::Return,
                     keymap::SpecialKey::Space => Key::Space,
+                    keymap::SpecialKey::Left => Key::Left,
                     keymap::SpecialKey::Right => Key::Right,
+                    keymap::SpecialKey::Up => Key::Up,
+                    keymap::SpecialKey::Down => Key::Down,
+                    keymap::SpecialKey::Home => Key::Home,
+                    keymap::SpecialKey::End => Key::End,
+                    keymap::SpecialKey::PageUp => Key::PageUp,
+                    keymap::SpecialKey::PageDown => Key::PageDown,
                 };
                 KeyEvent {
                     key,
@@ -696,8 +710,16 @@ impl InputMethodCore {
                         ]
                     }
                 } else {
-                    vec![Action::ForwardKey]
+                    let mut actions = self.cursor_moved();
+                    actions.push(Action::ForwardKey);
+                    actions
                 }
+            }
+
+            Key::Left | Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp | Key::PageDown => {
+                let mut actions = self.cursor_moved();
+                actions.push(Action::ForwardKey);
+                actions
             }
 
             // Escape: dismiss ghost text and notify engine of rejection.
@@ -888,6 +910,20 @@ impl InputMethodCore {
     /// Called when the input field gains focus.
     pub fn focus_gained(&mut self) {
         // Nothing to do — ready for new input.
+    }
+
+    /// Called when the cursor moves away from the current typing location.
+    ///
+    /// Clears preedit state, ghost text, recent context words, and bursty
+    /// session cache so stale predictions do not bleed into the new cursor
+    /// location after navigation.
+    pub fn cursor_moved(&mut self) -> Vec<Action> {
+        self.reset_word();
+        self.context.clear();
+        self.lang_detector.reset();
+        self.engine.clear_session_cache();
+        self.active_hints = None;
+        vec![Action::HideGhost]
     }
 
     /// Reset internal state (e.g. on engine reset request).
@@ -1146,6 +1182,8 @@ impl InputMethodCore {
         if !was_locked {
             let (en_freq, bg_freq) = self.engine.score_both(db.en_text(), db.bg_text());
             db.update_scores(en_freq, bg_freq);
+            let lang_prior = self.active_hints.as_ref().and_then(|h| h.lang_prior);
+            db.apply_prior_lock_hint(lang_prior);
         }
 
         // Propagate flip detection from dual buffer to regime detector flag.
@@ -2114,6 +2152,22 @@ mod tests {
             core.predictions().first().map(|prediction| prediction.word.as_str()),
             Some("world")
         );
+    }
+
+    #[test]
+    fn navigation_key_clears_stale_context() {
+        let mut core = test_core();
+        core.handle_key(press(Key::Char('h')));
+        core.handle_key(press(Key::Char('e')));
+        assert!(core.has_ghost(), "typing should create a ghost before navigation");
+
+        let actions = core.handle_key(press(Key::Left));
+
+        assert!(has_action(&actions, &Action::HideGhost));
+        assert!(has_action(&actions, &Action::ForwardKey));
+        assert_eq!(core.current_word(), "");
+        assert!(!core.has_ghost());
+        assert_eq!(core.context_words(), (None, None));
     }
 
     // ── Config parsing hardening tests ─────────────────────────────────

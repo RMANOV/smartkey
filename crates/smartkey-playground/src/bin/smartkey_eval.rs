@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use smartkey_playground::replay::{
+    calibrate_replay_samples, load_replay_samples, print_calibration_report,
+};
 use smartkey_playground::report::{confidence_histogram, print_histogram, print_summary_table};
 use smartkey_playground::{Playground, Scenario};
 
@@ -33,10 +36,29 @@ struct Cli {
     /// Path to corpus directory
     #[arg(long)]
     corpus_dir: Option<PathBuf>,
+
+    /// Replay JSONL log captured from Linux SMARTKEY_DEBUG sessions
+    #[arg(long)]
+    replay_log: Option<PathBuf>,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(path) = cli.replay_log.as_deref() {
+        let samples = load_replay_samples(path).unwrap_or_else(|err| {
+            log::error!("{}", err);
+            std::process::exit(1);
+        });
+        let report = calibrate_replay_samples(&samples);
+        if cli.json {
+            let json = serde_json::to_string_pretty(&report).unwrap();
+            println!("{}", json);
+        } else {
+            print_calibration_report(&report);
+        }
+        return;
+    }
 
     let scenarios: Vec<Scenario> = if let Some(ref name) = cli.preset {
         match name.as_str() {

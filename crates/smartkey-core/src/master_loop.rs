@@ -122,6 +122,17 @@ impl MasterLoop {
 
     /// Process a key event through the master loop state machine.
     pub fn handle_key(&mut self, event: KeyEvent) -> Vec<Action> {
+        let resets_context = matches!(
+            event.key,
+            crate::input::Key::Left
+                | crate::input::Key::Up
+                | crate::input::Key::Down
+                | crate::input::Key::Home
+                | crate::input::Key::End
+                | crate::input::Key::PageUp
+                | crate::input::Key::PageDown
+        ) || (matches!(event.key, crate::input::Key::Right) && !self.core.has_ghost());
+
         // ── Phase 1: ANTICIPATE (on word start) ──────────────────────
         if !self.anticipated && self.core.current_word().is_empty() {
             self.phase = Phase::Anticipating;
@@ -142,6 +153,15 @@ impl MasterLoop {
         };
         let mut actions = self.core.handle_key(event.clone());
         self.apply_correction_override(&mut actions);
+
+        if resets_context {
+            self.anticipated = false;
+            self.phase = Phase::Anticipating;
+            self.core.clear_hints();
+            self.frustration.reset_word();
+            self.last_tab_accept = None;
+            self.last_accepted_prediction = None;
+        }
 
         // Track Tab acceptance time for REJECT detection.
         if is_tab && self.core.current_word().is_empty() {
@@ -542,7 +562,7 @@ mod tests {
     use super::*;
     use crate::correction_memory::CorrectionMemory;
     use crate::cvm::CvmSnapshot;
-    use crate::input::{InputConfig, Key, KeyEvent, Modifiers};
+    use crate::input::{Action, InputConfig, Key, KeyEvent, Modifiers};
     use crate::personal::{PersonalMarkovSnapshot, PersonalProfile};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -816,5 +836,20 @@ mod tests {
             ml.predictions().first().map(|prediction| prediction.word.as_str()),
             Some("world")
         );
+    }
+
+    #[test]
+    fn navigation_resets_anticipation_cycle() {
+        let mut ml = default_loop();
+        ml.handle_key(make_key(Key::Char('h')));
+        assert_eq!(ml.phase(), Phase::Tracking);
+
+        let actions = ml.handle_key(make_key(Key::Left));
+        assert!(actions.iter().any(|action| matches!(action, Action::HideGhost)));
+        assert_eq!(ml.phase(), Phase::Anticipating);
+
+        let next_actions = ml.handle_key(make_key(Key::Char('e')));
+        assert!(next_actions.iter().any(|action| matches!(action, Action::ForwardKey)));
+        assert_eq!(ml.phase(), Phase::Tracking);
     }
 }

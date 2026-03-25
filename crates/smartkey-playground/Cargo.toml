@@ -11,6 +11,9 @@ serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 log = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "smartkey-eval"
 path = "src/bin/smartkey_eval.rs"
