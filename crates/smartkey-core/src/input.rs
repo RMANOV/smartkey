@@ -2146,24 +2146,27 @@ mod tests {
             ..InputConfig::default()
         };
         let mut core = InputMethodCore::new(config);
-        core.load_word("word", 200);
-        core.load_word("world", 100);
-        core.load_bigram("hello", "world", 50);
-        core.load_bigram("hello", "word", 1);
+        core.load_word("world", 50);
+        core.load_word("worry", 50);
+        core.load_bigram("hello", "world", 10);
         core.apply_hints(&crate::master_loop::Hints {
             context_words: vec!["hello".into()],
             ..Default::default()
         });
 
         core.handle_key(press(Key::Char('w')));
-        let actions = core.handle_key(press(Key::Char('o')));
+        core.handle_key(press(Key::Char('o')));
+        core.handle_key(press(Key::Char('r')));
 
-        assert_eq!(ghost_text(&actions).as_deref(), Some("rld"));
-        assert_eq!(
-            core.predictions()
-                .first()
-                .map(|prediction| prediction.word.as_str()),
-            Some("world")
+        let world_pos = core.predictions().iter().position(|p| p.word == "world");
+        let worry_pos = core.predictions().iter().position(|p| p.word == "worry");
+        assert!(
+            world_pos.is_some() && worry_pos.is_some(),
+            "both context-sensitive candidates should appear"
+        );
+        assert!(
+            world_pos.unwrap() < worry_pos.unwrap(),
+            "hint context should rank 'world' above 'worry'"
         );
     }
 

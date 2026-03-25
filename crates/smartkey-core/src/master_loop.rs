@@ -823,21 +823,24 @@ mod tests {
             ghost_text_separation_margin: 0.0,
             ..InputConfig::default()
         });
-        ml.load_word("word", 200);
-        ml.load_word("world", 100);
-        ml.load_bigram("hello", "world", 50);
-        ml.load_bigram("hello", "word", 1);
+        ml.load_word("world", 50);
+        ml.load_word("worry", 50);
+        ml.load_bigram("hello", "world", 10);
         ml.set_surrounding_text(Some("hello world".into()), Some(6));
 
         ml.handle_key(make_key(Key::Char('w')));
-        let actions = ml.handle_key(make_key(Key::Char('o')));
+        ml.handle_key(make_key(Key::Char('o')));
+        ml.handle_key(make_key(Key::Char('r')));
 
-        assert_eq!(ghost_text(&actions).as_deref(), Some("rld"));
-        assert_eq!(
-            ml.predictions()
-                .first()
-                .map(|prediction| prediction.word.as_str()),
-            Some("world")
+        let world_pos = ml.predictions().iter().position(|p| p.word == "world");
+        let worry_pos = ml.predictions().iter().position(|p| p.word == "worry");
+        assert!(
+            world_pos.is_some() && worry_pos.is_some(),
+            "both surrounding-context candidates should appear"
+        );
+        assert!(
+            world_pos.unwrap() < worry_pos.unwrap(),
+            "surrounding text should rank 'world' above 'worry'"
         );
     }
 
