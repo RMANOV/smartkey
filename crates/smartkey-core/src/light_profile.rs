@@ -19,7 +19,7 @@ pub struct LightProfile {
     /// Words to suppress ghost after a rejection (0 = no suppression).
     pub suppress_after_reject: u8,
     /// Auto-tuned minimum confidence for ghost display.
-    /// Formula: max(0.15, 0.50 - 0.35 * accept_rate)
+    /// Formula: max(0.12, 0.35 - 0.25 * accept_rate)
     pub confidence_floor: f64,
 }
 
@@ -29,7 +29,7 @@ impl Default for LightProfile {
             lang_prior: [0.33, 0.34, 0.33],
             ghost_accept_rate: 0.50,
             suppress_after_reject: 0,
-            confidence_floor: 0.325, // max(0.15, 0.50 - 0.35*0.50)
+            confidence_floor: 0.225, // max(0.12, 0.35 - 0.25*0.50)
         }
     }
 }
@@ -47,7 +47,7 @@ impl LightProfile {
     /// Record a ghost text rejection. Temporarily suppresses ghosts.
     pub fn record_reject(&mut self) {
         self.ghost_accept_rate *= 0.95;
-        self.suppress_after_reject = 2; // suppress for next 2 words
+        self.suppress_after_reject = 1; // suppress for next 1 word
         self.update_confidence_floor();
     }
 
@@ -87,7 +87,7 @@ impl LightProfile {
     }
 
     fn update_confidence_floor(&mut self) {
-        self.confidence_floor = (0.50 - 0.35 * self.ghost_accept_rate).max(0.15);
+        self.confidence_floor = (0.35 - 0.25 * self.ghost_accept_rate).max(0.12);
     }
 }
 
@@ -106,7 +106,7 @@ mod tests {
         // no suppression initially
         assert_eq!(p.suppress_after_reject, 0);
         // confidence floor at default
-        assert!((p.confidence_floor - 0.325).abs() < 1e-6);
+        assert!((p.confidence_floor - 0.225).abs() < 1e-6);
     }
 
     #[test]
@@ -142,7 +142,7 @@ mod tests {
     fn record_reject_sets_suppression() {
         let mut p = LightProfile::default();
         p.record_reject();
-        assert_eq!(p.suppress_after_reject, 2);
+        assert_eq!(p.suppress_after_reject, 1);
     }
 
     #[test]
@@ -166,10 +166,10 @@ mod tests {
     #[test]
     fn tick_suppression_decrements_and_returns_true() {
         let mut p = LightProfile::default();
-        p.record_reject(); // sets suppress_after_reject = 2
+        p.record_reject(); // sets suppress_after_reject = 1
         let suppressed = p.tick_suppression();
         assert!(suppressed);
-        assert_eq!(p.suppress_after_reject, 1);
+        assert_eq!(p.suppress_after_reject, 0);
     }
 
     #[test]
@@ -183,8 +183,7 @@ mod tests {
     #[test]
     fn tick_suppression_exhausts_counter() {
         let mut p = LightProfile::default();
-        p.record_reject(); // suppress_after_reject = 2
-        assert!(p.tick_suppression()); // → 1, returns true
+        p.record_reject(); // suppress_after_reject = 1
         assert!(p.tick_suppression()); // → 0, returns true
         assert!(!p.tick_suppression()); // → 0, returns false
     }
@@ -205,8 +204,8 @@ mod tests {
         let low_accept_floor = p2.confidence_floor;
         // Higher accept rate → lower confidence floor (show more ghosts)
         assert!(high_accept_floor < low_accept_floor);
-        // Floor is always >= 0.15
-        assert!(high_accept_floor >= 0.15);
-        assert!(low_accept_floor >= 0.15);
+        // Floor is always >= 0.12
+        assert!(high_accept_floor >= 0.12);
+        assert!(low_accept_floor >= 0.12);
     }
 }

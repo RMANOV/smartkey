@@ -341,7 +341,7 @@ impl MasterLoop {
         // 4. Confidence boost from accept_rate.
         // High accept rate → positive boost (show more ghosts).
         // Low accept rate → negative boost (be stricter).
-        hints.confidence_boost = (self.light_profile.ghost_accept_rate - 0.50) * 0.10;
+        hints.confidence_boost = (self.light_profile.ghost_accept_rate - 0.50) * 0.20;
 
         // 5. Adaptive confidence floor from LightProfile (F14).
         // Overrides the static config `ghost_text_min_confidence` with a
@@ -360,7 +360,7 @@ impl MasterLoop {
             FrustrationSignal::Reject { severity } => {
                 self.light_profile.record_reject();
                 // Suppress ghost for 1-3 words based on severity.
-                self.suppress_countdown = (severity * 3.0).min(255.0).ceil() as u8;
+                self.suppress_countdown = (severity * 1.0).min(3.0).ceil() as u8;
                 // Record in correction memory if we know what was accepted.
                 if let Some(accepted) = &self.last_accepted_prediction {
                     let ctx_hash = self.current_context_hash();
@@ -565,8 +565,8 @@ mod tests {
 
     #[test]
     fn suppress_countdown_no_overflow_with_extreme_severity() {
-        // FrustrationSignal::Reject with severity=1.0 → suppress_countdown = ceil(1.0*3) = 3
-        // severity is clamped to [0,1], so countdown max = 3, no overflow
+        // FrustrationSignal::Reject with severity=1.0 → suppress_countdown = ceil(1.0*1) = 1
+        // severity is clamped to [0,1], so countdown max = 1, no overflow
         let mut ml = default_loop();
         // Drive a rejection scenario
         // suppress_countdown is u8, so verify it stays in bounds
@@ -630,22 +630,22 @@ mod tests {
 
     #[test]
     fn suppress_countdown_clamped_from_max_f64_severity() {
-        // handle_frustration uses: (severity * 3.0).min(255.0).ceil() as u8
-        // If severity = f64::MAX, the .min(255.0) clamp must prevent overflow.
+        // handle_frustration uses: (severity * 1.0).min(3.0).ceil() as u8
+        // If severity = f64::MAX, the .min(3.0) clamp must prevent overflow.
         let mut ml = default_loop();
         let signal = crate::frustration::FrustrationSignal::Reject { severity: f64::MAX };
         ml.handle_frustration(&signal);
-        // severity=f64::MAX → (f64::MAX * 3.0).min(255.0) = 255.0 → ceil = 255 → u8 = 255
+        // severity=f64::MAX → (f64::MAX * 1.0).min(3.0) = 3.0 → ceil = 3 → u8 = 3
         assert_eq!(
-            ml.suppress_countdown, 255,
-            "severity=f64::MAX should clamp to 255, got {}",
+            ml.suppress_countdown, 3,
+            "severity=f64::MAX should clamp to 3, got {}",
             ml.suppress_countdown
         );
     }
 
     #[test]
     fn suppress_countdown_zero_severity_produces_zero_or_one() {
-        // severity = 0.0 → (0.0 * 3.0).min(255.0).ceil() = 0.0 as u8 = 0
+        // severity = 0.0 → (0.0 * 1.0).min(3.0).ceil() = 0.0 as u8 = 0
         let mut ml = default_loop();
         let signal = crate::frustration::FrustrationSignal::Reject { severity: 0.0 };
         ml.handle_frustration(&signal);
@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn suppress_countdown_nan_severity_does_not_panic() {
-        // NaN severity: (NaN * 3.0) = NaN; NaN.min(255.0) = NaN on some platforms.
+        // NaN severity: (NaN * 1.0) = NaN; NaN.min(3.0) = NaN on some platforms.
         // NaN.ceil() = NaN; NaN as u8 = 0 in Rust (saturating cast).
         // Must not panic.
         let mut ml = default_loop();
