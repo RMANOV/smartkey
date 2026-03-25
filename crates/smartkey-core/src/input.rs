@@ -934,6 +934,20 @@ impl InputMethodCore {
         (prev1, prev2)
     }
 
+    fn prediction_context(&self) -> Vec<&str> {
+        if let Some(hints) = self.active_hints.as_ref() {
+            if !hints.context_words.is_empty() {
+                let keep_from = hints.context_words.len().saturating_sub(CONTEXT_SIZE);
+                return hints.context_words[keep_from..]
+                    .iter()
+                    .map(|word| word.as_str())
+                    .collect();
+            }
+        }
+
+        self.context.iter().map(|s| s.as_str()).collect()
+    }
+
     // -- personal profile persistence -----------------------------------
 
     /// Save the personal profile (CVM + Markov + weights) to the given path.
@@ -1306,8 +1320,7 @@ impl InputMethodCore {
             return String::new();
         }
 
-        let ctx_refs: arrayvec::ArrayVec<&str, 5> =
-            self.context.iter().map(|s| s.as_str()).collect();
+        let ctx_refs = self.prediction_context();
         let lang = if self.config.lang_detection {
             let det = self.lang_detector.detected();
             // Confidence gate: don't pass language hint when detection is uncertain.
@@ -2073,6 +2086,33 @@ mod tests {
             g.is_some() && !g.as_ref().unwrap().is_empty(),
             "single candidate should pass margin check: got {:?}",
             g
+        );
+    }
+
+    #[test]
+    fn prediction_uses_hint_context_when_available() {
+        let config = InputConfig {
+            use_ppm: false,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
+        core.load_word("word", 200);
+        core.load_word("world", 100);
+        core.load_bigram("hello", "world", 50);
+        core.load_bigram("hello", "word", 1);
+        core.apply_hints(&crate::master_loop::Hints {
+            context_words: vec!["hello".into()],
+            ..Default::default()
+        });
+
+        core.handle_key(press(Key::Char('w')));
+        let actions = core.handle_key(press(Key::Char('o')));
+
+        assert_eq!(ghost_text(&actions).as_deref(), Some("rld"));
+        assert_eq!(
+            core.predictions().first().map(|prediction| prediction.word.as_str()),
+            Some("world")
         );
     }
 

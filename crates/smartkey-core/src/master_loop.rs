@@ -45,6 +45,8 @@ pub struct Hints {
     /// Adaptive confidence floor from LightProfile (overrides config min_confidence).
     /// `None` = use the static config value.
     pub confidence_floor: Option<f64>,
+    /// Recent surrounding words from the active text field (oldest → newest).
+    pub context_words: Vec<String>,
 }
 
 impl Default for Hints {
@@ -54,6 +56,7 @@ impl Default for Hints {
             suppress_ghost: false,
             confidence_boost: 0.0,
             confidence_floor: None,
+            context_words: Vec::new(),
         }
     }
 }
@@ -80,6 +83,10 @@ pub struct MasterLoop {
     last_known_commits: usize,
     /// Whether anticipation was already run for the current word.
     anticipated: bool,
+    /// Cached surrounding text from the platform adapter (Linux IBus path).
+    surrounding_text: Option<String>,
+    /// Cursor position inside `surrounding_text` when provided by the platform.
+    surrounding_cursor_pos: Option<usize>,
 }
 
 impl MasterLoop {
@@ -96,6 +103,8 @@ impl MasterLoop {
             last_accepted_prediction: None,
             last_known_commits: 0,
             anticipated: false,
+            surrounding_text: None,
+            surrounding_cursor_pos: None,
         }
     }
 
@@ -171,6 +180,8 @@ impl MasterLoop {
         self.anticipated = false;
         self.core.clear_hints();
         self.frustration.reset_word();
+        self.surrounding_text = None;
+        self.surrounding_cursor_pos = None;
         self.core.focus_lost()
     }
 
@@ -182,6 +193,8 @@ impl MasterLoop {
         self.anticipated = false;
         self.core.clear_hints();
         self.frustration.reset_word();
+        self.surrounding_text = None;
+        self.surrounding_cursor_pos = None;
         self.core.reset()
     }
 
@@ -281,6 +294,15 @@ impl MasterLoop {
         self.core.load_corpus_file(path)
     }
 
+    /// Update the cached surrounding text from the active text field.
+    ///
+    /// Linux IBus adapters can push live surrounding text here so the
+    /// anticipation phase uses real document context instead of the null sampler.
+    pub fn set_surrounding_text(&mut self, text: Option<String>, cursor_pos: Option<usize>) {
+        self.surrounding_text = text.filter(|value| !value.trim().is_empty());
+        self.surrounding_cursor_pos = cursor_pos;
+    }
+
     /// Current phase of the master loop state machine.
     pub fn phase(&self) -> Phase {
         self.phase
@@ -304,10 +326,18 @@ impl MasterLoop {
         let mut hints = Hints::default();
 
         // 1. Sample surrounding text for context.
-        if let Some(text) = self.context_sampler.get_surrounding_text(100) {
+        if let Some(text) = self
+            .cached_surrounding_excerpt(100)
+            .or_else(|| self.context_sampler.get_surrounding_text(100))
+        {
             let analysis = context_sampler::analyze_surrounding(&text);
             if let Some(lang) = analysis.lang {
                 hints.lang_prior = Some(lang);
+            }
+            if !analysis.recent_words.is_empty() {
+                // `analyze_surrounding()` returns newest → oldest; reverse to
+                // keep chronology for Markov-style context consumers.
+                hints.context_words = analysis.recent_words.into_iter().rev().collect();
             }
         }
 
@@ -349,6 +379,42 @@ impl MasterLoop {
         hints.confidence_floor = Some(self.light_profile.confidence_floor);
 
         hints
+    }
+
+    fn cached_surrounding_excerpt(&self, max_chars: usize) -> Option<String> {
+        let text = self.surrounding_text.as_deref()?;
+        let before_cursor = match self.surrounding_cursor_pos {
+            Some(cursor_pos) => Self::slice_before_cursor(text, cursor_pos),
+            None => text,
+        };
+        let trimmed = before_cursor.trim_end();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let skip = trimmed.chars().count().saturating_sub(max_chars);
+        Some(trimmed.chars().skip(skip).collect())
+    }
+
+    fn slice_before_cursor(text: &str, cursor_pos: usize) -> &str {
+        let char_count = text.chars().count();
+        if cursor_pos <= char_count {
+            if cursor_pos == 0 {
+                return "";
+            }
+            let byte_idx = text
+                .char_indices()
+                .nth(cursor_pos)
+                .map(|(idx, _)| idx)
+                .unwrap_or(text.len());
+            &text[..byte_idx]
+        } else {
+            let mut byte_idx = cursor_pos.min(text.len());
+            while byte_idx > 0 && !text.is_char_boundary(byte_idx) {
+                byte_idx -= 1;
+            }
+            &text[..byte_idx]
+        }
     }
 
     // ======================================================================
@@ -726,6 +792,29 @@ mod tests {
         assert_eq!(
             ml.predictions().first().map(|p| p.word.as_str()),
             Some("help")
+        );
+    }
+
+    #[test]
+    fn surrounding_text_biases_predictions() {
+        let mut ml = MasterLoop::new(InputConfig {
+            use_ppm: false,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("word", 200);
+        ml.load_word("world", 100);
+        ml.load_bigram("hello", "world", 50);
+        ml.load_bigram("hello", "word", 1);
+        ml.set_surrounding_text(Some("hello world".into()), Some(6));
+
+        ml.handle_key(make_key(Key::Char('w')));
+        let actions = ml.handle_key(make_key(Key::Char('o')));
+
+        assert_eq!(ghost_text(&actions).as_deref(), Some("rld"));
+        assert_eq!(
+            ml.predictions().first().map(|prediction| prediction.word.as_str()),
+            Some("world")
         );
     }
 }

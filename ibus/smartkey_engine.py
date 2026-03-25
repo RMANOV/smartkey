@@ -116,6 +116,11 @@ except ImportError:
         def focus_gained(self) -> None:
             return None
 
+        def set_surrounding_text(
+            self, _text: str | None, _cursor_pos: int | None
+        ) -> None:
+            return None
+
         def reset(self) -> list[tuple[str, str]]:
             return []
 
@@ -191,7 +196,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Lifecycle.
     # -----------------------------------------------------------------------
     def __init__(self) -> None:
-        super().__init__()
+        if _HAS_IBUS:
+            super().__init__(active_surrounding_text=True)
+        else:
+            super().__init__()
 
         if not _HAS_CORE:
             raise RuntimeError(
@@ -223,6 +231,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # Used by _safe_commit() to guarantee preedit is hidden before commit,
         # and by backspace handling to consume the key when preedit is active.
         self._preedit_active: bool = False
+        self._surrounding_text: str | None = None
+        self._surrounding_cursor_pos: int | None = None
 
         # Load corpus.
         self._load_corpus()
@@ -290,6 +300,56 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 self._core.load_corpus_file(str(path))
             except OSError:
                 log.warning("Failed to load corpus %s", path, exc_info=True)
+
+    @staticmethod
+    def _decode_surrounding_text(text_obj: object | None) -> str | None:
+        if text_obj is None:
+            return None
+        if hasattr(text_obj, "get_text"):
+            try:
+                decoded = text_obj.get_text()
+            except TypeError:
+                decoded = None
+            if isinstance(decoded, str):
+                return decoded
+        if isinstance(text_obj, str):
+            return text_obj
+        return None
+
+    def _sync_surrounding_text(self, text: str | None, cursor_pos: int | None) -> None:
+        self._surrounding_text = text if text else None
+        self._surrounding_cursor_pos = (
+            cursor_pos if cursor_pos is not None and cursor_pos >= 0 else None
+        )
+        self._core.set_surrounding_text(
+            self._surrounding_text, self._surrounding_cursor_pos
+        )
+
+    def _refresh_surrounding_text(self) -> None:
+        if not _HAS_IBUS or not hasattr(self, "get_surrounding_text"):
+            return
+        try:
+            surrounding = self.get_surrounding_text()
+        except TypeError:
+            return
+        except Exception:
+            log.debug("smartkey: failed to refresh surrounding text", exc_info=True)
+            return
+
+        text_obj: object | None = None
+        cursor_pos: int | None = None
+        if isinstance(surrounding, tuple):
+            if surrounding:
+                text_obj = surrounding[0]
+            if len(surrounding) >= 2 and isinstance(surrounding[1], int):
+                cursor_pos = surrounding[1]
+        else:
+            text_obj = surrounding
+
+        self._sync_surrounding_text(
+            self._decode_surrounding_text(text_obj),
+            cursor_pos,
+        )
 
     # -----------------------------------------------------------------------
     # Ghost text display (IBus-specific).
@@ -428,6 +488,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_set_capabilities(self, caps: int) -> None:
         self._caps = caps
 
+    def do_set_surrounding_text(
+        self, text: object, cursor_pos: int, anchor_pos: int
+    ) -> None:
+        _ = anchor_pos
+        self._sync_surrounding_text(
+            self._decode_surrounding_text(text),
+            cursor_pos,
+        )
+
     # -----------------------------------------------------------------------
     # Key event handler.
     # -----------------------------------------------------------------------
@@ -445,6 +514,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # preventing the key from also deleting committed text in the app.
         is_backspace = keyval == IBus.KEY_BackSpace
         key_release = bool(state & (1 << 30))  # IBUS_RELEASE_MASK
+        if not key_release:
+            self._refresh_surrounding_text()
 
         # v0.5.0: prefer raw scancode path for dual-buffer layout-agnostic input.
         # Rust tables use evdev codes. On Wayland IBus sends evdev directly;
@@ -495,10 +566,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     def do_focus_in(self) -> None:
         self._core.focus_gained()
+        self._refresh_surrounding_text()
 
     def do_focus_out(self) -> None:
         actions = self._core.focus_lost()
         self._execute_actions(actions)
+        self._sync_surrounding_text(None, None)
         # Debounced auto-save: persist personal profile at most once per 60s.
         now = time.monotonic()
         if now - self._last_save >= 60.0:
@@ -511,6 +584,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_reset(self) -> None:
         actions = self._core.reset()
         self._execute_actions(actions)
+        self._sync_surrounding_text(None, None)
 
     def do_enable(self) -> None:
         pass  # Rust core handles enabled state via kill switch.
@@ -518,6 +592,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_disable(self) -> None:
         actions = self._core.reset()
         self._execute_actions(actions)
+        self._sync_surrounding_text(None, None)
         # Save personal profile on engine disable (session end).
         try:
             self._core.save_personal()

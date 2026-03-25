@@ -153,6 +153,12 @@ impl PyInputMethodCore {
         self.inner.focus_gained();
     }
 
+    /// Update surrounding text from the platform adapter.
+    fn set_surrounding_text(&mut self, text: Option<&str>, cursor_pos: Option<usize>) {
+        self.inner
+            .set_surrounding_text(text.map(str::to_owned), cursor_pos);
+    }
+
     /// Reset internal state.
     fn reset(&mut self) -> Vec<(String, String)> {
         self.inner.reset().iter().map(action_to_tuple).collect()
