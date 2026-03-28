@@ -203,6 +203,17 @@ impl SmartKeyEngine {
         LangId::En // default for ambiguous (digits, symbols)
     }
 
+    /// Compute adaptive interpolation weights for all corpus Markov chains.
+    ///
+    /// Called after corpus loading is complete. Each per-language Markov chain
+    /// auto-tunes its λ weights based on corpus statistics (coverage and
+    /// discrimination power) instead of using fixed [0.6, 0.3, 0.1].
+    pub fn compute_adaptive_lambdas(&mut self) {
+        for model in self.lang_models.models_mut() {
+            model.markov.compute_adaptive_lambda();
+        }
+    }
+
     /// Feed a word into the personal CVM layer (call when the user types a word).
     pub fn learn(&mut self, word: &str) {
         self.personal.process(word);
@@ -298,6 +309,15 @@ impl SmartKeyEngine {
         if let (Some(w1), Some(w2)) = (prev2, prev1) {
             self.personal_markov.train_trigram(w1, w2, word, 1);
         }
+        self.cache.borrow_mut().invalidate();
+    }
+
+    /// Train the personal Markov chain with higher-order n-gram data (4-gram+).
+    ///
+    /// Called from `commit_word()` with the full context window for ∞-gram
+    /// backoff learning. Enables longer-context predictions over time.
+    pub fn learn_online_ngram(&mut self, context: &[&str], word: &str) {
+        self.personal_markov.train_ngram(context, word, 1);
         self.cache.borrow_mut().invalidate();
     }
 
@@ -811,6 +831,8 @@ impl SmartKeyEngine {
         for c in &all_candidates {
             // Blend corpus Markov and personal Markov.
             // Use the best score across relevant language models.
+            // Corpus models use trigram backoff; personal model uses ∞-gram
+            // extended backoff (leverages higher-order n-grams from user typing).
             let corpus_m = models
                 .iter()
                 .map(|model| {
@@ -824,7 +846,7 @@ impl SmartKeyEngine {
                 .fold(1e-6_f64, f64::max);
             let personal_m = self
                 .personal_markov
-                .score_with_backoff(&c.word, prev1, prev2);
+                .score_extended_backoff(&c.word, context);
             let m = (1.0 - self.personal_markov_delta) * corpus_m
                 + self.personal_markov_delta * personal_m;
             let cvm_score = self.personal.frequency_score(&c.word);

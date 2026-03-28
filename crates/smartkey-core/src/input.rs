@@ -95,7 +95,7 @@ pub enum Action {
 // Configuration
 // ======================================================================
 
-const CONTEXT_SIZE: usize = 5;
+const CONTEXT_SIZE: usize = 7;
 
 /// Platform-agnostic input method configuration.
 #[derive(Debug, Clone)]
@@ -554,6 +554,8 @@ impl InputMethodCore {
         } else {
             corpus.load_into_engine(&mut self.engine);
         }
+        // Auto-tune Markov interpolation weights from corpus statistics (Phase 2).
+        self.engine.compute_adaptive_lambdas();
         Ok(())
     }
 
@@ -1114,6 +1116,18 @@ impl InputMethodCore {
             let word_lower = word.to_lowercase();
             self.engine.learn(&word_lower);
             self.engine.learn_online_markov(prev1, prev2, &word_lower);
+
+            // Extended n-gram learning (4-gram through 5-gram) for ∞-gram backoff.
+            // Uses the full context window to learn higher-order patterns from
+            // user typing, enabling longer-context predictions over time.
+            if self.context.len() >= 3 {
+                let ctx: Vec<&str> = self.context.iter().map(|s| s.as_str()).collect();
+                let ctx_len = ctx.len().min(5); // learn up to 5-gram (4 context words)
+                for n in 3..=ctx_len {
+                    let start = ctx.len() - n;
+                    self.engine.learn_online_ngram(&ctx[start..], &word_lower);
+                }
+            }
 
             // Feed word to per-language CVM track + momentum.
             let lang = if self.config.lang_detection {

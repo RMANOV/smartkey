@@ -11,3 +11,4 @@ press-releases/
 .worktrees
 corpus/raw/
 corpus/*.bin
+.firecrawl/

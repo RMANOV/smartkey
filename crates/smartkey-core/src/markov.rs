@@ -15,16 +15,32 @@ pub type BigramData = HashMap<String, (HashMap<String, u32>, u32)>;
 /// Trigram data: w1 → w2 → (followers_map, cached_total).
 pub type TrigramData = HashMap<String, HashMap<String, (HashMap<String, u32>, u32)>>;
 
-/// Interpolated Markov chain language model (up to trigram).
+/// Higher-order n-gram data: context tuple → (followers_map, cached_total).
+/// Used for 4-gram through 7-gram (personal learning from user typing).
+pub type HigherNgramData = HashMap<Vec<String>, (HashMap<String, u32>, u32)>;
+
+/// Maximum n-gram order supported (7-gram = 6 context words + 1 predicted word).
+pub const MAX_NGRAM_ORDER: usize = 7;
+
+/// Interpolated Markov chain language model with extended ∞-gram backoff.
+///
+/// Stores bigrams and trigrams (from corpus) plus higher-order n-grams
+/// (from personal learning). Scoring uses longest-suffix-match backoff
+/// inspired by Infini-gram (Liu et al., ICML 2024): start from the
+/// longest available context and back off to shorter only when needed.
 pub struct MarkovChain {
     /// context_word → (followers_map, cached_total)
     bigrams: BigramData,
     /// w1 → w2 → (followers_map, cached_total)
     trigrams: TrigramData,
+    /// 4-gram through 7-gram contexts (personal learning only).
+    higher_ngrams: HigherNgramData,
     /// Distinct words observed (tracked incrementally).
     vocab: HashSet<String>,
     /// Interpolation weights: [trigram, bigram, unigram].
     lambda: [f64; 3],
+    /// Auto-tuned weights from corpus statistics (None = use fixed lambda).
+    adaptive_lambda: Option<[f64; 3]>,
     /// Per-word unigram frequency counts for frequency-weighted backoff.
     /// Populated via `train_unigram()` during corpus loading.
     unigram_counts: HashMap<String, u32>,
@@ -38,8 +54,10 @@ impl MarkovChain {
         Self {
             bigrams: HashMap::new(),
             trigrams: HashMap::new(),
+            higher_ngrams: HashMap::new(),
             vocab: HashSet::new(),
             lambda: [0.6, 0.3, 0.1],
+            adaptive_lambda: None,
             unigram_counts: HashMap::new(),
             total_unigram_count: 0,
         }
@@ -50,8 +68,10 @@ impl MarkovChain {
         Self {
             bigrams: HashMap::new(),
             trigrams: HashMap::new(),
+            higher_ngrams: HashMap::new(),
             vocab: HashSet::new(),
             lambda,
+            adaptive_lambda: None,
             unigram_counts: HashMap::new(),
             total_unigram_count: 0,
         }
@@ -94,6 +114,30 @@ impl MarkovChain {
             .entry(w1.to_owned())
             .or_default()
             .entry(w2.to_owned())
+            .or_insert_with(|| (HashMap::new(), 0));
+        let entry = followers.entry(word.to_owned()).or_insert(0);
+        *entry = entry.saturating_add(count);
+        *total = total.saturating_add(count);
+        self.vocab.insert(word.to_owned());
+    }
+
+    /// Record `count` observations of a higher-order n-gram (4-gram through 7-gram).
+    ///
+    /// `context` is the preceding words (e.g. for a 5-gram: 4 context words).
+    /// Contexts longer than `MAX_NGRAM_ORDER - 1` are silently truncated.
+    pub fn train_ngram(&mut self, context: &[&str], word: &str, count: u32) {
+        if context.len() < 3 {
+            // Use dedicated bigram/trigram storage for orders ≤3.
+            return;
+        }
+        let ctx_len = context.len().min(MAX_NGRAM_ORDER - 1);
+        let key: Vec<String> = context[context.len() - ctx_len..]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (followers, total) = self
+            .higher_ngrams
+            .entry(key)
             .or_insert_with(|| (HashMap::new(), 0));
         let entry = followers.entry(word.to_owned()).or_insert(0);
         *entry = entry.saturating_add(count);
@@ -161,9 +205,67 @@ impl MarkovChain {
         1.0 / self.vocab.len() as f64
     }
 
+    /// P(word | context) from higher-order n-gram counts (4-gram+).
+    ///
+    /// Returns `None` when the context has never been observed.
+    fn higher_ngram_prob(&self, word: &str, context: &[&str]) -> Option<f64> {
+        if context.len() < 3 {
+            return None;
+        }
+        let key: Vec<String> = context.iter().map(|s| s.to_string()).collect();
+        let (followers, total) = self.higher_ngrams.get(&key)?;
+        if *total == 0 {
+            return None;
+        }
+        let count = followers.get(word).copied().unwrap_or(0);
+        if count == 0 {
+            return None;
+        }
+        Some(count as f64 / *total as f64)
+    }
+
     // ------------------------------------------------------------------
     // Scoring
     // ------------------------------------------------------------------
+
+    /// Extended ∞-gram backoff score (Infini-gram inspired).
+    ///
+    /// Starts from the longest available context and backs off to shorter
+    /// contexts when no match is found. Higher-order matches receive a
+    /// confidence boost because they capture more specific context.
+    ///
+    /// Falls back to the classic `score_with_backoff()` for trigram and below.
+    pub fn score_extended_backoff(&self, word: &str, context: &[&str]) -> f64 {
+        // Try higher-order n-grams from longest to shortest (7-gram → 4-gram).
+        let max_ctx = context.len().min(MAX_NGRAM_ORDER - 1);
+        for n in (3..=max_ctx).rev() {
+            let start = context.len() - n;
+            let ctx_slice = &context[start..];
+            if let Some(prob) = self.higher_ngram_prob(word, ctx_slice) {
+                // Higher-order match found — blend with lower-order for smoothing.
+                // Confidence bonus: longer context = more specific = higher weight.
+                let confidence = 0.7 + 0.05 * (n as f64 - 3.0); // 0.7 for 4-gram, 0.9 for 7-gram
+                let lower = self.score_trigram_and_below(word, context);
+                return (confidence * prob + (1.0 - confidence) * lower).max(UNSEEN_FLOOR);
+            }
+        }
+        // No higher-order match — fall through to trigram/bigram/unigram.
+        self.score_trigram_and_below(word, context)
+    }
+
+    /// Score using trigram, bigram, and unigram levels only.
+    ///
+    /// Extracts prev1/prev2 from the context slice and delegates to
+    /// `score_with_backoff()`.
+    fn score_trigram_and_below(&self, word: &str, context: &[&str]) -> f64 {
+        let prev1 = context.last().copied();
+        let prev2 = if context.len() >= 2 {
+            Some(context[context.len() - 2])
+        } else {
+            None
+        };
+        self.score_with_backoff(word, prev1, prev2)
+    }
 
     /// Interpolated backoff score.
     ///
@@ -177,20 +279,19 @@ impl MarkovChain {
     /// The score is clamped to at least `UNSEEN_FLOOR`.
     pub fn score_with_backoff(&self, word: &str, recent: Option<&str>, older: Option<&str>) -> f64 {
         let p_uni = self.unigram_prob(word);
+        let lam = self.effective_lambda();
 
         let score = match (older, recent) {
             (Some(w1), Some(w2)) => {
                 let p_tri = self.trigram_prob(word, w1, w2);
                 let p_bi = self.bigram_prob(word, w2);
-                self.lambda[0] * p_tri + self.lambda[1] * p_bi + self.lambda[2] * p_uni
+                lam[0] * p_tri + lam[1] * p_bi + lam[2] * p_uni
             }
             (None, Some(ctx)) => {
                 // No trigram context — redistribute λ₁ proportionally.
                 let p_bi = self.bigram_prob(word, ctx);
-                let w_bi = self.lambda[1]
-                    + self.lambda[0] * (self.lambda[1] / (self.lambda[1] + self.lambda[2]));
-                let w_uni = self.lambda[2]
-                    + self.lambda[0] * (self.lambda[2] / (self.lambda[1] + self.lambda[2]));
+                let w_bi = lam[1] + lam[0] * (lam[1] / (lam[1] + lam[2]));
+                let w_uni = lam[2] + lam[0] * (lam[2] / (lam[1] + lam[2]));
                 w_bi * p_bi + w_uni * p_uni
             }
             _ => p_uni,
@@ -240,6 +341,83 @@ impl MarkovChain {
     /// Total unigram count (for collocation PMI computation).
     pub fn total_unigram_count(&self) -> u64 {
         self.total_unigram_count
+    }
+
+    /// Raw higher-order n-gram data access (for serialization).
+    pub fn higher_ngrams_raw(&self) -> &HigherNgramData {
+        &self.higher_ngrams
+    }
+
+    // ------------------------------------------------------------------
+    // Adaptive lambda (Information Gain inspired, Phase 2)
+    // ------------------------------------------------------------------
+
+    /// Compute adaptive interpolation weights from corpus statistics.
+    ///
+    /// Inspired by Olifant/Memory-based LMs (van den Bosch, 2025): instead
+    /// of fixed λ=[0.6, 0.3, 0.1], compute weights proportional to the
+    /// empirical coverage and discrimination power at each n-gram level.
+    ///
+    /// Call after corpus loading is complete. The computed weights are used
+    /// by `score_with_backoff()` when `adaptive_lambda` is `Some`.
+    pub fn compute_adaptive_lambda(&mut self) {
+        let bigram_contexts = self.bigrams.len() as f64;
+        let trigram_contexts: usize = self.trigrams.values().map(|v| v.len()).sum();
+        let trigram_contexts = trigram_contexts as f64;
+        let vocab = self.vocab.len().max(1) as f64;
+
+        if bigram_contexts < 10.0 || vocab < 10.0 {
+            // Too little data for meaningful adaptation — keep defaults.
+            return;
+        }
+
+        // Coverage ratio: what fraction of vocab appears as a context?
+        // Higher coverage = more useful that level is for discrimination.
+        let bigram_coverage = (bigram_contexts / vocab).min(1.0);
+        let trigram_coverage = (trigram_contexts / (bigram_contexts.max(1.0))).min(1.0);
+
+        // Compute discrimination power via average fan-out.
+        // Lower average fan-out = more discriminative (sharper distributions).
+        let bigram_avg_fanout = if bigram_contexts > 0.0 {
+            self.bigrams
+                .values()
+                .map(|(f, _)| f.len() as f64)
+                .sum::<f64>()
+                / bigram_contexts
+        } else {
+            vocab
+        };
+        let trigram_avg_fanout = if trigram_contexts > 0.0 {
+            self.trigrams
+                .values()
+                .flat_map(|v| v.values())
+                .map(|(f, _)| f.len() as f64)
+                .sum::<f64>()
+                / trigram_contexts
+        } else {
+            vocab
+        };
+
+        // Discrimination score: inverse of normalized fan-out.
+        // Smaller fan-out → sharper distribution → higher weight.
+        let tri_disc = 1.0 / (1.0 + trigram_avg_fanout / vocab);
+        let bi_disc = 1.0 / (1.0 + bigram_avg_fanout / vocab);
+        let uni_disc = 0.1; // unigram baseline (low discrimination)
+
+        // Raw weights = coverage × discrimination.
+        let w_tri = trigram_coverage * tri_disc;
+        let w_bi = bigram_coverage * bi_disc;
+        let w_uni = uni_disc;
+
+        let sum = w_tri + w_bi + w_uni;
+        if sum > 0.0 {
+            self.adaptive_lambda = Some([w_tri / sum, w_bi / sum, w_uni / sum]);
+        }
+    }
+
+    /// Get the effective interpolation weights (adaptive if computed, else fixed).
+    pub fn effective_lambda(&self) -> [f64; 3] {
+        self.adaptive_lambda.unwrap_or(self.lambda)
     }
 }
 
