@@ -312,7 +312,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             try:
                 self._core.load_corpus_file(str(path))
                 loaded_count += 1
-            except OSError:
+            except (OSError, ValueError):
                 log.warning("Failed to load corpus %s", path, exc_info=True)
 
         if loaded_count == 0 and corpus_files:

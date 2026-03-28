@@ -58,7 +58,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run benchmarks
-        run: cargo bench -p smartkey-core -- --output-format bencher 2>&1 | tee bench-output.txt
+        run: cargo bench -p smartkey-core -- --output-format bencher | tee bench-output.txt
       - name: Store benchmark results
         uses: actions/upload-artifact@v4
         with:
