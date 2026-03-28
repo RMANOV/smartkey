@@ -137,6 +137,8 @@ pub struct InputConfig {
     pub use_kneser_ney: bool,
     /// Enable Hedge/Exp3 adaptive weight mixer (experimental, replaces EMA).
     pub use_hedge: bool,
+    /// Enable neural reranker for nonlinear feature interactions (Phase 3).
+    pub use_reranker: bool,
     // ── Dual buffer (v0.5.0) ─────────────────────────────────────
     /// Enable layout-agnostic dual-buffer input.
     pub dual_buffer: DualBufferConfig,
@@ -165,6 +167,7 @@ impl Default for InputConfig {
             bpe_enabled: true,
             use_kneser_ney: true,
             use_hedge: true,
+            use_reranker: true,
             dual_buffer: DualBufferConfig::default(),
         }
     }

@@ -348,6 +348,11 @@ impl MarkovChain {
         &self.higher_ngrams
     }
 
+    /// Raw bigram data access (for reranker training).
+    pub fn bigram_data(&self) -> &BigramData {
+        &self.bigrams
+    }
+
     // ------------------------------------------------------------------
     // Adaptive lambda (Information Gain inspired, Phase 2)
     // ------------------------------------------------------------------

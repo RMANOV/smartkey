@@ -15,6 +15,7 @@ use crate::lang_model::LanguageModelBank;
 use crate::markov::MarkovChain;
 use crate::ngram::WordEntry;
 use crate::personal::{extract_markov_snapshot, AdaptiveWeightsSnapshot, PersonalProfile};
+use crate::reranker::NeuralReranker;
 use crate::session_cache::SessionCacheLM;
 use crate::tech_vocab::TechVocab;
 use crate::typing_regime::TypingRegime;
@@ -100,6 +101,11 @@ pub struct SmartKeyEngine {
     /// RefCell: `predict()` takes `&self` but calibration needs mutation; safe because
     /// SmartKeyEngine is single-threaded (see `cache` field comment above).
     calibrator: RefCell<ConfidenceCalibrator>,
+    /// Neural reranker (Phase 3): tiny feedforward network that captures
+    /// nonlinear feature interactions between scoring signals.
+    reranker: NeuralReranker,
+    /// Whether the neural reranker is enabled.
+    use_reranker: bool,
 }
 
 impl SmartKeyEngine {
@@ -157,6 +163,8 @@ impl SmartKeyEngine {
             use_kneser_ney: config.use_kneser_ney,
             use_hedge: config.use_hedge,
             calibrator: RefCell::new(ConfidenceCalibrator::new()),
+            reranker: NeuralReranker::new(),
+            use_reranker: config.use_reranker,
         }
     }
 
@@ -203,7 +211,8 @@ impl SmartKeyEngine {
         LangId::En // default for ambiguous (digits, symbols)
     }
 
-    /// Compute adaptive interpolation weights for all corpus Markov chains.
+    /// Compute adaptive interpolation weights for all corpus Markov chains
+    /// and train the neural reranker from corpus statistics.
     ///
     /// Called after corpus loading is complete. Each per-language Markov chain
     /// auto-tunes its λ weights based on corpus statistics (coverage and
@@ -212,6 +221,77 @@ impl SmartKeyEngine {
         for model in self.lang_models.models_mut() {
             model.markov.compute_adaptive_lambda();
         }
+        // Train the neural reranker from corpus bigram data.
+        if self.use_reranker {
+            self.train_reranker_from_corpus();
+        }
+    }
+
+    /// Train the neural reranker using corpus bigram co-occurrence data.
+    ///
+    /// For each bigram (context → word), generates training examples where the
+    /// correct word should score highest. This teaches the reranker to recognise
+    /// feature patterns that correlate with correct predictions.
+    fn train_reranker_from_corpus(&mut self) {
+        use crate::reranker::NUM_FEATURES;
+
+        // Collect training examples from corpus bigrams.
+        let mut examples: Vec<(Vec<[f64; NUM_FEATURES]>, usize)> = Vec::new();
+
+        for model in self.lang_models.all_models() {
+            let bigram_data = model.markov.bigram_data();
+            for (context, (followers, total)) in bigram_data.iter().take(200) {
+                if *total == 0 || followers.len() < 2 {
+                    continue;
+                }
+                // Sort followers by count to identify the "best" word.
+                let mut sorted: Vec<(&String, &u32)> = followers.iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(a.1));
+                let _target_word = sorted[0].0;
+
+                // Generate features for each follower.
+                let mut features_list: Vec<[f64; NUM_FEATURES]> = Vec::new();
+                let max_count = *sorted[0].1 as f64;
+
+                for (i, (word, count)) in sorted.iter().take(5).enumerate() {
+                    let markov_ratio = **count as f64 / max_count;
+                    let freq_rank = 1.0 / (1.0 + i as f64);
+                    let prefix_cov = if word.len() >= 2 {
+                        2.0 / word.len() as f64
+                    } else {
+                        1.0
+                    };
+                    features_list.push([
+                        markov_ratio,                              // ensemble_score proxy
+                        markov_ratio,                              // markov_ratio
+                        0.0,        // personal_ratio (no personal data at corpus load)
+                        prefix_cov, // prefix_coverage
+                        freq_rank,  // frequency_rank
+                        if context.len() > 3 { 0.4 } else { 0.2 }, // context_match proxy
+                    ]);
+                }
+
+                if !features_list.is_empty() {
+                    examples.push((features_list, 0)); // target is always index 0 (highest count)
+                }
+            }
+        }
+
+        if !examples.is_empty() {
+            // Two training passes for convergence.
+            self.reranker.train_batch(&examples);
+            self.reranker.train_batch(&examples);
+        }
+    }
+
+    /// Access the neural reranker (for persistence).
+    pub fn reranker(&self) -> &NeuralReranker {
+        &self.reranker
+    }
+
+    /// Restore reranker weights (from personal profile).
+    pub fn set_reranker(&mut self, reranker: NeuralReranker) {
+        self.reranker = reranker;
     }
 
     /// Feed a word into the personal CVM layer (call when the user types a word).
@@ -1025,6 +1105,60 @@ impl SmartKeyEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         scored.truncate(limit);
+
+        // Step 4b (Phase 3): Neural reranking pass.
+        // Extract features per candidate and let the reranker blend its score.
+        if self.use_reranker && self.reranker.is_trained() {
+            let max_score = scored.first().map(|p| p.score).unwrap_or(1.0).max(1e-6);
+            let mut rerank_data: arrayvec::ArrayVec<(f64, [f64; 6]), 30> =
+                arrayvec::ArrayVec::new();
+
+            for (i, (pred, r)) in scored.iter().zip(raw.iter()).enumerate() {
+                let prefix_coverage = if pred.word.is_empty() {
+                    0.0
+                } else {
+                    prefix.len() as f64 / pred.word.len() as f64
+                };
+                let frequency_rank = 1.0 / (1.0 + i as f64);
+                let context_match = self
+                    .personal_markov
+                    .higher_ngrams_raw()
+                    .keys()
+                    .filter(|k| {
+                        let klen = k.len();
+                        klen <= context.len()
+                            && k.iter()
+                                .zip(context[context.len() - klen..].iter())
+                                .all(|(a, b)| a == b)
+                    })
+                    .map(|k| k.len())
+                    .max()
+                    .unwrap_or(0) as f64
+                    / 7.0;
+
+                let features = [
+                    pred.score / max_score,
+                    r.markov / max_markov.max(1e-6),
+                    r.personal / max_personal.max(1e-6),
+                    prefix_coverage,
+                    frequency_rank,
+                    context_match,
+                ];
+                rerank_data.push((pred.score, features));
+            }
+
+            self.reranker.rerank(&mut rerank_data);
+
+            // Apply reranked scores back and re-sort.
+            for (pred, (new_score, _)) in scored.iter_mut().zip(rerank_data.iter()) {
+                pred.score = *new_score;
+            }
+            scored.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
         // Step 5: normalise confidence via score-sum (softmax-style) so confidences
         // reflect each candidate's fractional share of total score mass.
