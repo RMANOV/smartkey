@@ -223,7 +223,10 @@ impl DualBuffer {
         &self.bg_buf
     }
 
-    /// Number of characters in the buffers (same for both).
+    /// Number of characters pushed (same for both buffers).
+    ///
+    /// Uses `en_buf` byte length, which equals the character count because
+    /// the EN buffer contains only single-byte ASCII characters.
     pub fn len(&self) -> usize {
         self.en_buf.len()
     }

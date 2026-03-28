@@ -251,18 +251,41 @@ The engine is language-agnostic by design. The character-level trie handles any 
 ## Test Suite
 
 ```
-94 tests across 10 modules:
+411 tests across 33 modules + integration suites:
 
-  cvm       22 tests  (streaming counter, decay, snapshots, probabilistic eviction)
-  ngram     17 tests  (trie operations, Cyrillic, prefix search, fuzzy matching)
-  markov     7 tests  (bigram/trigram probability, Katz backoff, candidate ranking)
-  prefix     8 tests  (single/multi-prefix matching, Aho-Corasick batch)
-  ensemble  11 tests  (prediction pipeline, personal boost, fuzzy discount, config)
-  input     16 tests  (key dispatch, ghost text, kill switch, focus lifecycle)
-  corpus     3 tests  (JSON round-trip, load into engine, dropped entries)
-  paths      4 tests  (cross-platform config/corpus path resolution)
-  mac        4 tests  (keycode mapping, FFI lifecycle, trigram, corpus file)
-  integration 5 tests (full pipeline, kill switch, multi-language, personal round-trip)
+  input              47 tests  (key dispatch, ghost text, kill switch, focus lifecycle)
+  ensemble           28 tests  (4-signal scoring, personal boost, fuzzy discount, config)
+  cvm                23 tests  (streaming counter, decay, snapshots, probabilistic eviction)
+  ngram              22 tests  (trie operations, Cyrillic, prefix search, fuzzy matching)
+  dual_buffer        18 tests  (layout-agnostic input, lock, flip detection, prior hints)
+  lang_detect        18 tests  (trigram classifier, EMA, instant detection, momentum)
+  frustration        13 tests  (rapid-delete, reject, abandon signals)
+  caps               12 tests  (smart capitalisation, proper nouns)
+  markov             11 tests  (bigram/trigram probability, Katz backoff)
+  ffi_protocol       11 tests  (action encoding/decoding, composing, replace)
+  light_profile      11 tests  (profile snapshots)
+  tech_vocab         10 tests  (tech term scoring, FastCoding regime)
+  typing_regime       9 tests  (regime detection: FastCoding/Normal/Chat)
+  keymap              9 tests  (scancode mapping, QWERTY/BG Phonetic)
+  correction_memory   9 tests  (correction tracking)
+  calibration         8 tests  (confidence calibration, score→probability)
+  kneser_ney          8 tests  (KN smoothing, discount estimation)
+  ppm                 8 tests  (PPM character-level model)
+  hedge               8 tests  (Exp3 adaptive weight mixer)
+  bpe                 7 tests  (BPE tokenizer, OOV fallback)
+  eval                7 tests  (prediction metrics, acceptance tracking)
+  cache               7 tests  (prediction cache, invalidation)
+  session_cache       6 tests  (burstiness tracking)
+  context_sampler     6 tests  (context sampling, surrounding text)
+  lang_cvm            5 tests  (per-language CVM tracks)
+  bg_morphology       5 tests  (Bulgarian morphological grouping)
+  personal            4 tests  (profile persistence, JSON round-trip)
+  paths               4 tests  (cross-platform config/corpus path resolution)
+  mac                 4 tests  (keycode mapping, FFI lifecycle, trigram, corpus)
+  lang_model          3 tests  (per-language model bank)
+  corpus              3 tests  (JSON round-trip, load into engine, dropped entries)
+  collocation         3 tests  (collocation detection, PMI)
+  integration        34 tests  (full pipeline, virtual typer, FFI contracts)
 ```
 
 ---

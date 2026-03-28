@@ -127,7 +127,14 @@ impl PyInputMethodCore {
     fn load_corpus_file(&mut self, path: &str) -> PyResult<()> {
         self.inner
             .load_corpus_file(std::path::Path::new(path))
-            .map_err(pyo3::exceptions::PyIOError::new_err)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("JSON") || msg.contains("parse") || msg.contains("deserialize") {
+                    pyo3::exceptions::PyValueError::new_err(msg)
+                } else {
+                    pyo3::exceptions::PyIOError::new_err(msg)
+                }
+            })
     }
 
     /// Process a key event. Returns list of `(action_type, payload)` tuples.

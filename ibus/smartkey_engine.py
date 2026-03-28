@@ -265,7 +265,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         corpus_files: list[Path] = []
 
         # Determine which directories to scan, in priority order.
-        env_override = os.environ.get("_CORPUS_DIR")
+        env_override = os.environ.get("SMARTKEY_CORPUS_DIR")
         search_dirs: list[Path] = []
         if env_override:
             search_dirs.append(Path(env_override).expanduser())
@@ -307,11 +307,20 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             len(corpus_files),
             corpus_files[0].parent,
         )
+        loaded_count = 0
         for path in corpus_files:
             try:
                 self._core.load_corpus_file(str(path))
+                loaded_count += 1
             except OSError:
                 log.warning("Failed to load corpus %s", path, exc_info=True)
+
+        if loaded_count == 0 and corpus_files:
+            log.error(
+                "smartkey: ALL %d corpus files failed to load — "
+                "predictions will be empty until corpus is available",
+                len(corpus_files),
+            )
 
     @staticmethod
     def _decode_surrounding_text(text_obj: object | None) -> str | None:

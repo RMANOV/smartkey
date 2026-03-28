@@ -35,6 +35,7 @@ jobs:
       - run: cargo test -p smartkey-core
       - run: cargo test -p smartkey-win
       - run: cargo check -p smartkey-win
+      - run: cargo check -p smartkey-playground
       - run: cargo clippy -p smartkey-win -- -D warnings
 
   build-macos:
@@ -46,7 +47,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p smartkey-core
       - run: cargo test -p smartkey-mac
-      - run: cargo check -p smartkey-mac --lib
+      - run: cargo check -p smartkey-mac
+      - run: cargo check -p smartkey-playground
+
+  bench:
+    name: Benchmarks (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run benchmarks
+        run: cargo bench -p smartkey-core -- --output-format bencher 2>&1 | tee bench-output.txt
+      - name: Store benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-output.txt
+          retention-days: 30
 
   clippy:
     name: Clippy
