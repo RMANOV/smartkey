@@ -297,7 +297,7 @@ mod tests {
             .collect();
 
         let loss1 = r.train_batch(&examples[..10]);
-        let loss2 = r.train_batch(&examples[10..50]);
+        let _loss2 = r.train_batch(&examples[10..50]);
         let loss3 = r.train_batch(&examples[50..]);
 
         // Loss should generally decrease (or at least not explode).
