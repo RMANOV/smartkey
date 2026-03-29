@@ -384,6 +384,70 @@ pub fn transliterate(input: &str) -> String {
     input.chars().filter_map(phonetic_map).collect()
 }
 
+/// Map a Cyrillic character back to its BG Phonetic Latin equivalent.
+pub fn reverse_phonetic_map(ch: char) -> Option<char> {
+    Some(match ch {
+        'а' => 'a',
+        'А' => 'A',
+        'б' => 'b',
+        'Б' => 'B',
+        'ц' => 'c',
+        'Ц' => 'C',
+        'д' => 'd',
+        'Д' => 'D',
+        'е' => 'e',
+        'Е' => 'E',
+        'ф' => 'f',
+        'Ф' => 'F',
+        'г' => 'g',
+        'Г' => 'G',
+        'х' => 'h',
+        'Х' => 'H',
+        'и' => 'i',
+        'И' => 'I',
+        'й' => 'j',
+        'Й' => 'J',
+        'к' => 'k',
+        'К' => 'K',
+        'л' => 'l',
+        'Л' => 'L',
+        'м' => 'm',
+        'М' => 'M',
+        'н' => 'n',
+        'Н' => 'N',
+        'о' => 'o',
+        'О' => 'O',
+        'п' => 'p',
+        'П' => 'P',
+        'я' => 'q',
+        'Я' => 'Q',
+        'р' => 'r',
+        'Р' => 'R',
+        'с' => 's',
+        'С' => 'S',
+        'т' => 't',
+        'Т' => 'T',
+        'у' => 'u',
+        'У' => 'U',
+        'в' => 'v',
+        'В' => 'V',
+        'ш' => 'w',
+        'Ш' => 'W',
+        'ь' => 'x',
+        'Ь' => 'X',
+        'ъ' => 'y',
+        'Ъ' => 'Y',
+        'з' => 'z',
+        'З' => 'Z',
+        _ => return None,
+    })
+}
+
+/// Reverse-transliterate a Cyrillic string to Latin using BG Phonetic layout.
+pub fn reverse_transliterate(input: &str) -> String {
+    input.chars().filter_map(reverse_phonetic_map).collect()
+}
+
 impl Default for LanguageDetector {
     fn default() -> Self {
         Self::new()

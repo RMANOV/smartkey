@@ -1206,9 +1206,9 @@ impl InputMethodCore {
     /// Transliterates the word via phonetic map and compares corpus frequencies.
     /// If the transliterated version is 10x+ more frequent → auto-correct.
     fn try_language_correction(&self, word: &str) -> Option<Action> {
-        use crate::lang_detect::{transliterate, LangId};
+        use crate::lang_detect::{reverse_transliterate, transliterate, LangId};
 
-        if word.len() < 2 {
+        if word.chars().count() < 2 {
             return None;
         }
 
@@ -1228,10 +1228,7 @@ impl InputMethodCore {
         let other_word = if typed_lang == LangId::En {
             transliterate(word)
         } else {
-            // Reverse transliteration: Cyrillic → Latin (not directly supported,
-            // but we can check if the Latin interpretation exists in EN corpus).
-            // For now, only support Latin→Cyrillic correction (most common case).
-            return None;
+            reverse_transliterate(word)
         };
 
         if other_word.is_empty() || other_word.len() < 2 {
@@ -1244,7 +1241,7 @@ impl InputMethodCore {
 
         // Only correct if the other language is overwhelmingly more likely.
         // Safety: if both exist, don't correct (ambiguous).
-        if other_freq > 0.0 && (typed_freq < 1.0 || other_freq / typed_freq.max(1.0) >= 10.0) {
+        if other_freq > 0.0 && (typed_freq < 1.0 || other_freq / typed_freq.max(1.0) >= 5.0) {
             let replace_len = word.chars().count();
             return Some(Action::ReplaceWord {
                 replace_len,
@@ -1306,10 +1303,7 @@ impl InputMethodCore {
         let preds = self.engine.predict("", &context, 3, lang);
 
         let show = preds.first().and_then(|top| {
-            if top.confidence >= self.config.ghost_text_min_confidence
-                && !top.word.is_empty()
-                && top.word.chars().count() >= 2
-            {
+            if top.confidence >= self.config.ghost_text_min_confidence && !top.word.is_empty() {
                 Some(top.word.clone())
             } else {
                 None
