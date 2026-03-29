@@ -669,6 +669,22 @@ impl SmartKeyEngine {
         }
     }
 
+    /// Exact word frequency in a specific language model (for auto-correction).
+    ///
+    /// Returns 0.0 if the word is not found.
+    pub fn word_frequency(&self, word: &str, lang: LangId) -> f64 {
+        self.lang_models
+            .get(lang)
+            .and_then(|m| {
+                m.trie
+                    .prefix_search(word, 1)
+                    .first()
+                    .filter(|e| e.word == word)
+                    .map(|e| e.frequency as f64)
+            })
+            .unwrap_or(0.0)
+    }
+
     /// Score two prefixes (EN and BG interpretations) for dual-buffer comparison.
     ///
     /// Uses per-language models directly for precise scoring: EN prefix against

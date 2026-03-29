@@ -428,6 +428,9 @@ pub struct InputMethodCore {
     caps_engine: CapsEngine,
     /// Hints injected by MasterLoop (v0.6: proactive anticipation).
     active_hints: Option<crate::master_loop::Hints>,
+    /// True when an anticipatory (next-word) ghost is showing, not a prefix ghost.
+    /// Used to distinguish Tab-accept behavior.
+    anticipatory_ghost_active: bool,
 }
 
 impl InputMethodCore {
@@ -449,6 +452,7 @@ impl InputMethodCore {
             current_word_had_flip: false,
             caps_engine: CapsEngine::new(),
             active_hints: None,
+            anticipatory_ghost_active: false,
         }
     }
 
@@ -678,7 +682,11 @@ impl InputMethodCore {
                     for word in &words {
                         self.commit_word_internal(word, false);
                     }
+                    let last_word = words.last().copied().unwrap_or("").to_string();
                     self.reset_word();
+                    // After Tab-accept: run post-commit pipeline for next-word ghost.
+                    let mut actions = actions;
+                    actions.extend(self.post_commit_pipeline(&last_word));
                     actions
                 } else if self.in_hypothesis_phase() && !self.current_word.is_empty() {
                     // Hypothesis phase, no ghost: commit preedit prefix + forward Tab.
@@ -787,12 +795,20 @@ impl InputMethodCore {
                         ];
                     }
                 }
-                if !self.current_word.is_empty() {
+                let committed = if !self.current_word.is_empty() {
                     let word = std::mem::take(&mut self.current_word);
                     self.commit_word_internal(&word, true);
-                }
+                    Some(word)
+                } else {
+                    None
+                };
                 self.reset_word();
-                vec![Action::HideGhost, Action::ForwardKey]
+                let mut actions = vec![Action::HideGhost, Action::ForwardKey];
+                // Post-commit intelligence pipeline: auto-correct, auto-caps, next-word ghost.
+                if let Some(ref word) = committed {
+                    actions.extend(self.post_commit_pipeline(word));
+                }
+                actions
             }
 
             // Backspace: trim the current word.
@@ -839,6 +855,11 @@ impl InputMethodCore {
 
             // Printable character: detect language, then predict.
             Key::Char(ch) => {
+                // Clear anticipatory ghost if active — user is typing a new word.
+                if self.anticipatory_ghost_active {
+                    self.anticipatory_ghost_active = false;
+                    self.ghost.clear();
+                }
                 self.current_word.push(ch);
 
                 // v0.4.1: detection BEFORE prediction (instant classify).
@@ -1173,6 +1194,166 @@ impl InputMethodCore {
         }
     }
 
+    // ── Post-Commit Intelligence Pipeline ─────────────────────────────
+    //
+    // Three steps that fire after every word commit (Space/Enter):
+    //   1. Language auto-correction (EN↔BG)
+    //   2. Auto-capitalization (sentence start, proper nouns)
+    //   3. Anticipatory next-word ghost
+
+    /// Step 1: Check if the committed word belongs to the wrong language.
+    ///
+    /// Transliterates the word via phonetic map and compares corpus frequencies.
+    /// If the transliterated version is 10x+ more frequent → auto-correct.
+    fn try_language_correction(&self, word: &str) -> Option<Action> {
+        use crate::lang_detect::{transliterate, LangId};
+
+        if word.len() < 2 {
+            return None;
+        }
+
+        // Determine word's script: Latin → check BG transliteration, Cyrillic → check EN.
+        let first_alpha = word.chars().find(|c| c.is_alphabetic())?;
+        let (typed_lang, other_lang) = if first_alpha.is_ascii_alphabetic() {
+            (LangId::En, LangId::Bg)
+        } else if ('\u{0400}'..='\u{04FF}').contains(&first_alpha) {
+            (LangId::Bg, LangId::En)
+        } else {
+            return None;
+        };
+
+        let typed_freq = self.engine.word_frequency(&word.to_lowercase(), typed_lang);
+
+        // Transliterate to the other language.
+        let other_word = if typed_lang == LangId::En {
+            transliterate(word)
+        } else {
+            // Reverse transliteration: Cyrillic → Latin (not directly supported,
+            // but we can check if the Latin interpretation exists in EN corpus).
+            // For now, only support Latin→Cyrillic correction (most common case).
+            return None;
+        };
+
+        if other_word.is_empty() || other_word.len() < 2 {
+            return None;
+        }
+
+        let other_freq = self
+            .engine
+            .word_frequency(&other_word.to_lowercase(), other_lang);
+
+        // Only correct if the other language is overwhelmingly more likely.
+        // Safety: if both exist, don't correct (ambiguous).
+        if other_freq > 0.0 && (typed_freq < 1.0 || other_freq / typed_freq.max(1.0) >= 10.0) {
+            let replace_len = word.chars().count();
+            return Some(Action::ReplaceWord {
+                replace_len,
+                text: other_word,
+            });
+        }
+
+        None
+    }
+
+    /// Step 2: Auto-capitalize if previous context requires it.
+    ///
+    /// Fires after sentence-ending punctuation (. ! ? \n) and for proper nouns.
+    fn try_auto_capitalize(&self, word: &str) -> Option<Action> {
+        if word.is_empty() {
+            return None;
+        }
+
+        let first_char = word.chars().next()?;
+        if first_char.is_uppercase() {
+            return None; // Already capitalized.
+        }
+
+        // Check sentence-start: previous committed word ends with .!?\n
+        let needs_cap = if let Some(prev) = self.context.back() {
+            CapsEngine::requires_capitalization(prev)
+        } else {
+            true // Start of input.
+        };
+
+        // Check proper noun.
+        let is_proper = self.caps_engine.is_proper_noun(word);
+
+        if needs_cap || is_proper {
+            let capitalized = CapsEngine::capitalize_first(word);
+            if capitalized != word {
+                return Some(Action::ReplaceWord {
+                    replace_len: word.chars().count(),
+                    text: capitalized,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Step 3: Show anticipatory next-word ghost immediately after commit.
+    ///
+    /// Predicts the most likely next word with empty prefix. If confidence
+    /// is above threshold, shows it as ghost text. Tab accepts, typing clears.
+    fn try_anticipatory_ghost(&mut self) -> Option<Action> {
+        let lang = if self.config.lang_detection {
+            Some(self.lang_detector.detected().lang)
+        } else {
+            None
+        };
+
+        let context = self.prediction_context();
+        let preds = self.engine.predict("", &context, 3, lang);
+
+        let show = preds.first().and_then(|top| {
+            if top.confidence >= self.config.ghost_text_min_confidence
+                && !top.word.is_empty()
+                && top.word.chars().count() >= 2
+            {
+                Some(top.word.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(word) = show {
+            self.ghost.clone_from(&word);
+            self.last_predictions = preds;
+            self.anticipatory_ghost_active = true;
+            return Some(Action::ShowGhost(word));
+        }
+
+        None
+    }
+
+    /// Run the full post-commit pipeline: language correction → caps → next-word ghost.
+    /// Returns a list of actions to append to the Space/Enter handler.
+    fn post_commit_pipeline(&mut self, committed_word: &str) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let mut effective_word = committed_word.to_string();
+
+        // Step 1: Language auto-correction.
+        if let Some(correction) = self.try_language_correction(&effective_word) {
+            if let Action::ReplaceWord { ref text, .. } = correction {
+                effective_word = text.clone();
+            }
+            actions.push(correction);
+        }
+
+        // Step 2: Auto-capitalization.
+        if let Some(cap_action) = self.try_auto_capitalize(&effective_word) {
+            actions.push(cap_action);
+        }
+
+        // Step 3: Anticipatory next-word ghost.
+        if self.config.ghost_text {
+            if let Some(ghost_action) = self.try_anticipatory_ghost() {
+                actions.push(ghost_action);
+            }
+        }
+
+        actions
+    }
+
     fn reset_word(&mut self) {
         self.current_word.clear();
         self.ghost.clear();
@@ -1180,6 +1361,7 @@ impl InputMethodCore {
         self.transliteration_active = false;
         self.dual_buffer = None;
         self.current_word_had_flip = false;
+        self.anticipatory_ghost_active = false;
     }
 
     // ── Dual buffer key handling (v0.5.0) ────────────────────────────
