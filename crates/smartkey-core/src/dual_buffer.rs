@@ -158,7 +158,22 @@ impl DualBuffer {
         let Some(prior_lang) = prior else {
             return;
         };
-        if !matches!(prior_lang, LangId::En | LangId::Bg) || prior_lang != self.winner {
+        if !matches!(prior_lang, LangId::En | LangId::Bg) {
+            return;
+        }
+
+        // On the 1st character, context overrides corpus — single-char
+        // frequencies are meaningless for language discrimination.
+        // Momentum (≥60% of last 5 words) is the only reliable signal.
+        if self.en_buf.len() == 1 && prior_lang != self.winner {
+            self.winner = prior_lang;
+            self.confidence = 0.65;
+            self.locked = true;
+            self.locked_lang = Some(prior_lang);
+            return;
+        }
+
+        if prior_lang != self.winner {
             return;
         }
 
@@ -524,5 +539,58 @@ mod tests {
         // The en_buf is always the EN layout text regardless of En or Tech winner.
         assert_eq!(b.en_text(), "hel");
         assert_eq!(b.bg_text(), "хел");
+    }
+
+    // ── 1st-character context override tests ──────────────────────
+
+    #[test]
+    fn prior_overrides_corpus_on_char_1() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('h', 'х');
+        // EN corpus wins overwhelmingly.
+        b.update_scores(1_000_000.0, 1.0);
+        assert_eq!(b.winner_lang(), LangId::En);
+        assert!(!b.is_locked());
+
+        // Prior says BG (momentum from last 5 words).
+        // On char 1, prior should OVERRIDE corpus winner.
+        b.apply_prior_lock_hint(Some(LangId::Bg));
+        assert_eq!(
+            b.winner_lang(),
+            LangId::Bg,
+            "prior should override on char 1"
+        );
+        assert!(
+            b.is_locked(),
+            "should lock immediately on char 1 with prior"
+        );
+        assert_eq!(b.winner_text(), "х");
+    }
+
+    #[test]
+    fn no_override_without_prior_on_char_1() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('h', 'х');
+        b.update_scores(1_000_000.0, 1.0);
+        b.apply_prior_lock_hint(None);
+        // No prior → no override → existing behavior.
+        assert_eq!(b.winner_lang(), LangId::En);
+        assert!(!b.is_locked());
+    }
+
+    #[test]
+    fn prior_no_override_on_char_2_plus() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('h', 'х');
+        b.push('e', 'е');
+        // 2 chars: prior mismatch should NOT override (only char 1 overrides).
+        b.update_scores(1_000_000.0, 1.0);
+        b.apply_prior_lock_hint(Some(LangId::Bg));
+        assert_eq!(
+            b.winner_lang(),
+            LangId::En,
+            "prior should NOT override after char 1"
+        );
+        assert!(!b.is_locked());
     }
 }

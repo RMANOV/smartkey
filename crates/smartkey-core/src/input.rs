@@ -1381,7 +1381,11 @@ impl InputMethodCore {
         if !was_locked {
             let (en_freq, bg_freq) = self.engine.score_both(db.en_text(), db.bg_text());
             db.update_scores(en_freq, bg_freq);
-            let lang_prior = self.active_hints.as_ref().and_then(|h| h.lang_prior);
+            let lang_prior = self
+                .active_hints
+                .as_ref()
+                .and_then(|h| h.lang_prior)
+                .or_else(|| self.lang_detector.momentum_lang());
             db.apply_prior_lock_hint(lang_prior);
         }
 
