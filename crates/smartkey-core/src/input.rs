@@ -782,18 +782,20 @@ impl InputMethodCore {
                     }
                 }
 
-                if let Some(ref db) = self.dual_buffer {
-                    if !db.is_locked() && !self.current_word.is_empty() {
-                        // Hypothesis phase: commit preedit prefix before forwarding.
-                        let prefix = self.current_word.clone();
-                        self.commit_word_internal(&prefix, true);
-                        self.reset_word();
-                        return vec![
-                            Action::HideGhost,
-                            Action::CommitText(prefix),
-                            Action::ForwardKey,
-                        ];
-                    }
+                if self.dual_buffer.is_some() && !self.current_word.is_empty() {
+                    // Full-word composing: commit entire preedit word at once.
+                    // The word has been in composing mode the whole time — the
+                    // user sees the correct script; now we finalize it.
+                    let word = self.current_word.clone();
+                    self.commit_word_internal(&word, true);
+                    self.reset_word();
+                    let mut actions = vec![
+                        Action::HideGhost,
+                        Action::CommitText(word.clone()),
+                        Action::ForwardKey,
+                    ];
+                    actions.extend(self.post_commit_pipeline(&word));
+                    return actions;
                 }
                 let committed = if !self.current_word.is_empty() {
                     let word = std::mem::take(&mut self.current_word);
@@ -815,35 +817,23 @@ impl InputMethodCore {
             Key::Backspace => {
                 if let Some(ref mut db) = self.dual_buffer {
                     if !db.is_empty() {
-                        let was_locked = db.is_locked();
                         db.pop();
                         if db.is_empty() {
+                            // All chars deleted — clear preedit entirely.
                             self.dual_buffer = None;
                             self.current_word.clear();
                             self.ghost.clear();
-                            if was_locked {
-                                // Committed chars in app: forward backspace to delete last one.
-                                return vec![Action::HideGhost, Action::ForwardKey];
-                            } else {
-                                // Hypothesis: nothing in app, just clear preedit.
-                                return vec![Action::HideGhost];
-                            }
+                            return vec![Action::HideGhost];
                         }
-                        if !was_locked {
-                            // Hypothesis: re-score, update preedit.
-                            let (ef, bf) = self.engine.score_both(db.en_text(), db.bg_text());
-                            db.update_scores(ef, bf);
-                            self.current_word = db.winner_text().to_string();
-                            let ghost = self.compute_ghost_suffix();
-                            return vec![Action::ShowComposing {
-                                typed: self.current_word.clone(),
-                                ghost,
-                            }];
-                        }
-                        // Locked: forward backspace to app + update ghost.
+                        // Full-word composing: re-score and update preedit.
+                        let (ef, bf) = self.engine.score_both(db.en_text(), db.bg_text());
+                        db.update_scores(ef, bf);
                         self.current_word = db.winner_text().to_string();
-                        let ghost_action = self.update_predictions();
-                        return vec![Action::HideGhost, Action::ForwardKey, ghost_action];
+                        let ghost = self.compute_ghost_suffix();
+                        return vec![Action::ShowComposing {
+                            typed: self.current_word.clone(),
+                            ghost,
+                        }];
                     }
                 }
                 if !self.current_word.is_empty() {
@@ -1412,35 +1402,16 @@ impl InputMethodCore {
             }
         }
 
-        if !db.is_locked() {
-            // ═══ HYPOTHESIS PHASE ═══
-            // Nothing committed. Everything in preedit.
-            let ghost_suffix = self.compute_ghost_suffix();
-            return vec![Action::ShowComposing {
-                typed: self.current_word.clone(),
-                ghost: ghost_suffix,
-            }];
-        }
-
-        if !was_locked {
-            // ═══ JUST LOCKED (transition) ═══
-            // Commit entire accumulated prefix at once.
-            let ghost_action = self.update_predictions();
-            return vec![
-                Action::HideGhost,
-                Action::CommitText(self.current_word.clone()),
-                ghost_action,
-            ];
-        }
-
-        // ═══ LOCKED PHASE ═══
-        // One char at a time, language already decided.
-        let ghost_action = self.update_predictions();
-        vec![
-            Action::HideGhost,
-            Action::CommitText(winner_char.to_string()),
-            ghost_action,
-        ]
+        // ═══ FULL-WORD COMPOSING ═══
+        // Keep the ENTIRE word in preedit until Space/Enter commits it.
+        // The user sees the correct script (winner interpretation) in real-time
+        // as underlined composing text — no jarring ReplaceWord corrections.
+        // Lock is an internal scoring signal, not a commit trigger.
+        let ghost_suffix = self.compute_ghost_suffix();
+        vec![Action::ShowComposing {
+            typed: self.current_word.clone(),
+            ghost: ghost_suffix,
+        }]
     }
 
     /// Check if the user is typing on the wrong keyboard layout.
