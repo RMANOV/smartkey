@@ -845,6 +845,25 @@ impl InputMethodCore {
 
             // Printable character: detect language, then predict.
             Key::Char(ch) => {
+                // ── Composing guard (v0.5.1) ──
+                // Full-word composing keeps the entire word in preedit until
+                // Space/Enter.  Non-dual-buffer chars (digits, punctuation)
+                // bypass the dual buffer, so they would clear the preedit via
+                // HideGhost without committing the composed text — losing the
+                // user's typed letters.  Commit the composed word first.
+                if self.dual_buffer.is_some()
+                    && !self.current_word.is_empty()
+                    && !ch.is_alphabetic()
+                {
+                    let word = self.current_word.clone();
+                    self.commit_word_internal(&word, true);
+                    self.reset_word();
+                    let mut actions = vec![Action::HideGhost, Action::CommitText(word.clone())];
+                    actions.extend(self.post_commit_pipeline(&word));
+                    actions.push(Action::ForwardKey);
+                    return actions;
+                }
+
                 // Clear anticipatory ghost if active — user is typing a new word.
                 if self.anticipatory_ghost_active {
                     self.anticipatory_ghost_active = false;
@@ -2175,6 +2194,36 @@ mod tests {
             "number key should be forwarded normally"
         );
         assert!(core.dual_buffer.is_none());
+    }
+
+    #[test]
+    fn test_digit_during_composing_commits_word() {
+        // When dual buffer composing is active (user typed letters), a digit
+        // must commit the composed word before forwarding the digit.
+        // This prevents the preedit from vanishing without the text reaching
+        // the application — the root cause of "can't type numbers in browser".
+        let mut core = test_core_dual();
+        core.handle_key(press_raw(35)); // h → composing starts
+        core.handle_key(press_raw(18)); // e → composing continues
+        assert!(core.dual_buffer.is_some(), "dual buffer should be active");
+
+        let actions = core.handle_key(press_raw(2)); // '1' digit
+                                                     // Must commit the composed word.
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::CommitText(_))),
+            "digit during composing must commit the composed word"
+        );
+        // Must forward the digit key.
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::ForwardKey)),
+            "digit must be forwarded to the application"
+        );
+        // Composing state must be cleared.
+        assert!(core.dual_buffer.is_none(), "dual buffer should be reset");
+        assert!(
+            core.current_word().is_empty(),
+            "current word should be empty"
+        );
     }
 
     #[test]
