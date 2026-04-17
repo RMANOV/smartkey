@@ -1,7 +1,5 @@
 # SmartKey
 
-[![CI](https://github.com/RMANOV/smartkey/actions/workflows/ci.yml/badge.svg)](https://github.com/RMANOV/smartkey/actions/workflows/ci.yml)
-
 **Rust-powered predictive keyboard engine with word-by-word smart suggestions, CVM streaming adaptation, and cross-platform input method integration.**
 
 All prediction happens in pure Rust. Zero network. Zero cloud. Sub-millisecond predictions. Your typing patterns never leave your machine.
