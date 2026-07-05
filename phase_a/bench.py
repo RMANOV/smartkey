@@ -27,6 +27,12 @@ def main() -> int:
         action="store_true",
         help="exit non-zero if the >20ms budget is violated (for preflight gating)",
     )
+    ap.add_argument(
+        "--realistic",
+        action="store_true",
+        help="also pace events at human typing cadence (proves tight-loop tail "
+        "spikes are a bench artifact, not a real-typing stall)",
+    )
     args = ap.parse_args()
     files = default_corpus_files()
     if not files:
@@ -67,34 +73,70 @@ def main() -> int:
     print(f"  sample p_top3  : {[round(x,4) for x in sample_p]}")
 
     n = 5000
+    # full_hook = external wall time of the ENTIRE log_prediction() call
+    # (compute + INSERT + commit + latency write-back + commit) — the TRUE
+    # synchronous cost the hook adds to a keystroke (Codex B1).
+    full_hook = np.empty(n, dtype=float)
+    resolve_lat = []
     for i in range(n):
         ctx = rng.choice(top_words)
         top3 = rng.sample(top_words, 3)
+        h0 = time.perf_counter_ns()
         pend = logger.log_prediction(ctx, top3)
+        full_hook[i] = (time.perf_counter_ns() - h0) / 1000.0
         if i % 2 == 0:
+            r0 = time.perf_counter_ns()
             logger.resolve(pend, top3[rng.randint(0, 2)] if rng.random() < 0.3 else "MISS")
+            resolve_lat.append((time.perf_counter_ns() - r0) / 1000.0)
     logger.close()
 
     conn = connect(db, readonly=True)
-    lat = np.array(
+    stored = np.array(
         [r[0] for r in conn.execute("SELECT latency_us FROM events").fetchall()],
         dtype=float,
     )
     conn.close()
+    resolve_lat = np.array(resolve_lat, dtype=float)
+
+    def _row(label, a):
+        print(
+            f"  {label:22s} mean {a.mean():6.1f}  p50 {np.percentile(a,50):5.0f}  "
+            f"p99 {np.percentile(a,99):5.0f}  max {a.max():6.0f} us  "
+            f">20ms {np.mean(a>LATENCY_BUDGET_US):.4%}"
+        )
 
     print("-" * 66)
-    print(f"  events logged  : {len(lat):,}")
-    print(f"  latency mean   : {lat.mean():.1f} us")
-    print(f"  latency p50    : {np.percentile(lat,50):.0f} us")
-    print(f"  latency p99    : {np.percentile(lat,99):.0f} us")
-    print(f"  latency max    : {lat.max():.0f} us")
-    print(f"  budget         : 20000 us (20 ms)")
-    over_frac = float(np.mean(lat > LATENCY_BUDGET_US))
-    print(f"  events > 20ms  : {over_frac:.4%}  (PASS <=1%)")
+    print(f"  events logged  : {len(stored):,}   budget 20000 us (20 ms), PASS <=1%")
+    _row("stored latency_us", stored)         # what the gate reads (now incl. commit)
+    _row("FULL hook (external)", full_hook)   # the true full synchronous path
+    _row("resolve() (external)", resolve_lat)
+    if args.realistic:
+        # Pace at ~human fast typing (30ms/keystroke). Spreads commits so WAL
+        # checkpoints don't pile up — the tight-loop tail should vanish.
+        m = 400
+        paced = np.empty(m, dtype=float)
+        logger2 = PhaseALogger(data_dir() / "bench_realistic.db", fm,
+                               synthetic=True, notes="benchmark realistic")
+        for i in range(m):
+            ctx = rng.choice(top_words)
+            top3 = rng.sample(top_words, 3)
+            h0 = time.perf_counter_ns()
+            logger2.log_prediction(ctx, top3)
+            paced[i] = (time.perf_counter_ns() - h0) / 1000.0
+            time.sleep(0.030)
+        logger2.close()
+        _row("paced (30ms cadence)", paced)
+
     print("=" * 66)
     print("Phase-A зелено ≠ доказателство за team tier.")
-    if args.check and over_frac > MAX_OVER_BUDGET_FRAC:
-        print(f"CHECK FAILED: over-budget {over_frac:.4%} > {MAX_OVER_BUDGET_FRAC:.0%}")
+    # Gate on the TRUE full path (the strictest, honest measure).
+    over_full = float(np.mean(full_hook > LATENCY_BUDGET_US))
+    over_resolve = float(np.mean(resolve_lat > LATENCY_BUDGET_US))
+    if args.check and (over_full > MAX_OVER_BUDGET_FRAC or over_resolve > MAX_OVER_BUDGET_FRAC):
+        print(
+            f"CHECK FAILED: full-hook >20ms {over_full:.4%} / resolve {over_resolve:.4%} "
+            f"> {MAX_OVER_BUDGET_FRAC:.0%}"
+        )
         return 1
     return 0
 

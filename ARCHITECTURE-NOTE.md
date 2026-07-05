@@ -63,23 +63,35 @@ the same two moments, guarded by `SMARTKEY_PHASE_A=1` (no-op otherwise):
 | **drop in-flight** | `do_reset`, `do_focus_out` → `on_reset()` | pending stays unresolved |
 | **flush/close** | `do_disable` → `close()` | commit + close DB |
 
-### Resolver semantics = `next_token_in_top3`
+### Resolver semantics = `next_token_in_top3` (covers EVERY next-token)
 
 We log at the **`ghost` action** (ShowGhost carries *no typed prefix* → the
-cursor is at a word boundary and the whole next token is being anticipated).
-The event resolves to the **next token committed to the application**. In-word
-completions (`composing`, which carry a typed prefix) are deliberately **not**
-logged: they are a different semantic and would supersede one another per
-keystroke. One clean event per predicted word position — exactly what the
-resolver name promises. This is the one engine-coupled choice, documented here.
+cursor is at a word boundary and the whole next token is being anticipated),
+snapshotting the context token list (`ctx_tokens`, `n_ctx`). The event resolves
+to the token that later occupies **slot `n_ctx` in the surrounding text** — i.e.
+the word the user actually produced next, *whatever* it was: an accepted
+prediction, a word typed out and forwarded, or a rejection. A non-top-3 next
+token records **`outcome = 0`** (not "unresolved"). This is the Codex-B2 fix: the
+resolution must cover every committed next-token, not only the ones the engine's
+own ghost won.
 
-- Top3 words and the resolved token are **lowercased** before membership/lookup
-  so they align with the (lowercase) corpus keys and each other.
-- If the engine emits no `commit`/`replace` for a word (e.g. some fallback input
-  modes forward characters directly), that event stays **unresolved**. A high
-  unresolved rate is therefore a *real* plumbing signal — and `>5% unresolved`
-  is a spec FAIL condition, which is correct: the harness would be unable to
-  observe outcomes and must say so.
+Two resolution signals, whichever fires first (both proven in the self-test):
+1. **surrounding-text delta** (`observe_context`, on every key/focus): when a
+   later context is a prefix-extension of `ctx_tokens`, the word at slot `n_ctx`
+   is the actual next token. Covers forwarded/typed/rejected words uniformly.
+2. **commit fast-path** (`on_commit`, on the engine's commit/replace action): an
+   explicit accept / autocommit resolves immediately — corroboration for apps
+   without surrounding text.
+
+- In-word completions (`composing`, with a typed prefix) are deliberately not
+  logged — one clean event per predicted word position.
+- Top3 words and the resolved token are **lowercased** before membership/lookup.
+- An event stays **unresolved** only when *neither* signal is observable (an app
+  with no surrounding text AND no commit action). That is an honest plumbing
+  gap; `>5% unresolved` is a spec FAIL, which correctly flags it. The conductor
+  confirms coverage live (see `CONDUCTOR-ACTIVATION.md`): after typing some
+  non-predicted words, `analyze` must show `outcome=0` rows and a low unresolved
+  rate.
 
 ### Privacy (L0-leakage mitigation)
 

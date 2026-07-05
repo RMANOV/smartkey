@@ -24,8 +24,13 @@ rollback + `--dry-run`), `switch-to-lab.sh --confirm` (gated switch),
 ```bash
 /home/rmanov/smartkey-phase-a-lab/phase_a/switch-to-lab.sh --confirm
 ```
-It refuses unless the gate below is green, captures the current engine for
-rollback first, then switches ibus to the lab `smartkey` engine.
+It refuses unless the gate below is green, runs the gate itself (no skip hatch),
+captures the current engine for rollback first, switches ibus to the lab
+`smartkey` engine, and then **fails closed**: if the active engine is not the
+lab engine, or the mechanical engine-identity receipt does not prove the
+selected engine is *this lab process* (fresh heartbeat, `phase_a=1`, lab commit
+match, live PID — not the installed `/usr/share/ibus/component/smartkey.xml`),
+it auto-rolls-back and aborts non-zero.
 
 ## The instant rollback, in one line (keep it ready the whole window)
 ```bash
@@ -64,9 +69,9 @@ Then two **manual** preconditions the conductor confirms live:
    ```bash
    phase_a/rollback.sh --dry-run     # current -> panic layout -> back to current
    ```
-   Type a few characters at the panic layout to confirm real typing works, then
-   confirm you are restored. This proves the safety net **before** you ever touch
-   the lab engine.
+   It **pauses** and makes you actually type at the panic layout and press ENTER
+   to confirm real typing works, then restores and pauses again. This proves the
+   safety net **before** you ever touch the lab engine.
 7. **lab engine builds/launches cleanly:**
    ```bash
    phase_a/run-lab-engine.sh          # in its own terminal; leave it running
@@ -81,8 +86,18 @@ line is red: DO NOT SWITCH.
 
 ## After the switch
 
-- Confirm `ibus engine` reports `smartkey` and type a sentence. If anything is
-  wrong, run `rollback.sh` immediately.
+- `switch-to-lab.sh` already verified the active engine is the lab process
+  (identity receipt) and would have auto-rolled-back otherwise. If anything ever
+  feels wrong later, run `rollback.sh` immediately.
+- **Confirm outcome coverage (Codex-B2 live check):** type a short paragraph that
+  includes a few words the engine does NOT predict, then:
+  ```bash
+  /home/rmanov/smartkey/.venv/bin/python3 -m phase_a.analyze
+  ```
+  The report must show a **low unresolved rate** and the presence of
+  `outcome=0` rows (non-top-3 next tokens being recorded, not just accepts). A
+  high unresolved rate here means the harness cannot observe next-tokens in your
+  apps — stop and report, do not run the 14-day window on that.
 - Events log to `phase_a_data/events.db` (`synthetic=0`). **Privacy:** no
   plaintext typing is stored — only `context_hash` (keyed HMAC), a candidate
   count, `p_top3`, latency, and the `outcome` bit. Candidate words and the

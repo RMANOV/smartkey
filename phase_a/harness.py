@@ -32,7 +32,7 @@ import hmac
 import json
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .constants import (
@@ -101,11 +101,20 @@ def context_hash(context: str, salt: bytes) -> str:
 
 @dataclass
 class Pending:
-    """Handle for an in-flight prediction awaiting its resolved token."""
+    """Handle for an in-flight prediction awaiting its resolved token.
+
+    ``ctx_tokens`` / ``n_ctx`` snapshot the context token list at prediction
+    time so the adapter can resolve the event against the actual next token
+    (the word that later fills slot ``n_ctx`` in the surrounding text) —
+    covering every committed next-token, not only accepted predictions. Held in
+    memory only; never persisted (privacy).
+    """
 
     row_id: int
     top3: list[str]
     context: str
+    ctx_tokens: list[str] = field(default_factory=list)
+    n_ctx: int = 0
 
 
 def connect(db_path: str | Path, *, readonly: bool = False) -> sqlite3.Connection:
@@ -145,6 +154,11 @@ class PhaseALogger:
         self.synthetic = 1 if synthetic else 0
         self.resolver = resolver
         self._salt = context_salt()
+        # Pipelined latency: each row stores the FULL cost (compute + INSERT +
+        # commit) of the PREVIOUS event, so the hot path commits exactly once
+        # yet the stored value is honestly commit-inclusive (Codex B1). The
+        # one-row shift is invariant for the gate (a distribution over rows).
+        self._prev_latency_us = 0
         self.conn = connect(db_path)
         self.run_id = f"{int(time.time() * 1000)}-{'syn' if synthetic else 'real'}"
         self._write_run_metadata(engine_commit, notes)
@@ -177,9 +191,12 @@ class PhaseALogger:
     ) -> Pending:
         """Record a prediction event; returns a handle to resolve later.
 
-        Latency is measured across the added work (p_top3 compute + hash +
-        durable INSERT) — the trailing latency write-back is post-measurement
-        bookkeeping, disclosed as such.
+        Single durable commit on the hot path. The stored ``latency_us`` is the
+        FULL cost (compute + INSERT + commit) of the *previous* event — measured
+        including the commit (Codex B1) — so the value is honestly
+        commit-inclusive without a second write/commit that would inflate the
+        tail (WAL-checkpoint fsyncs). The one-row attribution shift is invariant
+        for the gate, which reads the distribution of ``latency_us``.
         """
         if ts is None:
             ts = time.time()
@@ -198,18 +215,15 @@ class PhaseALogger:
                 ch,
                 len(top3),
                 p_top3,
-                0,  # placeholder; overwritten below with the measured latency
+                self._prev_latency_us,  # full cost of the PREVIOUS event
                 EVENT_CLASS,
                 self.resolver,
                 self.synthetic,
             ),
         )
         row_id = int(cur.lastrowid)
-        latency_us = (time.perf_counter_ns() - t0) // 1000
-        self.conn.execute(
-            "UPDATE events SET latency_us=? WHERE id=?", (latency_us, row_id)
-        )
-        self.conn.commit()
+        self.conn.commit()  # the single durable write — included in the timing
+        self._prev_latency_us = (time.perf_counter_ns() - t0) // 1000
         # top3 is retained IN MEMORY only (to compute outcome at resolution);
         # it is never persisted and is discarded when the Pending is dropped.
         return Pending(row_id=row_id, top3=top3, context=context)

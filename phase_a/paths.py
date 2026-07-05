@@ -32,6 +32,13 @@ def alarm_file() -> Path:
     return data_dir() / "WATCHDOG-ALARM.txt"
 
 
+def engine_identity_file() -> Path:
+    """Mechanical receipt written by the LAB engine process when the harness is
+    active: pid / exe / lab commit / phase_a=1 / heartbeat. The switch script
+    asserts this matches the lab process (not the installed component)."""
+    return data_dir() / "ENGINE-IDENTITY.json"
+
+
 def receipts_dir() -> Path:
     d = data_dir() / "receipts"
     d.mkdir(parents=True, exist_ok=True)

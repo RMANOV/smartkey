@@ -20,6 +20,8 @@ Exit code 0 iff every check passes.
 from __future__ import annotations
 
 import datetime as _dt
+import json
+import os
 import random
 import sqlite3
 import time
@@ -28,7 +30,7 @@ from pathlib import Path
 from .analyze import analyze, format_report
 from .constants import EVENT_CLASS, RESOLVER
 from .harness import PhaseALogger, connect
-from .paths import alarm_file, data_dir
+from .paths import alarm_file, data_dir, engine_identity_file
 from .sweep import run_sweep, run_watchdog
 
 
@@ -260,6 +262,66 @@ def check_schema_invariant() -> tuple[bool, str]:
     return ok, f"resolver_rejected={rejected} class_rejected={rejected_class}"
 
 
+def check_b2_outcome_coverage() -> tuple[bool, str]:
+    """Codex B2 proof: the adapter resolves EVERY next-token via surrounding-text
+    delta — a non-predicted next word records outcome=0 (not 'unresolved') —
+    plus the commit fast-path. Also proves the MAJOR engine-identity receipt."""
+    from pathlib import Path
+
+    from .engine_adapter import PhaseAAdapter
+    from .harness import connect
+
+    db = _fresh(data_dir() / "selftest_b2.db")
+    if engine_identity_file().exists():
+        engine_identity_file().unlink()
+    ad = PhaseAAdapter(db, [Path("corpus/corpus_tech.json")], engine_commit="deadbeef",
+                       notes="selftest B2")
+
+    def predict_then_type(top3, typed_surrounding):
+        ad.on_next_word_prediction(top3)
+        ad.observe_context(typed_surrounding)  # resolves the pending via delta
+
+    ad.observe_context("")                                   # start, ctx=[]
+    predict_then_type(["cat", "dog", "bird"], "cat ")        # -> 'cat' in top3   => 1
+    predict_then_type(["sat", "ran", "xyz"], "cat sat ")     # -> 'sat' in top3   => 1
+    predict_then_type(["on", "in", "at"], "cat sat zzz ")    # -> 'zzz' NOT top3  => 0  (the fix)
+    predict_then_type(["the", "a", "up"], "cat sat zzz the big mat ")  # multiword -> 'the' => 1
+    ad.on_next_word_prediction(["end", "stop", "done"])      # pending, then...
+    ad.observe_context(None)                                 # no surrounding text -> stays unresolved
+    ad.close()
+
+    conn = connect(db, readonly=True)
+    outcomes = [r[0] for r in conn.execute("SELECT outcome FROM events ORDER BY id")]
+    conn.close()
+
+    # commit fast-path (fresh adapter): explicit commit resolves outcome=1
+    db2 = _fresh(data_dir() / "selftest_b2_commit.db")
+    ad2 = PhaseAAdapter(db2, [Path("corpus/corpus_tech.json")], engine_commit="d2")
+    ad2.observe_context("hello ")
+    ad2.on_next_word_prediction(["world", "there", "you"])
+    ad2.on_commit("world")                                    # fast-path -> 1
+    ad2.close()
+    conn2 = connect(db2, readonly=True)
+    commit_outcome = conn2.execute("SELECT outcome FROM events ORDER BY id").fetchone()[0]
+    conn2.close()
+
+    # identity receipt present + valid (Codex MAJOR)
+    ident_ok = False
+    if engine_identity_file().exists():
+        ident = json.loads(engine_identity_file().read_text())
+        ident_ok = ident.get("phase_a") == 1 and ident.get("pid") == os.getpid()
+
+    ok = (
+        outcomes == [1, 1, 0, 1, None]
+        and commit_outcome == 1
+        and ident_ok
+    )
+    return ok, (
+        f"delta outcomes={outcomes} (expect [1,1,0,1,None]) commit_fastpath={commit_outcome} "
+        f"identity_ok={ident_ok}"
+    )
+
+
 def check_live_sweep_watchdog() -> tuple[bool, str]:
     """run_sweep produces a receipt; run_watchdog returns 0 right after a sweep."""
     db = data_dir() / "selftest_green.db"  # reuse GREEN db (has data + sweeps)
@@ -280,6 +342,7 @@ CHECKS = [
     ("6 missed watchdog +alarm -> not-that-FAIL", check_inband_alarm_distinction),
     ("7 schema invariant rejects llm:/human", check_schema_invariant),
     ("8 live sweep + watchdog", check_live_sweep_watchdog),
+    ("9 B2 outcome coverage (non-top3 -> 0) + identity", check_b2_outcome_coverage),
 ]
 
 

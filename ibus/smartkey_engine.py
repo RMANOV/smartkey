@@ -277,18 +277,33 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Phase-A instrumentation hooks (no-ops unless the harness is enabled).
     # -----------------------------------------------------------------------
     def _phase_a_ghost(self) -> None:
-        """Log a next-word prediction event (candidate-generation point)."""
+        """Log a next-word prediction event (candidate-generation point).
+
+        Context has already been observed (and any prior pending resolved) by
+        _phase_a_observe() earlier in this key event, so last_tokens is fresh.
+        """
         if self._phase_a is None:
             return
         try:
-            self._phase_a.note_context(self._surrounding_text or "")
             preds = self._core.predictions()
             self._phase_a.on_next_word_prediction([p[0] for p in preds[:3]])
         except Exception:
             log.debug("smartkey: phase-a ghost hook failed", exc_info=True)
 
+    def _phase_a_observe(self) -> None:
+        """Observe current surrounding text: resolve a pending prediction if the
+        actual next token now fills its slot, and refresh the identity receipt.
+        Runs on every key event / focus so resolution covers EVERY next-token,
+        not only the ones the engine committed via an action."""
+        if self._phase_a is None:
+            return
+        try:
+            self._phase_a.observe_context(self._surrounding_text or "")
+        except Exception:
+            log.debug("smartkey: phase-a observe hook failed", exc_info=True)
+
     def _phase_a_commit(self, text: str) -> None:
-        """Resolve the pending prediction with the next committed token."""
+        """Resolve fast-path: explicit engine commit/replace of the next token."""
         if self._phase_a is None:
             return
         try:
@@ -739,6 +754,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         )
         if not key_release:
             self._refresh_surrounding_text()
+            self._phase_a_observe()  # Phase-A: resolve pending via context delta
 
         # v0.5.0: prefer raw scancode path for dual-buffer layout-agnostic input.
         # Rust tables use evdev codes. On Wayland IBus sends evdev directly;
@@ -796,6 +812,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_focus_in(self) -> None:
         self._core.focus_gained()
         self._refresh_surrounding_text()
+        self._phase_a_observe()  # Phase-A: heartbeat identity + resolve on refocus
 
     def do_focus_out(self) -> None:
         actions = self._core.focus_lost()

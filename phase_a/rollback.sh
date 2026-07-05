@@ -37,12 +37,24 @@ mode="${1:-}"
 case "$mode" in
     --panic) target="$PANIC_ENGINE" ;;
     --dry-run)
+        # Prove the rollback WHILE smartkey is still healthy: switch to the
+        # panic layout, PAUSE for the human to actually type and confirm, then
+        # restore and confirm again. No auto-continue: verification is real.
         prev="$(_ibus_current)"
         echo "LIVE rollback dry-run: current='$prev'  panic='$PANIC_ENGINE'"
         _ibus_engine "$PANIC_ENGINE"
-        echo ">>> Type a few characters now to confirm the bare layout works. <<<"
+        now="$(_ibus_current)"
+        echo ">>> Active engine is now '$now'. Focus a text field and TYPE a few words."
+        if [[ "${PHASEA_NONINTERACTIVE:-0}" != "1" ]]; then
+            read -r -p ">>> Press ENTER only AFTER you have verified typing WORKS in panic mode... " _
+        fi
         _ibus_engine "$prev"
-        echo "restored to '$prev'. If both switches printed cleanly, rollback is proven."
+        back="$(_ibus_current)"
+        echo ">>> Restored to '$back'. Type again to confirm your normal engine works."
+        if [[ "${PHASEA_NONINTERACTIVE:-0}" != "1" ]]; then
+            read -r -p ">>> Press ENTER only AFTER you have verified typing WORKS again... " _
+        fi
+        echo "ROLLBACK DRY-RUN COMPLETE: panic layout and restore both interactively verified."
         exit 0
         ;;
     "" )
