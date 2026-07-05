@@ -17,6 +17,12 @@ sklearn `IsotonicRegression` only.
 | `selftest.py` | end-to-end proof on synthetic data (incl. forced FAIL) |
 | `bench.py` | logging-overhead benchmark vs the 20 ms budget |
 | `run-lab-engine.sh` | launch the instrumented lab ibus engine with logging ON |
+| `preflight.sh` | hard precondition gate before any live ibus switch |
+| `rollback.sh` | instant rollback to the live engine (`--panic` = bare keyboard) |
+| `switch-to-lab.sh` | conductor-only gated switch (`--confirm`) |
+
+The ibus switch is performed by the **conductor** (the operator delegated it —
+smartkey is his live IME); see `../CONDUCTOR-ACTIVATION.md`.
 
 ## Commands
 

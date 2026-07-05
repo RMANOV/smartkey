@@ -6,6 +6,7 @@ load time / size, per-event latency distribution (the value stored in
 
 from __future__ import annotations
 
+import argparse
 import random
 import time
 import tracemalloc
@@ -13,12 +14,20 @@ from pathlib import Path
 
 import numpy as np
 
+from .constants import LATENCY_BUDGET_US, MAX_OVER_BUDGET_FRAC
 from .freqmodel import FreqModel, default_corpus_files
 from .harness import PhaseALogger, connect
 from .paths import data_dir
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description="Phase-A logging-overhead benchmark")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="exit non-zero if the >20ms budget is violated (for preflight gating)",
+    )
+    args = ap.parse_args()
     files = default_corpus_files()
     if not files:
         print("no corpus files found")
@@ -80,9 +89,13 @@ def main() -> int:
     print(f"  latency p99    : {np.percentile(lat,99):.0f} us")
     print(f"  latency max    : {lat.max():.0f} us")
     print(f"  budget         : 20000 us (20 ms)")
-    print(f"  events > 20ms  : {np.mean(lat>20000):.4%}  (PASS <=1%)")
+    over_frac = float(np.mean(lat > LATENCY_BUDGET_US))
+    print(f"  events > 20ms  : {over_frac:.4%}  (PASS <=1%)")
     print("=" * 66)
     print("Phase-A зелено ≠ доказателство за team tier.")
+    if args.check and over_frac > MAX_OVER_BUDGET_FRAC:
+        print(f"CHECK FAILED: over-budget {over_frac:.4%} > {MAX_OVER_BUDGET_FRAC:.0%}")
+        return 1
     return 0
 
 

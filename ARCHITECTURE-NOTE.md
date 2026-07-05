@@ -86,6 +86,8 @@ resolver name promises. This is the one engine-coupled choice, documented here.
 Work is confined to the `phase-a-lab` git worktree
 (`/home/rmanov/smartkey-phase-a-lab`) with **push disabled** in both the main
 repo and worktree configs. See `isolation-receipt.txt` (captured before any code
-was written) and `OPERATOR-ACTIVATION.md`. The installed/live ibus engine and
+was written) and `CONDUCTOR-ACTIVATION.md`. The installed/live ibus engine and
 the main working tree of `~/smartkey` are untouched; activating the lab engine
-for real typing is the operator's manual step.
+for real typing is the **conductor's** guarded step (the operator delegated the
+switch, since smartkey is his live IME), gated by `phase_a/preflight.sh` and a
+pre-proven `phase_a/rollback.sh`.
