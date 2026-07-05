@@ -6,7 +6,9 @@ set -uo pipefail
 
 LAB=/home/rmanov/smartkey-phase-a-lab
 PY=/home/rmanov/smartkey/.venv/bin/python3
+PREFLIGHT_DATA="$LAB/phase_a_data/preflight"
 cd "$LAB"
+mkdir -p "$PREFLIGHT_DATA"
 
 ok=1
 pass() { echo "  [ OK ] $1"; }
@@ -17,7 +19,7 @@ echo " PHASE-A PRE-SWITCH PRECONDITION GATE"
 echo "==================================================================="
 
 # 1. self-test (incl. forced-FAIL proof + schema rejection)
-if "$PY" -m phase_a.selftest >/tmp/phasea_selftest.log 2>&1 && \
+if SMARTKEY_PHASEA_DATA="$PREFLIGHT_DATA" "$PY" -m phase_a.selftest >/tmp/phasea_selftest.log 2>&1 && \
    grep -q "ALL CHECKS PASS" /tmp/phasea_selftest.log; then
     pass "self-test ALL CHECKS PASS (incl. forced-FAIL, schema invariant, B2/B4 outcome)"
 else
@@ -25,7 +27,7 @@ else
 fi
 
 # 2. logging overhead within the 20ms budget
-if "$PY" -m phase_a.bench --check >/tmp/phasea_bench.log 2>&1; then
+if SMARTKEY_PHASEA_DATA="$PREFLIGHT_DATA" "$PY" -m phase_a.bench --check >/tmp/phasea_bench.log 2>&1; then
     pass "logging overhead within <=20ms budget ($(grep 'latency p99' /tmp/phasea_bench.log | tr -s ' '))"
 else
     fail "logging overhead check failed — see /tmp/phasea_bench.log"

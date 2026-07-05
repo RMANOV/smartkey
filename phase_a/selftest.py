@@ -271,11 +271,17 @@ def check_b2_outcome_coverage() -> tuple[bool, str]:
     from .engine_adapter import PhaseAAdapter
     from .harness import connect
 
+    ident_file = data_dir() / "selftest_ENGINE-IDENTITY.json"
     db = _fresh(data_dir() / "selftest_b2.db")
-    if engine_identity_file().exists():
-        engine_identity_file().unlink()
-    ad = PhaseAAdapter(db, [Path("corpus/corpus_tech.json")], engine_commit="deadbeef",
-                       notes="selftest B2")
+    if ident_file.exists():
+        ident_file.unlink()
+    ad = PhaseAAdapter(
+        db,
+        [Path("corpus/corpus_tech.json")],
+        engine_commit="deadbeef",
+        notes="selftest B2",
+        identity_file=ident_file,
+    )
 
     def predict_then_type(top3, typed_surrounding):
         ad.on_next_word_prediction(top3)
@@ -296,7 +302,12 @@ def check_b2_outcome_coverage() -> tuple[bool, str]:
 
     # commit fast-path (fresh adapter): explicit commit resolves outcome=1
     db2 = _fresh(data_dir() / "selftest_b2_commit.db")
-    ad2 = PhaseAAdapter(db2, [Path("corpus/corpus_tech.json")], engine_commit="d2")
+    ad2 = PhaseAAdapter(
+        db2,
+        [Path("corpus/corpus_tech.json")],
+        engine_commit="d2",
+        identity_file=data_dir() / "selftest_ENGINE-IDENTITY-commit.json",
+    )
     ad2.observe_context("hello ")
     ad2.on_next_word_prediction(["world", "there", "you"])
     ad2.on_commit("world")                                    # fast-path -> 1
@@ -307,8 +318,8 @@ def check_b2_outcome_coverage() -> tuple[bool, str]:
 
     # identity receipt present + valid (Codex MAJOR)
     ident_ok = False
-    if engine_identity_file().exists():
-        ident = json.loads(engine_identity_file().read_text())
+    if ident_file.exists():
+        ident = json.loads(ident_file.read_text())
         ident_ok = ident.get("phase_a") == 1 and ident.get("pid") == os.getpid()
 
     ok = (
@@ -335,7 +346,12 @@ def check_b4_cursor() -> tuple[bool, str]:
 
     # --- FIXED path: observe_surrounding(text, cursor_pos) uses before-cursor ---
     db = _fresh(data_dir() / "selftest_b4.db")
-    ad = PhaseAAdapter(db, [Path("corpus/corpus_tech.json")], engine_commit="b4")
+    ad = PhaseAAdapter(
+        db,
+        [Path("corpus/corpus_tech.json")],
+        engine_commit="b4",
+        identity_file=data_dir() / "selftest_ENGINE-IDENTITY-b4.json",
+    )
     ad.observe_surrounding("alpha FUTURE", 5)              # before-cursor 'alpha'
     ad.on_next_word_prediction(["beta", "gamma", "delta"])  # pending, n_ctx=1
     ad.observe_surrounding("alpha FUTURE", 5)              # still mid-edit -> no grab
@@ -349,7 +365,12 @@ def check_b4_cursor() -> tuple[bool, str]:
 
     # --- BUG path (whole text, no cursor): would grab 'future' -> outcome 0 ---
     db2 = _fresh(data_dir() / "selftest_b4_bug.db")
-    ad2 = PhaseAAdapter(db2, [Path("corpus/corpus_tech.json")], engine_commit="b4b")
+    ad2 = PhaseAAdapter(
+        db2,
+        [Path("corpus/corpus_tech.json")],
+        engine_commit="b4b",
+        identity_file=data_dir() / "selftest_ENGINE-IDENTITY-b4-bug.json",
+    )
     ad2.observe_context("alpha")
     ad2.on_next_word_prediction(["beta", "gamma", "delta"])
     ad2.observe_context("alpha FUTURE")                   # whole text = the bug

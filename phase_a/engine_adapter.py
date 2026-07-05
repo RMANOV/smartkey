@@ -41,6 +41,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 from .freqmodel import FreqModel, _WORD_RE
 from .harness import Pending, PhaseALogger
@@ -65,6 +66,7 @@ class PhaseAAdapter:
         corpus_files,
         engine_commit: str | None = None,
         notes: str | None = None,
+        identity_file: str | Path | None = None,
     ) -> None:
         self.freq = FreqModel.load(corpus_files)
         self.logger = PhaseALogger(
@@ -79,6 +81,9 @@ class PhaseAAdapter:
         self.last_tokens: list[str] = []
         self.last_context: str = ""
         self._events = 0
+        self._identity_file = (
+            Path(identity_file) if identity_file is not None else engine_identity_file()
+        )
         self._write_identity(started=True)
 
     # ---- mechanical engine-identity receipt (Codex MAJOR) --------------------
@@ -96,7 +101,7 @@ class PhaseAAdapter:
             }
             if started:
                 payload["started_ts"] = time.time()
-            engine_identity_file().write_text(
+            self._identity_file.write_text(
                 json.dumps(payload, ensure_ascii=False), encoding="utf-8"
             )
         except Exception:

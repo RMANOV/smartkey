@@ -253,11 +253,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # SMARTKEY_PHASE_A=1. When off, self._phase_a is None and every hook
         # below is a no-op, so production behaviour is byte-for-byte unchanged.
         self._phase_a = None
+        self._phase_a_action_trace: Path | None = None
         if os.environ.get("SMARTKEY_PHASE_A") == "1":
             try:
                 from phase_a.engine_adapter import PhaseAAdapter
                 from phase_a.freqmodel import default_corpus_files
-                from phase_a.paths import default_db_path
+                from phase_a.paths import data_dir, default_db_path
 
                 self._phase_a = PhaseAAdapter(
                     str(default_db_path()),
@@ -265,6 +266,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     engine_commit=os.environ.get("SMARTKEY_PHASEA_COMMIT"),
                     notes="ibus real-typing run",
                 )
+                self._phase_a_action_trace = data_dir() / "action_trace.jsonl"
                 log.info("smartkey: Phase-A harness ENABLED (db=%s)", default_db_path())
             except Exception:
                 log.warning(
@@ -315,6 +317,29 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._phase_a.on_commit(text)
         except Exception:
             log.debug("smartkey: phase-a commit hook failed", exc_info=True)
+
+    def _phase_a_trace_actions(
+        self, keyval: int, keycode: int, state: int, actions: list[tuple[str, str]]
+    ) -> None:
+        """Phase-A-only action breadcrumb. Stores no typed payload/plaintext."""
+        if self._phase_a_action_trace is None:
+            return
+        try:
+            self._phase_a_action_trace.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": time.time(),
+                "keyval": keyval,
+                "keycode": keycode,
+                "state": state,
+                "actions": [
+                    {"type": action_type, "payload_len": len(payload or "")}
+                    for action_type, payload in actions
+                ],
+            }
+            with self._phase_a_action_trace.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            log.debug("smartkey: phase-a action trace failed", exc_info=True)
 
     # -----------------------------------------------------------------------
     # Corpus loading.
@@ -708,6 +733,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 typed, ghost = decoded
                 self._show_composing(typed, ghost)
                 self._track_prediction_shown(ghost)
+                self._phase_a_ghost()  # Phase-A: dual-buffer composing prediction event
                 if _PRED_LOG:
                     preds2 = self._core.predictions()
                     top3 = preds2[:3]
@@ -768,6 +794,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             evdev_keycode = keycode if _IS_WAYLAND else max(keycode - 8, 0)
             preedit_was_active = self._preedit_active
             actions = self._core.process_keycode(evdev_keycode, state)
+            self._phase_a_trace_actions(keyval, keycode, state, actions)
             log.debug("actions (keycode): %s", actions)
             result = self._execute_actions(actions)
             self._finalize_prediction_outcome(
@@ -800,6 +827,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             )
         preedit_was_active = self._preedit_active
         actions = self._core.handle_key(keyval, state)
+        self._phase_a_trace_actions(keyval, keycode, state, actions)
         log.debug("actions: %s", actions)
         result = self._execute_actions(actions)
         self._finalize_prediction_outcome(
