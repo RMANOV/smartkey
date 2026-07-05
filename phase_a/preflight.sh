@@ -7,6 +7,7 @@ set -uo pipefail
 LAB=/home/rmanov/smartkey-phase-a-lab
 PY=/home/rmanov/smartkey/.venv/bin/python3
 PREFLIGHT_DATA="$LAB/phase_a_data/preflight"
+LAB_ENGINE="${PHASEA_LAB_ENGINE:-smartkey-phasea}"
 cd "$LAB"
 mkdir -p "$PREFLIGHT_DATA"
 
@@ -56,6 +57,11 @@ if command -v ibus >/dev/null 2>&1 && ibus engine >/dev/null 2>&1; then
     else
         fail "panic rollback engine '${PHASEA_PANIC_ENGINE:-xkb:us::eng}' NOT in ibus list-engine"
     fi
+    if ibus list-engine 2>/dev/null | grep -q "^  $LAB_ENGINE "; then
+        pass "lab IBus engine '$LAB_ENGINE' is registered"
+    else
+        fail "lab IBus engine '$LAB_ENGINE' is not registered; run phase_a/install-ibus-component.sh and restart ibus-daemon"
+    fi
 else
     fail "ibus not reachable here — run this on the operator's live session"
 fi
@@ -63,10 +69,10 @@ fi
 echo "-------------------------------------------------------------------"
 echo " REMAINING MANUAL PRECONDITIONS (conductor confirms live):"
 echo "   [ ] rollback dry-run confirmed:  phase_a/rollback.sh --dry-run"
-echo "   [ ] lab engine builds/launches cleanly: phase_a/run-lab-engine.sh"
+echo "   [ ] lab engine auto-launches via registered IBus component during switch"
 echo "-------------------------------------------------------------------"
 if [[ "$ok" == "1" ]]; then
-    echo " GATE: automated preconditions GREEN. Do the 2 manual steps, then switch."
+    echo " GATE: automated preconditions GREEN. Do the rollback dry-run, then switch."
 else
     echo " GATE: RED — DO NOT SWITCH."
 fi

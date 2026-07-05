@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# User-level IBus launcher for the Phase-A lab engine.
+#
+# This is intentionally separate from the installed "smartkey" engine. IBus
+# should auto-launch this wrapper for the registered "smartkey-phasea" engine,
+# which avoids same-name routing collisions with the normal installed engine.
+set -euo pipefail
+
+LAB=/home/rmanov/smartkey-phase-a-lab
+VENV_PY=/home/rmanov/smartkey/.venv/bin/python3
+
+cd "$LAB"
+export SMARTKEY_PHASE_A=1
+export SMARTKEY_PHASEA_COMMIT="$(git -C "$LAB" rev-parse HEAD 2>/dev/null || echo unknown)"
+export SMARTKEY_IBUS_ENGINE_NAME="${SMARTKEY_IBUS_ENGINE_NAME:-smartkey-phasea}"
+export PYTHONPATH="$LAB:${PYTHONPATH:-}"
+
+exec "$VENV_PY" -m ibus.main "$@"

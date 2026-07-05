@@ -6,8 +6,11 @@
 #
 #   phase_a/switch-to-lab.sh --confirm
 #
-# PREREQUISITE: the lab engine process must already be running:
-#   phase_a/run-lab-engine.sh   (in its own terminal/session)
+# PREREQUISITE: the lab IBus component must be registered:
+#   phase_a/install-ibus-component.sh
+#
+# IBus auto-launches the lab engine wrapper on switch. Do not also run
+# phase_a/run-lab-engine.sh unless debugging manual component registration.
 set -uo pipefail
 
 LAB=/home/rmanov/smartkey-phase-a-lab
