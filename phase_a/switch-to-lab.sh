@@ -81,7 +81,9 @@ if d.get("phase_a") != 1: probs.append("phase_a!=1")
 hb = float(d.get("heartbeat_ts", 0))
 if hb < switch_ts - 2: probs.append(f"stale heartbeat ({time.time()-hb:.0f}s old, before switch)")
 lc = str(d.get("lab_commit"))
-if lab_head != "unknown" and lc not in (lab_head, lab_head[:12], "unknown", "None"):
+# When HEAD is known, the receipt MUST carry the real commit — 'unknown'/'None'
+# are NOT acceptable (that would defeat the fail-closed identity proof).
+if lab_head != "unknown" and lc not in (lab_head, lab_head[:12]):
     probs.append(f"lab_commit {lc[:12]} != HEAD {lab_head[:12]}")
 pid = d.get("pid")
 alive = False

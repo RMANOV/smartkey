@@ -107,6 +107,16 @@ class PhaseAAdapter:
         self._write_identity()
 
     # ---- context observation + resolution ------------------------------------
+    def observe_surrounding(self, surrounding_text: str | None, cursor_pos) -> None:
+        """IBus gives (text, cursor_pos). Only the text BEFORE the cursor is the
+        committed context; resolving against after-cursor words when the operator
+        edits mid-text would grab a token they have not typed yet (Codex B4).
+        Slice to the before-cursor prefix when cursor_pos is valid."""
+        text = surrounding_text or ""
+        if isinstance(cursor_pos, int) and 0 <= cursor_pos <= len(text):
+            text = text[:cursor_pos]
+        self.observe_context(text)
+
     def observe_context(self, surrounding_text_before_cursor: str | None) -> None:
         """Update context and resolve a pending prediction if the actual next
         token now occupies its predicted slot (surrounding-text delta)."""

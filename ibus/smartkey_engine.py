@@ -298,7 +298,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if self._phase_a is None:
             return
         try:
-            self._phase_a.observe_context(self._surrounding_text or "")
+            # Pass BOTH text and cursor_pos: the adapter uses only the
+            # before-cursor prefix so mid-text editing cannot resolve a
+            # prediction against an after-cursor word (Codex B4).
+            self._phase_a.observe_surrounding(
+                self._surrounding_text, self._surrounding_cursor_pos
+            )
         except Exception:
             log.debug("smartkey: phase-a observe hook failed", exc_info=True)
 

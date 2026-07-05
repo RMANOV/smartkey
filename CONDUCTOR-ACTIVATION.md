@@ -53,9 +53,9 @@ cd /home/rmanov/smartkey-phase-a-lab && phase_a/preflight.sh
 ```
 It checks and must report `[ OK ]` for every line:
 
-1. **self-test 8/8** — logging / split / bucketing / isotonic / gate / sweep /
-   watchdog, **including the forced-FAIL proof** and the no-LLM schema-invariant
-   rejection.
+1. **self-test — ALL CHECKS PASS** — logging / split / bucketing / isotonic /
+   gate / sweep / watchdog, **including the forced-FAIL proof**, the no-LLM
+   schema-invariant rejection, and the B2/B4 outcome-coverage checks.
 2. **≤20ms logging budget met** — `bench --check` (measured p99 ≈ 55–60 µs,
    0.00% over 20 ms with the real corpus).
 3. **isolation receipt present** (`isolation-receipt.txt`).

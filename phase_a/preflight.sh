@@ -19,7 +19,7 @@ echo "==================================================================="
 # 1. self-test (incl. forced-FAIL proof + schema rejection)
 if "$PY" -m phase_a.selftest >/tmp/phasea_selftest.log 2>&1 && \
    grep -q "ALL CHECKS PASS" /tmp/phasea_selftest.log; then
-    pass "self-test 8/8 (incl. forced-FAIL + schema invariant)"
+    pass "self-test ALL CHECKS PASS (incl. forced-FAIL, schema invariant, B2/B4 outcome)"
 else
     fail "self-test did NOT pass — see /tmp/phasea_selftest.log"
 fi

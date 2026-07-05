@@ -322,6 +322,56 @@ def check_b2_outcome_coverage() -> tuple[bool, str]:
     )
 
 
+def check_b4_cursor() -> tuple[bool, str]:
+    """Codex B4: the observe path must use only BEFORE-cursor text. With an
+    existing buffer 'alpha FUTURE' and the cursor right after 'alpha', a pending
+    prediction must NOT grab the after-cursor 'FUTURE' — it stays pending until
+    the real next token is typed. Also proves the fix is load-bearing (whole-text
+    observe would wrongly grab it)."""
+    from pathlib import Path
+
+    from .engine_adapter import PhaseAAdapter
+    from .harness import connect
+
+    # --- FIXED path: observe_surrounding(text, cursor_pos) uses before-cursor ---
+    db = _fresh(data_dir() / "selftest_b4.db")
+    ad = PhaseAAdapter(db, [Path("corpus/corpus_tech.json")], engine_commit="b4")
+    ad.observe_surrounding("alpha FUTURE", 5)              # before-cursor 'alpha'
+    ad.on_next_word_prediction(["beta", "gamma", "delta"])  # pending, n_ctx=1
+    ad.observe_surrounding("alpha FUTURE", 5)              # still mid-edit -> no grab
+    stayed_pending = ad.pending is not None
+    ad.observe_surrounding("alpha beta FUTURE", 10)        # real next token typed
+    resolved_after_real = ad.pending is None
+    ad.close()
+    conn = connect(db, readonly=True)
+    rows = conn.execute("SELECT outcome FROM events ORDER BY id").fetchall()
+    conn.close()
+
+    # --- BUG path (whole text, no cursor): would grab 'future' -> outcome 0 ---
+    db2 = _fresh(data_dir() / "selftest_b4_bug.db")
+    ad2 = PhaseAAdapter(db2, [Path("corpus/corpus_tech.json")], engine_commit="b4b")
+    ad2.observe_context("alpha")
+    ad2.on_next_word_prediction(["beta", "gamma", "delta"])
+    ad2.observe_context("alpha FUTURE")                   # whole text = the bug
+    bug_grabbed_early = ad2.pending is None
+    ad2.close()
+    conn2 = connect(db2, readonly=True)
+    bug_rows = conn2.execute("SELECT outcome FROM events ORDER BY id").fetchall()
+    conn2.close()
+
+    ok = (
+        stayed_pending
+        and resolved_after_real
+        and rows == [(1,)]
+        and bug_grabbed_early
+        and bug_rows == [(0,)]
+    )
+    return ok, (
+        f"stayed_pending={stayed_pending} resolved_after_real={resolved_after_real} "
+        f"fixed_outcome={rows} | bug_grabbed_early={bug_grabbed_early} bug_outcome={bug_rows}"
+    )
+
+
 def check_live_sweep_watchdog() -> tuple[bool, str]:
     """run_sweep produces a receipt; run_watchdog returns 0 right after a sweep."""
     db = data_dir() / "selftest_green.db"  # reuse GREEN db (has data + sweeps)
@@ -343,6 +393,7 @@ CHECKS = [
     ("7 schema invariant rejects llm:/human", check_schema_invariant),
     ("8 live sweep + watchdog", check_live_sweep_watchdog),
     ("9 B2 outcome coverage (non-top3 -> 0) + identity", check_b2_outcome_coverage),
+    ("10 B4 before-cursor (no mid-edit grab)", check_b4_cursor),
 ]
 
 
