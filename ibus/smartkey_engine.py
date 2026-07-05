@@ -254,6 +254,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # below is a no-op, so production behaviour is byte-for-byte unchanged.
         self._phase_a = None
         self._phase_a_action_trace: Path | None = None
+        self._phase_a_callback_trace: Path | None = None
         if os.environ.get("SMARTKEY_PHASE_A") == "1":
             try:
                 from phase_a.engine_adapter import PhaseAAdapter
@@ -267,6 +268,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     notes="ibus real-typing run",
                 )
                 self._phase_a_action_trace = data_dir() / "action_trace.jsonl"
+                self._phase_a_callback_trace = data_dir() / "callback_trace.jsonl"
                 log.info("smartkey: Phase-A harness ENABLED (db=%s)", default_db_path())
             except Exception:
                 log.warning(
@@ -340,6 +342,40 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception:
             log.debug("smartkey: phase-a action trace failed", exc_info=True)
+
+    @staticmethod
+    def _phase_a_key_kind(keyval: int) -> str:
+        if keyval == IBus.KEY_space:
+            return "space"
+        if keyval == IBus.KEY_Return:
+            return "return"
+        if keyval == IBus.KEY_Tab:
+            return "tab"
+        if keyval == IBus.KEY_BackSpace:
+            return "backspace"
+        if keyval == IBus.KEY_Escape:
+            return "escape"
+        if SmartKeyEngine._is_navigation_key(keyval):
+            return "navigation"
+        if SmartKeyEngine._is_printable_keyval(keyval):
+            return "printable"
+        return "other"
+
+    def _phase_a_trace_callback(self, callback: str, **fields: object) -> None:
+        """Phase-A-only callback breadcrumb. Stores no surrounding/plaintext."""
+        if self._phase_a_callback_trace is None:
+            return
+        try:
+            self._phase_a_callback_trace.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": time.time(),
+                "callback": callback,
+            }
+            record.update(fields)
+            with self._phase_a_callback_trace.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            log.debug("smartkey: phase-a callback trace failed", exc_info=True)
 
     # -----------------------------------------------------------------------
     # Corpus loading.
@@ -751,13 +787,20 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
     def do_set_capabilities(self, caps: int) -> None:
         self._caps = caps
+        self._phase_a_trace_callback("set_capabilities", caps=caps)
 
     def do_set_surrounding_text(
         self, text: object, cursor_pos: int, anchor_pos: int
     ) -> None:
-        _ = anchor_pos
+        decoded = self._decode_surrounding_text(text)
+        self._phase_a_trace_callback(
+            "set_surrounding_text",
+            text_len=len(decoded or ""),
+            cursor_pos=cursor_pos,
+            anchor_pos=anchor_pos,
+        )
         self._sync_surrounding_text(
-            self._decode_surrounding_text(text),
+            decoded,
             cursor_pos,
         )
 
@@ -773,6 +816,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         (``handle_key()``) when keycode is unavailable.
         """
         log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)
+        self._phase_a_trace_callback(
+            "process_key_event",
+            keycode=keycode,
+            state=state,
+            key_kind=self._phase_a_key_kind(keyval),
+            release=bool(state & (1 << 30)),
+        )
 
         # Track backspace so we can consume it when preedit is active,
         # preventing the key from also deleting committed text in the app.
@@ -843,11 +893,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # IBus lifecycle callbacks.
     # -----------------------------------------------------------------------
     def do_focus_in(self) -> None:
+        self._phase_a_trace_callback("focus_in")
         self._core.focus_gained()
         self._refresh_surrounding_text()
         self._phase_a_observe()  # Phase-A: heartbeat identity + resolve on refocus
 
     def do_focus_out(self) -> None:
+        self._phase_a_trace_callback("focus_out")
         actions = self._core.focus_lost()
         self._execute_actions(actions)
         self._active_prediction = None
@@ -864,6 +916,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 log.warning("smartkey: failed to save personal profile", exc_info=True)
 
     def do_reset(self) -> None:
+        self._phase_a_trace_callback("reset")
         actions = self._core.reset()
         self._execute_actions(actions)
         self._active_prediction = None
@@ -872,9 +925,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._phase_a.on_reset()  # Phase-A: drop in-flight prediction
 
     def do_enable(self) -> None:
+        self._phase_a_trace_callback("enable")
         pass  # Rust core handles enabled state via kill switch.
 
     def do_disable(self) -> None:
+        self._phase_a_trace_callback("disable")
         actions = self._core.reset()
         self._execute_actions(actions)
         self._active_prediction = None
