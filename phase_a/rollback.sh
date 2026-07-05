@@ -16,11 +16,27 @@ LAB=/home/rmanov/smartkey-phase-a-lab
 SAVED="$LAB/phase_a_data/rollback-engine.txt"
 PANIC_ENGINE="${PHASEA_PANIC_ENGINE:-xkb:us::eng}"   # universal fallback; override if needed
 
+# The safety net must work even if ibus-daemon DIED: (re)start it before any
+# engine set, since `ibus engine` (ibus_bus_set_global_engine) fails when the
+# daemon is down.
+_ensure_ibus_up() {
+    [[ "${PHASEA_IBUS_DRYRUN:-0}" == "1" ]] && return 0
+    ibus engine >/dev/null 2>&1 && return 0            # already reachable
+    echo "ibus-daemon not reachable — (re)starting it..."
+    command -v ibus-daemon >/dev/null 2>&1 && ibus-daemon -drxR >/dev/null 2>&1 &
+    for _ in 1 2 3 4 5 6 7 8; do
+        ibus engine >/dev/null 2>&1 && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
 # Dry-run / test hook: set PHASEA_IBUS_DRYRUN=1 to echo instead of switching.
 _ibus_engine() {
     if [[ "${PHASEA_IBUS_DRYRUN:-0}" == "1" ]]; then
         echo "[dryrun] ibus engine $1"
     else
+        _ensure_ibus_up || echo "WARNING: ibus-daemon still not reachable — trying the set anyway"
         ibus engine "$1"
     fi
 }

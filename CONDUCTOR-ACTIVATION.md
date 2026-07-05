@@ -20,6 +20,27 @@ rollback + `--dry-run`), `switch-to-lab.sh --confirm` (gated switch),
 
 ---
 
+## 0. Environment prerequisite — DO THIS FIRST
+
+**Run every command below in a NATIVE graphical desktop terminal** — one that has
+`DISPLAY` / `WAYLAND_DISPLAY` and a session `DBUS_SESSION_BUS_ADDRESS`. An
+embedded/agent/SSH shell without those will fail with `IBUS_IS_BUS assertion` /
+`Cannot connect to IBus bus`, and `ibus engine` cannot talk to the desktop.
+
+**Start (or replace) the IBus daemon first — it is not automatic:**
+```bash
+ibus-daemon -drxR      # -d daemonize  -r replace  -x xim  -R restart panel/config on death
+```
+Verify it is reachable before anything else:
+```bash
+ibus engine            # prints the current engine (e.g. 'smartkey'); if this
+                       # errors, ibus-daemon is not up in THIS session — fix that first.
+```
+The precondition gate (`preflight.sh`) checks this and goes RED if the daemon is
+unreachable.
+
+---
+
 ## The switch, in one line
 ```bash
 /home/rmanov/smartkey-phase-a-lab/phase_a/switch-to-lab.sh --confirm
@@ -153,7 +174,9 @@ You do not need to wait for the conductor. Any of these restores typing instantl
   hotkey) cycles input sources away from SmartKey.
 
 The panic path uses a plain keyboard layout, so it does not depend on any
-smartkey component being healthy.
+smartkey component being healthy. `rollback.sh` also **(re)starts ibus-daemon**
+(`ibus-daemon -drxR`) if it finds the daemon down before setting the engine, so
+the safety net works even if the daemon itself died.
 
 ---
 Phase-A зелено ≠ доказателство за team tier.
