@@ -46,9 +46,20 @@ _ENGINE_MODULE = _smartkey_engine
 # ---------------------------------------------------------------------------
 # Constants.
 # ---------------------------------------------------------------------------
-_BUS_NAME = "org.freedesktop.IBus.SmartKey"
-_OBJECT_PATH = "/org/freedesktop/IBus/Engine/SmartKey"
-_ENGINE_NAME = "smartkey"
+_ENGINE_NAME = os.environ.get("SMARTKEY_IBUS_ENGINE_NAME", "smartkey")
+_ENGINE_SUFFIX = "".join(ch for ch in _ENGINE_NAME.title() if ch.isalnum())
+_BUS_NAME = os.environ.get(
+    "SMARTKEY_IBUS_BUS_NAME",
+    "org.freedesktop.IBus.SmartKey"
+    if _ENGINE_NAME == "smartkey"
+    else f"org.freedesktop.IBus.{_ENGINE_SUFFIX}",
+)
+_OBJECT_PATH = os.environ.get(
+    "SMARTKEY_IBUS_OBJECT_PATH",
+    "/org/freedesktop/IBus/Engine/SmartKey"
+    if _ENGINE_NAME == "smartkey"
+    else f"/org/freedesktop/IBus/Engine/{_ENGINE_SUFFIX}",
+)
 _ENGINE_VERSION = "0.5.0"
 _ENGINE_LICENSE = "GPL-3.0-only"
 _ENGINE_AUTHOR = "SmartKey Contributors"

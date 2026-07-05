@@ -15,10 +15,11 @@ VENV_PY=/home/rmanov/smartkey/.venv/bin/python3
 cd "$LAB"
 export SMARTKEY_PHASE_A=1
 export SMARTKEY_PHASEA_COMMIT="$(git -C "$LAB" rev-parse HEAD 2>/dev/null || echo unknown)"
+export SMARTKEY_IBUS_ENGINE_NAME="${SMARTKEY_IBUS_ENGINE_NAME:-smartkey-phasea}"
 export PYTHONPATH="$LAB:${PYTHONPATH:-}"
 # Optional: uncomment to force a specific corpus dir (defaults to $LAB/corpus).
 # export SMARTKEY_CORPUS_DIR="$HOME/.config/smartkey"
 
-echo "Phase-A LAB engine: SMARTKEY_PHASE_A=1  commit=$SMARTKEY_PHASEA_COMMIT"
+echo "Phase-A LAB engine: SMARTKEY_PHASE_A=1  commit=$SMARTKEY_PHASEA_COMMIT  engine=$SMARTKEY_IBUS_ENGINE_NAME"
 echo "event DB -> $LAB/phase_a_data/events.db"
 exec "$VENV_PY" -m ibus.main "$@"

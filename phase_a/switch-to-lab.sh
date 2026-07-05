@@ -14,7 +14,7 @@ LAB=/home/rmanov/smartkey-phase-a-lab
 PY=/home/rmanov/smartkey/.venv/bin/python3
 SAVED="$LAB/phase_a_data/rollback-engine.txt"
 IDENT="$LAB/phase_a_data/ENGINE-IDENTITY.json"
-LAB_ENGINE="${PHASEA_LAB_ENGINE:-smartkey}"
+LAB_ENGINE="${PHASEA_LAB_ENGINE:-smartkey-phasea}"
 
 _ibus_engine() { [[ "${PHASEA_IBUS_DRYRUN:-0}" == "1" ]] && echo "[dryrun] ibus engine $1" >&2 || ibus engine "$1"; }
 _ibus_current() { [[ "${PHASEA_IBUS_DRYRUN:-0}" == "1" ]] && echo "${PHASEA_FAKE_CURRENT:-$LAB_ENGINE}" || ibus engine 2>/dev/null; }
