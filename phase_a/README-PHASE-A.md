@@ -10,7 +10,7 @@ sklearn `IsotonicRegression` only.
 |---|---|
 | `constants.py` | hash-committed thresholds, resolver, firewall line |
 | `freqmodel.py` | raw normalised-frequency model (dumb baseline p_top3); corpus hash pin |
-| `harness.py` | SQLite schema + `PhaseALogger` (INSERT@prediction, UPDATE@resolution) |
+| `harness.py` | SQLite schema + `PhaseALogger` (INSERT@prediction, UPDATE@resolution); stores no plaintext words — only context_hash (keyed HMAC), n_candidates, p_top3, latency, outcome |
 | `engine_adapter.py` | IBus-free wiring (`note_context`/`on_next_word_prediction`/`on_commit`/`on_reset`) |
 | `analyze.py` | 50/50 split → 5 quantile buckets → isotonic → mechanical PASS/FAIL/INCONCLUSIVE |
 | `sweep.py` | daily receipt + 48h watchdog |

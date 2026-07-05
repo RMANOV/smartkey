@@ -58,8 +58,8 @@ the same two moments, guarded by `SMARTKEY_PHASE_A=1` (no-op otherwise):
 
 | Phase-A event | smartkey_engine.py site | what it captures |
 |---|---|---|
-| **candidate-generation** (next-word prediction) | `_execute_actions` → `ghost` branch → `_phase_a_ghost()` | context (surrounding text), top3 words, p_top3, latency, INSERT row (outcome NULL) |
-| **resolution** (next token committed) | `_execute_actions` → `commit` & `replace` branches → `_phase_a_commit()` | resolved token → UPDATE outcome = token ∈ top3 |
+| **candidate-generation** (next-word prediction) | `_execute_actions` → `ghost` branch → `_phase_a_ghost()` | reads context + top3 words *in memory*; **stores only** context_hash, n_candidates, p_top3, latency (outcome NULL) |
+| **resolution** (next token committed) | `_execute_actions` → `commit` & `replace` branches → `_phase_a_commit()` | computes outcome = (token ∈ top3) *in memory*; **stores only** the {0,1} bit — the token is never persisted |
 | **drop in-flight** | `do_reset`, `do_focus_out` → `on_reset()` | pending stays unresolved |
 | **flush/close** | `do_disable` → `close()` | commit + close DB |
 
@@ -80,6 +80,20 @@ resolver name promises. This is the one engine-coupled choice, documented here.
   unresolved rate is therefore a *real* plumbing signal — and `>5% unresolved`
   is a spec FAIL condition, which is correct: the harness would be unable to
   observe outcomes and must say so.
+
+### Privacy (L0-leakage mitigation)
+
+The calibration gate needs only `outcome ∈ {0,1}` and `p_top3`, so **no plaintext
+linguistic content is persisted**. Candidate words and the resolved token exist
+only in memory (in the `Pending` handle) long enough to compute p_top3 and the
+outcome bit; `events.db` stores just `context_hash`, `n_candidates` (a 0–3
+count), `p_top3`, `latency_us`, `outcome`, and timestamps. `context_hash` is a
+keyed HMAC-SHA256 whose salt lives in a `0600` sidecar (`phase_a_data/context_salt`),
+**not** in the DB — so leaking `events.db` alone cannot dictionary-recover a
+context word from the ~190k-word corpus. Over a 14-day real-typing window the DB
+therefore contains no passwords / medical / family terms. Verified: grepping the
+DB for known sensitive tokens yields zero hits; the raw salt bytes are absent
+from the DB.
 
 ## 4. Isolation
 

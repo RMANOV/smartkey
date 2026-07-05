@@ -83,7 +83,11 @@ line is red: DO NOT SWITCH.
 
 - Confirm `ibus engine` reports `smartkey` and type a sentence. If anything is
   wrong, run `rollback.sh` immediately.
-- Events log to `phase_a_data/events.db` (`synthetic=0`).
+- Events log to `phase_a_data/events.db` (`synthetic=0`). **Privacy:** no
+  plaintext typing is stored — only `context_hash` (keyed HMAC), a candidate
+  count, `p_top3`, latency, and the `outcome` bit. Candidate words and the
+  resolved token never leave memory. The HMAC key is in a `0600` sidecar
+  (`phase_a_data/context_salt`), not in the DB.
 - Daily automation (document only — do NOT auto-install; `crontab -e`):
   ```cron
   55 23 * * * cd /home/rmanov/smartkey-phase-a-lab && /home/rmanov/smartkey/.venv/bin/python3 -m phase_a.sweep sweep    >> /home/rmanov/smartkey-phase-a-lab/phase_a_data/cron.log 2>&1
