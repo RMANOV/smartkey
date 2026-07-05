@@ -255,6 +255,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._phase_a = None
         self._phase_a_action_trace: Path | None = None
         self._phase_a_callback_trace: Path | None = None
+        self._phase_a_prediction_trace: Path | None = None
         if os.environ.get("SMARTKEY_PHASE_A") == "1":
             try:
                 from phase_a.engine_adapter import PhaseAAdapter
@@ -269,6 +270,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 )
                 self._phase_a_action_trace = data_dir() / "action_trace.jsonl"
                 self._phase_a_callback_trace = data_dir() / "callback_trace.jsonl"
+                self._phase_a_prediction_trace = data_dir() / "prediction_trace.jsonl"
                 log.info("smartkey: Phase-A harness ENABLED (db=%s)", default_db_path())
             except Exception:
                 log.warning(
@@ -280,6 +282,32 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     # Phase-A instrumentation hooks (no-ops unless the harness is enabled).
     # -----------------------------------------------------------------------
+    def _phase_a_trace_prediction_hook(
+        self,
+        source: str,
+        preds_count: int,
+        logged: bool,
+        reason: str,
+    ) -> None:
+        """Phase-A prediction-hook breadcrumb. Stores no words/plaintext."""
+        if self._phase_a_prediction_trace is None:
+            return
+        try:
+            self._phase_a_prediction_trace.parent.mkdir(parents=True, exist_ok=True)
+            events = getattr(self._phase_a, "_events", None)
+            record = {
+                "ts": time.time(),
+                "source": source,
+                "preds_count": preds_count,
+                "logged": logged,
+                "reason": reason,
+                "events": events,
+            }
+            with self._phase_a_prediction_trace.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            log.debug("smartkey: phase-a prediction trace failed", exc_info=True)
+
     def _phase_a_ghost(self) -> None:
         """Log a next-word prediction event (candidate-generation point).
 
@@ -290,8 +318,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return
         try:
             preds = self._core.predictions()
-            self._phase_a.on_next_word_prediction([p[0] for p in preds[:3]])
+            top3 = [p[0] for p in preds[:3]]
+            before = getattr(self._phase_a, "_events", None)
+            self._phase_a.on_next_word_prediction(top3)
+            after = getattr(self._phase_a, "_events", None)
+            logged = isinstance(before, int) and isinstance(after, int) and after > before
+            self._phase_a_trace_prediction_hook(
+                "core_predictions",
+                len(top3),
+                logged,
+                "logged" if logged else ("empty_predictions" if not top3 else "dedup_or_pending"),
+            )
         except Exception:
+            self._phase_a_trace_prediction_hook("core_predictions", 0, False, "exception")
             log.debug("smartkey: phase-a ghost hook failed", exc_info=True)
 
     def _phase_a_observe(self) -> None:
@@ -712,11 +751,60 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._clear_ghost()
         self.commit_text(IBus.Text.new_from_string(text))
 
+    @staticmethod
+    def _coalesce_same_batch_commit_replace(
+        actions: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """Fold commit+replace of the same just-committed word into one commit.
+
+        The Rust core can emit CommitText(word) followed by ReplaceWord(len(word),
+        corrected_word) from the post-commit pipeline. That is fine for hosts where
+        delete_surrounding_text is perfectly reliable, but brittle in live IBus:
+        if the deletion is ignored or races the commit, users see duplicated words.
+
+        Only coalesce when the replace length exactly matches the preceding commit
+        in the same action batch. Standalone ReplaceWord remains untouched because
+        it may be correcting already-forwarded application text.
+        """
+        if not actions:
+            return actions
+
+        coalesced: list[tuple[str, str]] = []
+        pending_commit_idx: int | None = None
+        pending_commit_text: str | None = None
+
+        for action_type, payload in actions:
+            if action_type == "commit":
+                pending_commit_idx = len(coalesced)
+                pending_commit_text = payload
+                coalesced.append((action_type, payload))
+                continue
+
+            if action_type == "replace" and pending_commit_idx is not None:
+                decoded = ffi_decode_replace_payload(payload)
+                if decoded is None:
+                    try:
+                        n_str, replacement_text = payload.split("\x1f", 1)
+                        decoded = (int(n_str), replacement_text)
+                    except (ValueError, TypeError):
+                        decoded = None
+                if decoded is not None and pending_commit_text is not None:
+                    replace_len, replacement = decoded
+                    if replace_len == len(pending_commit_text):
+                        coalesced[pending_commit_idx] = ("commit", replacement)
+                        pending_commit_text = replacement
+                        continue
+
+            coalesced.append((action_type, payload))
+
+        return coalesced
+
     # -----------------------------------------------------------------------
     # Action dispatcher — translates Rust actions to IBus API calls.
     # -----------------------------------------------------------------------
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
+        actions = self._coalesce_same_batch_commit_replace(actions)
         consumed = True
         for action_type, payload in actions:
             if action_type == "ghost":

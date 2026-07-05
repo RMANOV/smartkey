@@ -425,6 +425,45 @@ def check_live_db_guard() -> tuple[bool, str]:
     return blocked, f"live_default_db_blocked={blocked}"
 
 
+def check_ibus_commit_replace_coalesce() -> tuple[bool, str]:
+    """IBus wrapper must not delete+recommit a word committed in the same batch."""
+    from ibus.smartkey_engine import SmartKeyEngine
+
+    replace_payload = "4\x1fTEST"
+    actions = [
+        ("hide", ""),
+        ("commit", "test"),
+        ("forward", ""),
+        ("replace", replace_payload),
+        ("ghost", "x"),
+    ]
+    coalesced = SmartKeyEngine._coalesce_same_batch_commit_replace(actions)
+    expected = [
+        ("hide", ""),
+        ("commit", "TEST"),
+        ("forward", ""),
+        ("ghost", "x"),
+    ]
+
+    standalone = SmartKeyEngine._coalesce_same_batch_commit_replace(
+        [("replace", replace_payload), ("forward", "")]
+    )
+    mismatch = SmartKeyEngine._coalesce_same_batch_commit_replace(
+        [("commit", "abc"), ("replace", replace_payload)]
+    )
+
+    ok = (
+        coalesced == expected
+        and standalone == [("replace", replace_payload), ("forward", "")]
+        and mismatch == [("commit", "abc"), ("replace", replace_payload)]
+    )
+    return ok, (
+        f"coalesced={coalesced == expected} "
+        f"standalone_preserved={standalone[0][0] == 'replace'} "
+        f"mismatch_preserved={mismatch[-1][0] == 'replace'}"
+    )
+
+
 def check_live_sweep_watchdog() -> tuple[bool, str]:
     """run_sweep produces a receipt; run_watchdog returns 0 right after a sweep."""
     db = data_dir() / "selftest_green.db"  # reuse GREEN db (has data + sweeps)
@@ -448,6 +487,7 @@ CHECKS = [
     ("9 B2 outcome coverage (non-top3 -> 0) + identity", check_b2_outcome_coverage),
     ("10 B4 before-cursor (no mid-edit grab)", check_b4_cursor),
     ("11 live events.db guard", check_live_db_guard),
+    ("12 IBus commit+replace coalesce", check_ibus_commit_replace_coalesce),
 ]
 
 
