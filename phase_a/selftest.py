@@ -101,12 +101,11 @@ def _craft_db(name: str, rows: list[tuple], with_sweeps: bool) -> Path:
     )
     for ts, p, outcome, lat in rows:
         conn.execute(
-            "INSERT INTO events (run_id, ts, context_hash, top3, p_top3, latency_us, "
-            "resolved_token, outcome, class, resolver, synthetic) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,1)",
+            "INSERT INTO events (run_id, ts, context_hash, n_candidates, p_top3, "
+            "latency_us, outcome, class, resolver, synthetic) "
+            "VALUES (?,?,?,?,?,?,?,?,?,1)",
             (
-                f"craft-{name}", ts, "ch", '["x"]', p, lat,
-                ("x" if outcome == 1 else "MISS") if outcome is not None else None,
+                f"craft-{name}", ts, "ch", 3, p, lat,
                 outcome, EVENT_CLASS, RESOLVER,
             ),
         )
@@ -238,8 +237,9 @@ def check_schema_invariant() -> tuple[bool, str]:
     rejected = False
     try:
         conn.execute(
-            "INSERT INTO events (run_id, ts, context_hash, top3, p_top3, latency_us, "
-            "class, resolver, synthetic) VALUES ('s',0,'c','[]',0.0,1,'machine','llm:gpt',1)"
+            "INSERT INTO events (run_id, ts, context_hash, n_candidates, p_top3, "
+            "latency_us, class, resolver, synthetic) "
+            "VALUES ('s',0,'c',3,0.0,1,'machine','llm:gpt',1)"
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -248,8 +248,9 @@ def check_schema_invariant() -> tuple[bool, str]:
     rejected_class = False
     try:
         conn.execute(
-            "INSERT INTO events (run_id, ts, context_hash, top3, p_top3, latency_us, "
-            "class, resolver, synthetic) VALUES ('s',0,'c','[]',0.0,1,'human','script:x',1)"
+            "INSERT INTO events (run_id, ts, context_hash, n_candidates, p_top3, "
+            "latency_us, class, resolver, synthetic) "
+            "VALUES ('s',0,'c',3,0.0,1,'human','script:x',1)"
         )
         conn.commit()
     except sqlite3.IntegrityError:

@@ -36,3 +36,22 @@ def receipts_dir() -> Path:
     d = data_dir() / "receipts"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def context_salt() -> bytes:
+    """Per-data-dir random salt for keyed context hashing, stored in a 0600
+    sidecar file OUTSIDE the event DB. This keeps context_hash from being a
+    dictionary-recoverable hash of a single corpus word: leaking events.db
+    alone no longer reveals context words (the key is not in the DB).
+    """
+    f = data_dir() / "context_salt"
+    if f.exists():
+        return f.read_bytes()
+    salt = os.urandom(16)
+    try:
+        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(salt)
+        return salt
+    except FileExistsError:  # concurrent create — reuse the winner's salt
+        return f.read_bytes()

@@ -2,10 +2,20 @@
 
 One row per prediction event. The row is INSERTed at candidate-generation time
 (so events that never resolve are still counted toward the unresolved rate) and
-UPDATEd with ``resolved_token`` + ``outcome`` when the next actual token becomes
-known. ``latency_us`` is wall-clock microseconds measured in the *same* event
-path — it brackets the added instrumentation cost (p_top3 compute + hash +
-durable INSERT), which is exactly the overhead the ≤20 ms/event budget governs.
+UPDATEd with ``outcome`` when the next actual token becomes known.
+``latency_us`` is wall-clock microseconds measured in the *same* event path — it
+brackets the added instrumentation cost (p_top3 compute + hash + durable
+INSERT), which is exactly the overhead the ≤20 ms/event budget governs.
+
+PRIVACY (L0-leakage mitigation, conductor decision): the calibration gate needs
+only ``outcome ∈ {0,1}`` and ``p_top3``. Therefore NO plaintext linguistic
+content is persisted — not the candidate words, not the resolved token. The
+outcome (was the actual next token in the predicted top-3) is computed in memory
+at resolution time and only the {0,1} bit is stored. ``context_hash`` is a keyed
+HMAC (salt kept in a 0600 sidecar, not in the DB) so it is not a
+dictionary-recoverable hash of a single corpus word. Over a 14-day real-typing
+window, events.db thus contains only aggregates and hashes — no passwords /
+medical / family terms.
 
 The no-LLM schema invariant (Codex major) is enforced at the storage layer: a
 CHECK constraint rejects any resolver whose prefix is not 'script:'/'sql:' and
@@ -18,6 +28,7 @@ drive the exact same API, so the machinery is proven without IBus or the GUI.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import sqlite3
 import time
@@ -30,6 +41,7 @@ from .constants import (
     HARNESS_VERSION,
     RESOLVER,
 )
+from .paths import context_salt
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS run_metadata (
@@ -49,17 +61,18 @@ CREATE TABLE IF NOT EXISTS events (
     id             INTEGER PRIMARY KEY,
     run_id         TEXT NOT NULL,
     ts             REAL NOT NULL,
-    context_hash   TEXT NOT NULL,
-    top3           TEXT NOT NULL,
+    context_hash   TEXT NOT NULL,          -- keyed HMAC; NOT recoverable from DB alone
+    n_candidates   INTEGER NOT NULL,       -- count only (0-3); NO candidate words stored
     p_top3         REAL NOT NULL,
     latency_us     INTEGER NOT NULL,
-    resolved_token TEXT,
     outcome        INTEGER CHECK (outcome IN (0, 1) OR outcome IS NULL),
     class          TEXT NOT NULL DEFAULT 'machine' CHECK (class = 'machine'),
     resolver       TEXT NOT NULL
         CHECK (resolver LIKE 'script:%' OR resolver LIKE 'sql:%'),
     resolved_ts    REAL,
     synthetic      INTEGER NOT NULL CHECK (synthetic IN (0, 1))
+    -- NOTE: no top3 / resolved_token columns. Plaintext linguistic content is
+    -- never persisted; outcome is computed in memory and only the {0,1} bit kept.
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts  ON events (ts);
 CREATE INDEX IF NOT EXISTS idx_events_run ON events (run_id);
@@ -79,9 +92,11 @@ CREATE INDEX IF NOT EXISTS idx_sweeps_date ON sweeps (sweep_date);
 """
 
 
-def context_hash(context: str) -> str:
-    """Stable 16-hex-char hash of the context (privacy-preserving, no raw text)."""
-    return hashlib.sha1(context.encode("utf-8")).hexdigest()[:16]
+def context_hash(context: str, salt: bytes) -> str:
+    """Keyed 16-hex-char HMAC of the context. The salt (kept in a 0600 sidecar,
+    not in the DB) makes this non-recoverable by dictionary attack over the
+    corpus vocabulary — so events.db alone never reveals a context word."""
+    return hmac.new(salt, context.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
 
 
 @dataclass
@@ -129,6 +144,7 @@ class PhaseALogger:
         self.freq = freq_model
         self.synthetic = 1 if synthetic else 0
         self.resolver = resolver
+        self._salt = context_salt()
         self.conn = connect(db_path)
         self.run_id = f"{int(time.time() * 1000)}-{'syn' if synthetic else 'real'}"
         self._write_run_metadata(engine_commit, notes)
@@ -168,18 +184,19 @@ class PhaseALogger:
         if ts is None:
             ts = time.time()
         t0 = time.perf_counter_ns()
+        top3 = list(top3[:3])
         p_top3 = self.freq.p_top3(context, top3)
-        ch = context_hash(context)
-        top3_json = json.dumps(list(top3[:3]), ensure_ascii=False)
+        ch = context_hash(context, self._salt)
+        # Only the candidate COUNT is stored — never the candidate words.
         cur = self.conn.execute(
-            "INSERT INTO events (run_id, ts, context_hash, top3, p_top3, "
-            "latency_us, resolved_token, outcome, class, resolver, synthetic) "
-            "VALUES (?,?,?,?,?,?,NULL,NULL,?,?,?)",
+            "INSERT INTO events (run_id, ts, context_hash, n_candidates, p_top3, "
+            "latency_us, outcome, class, resolver, synthetic) "
+            "VALUES (?,?,?,?,?,?,NULL,?,?,?)",
             (
                 self.run_id,
                 ts,
                 ch,
-                top3_json,
+                len(top3),
                 p_top3,
                 0,  # placeholder; overwritten below with the measured latency
                 EVENT_CLASS,
@@ -193,15 +210,18 @@ class PhaseALogger:
             "UPDATE events SET latency_us=? WHERE id=?", (latency_us, row_id)
         )
         self.conn.commit()
-        return Pending(row_id=row_id, top3=list(top3[:3]), context=context)
+        # top3 is retained IN MEMORY only (to compute outcome at resolution);
+        # it is never persisted and is discarded when the Pending is dropped.
+        return Pending(row_id=row_id, top3=top3, context=context)
 
     # ---- resolution point ----------------------------------------------------
     def resolve(self, pending: Pending, resolved_token: str) -> int:
-        """Bind the actual next token to a pending event; returns the outcome."""
+        """Compute outcome in memory (was the actual next token in the predicted
+        top-3) and persist ONLY the {0,1} bit — the token itself is discarded."""
         outcome = 1 if resolved_token in set(pending.top3) else 0
         self.conn.execute(
-            "UPDATE events SET resolved_token=?, outcome=?, resolved_ts=? WHERE id=?",
-            (resolved_token, outcome, time.time(), pending.row_id),
+            "UPDATE events SET outcome=?, resolved_ts=? WHERE id=?",
+            (outcome, time.time(), pending.row_id),
         )
         self.conn.commit()
         return outcome
