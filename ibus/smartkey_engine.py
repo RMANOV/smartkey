@@ -249,6 +249,53 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # Load corpus.
         self._load_corpus()
 
+        # Phase-A harness (spec §12.4) — observational, OFF unless
+        # SMARTKEY_PHASE_A=1. When off, self._phase_a is None and every hook
+        # below is a no-op, so production behaviour is byte-for-byte unchanged.
+        self._phase_a = None
+        if os.environ.get("SMARTKEY_PHASE_A") == "1":
+            try:
+                from phase_a.engine_adapter import PhaseAAdapter
+                from phase_a.freqmodel import default_corpus_files
+                from phase_a.paths import default_db_path
+
+                self._phase_a = PhaseAAdapter(
+                    str(default_db_path()),
+                    default_corpus_files(),
+                    engine_commit=os.environ.get("SMARTKEY_PHASEA_COMMIT"),
+                    notes="ibus real-typing run",
+                )
+                log.info("smartkey: Phase-A harness ENABLED (db=%s)", default_db_path())
+            except Exception:
+                log.warning(
+                    "smartkey: Phase-A harness failed to init; continuing without it",
+                    exc_info=True,
+                )
+                self._phase_a = None
+
+    # -----------------------------------------------------------------------
+    # Phase-A instrumentation hooks (no-ops unless the harness is enabled).
+    # -----------------------------------------------------------------------
+    def _phase_a_ghost(self) -> None:
+        """Log a next-word prediction event (candidate-generation point)."""
+        if self._phase_a is None:
+            return
+        try:
+            self._phase_a.note_context(self._surrounding_text or "")
+            preds = self._core.predictions()
+            self._phase_a.on_next_word_prediction([p[0] for p in preds[:3]])
+        except Exception:
+            log.debug("smartkey: phase-a ghost hook failed", exc_info=True)
+
+    def _phase_a_commit(self, text: str) -> None:
+        """Resolve the pending prediction with the next committed token."""
+        if self._phase_a is None:
+            return
+        try:
+            self._phase_a.on_commit(text)
+        except Exception:
+            log.debug("smartkey: phase-a commit hook failed", exc_info=True)
+
     # -----------------------------------------------------------------------
     # Corpus loading.
     # -----------------------------------------------------------------------
@@ -594,6 +641,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             if action_type == "ghost":
                 self._show_ghost(payload)
                 self._track_prediction_shown(payload)
+                self._phase_a_ghost()  # Phase-A: next-word prediction event
                 if _PRED_LOG:
                     preds = self._core.predictions()
                     top3 = preds[:3]
@@ -609,6 +657,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 self._clear_ghost()
             elif action_type == "commit":
                 self._safe_commit(payload)
+                self._phase_a_commit(payload)  # Phase-A: resolve pending
                 if _PRED_LOG:
                     _PRED_LOG.write(
                         str(time.time()) + " | TAB_ACCEPT | " + payload + "\n"
@@ -630,6 +679,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     for _ in range(replace_len):
                         self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
                 self._safe_commit(text)
+                self._phase_a_commit(text)  # Phase-A: resolve pending
             elif action_type == "composing":
                 decoded = ffi_decode_composing_payload(payload)
                 if decoded is None:
@@ -752,6 +802,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._execute_actions(actions)
         self._active_prediction = None
         self._sync_surrounding_text(None, None)
+        if self._phase_a is not None:
+            self._phase_a.on_reset()  # Phase-A: drop in-flight prediction
         # Debounced auto-save: persist personal profile at most once per 60s.
         now = time.monotonic()
         if now - self._last_save >= 60.0:
@@ -766,6 +818,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._execute_actions(actions)
         self._active_prediction = None
         self._sync_surrounding_text(None, None)
+        if self._phase_a is not None:
+            self._phase_a.on_reset()  # Phase-A: drop in-flight prediction
 
     def do_enable(self) -> None:
         pass  # Rust core handles enabled state via kill switch.
@@ -780,3 +834,5 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._core.save_personal()
         except OSError:
             log.warning("smartkey: failed to save personal profile", exc_info=True)
+        if self._phase_a is not None:
+            self._phase_a.close()  # Phase-A: flush & close the event DB

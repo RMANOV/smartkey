@@ -12,3 +12,5 @@ press-releases/
 corpus/raw/
 corpus/*.bin
 .firecrawl/
+# Phase-A runtime data (event DBs, receipts, alarms, cron logs) — never committed
+/phase_a_data/

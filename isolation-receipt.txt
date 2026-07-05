@@ -1,0 +1,35 @@
+================================================================
+ PHASE-A ISOLATION RECEIPT  (Codex blocker 4)
+ ticket 25d391a0ba2f  ·  captured BEFORE any harness code written
+ generated: 2026-07-05T22:38:07+03:00
+================================================================
+
+LAB WORKTREE PATH : /home/rmanov/smartkey-phase-a-lab
+LAB BRANCH        : phase-a-lab
+LAB HEAD COMMIT   : 23c11f46a4276b8801539bac08803494ec9a4a3c
+BASE (master) HEAD: 23c11f46a4276b8801539bac08803494ec9a4a3c
+
+---- git remote -v  (FROM LAB PATH /home/rmanov/smartkey-phase-a-lab) ----
+origin	https://github.com/RMANOV/smartkey.git (fetch)
+origin	DISABLED (push)
+
+---- git remote -v  (FROM MAIN REPO /home/rmanov/smartkey) ----
+origin	https://github.com/RMANOV/smartkey.git (fetch)
+origin	DISABLED (push)
+
+---- git worktree list ----
+/home/rmanov/smartkey                     23c11f4 [master]
+/home/rmanov/smartkey-phase-a-lab         23c11f4 [phase-a-lab]
+/home/rmanov/smartkey-predictive-ooda-lab 23c11f4 [predictive-ooda-lab]
+
+ORIGINAL push URL (recorded for operator restoration):
+  https://github.com/RMANOV/smartkey.git
+RESTORE push (operator, AFTER lab window) with:
+  git -C /home/rmanov/smartkey            remote set-url --push origin https://github.com/RMANOV/smartkey.git
+  git -C /home/rmanov/smartkey-phase-a-lab remote set-url --push origin https://github.com/RMANOV/smartkey.git
+
+ISOLATION INVARIANTS (per spec §12.4 blocker 4):
+  (1) public smartkey/master UNTOUCHED  -> main tree safe
+  (2) separate directory                -> zero accidental mixing
+  (3) push physically DISABLED both cfgs -> embargo is plumbing, not will
+================================================================
