@@ -45,7 +45,7 @@ from pathlib import Path
 
 from .freqmodel import FreqModel, _WORD_RE
 from .harness import Pending, PhaseALogger
-from .paths import engine_identity_file
+from .paths import default_db_path, engine_identity_file
 
 log = logging.getLogger("smartkey.phase_a")
 
@@ -68,6 +68,14 @@ class PhaseAAdapter:
         notes: str | None = None,
         identity_file: str | Path | None = None,
     ) -> None:
+        if Path(db_path).resolve() == default_db_path().resolve():
+            if os.environ.get("SMARTKEY_PHASE_A") != "1" or not os.environ.get(
+                "SMARTKEY_PHASEA_COMMIT"
+            ):
+                raise RuntimeError(
+                    "Refusing to write the live Phase-A events DB outside the "
+                    "SMARTKEY_PHASE_A lab engine process"
+                )
         self.freq = FreqModel.load(corpus_files)
         self.logger = PhaseALogger(
             db_path,

@@ -393,6 +393,38 @@ def check_b4_cursor() -> tuple[bool, str]:
     )
 
 
+def check_live_db_guard() -> tuple[bool, str]:
+    """The real events.db must not be writable by ad-hoc/test Python processes.
+
+    Only the lab engine process carries SMARTKEY_PHASE_A + SMARTKEY_PHASEA_COMMIT.
+    This prevents stdin diagnostics / self-tests from contaminating live evidence.
+    """
+    from pathlib import Path
+
+    from .engine_adapter import PhaseAAdapter
+    from .paths import default_db_path
+
+    old_phase = os.environ.pop("SMARTKEY_PHASE_A", None)
+    old_commit = os.environ.pop("SMARTKEY_PHASEA_COMMIT", None)
+    blocked = False
+    try:
+        try:
+            PhaseAAdapter(
+                default_db_path(),
+                [Path("corpus/corpus_tech.json")],
+                engine_commit="should-not-write-live",
+                identity_file=data_dir() / "selftest_ENGINE-IDENTITY-live-guard.json",
+            )
+        except RuntimeError as exc:
+            blocked = "Refusing to write the live Phase-A events DB" in str(exc)
+    finally:
+        if old_phase is not None:
+            os.environ["SMARTKEY_PHASE_A"] = old_phase
+        if old_commit is not None:
+            os.environ["SMARTKEY_PHASEA_COMMIT"] = old_commit
+    return blocked, f"live_default_db_blocked={blocked}"
+
+
 def check_live_sweep_watchdog() -> tuple[bool, str]:
     """run_sweep produces a receipt; run_watchdog returns 0 right after a sweep."""
     db = data_dir() / "selftest_green.db"  # reuse GREEN db (has data + sweeps)
@@ -415,6 +447,7 @@ CHECKS = [
     ("8 live sweep + watchdog", check_live_sweep_watchdog),
     ("9 B2 outcome coverage (non-top3 -> 0) + identity", check_b2_outcome_coverage),
     ("10 B4 before-cursor (no mid-edit grab)", check_b4_cursor),
+    ("11 live events.db guard", check_live_db_guard),
 ]
 
 
