@@ -67,6 +67,7 @@ class PhaseAAdapter:
         engine_commit: str | None = None,
         notes: str | None = None,
         identity_file: str | Path | None = None,
+        engine_meta: dict | None = None,
     ) -> None:
         if Path(db_path).resolve() == default_db_path().resolve():
             if os.environ.get("SMARTKEY_PHASE_A") != "1" or not os.environ.get(
@@ -85,6 +86,10 @@ class PhaseAAdapter:
             notes=notes,
         )
         self.engine_commit = engine_commit
+        # Optional static facts about the LOADED engine module (file path + trace
+        # build sentinel). Merged into the identity receipt so a live smoke can
+        # detect a stale/mismatched engine process, not just a missing heartbeat.
+        self._engine_meta = dict(engine_meta or {})
         self.pending: Pending | None = None
         self.last_tokens: list[str] = []
         self.last_context: str = ""
@@ -107,6 +112,8 @@ class PhaseAAdapter:
                 "events": self._events,
                 "heartbeat_ts": time.time(),
             }
+            if self._engine_meta:
+                payload.update(self._engine_meta)
             if started:
                 payload["started_ts"] = time.time()
             self._identity_file.write_text(
@@ -157,24 +164,35 @@ class PhaseAAdapter:
         """Back-compat shim: same as observe_context (also resolves)."""
         self.observe_context(surrounding_text_before_cursor)
 
-    def on_next_word_prediction(self, top3_words: list[str]) -> None:
+    def on_next_word_prediction(self, top3_words: list[str]) -> str:
+        """Log a next-word prediction event. Returns a machine reason string
+        (``logged`` | ``superseded_logged`` | ``dedup_redraw`` |
+        ``empty_prediction``) so the caller can trace WHY an event did or did not
+        record — turning a silent 0-events live run into a self-diagnosing one."""
         norm = [w.lower() for w in top3_words[:3] if w]
         if not norm:
-            return
-        # Redraw of the identical prediction for the same context: skip.
+            return "empty_prediction"
+        # TRUE consecutive redraw: the SAME still-unresolved prediction for the
+        # SAME context. Skip so a redraw is not double-counted. This can only fire
+        # for an identical repaint — a new word boundary either advances
+        # last_tokens (context grows) or has already resolved+cleared the pending
+        # (commit/context-delta), so a genuine next-word prediction is never
+        # suppressed here.
         if (
             self.pending is not None
             and self.pending.ctx_tokens == self.last_tokens
             and self.pending.top3 == norm
         ):
-            return
+            return "dedup_redraw"
         # A new, different prediction before the previous one resolved: the old
         # one was superseded — leave it as outcome=NULL (unresolved).
+        superseded = self.pending is not None
         p = self.logger.log_prediction(self.last_context, norm)
         p.ctx_tokens = list(self.last_tokens)
         p.n_ctx = len(self.last_tokens)
         self.pending = p
         self._events += 1
+        return "superseded_logged" if superseded else "logged"
 
     # ---- resolution fast-path (explicit commit/replace) ----------------------
     def on_commit(self, committed_text: str | None) -> None:

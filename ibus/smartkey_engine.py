@@ -17,6 +17,14 @@ from pathlib import Path
 
 log = logging.getLogger("smartkey")
 
+# Phase-A instrumentation build sentinel. Stamped into the ENGINE-IDENTITY
+# receipt AND the first line of prediction_trace.jsonl at harness init so a LIVE
+# smoke can tell at a glance whether the *actually loaded* engine module carries
+# the current Phase-A hooks — or whether IBus is still running a STALE process /
+# bytecode from before them (the failure mode where ghosts fire but events stay
+# 0 and prediction_trace is never written). Bump when the trace contract changes.
+PHASE_A_TRACE_VERSION = "v2-2026-07-06-selfdiag"
+
 # ---------------------------------------------------------------------------
 # IBus GObject introspection -- may not be installed on all systems.
 # ---------------------------------------------------------------------------
@@ -267,10 +275,33 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     default_corpus_files(),
                     engine_commit=os.environ.get("SMARTKEY_PHASEA_COMMIT"),
                     notes="ibus real-typing run",
+                    engine_meta={
+                        "engine_file": __file__,
+                        "trace_version": PHASE_A_TRACE_VERSION,
+                    },
                 )
                 self._phase_a_action_trace = data_dir() / "action_trace.jsonl"
                 self._phase_a_callback_trace = data_dir() / "callback_trace.jsonl"
                 self._phase_a_prediction_trace = data_dir() / "prediction_trace.jsonl"
+                # First line of prediction_trace.jsonl = a build fingerprint. If a
+                # live smoke shows ghosts firing but this line is ABSENT, the
+                # running IBus engine is a STALE process/bytecode predating these
+                # hooks — restart it. If present with the right trace_version but
+                # events stay 0, the gap is genuine and the per-ghost reasons say
+                # why. This is the signal that was missing when a "9d5cbb4" run
+                # logged zero events and zero prediction_trace lines.
+                self._phase_a_trace_prediction_hook(
+                    "harness_init",
+                    0,
+                    False,
+                    "startup",
+                    extra={
+                        "engine_file": __file__,
+                        "trace_version": PHASE_A_TRACE_VERSION,
+                        "lab_commit": os.environ.get("SMARTKEY_PHASEA_COMMIT"),
+                        "pid": os.getpid(),
+                    },
+                )
                 log.info("smartkey: Phase-A harness ENABLED (db=%s)", default_db_path())
             except Exception:
                 log.warning(
@@ -288,8 +319,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         preds_count: int,
         logged: bool,
         reason: str,
+        extra: dict[str, object] | None = None,
     ) -> None:
-        """Phase-A prediction-hook breadcrumb. Stores no words/plaintext."""
+        """Phase-A prediction-hook breadcrumb. Stores no words/plaintext.
+
+        Written on EVERY ghost hook (logged or not) and once at harness init, so
+        a live smoke that produces zero events still leaves a per-call reason
+        trail — and its very first line proves which engine build is running."""
         if self._phase_a_prediction_trace is None:
             return
         try:
@@ -303,6 +339,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 "reason": reason,
                 "events": events,
             }
+            if extra:
+                record.update(extra)
             with self._phase_a_prediction_trace.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception:
@@ -323,26 +361,30 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         """
         if self._phase_a is None:
             return
+        source = "core_predictions"
+        top3: list[str] = []
+        reason = "exception"
         try:
             preds = self._core.predictions()
             top3 = [p[0] for p in preds[:3]]
-            source = "core_predictions"
             if not top3 and shown:
                 top3 = [shown]
                 source = "action_payload"
-            before = getattr(self._phase_a, "_events", None)
-            self._phase_a.on_next_word_prediction(top3)
-            after = getattr(self._phase_a, "_events", None)
-            logged = isinstance(before, int) and isinstance(after, int) and after > before
-            self._phase_a_trace_prediction_hook(
-                source,
-                len(top3),
-                logged,
-                "logged" if logged else ("empty_prediction" if not top3 else "dedup_or_pending"),
+            result = self._phase_a.on_next_word_prediction(top3)
+            # The adapter now reports the precise reason; tolerate an older
+            # adapter that returns None by inferring from whether top3 was empty.
+            reason = result if isinstance(result, str) else (
+                "empty_prediction" if not top3 else "logged"
             )
         except Exception:
-            self._phase_a_trace_prediction_hook("core_predictions", 0, False, "exception")
+            reason = "exception"
             log.debug("smartkey: phase-a ghost hook failed", exc_info=True)
+        finally:
+            # ALWAYS leave a breadcrumb — a live smoke that logs zero events is
+            # then self-diagnosing (per-ghost reason), never silent.
+            self._phase_a_trace_prediction_hook(
+                source, len(top3), reason in ("logged", "superseded_logged"), reason
+            )
 
     def _phase_a_observe(self) -> None:
         """Observe current surrounding text: resolve a pending prediction if the
