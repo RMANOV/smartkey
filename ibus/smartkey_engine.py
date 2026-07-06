@@ -23,7 +23,7 @@ log = logging.getLogger("smartkey")
 # the current Phase-A hooks — or whether IBus is still running a STALE process /
 # bytecode from before them (the failure mode where ghosts fire but events stay
 # 0 and prediction_trace is never written). Bump when the trace contract changes.
-PHASE_A_TRACE_VERSION = "v2-2026-07-06-selfdiag"
+PHASE_A_TRACE_VERSION = "v3-2026-07-06-composing-commit"
 
 # ---------------------------------------------------------------------------
 # IBus GObject introspection -- may not be installed on all systems.
@@ -245,9 +245,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._caps: int = 0
 
         # Preedit lifecycle tracking: True while a preedit window is visible.
-        # Used by _safe_commit() to guarantee preedit is hidden before commit,
-        # and by backspace handling to consume the key when preedit is active.
+        # ``_preedit_mode`` distinguishes ghost-only preedit from full-word
+        # composing preedit.  Ghost commit must hide before committing the suffix;
+        # composing commit must commit the composed word before hiding, otherwise
+        # some clients materialize the preedit and then receive CommitText(word)
+        # again, producing doubled words.
         self._preedit_active: bool = False
+        self._preedit_mode: str | None = None
         self._surrounding_text: str | None = None
         self._surrounding_cursor_pos: int | None = None
         self._session_id = f"{int(time.time() * 1000)}-{os.getpid()}"
@@ -750,11 +754,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         ibus_text.set_attributes(attrs)
         self.update_preedit_text(ibus_text, byte_len, True)
         self._preedit_active = True
+        self._preedit_mode = "ghost"
 
     def _clear_ghost(self) -> None:
         """Remove any displayed ghost text."""
         self.hide_preedit_text()
         self._preedit_active = False
+        self._preedit_mode = None
 
     def _show_composing(self, typed: str, ghost: str) -> None:
         """Display composing preedit: typed prefix (normal) + ghost suffix (grey)."""
@@ -787,19 +793,25 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         ibus_text.set_attributes(attrs)
         self.update_preedit_text(ibus_text, typed_bytes, True)
         self._preedit_active = True
+        self._preedit_mode = "composing"
 
     # -----------------------------------------------------------------------
     # Qt-safe commit helper.
     # -----------------------------------------------------------------------
     def _safe_commit(self, text: str) -> None:
-        """Qt-safe commit: hide preedit BEFORE committing text.
+        """Qt-safe commit with mode-aware preedit ordering.
 
-        On some Qt versions, committing text while a preedit window is visible
-        causes the preedit content to be inserted twice (doubling bug).
-        _clear_ghost() calls hide_preedit_text() which is sufficient; do NOT
-        add an extra update_preedit_text("", 0, False) here as that triggers
-        double preedit events on certain Qt versions.
+        Ghost preedit is only suggestion text, so it must be hidden before
+        committing the accepted suffix.  Full-word composing preedit is the
+        user's current word; hiding it before CommitText can make some clients
+        materialize the preedit and then receive the same committed word again.
         """
+        if self._preedit_active and getattr(self, "_preedit_mode", None) == "composing":
+            self.commit_text(IBus.Text.new_from_string(text))
+            self.hide_preedit_text()
+            self._preedit_active = False
+            self._preedit_mode = None
+            return
         if self._preedit_active:
             self._clear_ghost()
         self.commit_text(IBus.Text.new_from_string(text))
@@ -858,8 +870,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
         actions = self._coalesce_same_batch_commit_replace(actions)
+        skip_hide_before_composing_commit = (
+            self._preedit_active
+            and getattr(self, "_preedit_mode", None) == "composing"
+            and any(action_type == "commit" for action_type, _ in actions)
+        )
         consumed = True
-        for action_type, payload in actions:
+        for idx, (action_type, payload) in enumerate(actions):
             if action_type == "ghost":
                 self._show_ghost(payload)
                 self._track_prediction_shown(payload)
@@ -878,6 +895,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     _PRED_LOG.write(" | ".join(pts) + "\n")
                     _PRED_LOG.flush()
             elif action_type == "hide":
+                if skip_hide_before_composing_commit and any(
+                    later_type == "commit" for later_type, _ in actions[idx + 1 :]
+                ):
+                    continue
                 self._clear_ghost()
             elif action_type == "commit":
                 self._safe_commit(payload)
