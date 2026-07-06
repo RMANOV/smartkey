@@ -308,26 +308,37 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         except Exception:
             log.debug("smartkey: phase-a prediction trace failed", exc_info=True)
 
-    def _phase_a_ghost(self) -> None:
+    def _phase_a_ghost(self, shown: str = "") -> None:
         """Log a next-word prediction event (candidate-generation point).
 
         Context has already been observed (and any prior pending resolved) by
         _phase_a_observe() earlier in this key event, so last_tokens is fresh.
+
+        ``shown`` is the ghost text this action actually displayed. Live, the
+        core's predictions() can be EMPTY at hook time even though the ghost was
+        shown (its text is carried in the action payload); re-querying
+        predictions() then loses the event. So we prefer predictions() (top-3
+        when available) and fall back to the shown ghost word (top-1) — logging
+        what was actually put on screen, never an empty set.
         """
         if self._phase_a is None:
             return
         try:
             preds = self._core.predictions()
             top3 = [p[0] for p in preds[:3]]
+            source = "core_predictions"
+            if not top3 and shown:
+                top3 = [shown]
+                source = "action_payload"
             before = getattr(self._phase_a, "_events", None)
             self._phase_a.on_next_word_prediction(top3)
             after = getattr(self._phase_a, "_events", None)
             logged = isinstance(before, int) and isinstance(after, int) and after > before
             self._phase_a_trace_prediction_hook(
-                "core_predictions",
+                source,
                 len(top3),
                 logged,
-                "logged" if logged else ("empty_predictions" if not top3 else "dedup_or_pending"),
+                "logged" if logged else ("empty_prediction" if not top3 else "dedup_or_pending"),
             )
         except Exception:
             self._phase_a_trace_prediction_hook("core_predictions", 0, False, "exception")
@@ -810,7 +821,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             if action_type == "ghost":
                 self._show_ghost(payload)
                 self._track_prediction_shown(payload)
-                self._phase_a_ghost()  # Phase-A: next-word prediction event
+                # payload = the ghost word actually shown; used as top-1 fallback
+                # when the core's predictions() is empty at hook time.
+                self._phase_a_ghost(payload)  # Phase-A: next-word prediction event
                 if _PRED_LOG:
                     preds = self._core.predictions()
                     top3 = preds[:3]
@@ -857,7 +870,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 typed, ghost = decoded
                 self._show_composing(typed, ghost)
                 self._track_prediction_shown(ghost)
-                self._phase_a_ghost()  # Phase-A: dual-buffer composing prediction event
+                # Phase-A ratified semantics (next_token_in_top3): composing is
+                # CURRENT-word completion, a different metric — NOT logged under
+                # the next_token resolver (per-keystroke logging also floods /
+                # supersedes). Only the ghost (next-word) action is instrumented.
                 if _PRED_LOG:
                     preds2 = self._core.predictions()
                     top3 = preds2[:3]
