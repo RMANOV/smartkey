@@ -12,5 +12,14 @@ from .constants import FIREWALL_LINE, RESOLVER
 from .engine_adapter import PhaseAAdapter
 from .freqmodel import FreqModel
 from .harness import PhaseALogger
+from .keyboard_distance import keyboard_weighted_distance, nearest_keyboard_candidates
 
-__all__ = ["FIREWALL_LINE", "RESOLVER", "PhaseAAdapter", "FreqModel", "PhaseALogger"]
+__all__ = [
+    "FIREWALL_LINE",
+    "RESOLVER",
+    "PhaseAAdapter",
+    "FreqModel",
+    "PhaseALogger",
+    "keyboard_weighted_distance",
+    "nearest_keyboard_candidates",
+]

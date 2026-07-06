@@ -12,6 +12,8 @@ sklearn `IsotonicRegression` only.
 | `freqmodel.py` | raw normalised-frequency model (dumb baseline p_top3); corpus hash pin |
 | `harness.py` | SQLite schema + `PhaseALogger` (INSERT@prediction, UPDATE@resolution); stores no plaintext words — only context_hash (keyed HMAC), n_candidates, p_top3, latency, outcome |
 | `engine_adapter.py` | IBus-free wiring (`note_context`/`on_next_word_prediction`/`on_commit`/`on_reset`) |
+| `keyboard_distance.py` | offline motor-error distance: cheap adjacent-key substitutions for EN QWERTY / BG phonetic |
+| `predictive_ooda.py` | offline test-mode OODA snapshot for unknown-token orientation; never mutates live text |
 | `analyze.py` | 50/50 split → 5 quantile buckets → isotonic → mechanical PASS/FAIL/INCONCLUSIVE |
 | `sweep.py` | daily receipt + 48h watchdog |
 | `selftest.py` | end-to-end proof on synthetic data (incl. forced FAIL) |
@@ -31,6 +33,7 @@ python -m phase_a.selftest                    # prove the machinery (exit 0 = al
 python -m phase_a.bench                        # logging overhead (real corpus)
 python -m phase_a.analyze                      # real DB: report + verdict (exit 0/2/3)
 python -m phase_a.analyze --synthetic          # analyse a synthetic DB
+python -m phase_a.predictive_ooda --token gello --candidates hello,yellow --layout en
 python -m phase_a.sweep sweep                  # daily receipt
 python -m phase_a.sweep watchdog               # 48h watchdog (exit 1 + alarm if stale)
 ```
