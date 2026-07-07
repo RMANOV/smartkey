@@ -23,7 +23,7 @@ log = logging.getLogger("smartkey")
 # the current Phase-A hooks — or whether IBus is still running a STALE process /
 # bytecode from before them (the failure mode where ghosts fire but events stay
 # 0 and prediction_trace is never written). Bump when the trace contract changes.
-PHASE_A_TRACE_VERSION = "v3-2026-07-06-composing-commit"
+PHASE_A_TRACE_VERSION = "v4-2026-07-07-zero-key-storm-guard"
 
 # ---------------------------------------------------------------------------
 # IBus GObject introspection -- may not be installed on all systems.
@@ -456,6 +456,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if SmartKeyEngine._is_printable_keyval(keyval):
             return "printable"
         return "other"
+
+    @staticmethod
+    def _is_spurious_zero_key_event(keyval: int, keycode: int, state: int) -> bool:
+        """Detect the live IBus/GTK zero-key storm seen on Fedora/GTK smoke.
+
+        The lab engine received tens of thousands of identical callbacks:
+        ``keyval=0, keycode=240, state=16``.  They are not printable keypresses,
+        not releases, and not special keys; forwarding them just feeds the loop
+        and starves useful evidence.  Consume exactly this inert event class so
+        real printable/special events can still flow normally.
+        """
+
+        return keyval == 0 and keycode == 240 and state in (16, 272)
 
     def _phase_a_trace_callback(self, callback: str, **fields: object) -> None:
         """Phase-A-only callback breadcrumb. Stores no surrounding/plaintext."""
@@ -990,6 +1003,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             key_kind=self._phase_a_key_kind(keyval),
             release=bool(state & (1 << 30)),
         )
+
+        if self._is_spurious_zero_key_event(keyval, keycode, state):
+            actions = [("consume_spurious_zero_key", "")]
+            self._phase_a_trace_actions(keyval, keycode, state, actions)
+            return True
 
         # Track backspace so we can consume it when preedit is active,
         # preventing the key from also deleting committed text in the app.
