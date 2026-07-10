@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import json
 import os
 import sys
 import tempfile
@@ -62,22 +61,20 @@ def main() -> int:
     consumed = engine.do_process_key_event(0, 240, 16)
     consumed_release_like = engine.do_process_key_event(0, 240, 272)
 
-    trace_path = Path(engine._phase_a_action_trace)
-    rows = [json.loads(line) for line in trace_path.read_text().splitlines() if line.strip()]
-    actions = [row["actions"][0]["type"] for row in rows]
-
     problems: list[str] = []
     if consumed is not True or consumed_release_like is not True:
         problems.append("spurious zero-key events must be consumed")
-    if actions != ["consume_spurious_zero_key", "consume_spurious_zero_key"]:
-        problems.append(f"unexpected trace actions: {actions!r}")
+    if Path(engine._phase_a_action_trace).exists():
+        problems.append("spurious zero-key events must not flood action trace")
+    if Path(engine._phase_a_callback_trace).exists():
+        problems.append("spurious zero-key events must not flood callback trace")
 
     if problems:
         print("FAIL:")
         for problem in problems:
             print("  -", problem)
         return 1
-    print("PASS: keyval=0/keycode=240 storm is consumed before Rust/core forwarding.")
+    print("PASS: zero-key storm is consumed before Rust/core and trace logging.")
     return 0
 
 

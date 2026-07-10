@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from json import JSONDecodeError
 from pathlib import Path
 
@@ -23,7 +24,7 @@ log = logging.getLogger("smartkey")
 # the current Phase-A hooks — or whether IBus is still running a STALE process /
 # bytecode from before them (the failure mode where ghosts fire but events stay
 # 0 and prediction_trace is never written). Bump when the trace contract changes.
-PHASE_A_TRACE_VERSION = "v4-2026-07-07-zero-key-storm-guard"
+PHASE_A_TRACE_VERSION = "v5-2026-07-10-preedit-clear"
 
 # ---------------------------------------------------------------------------
 # IBus GObject introspection -- may not be installed on all systems.
@@ -58,6 +59,13 @@ except (ValueError, ImportError):
             def new(*_a: object) -> "_FakeIBus.Attribute":
                 return _FakeIBus.Attribute()
 
+        class AttrType:
+            UNDERLINE = 1
+            FOREGROUND = 2
+
+        class AttrUnderline:
+            SINGLE = 1
+
         KEY_Tab = 0xFF09
         KEY_Escape = 0xFF1B
         KEY_Home = 0xFF50
@@ -73,11 +81,29 @@ except (ValueError, ImportError):
         KEY_Return = 0xFF0D
         KEY_Super_L = 0xFFEB
         KEY_Super_R = 0xFFEC
-        ATTR_TYPE_FOREGROUND = 1
-        ATTR_TYPE_UNDERLINE = 2
-        ATTR_UNDERLINE_SINGLE = 1
-
     IBus = _FakeIBus  # type: ignore[misc,assignment]
+
+
+def _ibus_enum_value(
+    enum_name: str, member_name: str, legacy_name: str, fallback: int
+) -> int:
+    """Resolve modern GI enums while retaining compatibility with old IBus."""
+    enum_type = getattr(IBus, enum_name, None)
+    if enum_type is not None and hasattr(enum_type, member_name):
+        return int(getattr(enum_type, member_name))
+    legacy = getattr(IBus, legacy_name, None)
+    return int(legacy) if legacy is not None else fallback
+
+
+_ATTR_TYPE_UNDERLINE = _ibus_enum_value(
+    "AttrType", "UNDERLINE", "ATTR_TYPE_UNDERLINE", 1
+)
+_ATTR_TYPE_FOREGROUND = _ibus_enum_value(
+    "AttrType", "FOREGROUND", "ATTR_TYPE_FOREGROUND", 2
+)
+_ATTR_UNDERLINE_SINGLE = _ibus_enum_value(
+    "AttrUnderline", "SINGLE", "ATTR_UNDERLINE_SINGLE", 1
+)
 
 # ---------------------------------------------------------------------------
 # Rust prediction engine via PyO3.
@@ -268,6 +294,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._phase_a_action_trace: Path | None = None
         self._phase_a_callback_trace: Path | None = None
         self._phase_a_prediction_trace: Path | None = None
+        self._phase_a_error_trace: Path | None = None
         if os.environ.get("SMARTKEY_PHASE_A") == "1":
             try:
                 from phase_a.engine_adapter import PhaseAAdapter
@@ -287,6 +314,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 self._phase_a_action_trace = data_dir() / "action_trace.jsonl"
                 self._phase_a_callback_trace = data_dir() / "callback_trace.jsonl"
                 self._phase_a_prediction_trace = data_dir() / "prediction_trace.jsonl"
+                self._phase_a_error_trace = data_dir() / "error_trace.jsonl"
                 # First line of prediction_trace.jsonl = a build fingerprint. If a
                 # live smoke shows ghosts firing but this line is ABSENT, the
                 # running IBus engine is a STALE process/bytecode predating these
@@ -438,6 +466,31 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception:
             log.debug("smartkey: phase-a action trace failed", exc_info=True)
+
+    def _phase_a_trace_error(self, callback: str, exc: BaseException) -> None:
+        """Persist a plaintext-free callback traceback for live lab failures."""
+        path = getattr(self, "_phase_a_error_trace", None)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": time.time(),
+                "callback": callback,
+                "error_type": type(exc).__name__,
+                "frames": [
+                    {
+                        "file": Path(frame.filename).name,
+                        "line": frame.lineno,
+                        "function": frame.name,
+                    }
+                    for frame in traceback.extract_tb(exc.__traceback__)
+                ],
+            }
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            log.debug("smartkey: phase-a error trace failed", exc_info=True)
 
     @staticmethod
     def _phase_a_key_kind(keyval: int) -> str:
@@ -754,18 +807,18 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def _show_ghost(self, text: str) -> None:
         """Display *text* as greyed-out preedit (ghost) text inline at cursor."""
         ibus_text = IBus.Text.new_from_string(text)
-        byte_len = len(text.encode("utf-8"))
+        text_len = len(text)
         attrs = IBus.AttrList()
         attrs.append(
-            IBus.Attribute.new(IBus.ATTR_TYPE_FOREGROUND, 0x888888, 0, byte_len)
+            IBus.Attribute.new(_ATTR_TYPE_FOREGROUND, 0x888888, 0, text_len)
         )
         attrs.append(
             IBus.Attribute.new(
-                IBus.ATTR_TYPE_UNDERLINE, IBus.ATTR_UNDERLINE_SINGLE, 0, byte_len
+                _ATTR_TYPE_UNDERLINE, _ATTR_UNDERLINE_SINGLE, 0, text_len
             )
         )
         ibus_text.set_attributes(attrs)
-        self.update_preedit_text(ibus_text, byte_len, True)
+        self.update_preedit_text(ibus_text, text_len, True)
         self._preedit_active = True
         self._preedit_mode = "ghost"
 
@@ -779,32 +832,32 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         """Display composing preedit: typed prefix (normal) + ghost suffix (grey)."""
         full_text = typed + ghost
         ibus_text = IBus.Text.new_from_string(full_text)
-        typed_bytes = len(typed.encode("utf-8"))
-        total_bytes = len(full_text.encode("utf-8"))
+        typed_len = len(typed)
+        total_len = len(full_text)
         attrs = IBus.AttrList()
         # Typed prefix: underline only (normal text color).
         attrs.append(
             IBus.Attribute.new(
-                IBus.ATTR_TYPE_UNDERLINE, IBus.ATTR_UNDERLINE_SINGLE, 0, typed_bytes
+                _ATTR_TYPE_UNDERLINE, _ATTR_UNDERLINE_SINGLE, 0, typed_len
             )
         )
         # Ghost suffix: grey + underline.
         if ghost:
             attrs.append(
                 IBus.Attribute.new(
-                    IBus.ATTR_TYPE_FOREGROUND, 0x888888, typed_bytes, total_bytes
+                    _ATTR_TYPE_FOREGROUND, 0x888888, typed_len, total_len
                 )
             )
             attrs.append(
                 IBus.Attribute.new(
-                    IBus.ATTR_TYPE_UNDERLINE,
-                    IBus.ATTR_UNDERLINE_SINGLE,
-                    typed_bytes,
-                    total_bytes,
+                    _ATTR_TYPE_UNDERLINE,
+                    _ATTR_UNDERLINE_SINGLE,
+                    typed_len,
+                    total_len,
                 )
             )
         ibus_text.set_attributes(attrs)
-        self.update_preedit_text(ibus_text, typed_bytes, True)
+        self.update_preedit_text(ibus_text, typed_len, True)
         self._preedit_active = True
         self._preedit_mode = "composing"
 
@@ -812,18 +865,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Qt-safe commit helper.
     # -----------------------------------------------------------------------
     def _safe_commit(self, text: str) -> None:
-        """Qt-safe commit with mode-aware preedit ordering.
+        """Commit text after ending preedit without retaining its old payload.
 
         Ghost preedit is only suggestion text, so it must be hidden before
-        committing the accepted suffix.  Full-word composing preedit is the
-        user's current word; hiding it before CommitText can make some clients
-        materialize the preedit and then receive the same committed word again.
+        committing the accepted suffix. Full-word composing preedit contains
+        the same word as CommitText. Merely hiding it leaves that payload in the
+        IBus client; some GTK/Qt clients then materialize both copies. Replace
+        the composing preedit with an empty invisible buffer before committing.
         """
         if self._preedit_active and getattr(self, "_preedit_mode", None) == "composing":
-            self.commit_text(IBus.Text.new_from_string(text))
-            self.hide_preedit_text()
+            self.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
             self._preedit_active = False
             self._preedit_mode = None
+            self.commit_text(IBus.Text.new_from_string(text))
             return
         if self._preedit_active:
             self._clear_ghost()
@@ -988,6 +1042,20 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Key event handler.
     # -----------------------------------------------------------------------
     def do_process_key_event(self, keyval: int, keycode: int, state: int) -> bool:
+        """Contain callback failures, preserve raw typing, and retain a trace."""
+        if self._is_spurious_zero_key_event(keyval, keycode, state):
+            return True
+        try:
+            return self._process_key_event(keyval, keycode, state)
+        except Exception as exc:
+            self._phase_a_trace_error("process_key_event", exc)
+            log.error(
+                "smartkey: process_key_event failed (%s)",
+                type(exc).__name__,
+            )
+            return False
+
+    def _process_key_event(self, keyval: int, keycode: int, state: int) -> bool:
         """Handle an IBus key event via the Rust core.
 
         When a valid hardware scancode is available (keycode > 0), the event
@@ -1003,11 +1071,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             key_kind=self._phase_a_key_kind(keyval),
             release=bool(state & (1 << 30)),
         )
-
-        if self._is_spurious_zero_key_event(keyval, keycode, state):
-            actions = [("consume_spurious_zero_key", "")]
-            self._phase_a_trace_actions(keyval, keycode, state, actions)
-            return True
 
         # Track backspace so we can consume it when preedit is active,
         # preventing the key from also deleting committed text in the app.
