@@ -24,7 +24,7 @@ log = logging.getLogger("smartkey")
 # the current Phase-A hooks — or whether IBus is still running a STALE process /
 # bytecode from before them (the failure mode where ghosts fire but events stay
 # 0 and prediction_trace is never written). Bump when the trace contract changes.
-PHASE_A_TRACE_VERSION = "v5-2026-07-10-preedit-clear"
+PHASE_A_TRACE_VERSION = "v6-2026-07-10-composing-replace-xkb"
 
 # ---------------------------------------------------------------------------
 # IBus GObject introspection -- may not be installed on all systems.
@@ -937,10 +937,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
         actions = self._coalesce_same_batch_commit_replace(actions)
-        skip_hide_before_composing_commit = (
+        composing_resolution_pending = (
             self._preedit_active
             and getattr(self, "_preedit_mode", None) == "composing"
-            and any(action_type == "commit" for action_type, _ in actions)
         )
         consumed = True
         for idx, (action_type, payload) in enumerate(actions):
@@ -962,13 +961,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     _PRED_LOG.write(" | ".join(pts) + "\n")
                     _PRED_LOG.flush()
             elif action_type == "hide":
-                if skip_hide_before_composing_commit and any(
-                    later_type == "commit" for later_type, _ in actions[idx + 1 :]
+                if composing_resolution_pending and any(
+                    later_type in {"commit", "replace"}
+                    for later_type, _ in actions[idx + 1 :]
                 ):
                     continue
                 self._clear_ghost()
             elif action_type == "commit":
                 self._safe_commit(payload)
+                composing_resolution_pending = False
                 self._phase_a_commit(payload)  # Phase-A: resolve pending
                 if _PRED_LOG:
                     _PRED_LOG.write(
@@ -976,21 +977,28 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     )
                     _PRED_LOG.flush()
             elif action_type == "replace":
-                if self._preedit_active:
-                    self._clear_ghost()
                 decoded = ffi_decode_replace_payload(payload)
                 if decoded is None:
                     log.warning("smartkey: malformed replace payload %r", payload)
                     continue
                 replace_len, text = decoded
-                if self._caps & 0x20:  # SURROUNDING_TEXT capability
-                    self.delete_surrounding_text(-replace_len, replace_len)
+                if composing_resolution_pending:
+                    # In dual-buffer mode the current word lives only in the
+                    # composing preedit. ReplaceWord resolves that preedit; it
+                    # must not delete the preceding committed application text.
+                    self._safe_commit(text)
                 else:
-                    # Fallback: backspace key events for apps without
-                    # surrounding text support (GTK4 Wayland, Electron, etc.)
-                    for _ in range(replace_len):
-                        self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
-                self._safe_commit(text)
+                    if self._preedit_active:
+                        self._clear_ghost()
+                    if self._caps & 0x20:  # SURROUNDING_TEXT capability
+                        self.delete_surrounding_text(-replace_len, replace_len)
+                    else:
+                        # Fallback: backspace key events for apps without
+                        # surrounding text support (GTK4 Wayland, Electron, etc.)
+                        for _ in range(replace_len):
+                            self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
+                    self._safe_commit(text)
+                composing_resolution_pending = False
                 self._phase_a_commit(text)  # Phase-A: resolve pending
             elif action_type == "composing":
                 decoded = ffi_decode_composing_payload(payload)

@@ -52,6 +52,12 @@ def build_engine(engine_module, mode: str):
         ("preedit", text, cursor, visible)
     )
     engine.commit_text = lambda text: events.append(("commit", text))
+    engine.delete_surrounding_text = lambda offset, length: events.append(
+        ("delete", offset, length)
+    )
+    engine.forward_key_event = lambda keyval, keycode, state: events.append(
+        ("key", keyval, keycode, state)
+    )
     return engine, events
 
 
@@ -106,6 +112,24 @@ def main() -> int:
         ghost, ghost_events = build_engine(module, "ghost")
         ghost._execute_actions([("hide", ""), ("commit", "suffix")])
 
+        composing_replace, composing_replace_events = build_engine(
+            module, "composing"
+        )
+        composing_replace._caps = 0x20
+        replace_consumed = composing_replace._execute_actions(
+            [
+                ("hide", ""),
+                ("replace", "12\x1fклавиатурата"),
+                ("forward", ""),
+            ]
+        )
+
+        committed_replace, committed_replace_events = build_engine(module, "ghost")
+        committed_replace._caps = 0x20
+        committed_replace._execute_actions(
+            [("hide", ""), ("replace", "4\x1fTEST"), ("forward", "")]
+        )
+
         offsets = module.SmartKeyEngine.__new__(module.SmartKeyEngine)
         preedits = []
         offsets.update_preedit_text = (
@@ -137,6 +161,25 @@ def main() -> int:
         problems.append("composing preedit state should be cleared after commit")
     if ghost_events != ["hide", ("commit", "suffix")]:
         problems.append(f"ghost order should remain hide->commit, got {ghost_events!r}")
+    if composing_replace_events != [
+        ("preedit", "", 0, False),
+        ("commit", "клавиатурата"),
+    ]:
+        problems.append(
+            "composing replace must not delete preceding committed text, got "
+            f"{composing_replace_events!r}"
+        )
+    if replace_consumed is not False:
+        problems.append("composing replace must still forward the delimiter")
+    if committed_replace_events != [
+        "hide",
+        ("delete", -4, 4),
+        ("commit", "TEST"),
+    ]:
+        problems.append(
+            "standalone replace must retain delete+commit behavior, got "
+            f"{committed_replace_events!r}"
+        )
     composing_text, composing_cursor, _, composing_attrs = preedits[0]
     if composing_text != "контролирайте" or composing_cursor != 11:
         problems.append(
