@@ -645,51 +645,11 @@ impl InputMethodCore {
             // Tab: accept entire ghost text.
             Key::Tab => {
                 if !self.ghost.is_empty() {
-                    let full_text = format!("{}{}", self.current_word, self.ghost);
-                    // F8: multi-word ghost may contain spaces — split into words.
-                    let words: Vec<&str> = full_text.split_whitespace().collect();
-                    let first_word = words.first().copied().unwrap_or(&full_text);
-
-                    // In hypothesis phase: prefix is in preedit, commit everything.
-                    // In locked/no-dual: prefix already in app, commit suffix only.
-                    let in_hypothesis = self.in_hypothesis_phase();
-                    let commit_text = if in_hypothesis {
-                        full_text.clone()
-                    } else {
-                        self.ghost.clone()
-                    };
-                    let actions = vec![Action::HideGhost, Action::CommitText(commit_text)];
-                    // Notify engine of accepted prediction for adaptive weight learning.
-                    let ctx: Vec<&str> = self.context.iter().map(|s| s.as_str()).collect();
-                    // F6: calibration observation — top prediction was accepted.
-                    if let Some(top) = self.last_predictions.first() {
-                        self.engine.observe_calibration(top.confidence, true);
-                    }
-                    self.engine.on_prediction_accepted(first_word, &ctx);
-                    // Record acceptance metrics: find rank in last_predictions.
-                    let rank = self
-                        .last_predictions
-                        .iter()
-                        .position(|p| p.word == first_word)
-                        .map(|i| i + 1) // 1-based
-                        .unwrap_or(1);
-                    self.metrics.record_acceptance(
-                        rank,
-                        self.ghost.chars().count(),
-                        full_text.chars().count(),
-                    );
-                    // Commit each word separately for correct context/Markov tracking.
-                    for word in &words {
-                        self.commit_word_internal(word, false);
-                    }
-                    let last_word = words.last().copied().unwrap_or("").to_string();
-                    self.reset_word();
-                    // After Tab-accept: run post-commit pipeline for next-word ghost.
-                    let mut actions = actions;
-                    actions.extend(self.post_commit_pipeline(&last_word));
-                    actions
-                } else if self.in_hypothesis_phase() && !self.current_word.is_empty() {
-                    // Hypothesis phase, no ghost: commit preedit prefix + forward Tab.
+                    self.accept_ghost_completion()
+                } else if self.dual_buffer.is_some() && !self.current_word.is_empty() {
+                    // Composing, no ghost: the prefix lives only in the preedit,
+                    // so commit it before forwarding Tab — otherwise a locked
+                    // dual buffer would forward Tab and abandon the typed word.
                     let prefix = self.current_word.clone();
                     self.commit_word_internal(&prefix, true);
                     self.reset_word();
@@ -763,6 +723,19 @@ impl InputMethodCore {
             // Space / Return: commit current word, delimit.
             Key::Space | Key::Return => {
                 let is_space = matches!(event.key, Key::Space);
+
+                // Word-boundary accept: a visible completion is accepted by
+                // Space/Return too (live contract: Tab/Space/Enter all accept),
+                // and the delimiter still lands in the app via ForwardKey.
+                // Applies ONLY while the user has a typed prefix — an
+                // anticipatory ghost (nothing typed) must never be committed
+                // by its delimiter, or double-Space/Enter after a word would
+                // inject the predicted next word unasked.
+                if !self.ghost.is_empty() && !self.current_word.is_empty() {
+                    let mut actions = self.accept_ghost_completion();
+                    actions.push(Action::ForwardKey);
+                    return actions;
+                }
 
                 // Aggressive Space-Commit (Goal 3): Auto-commit unique top prediction on Space.
                 if is_space && !self.current_word.is_empty() && self.last_predictions.len() == 1 {
@@ -926,6 +899,60 @@ impl InputMethodCore {
     /// Whether the dual buffer is active but not yet locked (hypothesis phase).
     fn in_hypothesis_phase(&self) -> bool {
         self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked())
+    }
+
+    /// Accept the visible ghost completion (shared by Tab and the
+    /// Space/Return word-boundary accept).
+    ///
+    /// Full-word composing (b3a2cb2) keeps the ENTIRE typed word in the
+    /// preedit until commit, regardless of dual-buffer lock state — "lock is
+    /// an internal scoring signal, not a commit trigger."  So whenever a dual
+    /// buffer is active the prefix lives in the composing preedit and the
+    /// accept must commit the full word; only the non-dual keyval path has
+    /// already forwarded the prefix to the app, where committing the ghost
+    /// suffix alone is correct.  (Using in_hypothesis_phase here dropped the
+    /// typed prefix once the buffer locked.)
+    ///
+    /// Caller precondition: `!self.ghost.is_empty()`.
+    fn accept_ghost_completion(&mut self) -> Vec<Action> {
+        let full_text = format!("{}{}", self.current_word, self.ghost);
+        // F8: multi-word ghost may contain spaces — split into words.
+        let words: Vec<&str> = full_text.split_whitespace().collect();
+        let first_word = words.first().copied().unwrap_or(&full_text);
+
+        let prefix_in_preedit = self.dual_buffer.is_some();
+        let commit_text = if prefix_in_preedit {
+            full_text.clone()
+        } else {
+            self.ghost.clone()
+        };
+        let actions = vec![Action::HideGhost, Action::CommitText(commit_text)];
+        // Notify engine of accepted prediction for adaptive weight learning.
+        let ctx: Vec<&str> = self.context.iter().map(|s| s.as_str()).collect();
+        // F6: calibration observation — top prediction was accepted.
+        if let Some(top) = self.last_predictions.first() {
+            self.engine.observe_calibration(top.confidence, true);
+        }
+        self.engine.on_prediction_accepted(first_word, &ctx);
+        // Record acceptance metrics: find rank in last_predictions.
+        let rank = self
+            .last_predictions
+            .iter()
+            .position(|p| p.word == first_word)
+            .map(|i| i + 1) // 1-based
+            .unwrap_or(1);
+        self.metrics
+            .record_acceptance(rank, self.ghost.chars().count(), full_text.chars().count());
+        // Commit each word separately for correct context/Markov tracking.
+        for word in &words {
+            self.commit_word_internal(word, false);
+        }
+        let last_word = words.last().copied().unwrap_or("").to_string();
+        self.reset_word();
+        // After accept: run post-commit pipeline for next-word ghost.
+        let mut actions = actions;
+        actions.extend(self.post_commit_pipeline(&last_word));
+        actions
     }
 
     // -- focus / reset --------------------------------------------------
@@ -1818,6 +1845,172 @@ mod tests {
 
         let actions = core.handle_key(press(Key::Backspace));
         assert_eq!(core.current_word(), "he");
+        assert!(has_action(&actions, &Action::ForwardKey));
+    }
+
+    /// Build a LOCKED dual buffer whose composing prefix lives in the preedit.
+    fn locked_dual_buffer(core: &InputMethodCore) -> DualBuffer {
+        let mut db = DualBuffer::from_config(&core.config.dual_buffer);
+        for _ in 0..4 {
+            db.push('h', 'h');
+        }
+        db.update_scores(100.0, 1.0); // high confidence + >= min_lock_chars → lock
+        assert!(db.is_locked(), "precondition: dual buffer must be locked");
+        db
+    }
+
+    /// Regression (accept bug): full-word composing keeps the entire word in the
+    /// preedit even after the dual buffer LOCKS.  Tab-accept must commit the full
+    /// word (prefix + ghost), never just the ghost suffix — otherwise the typed
+    /// prefix, held only in the composing preedit, is dropped by the IBus adapter
+    /// (whose composing-commit replaces the whole preedit with the payload).
+    #[test]
+    fn test_tab_accept_locked_composing_commits_full_word() {
+        let mut core = test_core();
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hel".to_string();
+        core.ghost = "lo".to_string();
+
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(
+            has_action(&actions, &Action::CommitText("hello".to_string())),
+            "locked composing Tab must commit the full word, got {actions:?}"
+        );
+        assert!(
+            !has_action(&actions, &Action::CommitText("lo".to_string())),
+            "must not commit only the ghost suffix (drops the typed prefix)"
+        );
+        assert!(has_action(&actions, &Action::HideGhost));
+    }
+
+    /// Regression (accept bug): Tab with no ghost while a LOCKED dual buffer is
+    /// active must still commit the composing prefix (it lives only in the
+    /// preedit) instead of forwarding Tab and abandoning the typed word.
+    #[test]
+    fn test_tab_no_ghost_locked_composing_commits_prefix() {
+        let mut core = test_core();
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hel".to_string();
+        core.ghost = String::new(); // no completion to accept
+
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(
+            has_action(&actions, &Action::CommitText("hel".to_string())),
+            "locked composing Tab (no ghost) must commit the prefix, got {actions:?}"
+        );
+    }
+
+    /// Guard: the non-dual keyval path is unchanged — the prefix was already
+    /// forwarded to the app, so Tab commits only the ghost suffix.
+    #[test]
+    fn test_tab_accept_keyval_path_commits_suffix_only() {
+        let mut core = test_core();
+        core.handle_key(press(Key::Char('h')));
+        core.handle_key(press(Key::Char('e')));
+        core.handle_key(press(Key::Char('l')));
+        assert!(
+            core.dual_buffer.is_none(),
+            "keyval path uses no dual buffer"
+        );
+        assert_eq!(core.ghost, "lo");
+
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(has_action(&actions, &Action::CommitText("lo".to_string())));
+        assert!(!has_action(
+            &actions,
+            &Action::CommitText("hello".to_string())
+        ));
+    }
+
+    /// Regression (accept bug): a visible completion must be accepted by the
+    /// word-boundary keys too — Space commits the FULL composing word and the
+    /// delimiter still lands in the app (ForwardKey).
+    #[test]
+    fn test_space_accepts_visible_completion_in_composing() {
+        let mut core = test_core();
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hel".to_string();
+        core.ghost = "lo".to_string();
+
+        let actions = core.handle_key(press(Key::Space));
+        assert!(
+            has_action(&actions, &Action::CommitText("hello".to_string())),
+            "Space must accept the completion (full word), got {actions:?}"
+        );
+        assert!(
+            has_action(&actions, &Action::ForwardKey),
+            "the Space delimiter must still be forwarded to the app"
+        );
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// Regression (accept bug): Return accepts a visible completion exactly
+    /// like Space (live contract: Tab/Space/Enter all accept).
+    #[test]
+    fn test_return_accepts_visible_completion_in_composing() {
+        let mut core = test_core();
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hel".to_string();
+        core.ghost = "lo".to_string();
+
+        let actions = core.handle_key(press(Key::Return));
+        assert!(
+            has_action(&actions, &Action::CommitText("hello".to_string())),
+            "Return must accept the completion (full word), got {actions:?}"
+        );
+        assert!(has_action(&actions, &Action::ForwardKey));
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// Guard: word-boundary accept on the keyval path commits only the ghost
+    /// suffix — the typed prefix was already forwarded to the app.
+    #[test]
+    fn test_space_accept_keyval_path_commits_suffix_only() {
+        let mut core = test_core();
+        core.handle_key(press(Key::Char('h')));
+        core.handle_key(press(Key::Char('e')));
+        core.handle_key(press(Key::Char('l')));
+        assert!(core.dual_buffer.is_none());
+        assert_eq!(core.ghost, "lo");
+
+        let actions = core.handle_key(press(Key::Space));
+        assert!(has_action(&actions, &Action::CommitText("lo".to_string())));
+        assert!(!has_action(
+            &actions,
+            &Action::CommitText("hello".to_string())
+        ));
+        assert!(has_action(&actions, &Action::ForwardKey));
+    }
+
+    /// Guard: an anticipatory ghost (nothing typed) must NOT be committed by
+    /// Space/Return — otherwise double-Space after a word would inject the
+    /// predicted next word unasked.
+    #[test]
+    fn test_space_does_not_accept_anticipatory_ghost() {
+        let mut core = test_core();
+        core.ghost = "world".to_string();
+        core.anticipatory_ghost_active = true;
+        assert!(core.current_word.is_empty());
+
+        let actions = core.handle_key(press(Key::Space));
+        assert!(
+            !has_action(&actions, &Action::CommitText("world".to_string())),
+            "anticipatory ghost must not be committed by Space, got {actions:?}"
+        );
+        assert!(has_action(&actions, &Action::ForwardKey));
+    }
+
+    /// Guard: Space with a composing prefix and NO visible completion keeps
+    /// the existing behavior — commit the typed word and forward the space.
+    #[test]
+    fn test_space_no_ghost_commits_typed_word() {
+        let mut core = test_core();
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hel".to_string();
+        core.ghost = String::new();
+
+        let actions = core.handle_key(press(Key::Space));
+        assert!(has_action(&actions, &Action::CommitText("hel".to_string())));
         assert!(has_action(&actions, &Action::ForwardKey));
     }
 
