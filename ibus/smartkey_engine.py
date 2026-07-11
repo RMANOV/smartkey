@@ -71,25 +71,41 @@ except (ValueError, ImportError):
 
     IBus = _FakeIBus  # type: ignore[misc,assignment]
 
+
+def _ibus_enum_value(
+    enum_name: str, member_name: str, legacy_name: str, fallback: int
+) -> int:
+    """Resolve modern GI enums while retaining compatibility with old IBus."""
+    enum_type = getattr(IBus, enum_name, None)
+    if enum_type is not None and hasattr(enum_type, member_name):
+        return int(getattr(enum_type, member_name))
+    legacy = getattr(IBus, legacy_name, None)
+    return int(legacy) if legacy is not None else fallback
+
+
+_ATTR_TYPE_UNDERLINE = _ibus_enum_value(
+    "AttrType", "UNDERLINE", "ATTR_TYPE_UNDERLINE", 1
+)
+_ATTR_TYPE_FOREGROUND = _ibus_enum_value(
+    "AttrType", "FOREGROUND", "ATTR_TYPE_FOREGROUND", 2
+)
+_ATTR_UNDERLINE_SINGLE = _ibus_enum_value(
+    "AttrUnderline", "SINGLE", "ATTR_UNDERLINE_SINGLE", 1
+)
+
 # ---------------------------------------------------------------------------
 # Rust prediction engine via PyO3.
 # ---------------------------------------------------------------------------
 try:
-    from smartkey_py import (  # type: ignore[import-untyped]
-        PyInputMethodCore,
-        ffi_decode_composing_payload,
-        ffi_decode_replace_payload,
-    )
+    # Keep the core import independent from optional protocol helpers.  A
+    # previously installed smartkey_py may expose PyInputMethodCore but predate
+    # ffi_decode_* and process_keycode; that core can still provide a safe,
+    # ordinary keyval path while the native extension is rebuilt.
+    from smartkey_py import PyInputMethodCore  # type: ignore[import-untyped]
 
     _HAS_CORE = True
 except ImportError:
     _HAS_CORE = False
-
-    def ffi_decode_replace_payload(_payload: str) -> tuple[int, str] | None:
-        return None
-
-    def ffi_decode_composing_payload(_payload: str) -> tuple[str, str] | None:
-        return None
 
     class PyInputMethodCore:  # type: ignore[no-redef]
         """Stub when the native extension is not available."""
@@ -145,6 +161,37 @@ except ImportError:
 
         def predictions(self) -> list[tuple[str, float, float]]:
             return []
+
+
+def _decode_replace_payload_fallback(payload: str) -> tuple[int, str] | None:
+    """Decode the Rust ReplaceWord wire format without the optional FFI shim."""
+    if not isinstance(payload, str) or "\x1f" not in payload:
+        return None
+    length_text, text = payload.split("\x1f", 1)
+    if not length_text or not length_text.isascii() or not length_text.isdigit():
+        return None
+    return int(length_text), text
+
+
+def _decode_composing_payload_fallback(payload: str) -> tuple[str, str] | None:
+    """Decode the Rust ShowComposing wire format without the optional FFI shim."""
+    if not isinstance(payload, str) or "\x00" not in payload:
+        return None
+    return tuple(payload.split("\x00", 1))  # type: ignore[return-value]
+
+
+if _HAS_CORE:
+    try:
+        from smartkey_py import (  # type: ignore[import-untyped]
+            ffi_decode_composing_payload,
+            ffi_decode_replace_payload,
+        )
+    except ImportError:
+        ffi_decode_replace_payload = _decode_replace_payload_fallback
+        ffi_decode_composing_payload = _decode_composing_payload_fallback
+else:
+    ffi_decode_replace_payload = _decode_replace_payload_fallback
+    ffi_decode_composing_payload = _decode_composing_payload_fallback
 
 
 # ---------------------------------------------------------------------------
@@ -236,10 +283,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # IBus client capabilities (set by do_set_capabilities callback).
         self._caps: int = 0
 
-        # Preedit lifecycle tracking: True while a preedit window is visible.
-        # Used by _safe_commit() to guarantee preedit is hidden before commit,
-        # and by backspace handling to consume the key when preedit is active.
+        # Preedit lifecycle tracking.  Ghost-only and full-word composing
+        # preedits need different commit ordering in browser/Qt clients.
         self._preedit_active: bool = False
+        self._preedit_mode: str | None = None
         self._surrounding_text: str | None = None
         self._surrounding_cursor_pos: int | None = None
         self._session_id = f"{int(time.time() * 1000)}-{os.getpid()}"
@@ -453,6 +500,17 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return True
         return self._is_printable_keyval(keyval)
 
+    @staticmethod
+    def _is_spurious_zero_key_event(keyval: int, keycode: int, state: int) -> bool:
+        """Recognize the inert IBus/GTK zero-key callback storm.
+
+        Fedora/GTK can emit repeated ``keyval=0, keycode=240, state=16``
+        callbacks while a preedit is active.  They are not printable or
+        release events; forwarding them can starve real browser key events.
+        Consume only this exact event class and leave all real keys untouched.
+        """
+        return keyval == 0 and keycode == 240 and state in (16, 272)
+
     def _clear_active_prediction_if(self, prediction_id: int) -> None:
         if (
             self._active_prediction
@@ -517,80 +575,131 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def _show_ghost(self, text: str) -> None:
         """Display *text* as greyed-out preedit (ghost) text inline at cursor."""
         ibus_text = IBus.Text.new_from_string(text)
-        byte_len = len(text.encode("utf-8"))
+        text_len = len(text)
         attrs = IBus.AttrList()
         attrs.append(
-            IBus.Attribute.new(IBus.ATTR_TYPE_FOREGROUND, 0x888888, 0, byte_len)
+            IBus.Attribute.new(_ATTR_TYPE_FOREGROUND, 0x888888, 0, text_len)
         )
         attrs.append(
             IBus.Attribute.new(
-                IBus.ATTR_TYPE_UNDERLINE, IBus.ATTR_UNDERLINE_SINGLE, 0, byte_len
+                _ATTR_TYPE_UNDERLINE, _ATTR_UNDERLINE_SINGLE, 0, text_len
             )
         )
         ibus_text.set_attributes(attrs)
-        self.update_preedit_text(ibus_text, byte_len, True)
+        self.update_preedit_text(ibus_text, text_len, True)
         self._preedit_active = True
+        self._preedit_mode = "ghost"
 
     def _clear_ghost(self) -> None:
         """Remove any displayed ghost text."""
         self.hide_preedit_text()
         self._preedit_active = False
+        self._preedit_mode = None
 
     def _show_composing(self, typed: str, ghost: str) -> None:
         """Display composing preedit: typed prefix (normal) + ghost suffix (grey)."""
         full_text = typed + ghost
         ibus_text = IBus.Text.new_from_string(full_text)
-        typed_bytes = len(typed.encode("utf-8"))
-        total_bytes = len(full_text.encode("utf-8"))
+        typed_len = len(typed)
+        total_len = len(full_text)
         attrs = IBus.AttrList()
         # Typed prefix: underline only (normal text color).
         attrs.append(
             IBus.Attribute.new(
-                IBus.ATTR_TYPE_UNDERLINE, IBus.ATTR_UNDERLINE_SINGLE, 0, typed_bytes
+                _ATTR_TYPE_UNDERLINE, _ATTR_UNDERLINE_SINGLE, 0, typed_len
             )
         )
         # Ghost suffix: grey + underline.
         if ghost:
             attrs.append(
                 IBus.Attribute.new(
-                    IBus.ATTR_TYPE_FOREGROUND, 0x888888, typed_bytes, total_bytes
+                    _ATTR_TYPE_FOREGROUND, 0x888888, typed_len, total_len
                 )
             )
             attrs.append(
                 IBus.Attribute.new(
-                    IBus.ATTR_TYPE_UNDERLINE,
-                    IBus.ATTR_UNDERLINE_SINGLE,
-                    typed_bytes,
-                    total_bytes,
+                    _ATTR_TYPE_UNDERLINE,
+                    _ATTR_UNDERLINE_SINGLE,
+                    typed_len,
+                    total_len,
                 )
             )
         ibus_text.set_attributes(attrs)
-        self.update_preedit_text(ibus_text, typed_bytes, True)
+        self.update_preedit_text(ibus_text, typed_len, True)
         self._preedit_active = True
+        self._preedit_mode = "composing"
 
     # -----------------------------------------------------------------------
     # Qt-safe commit helper.
     # -----------------------------------------------------------------------
     def _safe_commit(self, text: str) -> None:
-        """Qt-safe commit: hide preedit BEFORE committing text.
+        """Commit text with mode-aware preedit ordering.
 
-        On some Qt versions, committing text while a preedit window is visible
-        causes the preedit content to be inserted twice (doubling bug).
-        _clear_ghost() calls hide_preedit_text() which is sufficient; do NOT
-        add an extra update_preedit_text("", 0, False) here as that triggers
-        double preedit events on certain Qt versions.
+        A composing preedit contains the user's current word.  Some browser
+        clients retain that payload when it is merely hidden, then append the
+        explicit CommitText payload a second time.  Replace it with an empty
+        invisible preedit before committing.  Ghost-only preedits keep the
+        safer hide-before-commit ordering.
         """
+        if self._preedit_active and getattr(self, "_preedit_mode", None) == "composing":
+            self.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
+            self._preedit_active = False
+            self._preedit_mode = None
+            self.commit_text(IBus.Text.new_from_string(text))
+            return
         if self._preedit_active:
             self._clear_ghost()
         self.commit_text(IBus.Text.new_from_string(text))
+
+    @staticmethod
+    def _coalesce_same_batch_commit_replace(
+        actions: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """Fold commit+replace of the same word into one commit.
+
+        The post-commit pipeline can emit CommitText(word) followed by
+        ReplaceWord(len(word), corrected).  In browser clients a surrounding
+        delete racing the commit can leave both copies visible.  Coalesce only
+        when the replacement length exactly matches the preceding commit;
+        standalone replacements still correct already-forwarded text.
+        """
+        if not actions:
+            return actions
+
+        coalesced: list[tuple[str, str]] = []
+        pending_commit_idx: int | None = None
+        pending_commit_text: str | None = None
+        for action_type, payload in actions:
+            if action_type == "commit":
+                pending_commit_idx = len(coalesced)
+                pending_commit_text = payload
+                coalesced.append((action_type, payload))
+                continue
+
+            if action_type == "replace" and pending_commit_idx is not None:
+                decoded = ffi_decode_replace_payload(payload)
+                if decoded is not None and pending_commit_text is not None:
+                    replace_len, replacement = decoded
+                    if replace_len == len(pending_commit_text):
+                        coalesced[pending_commit_idx] = ("commit", replacement)
+                        pending_commit_text = replacement
+                        continue
+
+            coalesced.append((action_type, payload))
+        return coalesced
 
     # -----------------------------------------------------------------------
     # Action dispatcher — translates Rust actions to IBus API calls.
     # -----------------------------------------------------------------------
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
+        actions = self._coalesce_same_batch_commit_replace(actions)
+        composing_resolution_pending = (
+            self._preedit_active
+            and getattr(self, "_preedit_mode", None) == "composing"
+        )
         consumed = True
-        for action_type, payload in actions:
+        for idx, (action_type, payload) in enumerate(actions):
             if action_type == "ghost":
                 self._show_ghost(payload)
                 self._track_prediction_shown(payload)
@@ -606,30 +715,45 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     _PRED_LOG.write(" | ".join(pts) + "\n")
                     _PRED_LOG.flush()
             elif action_type == "hide":
+                # A full-word composing preedit must survive until the
+                # following commit/replace has cleared it explicitly.  Hiding
+                # it first is the browser doubling bug this adapter guards.
+                if composing_resolution_pending and any(
+                    later_type in {"commit", "replace"}
+                    for later_type, _ in actions[idx + 1 :]
+                ):
+                    continue
                 self._clear_ghost()
             elif action_type == "commit":
                 self._safe_commit(payload)
+                composing_resolution_pending = False
                 if _PRED_LOG:
                     _PRED_LOG.write(
                         str(time.time()) + " | TAB_ACCEPT | " + payload + "\n"
                     )
                     _PRED_LOG.flush()
             elif action_type == "replace":
-                if self._preedit_active:
-                    self._clear_ghost()
                 decoded = ffi_decode_replace_payload(payload)
                 if decoded is None:
                     log.warning("smartkey: malformed replace payload %r", payload)
                     continue
                 replace_len, text = decoded
-                if self._caps & 0x20:  # SURROUNDING_TEXT capability
-                    self.delete_surrounding_text(-replace_len, replace_len)
+                if composing_resolution_pending:
+                    # The current word exists only in the composing preedit;
+                    # never delete already-committed browser text for it.
+                    self._safe_commit(text)
                 else:
-                    # Fallback: backspace key events for apps without
-                    # surrounding text support (GTK4 Wayland, Electron, etc.)
-                    for _ in range(replace_len):
-                        self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
-                self._safe_commit(text)
+                    if self._preedit_active:
+                        self._clear_ghost()
+                    if self._caps & 0x20:  # SURROUNDING_TEXT capability
+                        self.delete_surrounding_text(-replace_len, replace_len)
+                    else:
+                        # Fallback: backspace key events for apps without
+                        # surrounding text support (GTK4 Wayland, Electron, etc.)
+                        for _ in range(replace_len):
+                            self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
+                    self._safe_commit(text)
+                composing_resolution_pending = False
             elif action_type == "composing":
                 decoded = ffi_decode_composing_payload(payload)
                 if decoded is None:
@@ -678,6 +802,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         """
         log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)
 
+        if self._is_spurious_zero_key_event(keyval, keycode, state):
+            return True
+
         # Track backspace so we can consume it when preedit is active,
         # preventing the key from also deleting committed text in the app.
         is_backspace = keyval == IBus.KEY_BackSpace
@@ -693,7 +820,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # v0.5.0: prefer raw scancode path for dual-buffer layout-agnostic input.
         # Rust tables use evdev codes. On Wayland IBus sends evdev directly;
         # on X11 IBus sends XKB (evdev + 8) — normalise to evdev.
-        if keycode > 0 and _HAS_CORE:
+        # Older installed native modules may not have the raw-scancode API.
+        # Keep those sessions usable by falling back to the ordinary keyval
+        # path instead of raising/consuming the browser's key event.
+        has_keycode_api = callable(getattr(self._core, "process_keycode", None))
+        if keycode > 0 and _HAS_CORE and has_keycode_api:
             evdev_keycode = keycode if _IS_WAYLAND else max(keycode - 8, 0)
             preedit_was_active = self._preedit_active
             actions = self._core.process_keycode(evdev_keycode, state)
