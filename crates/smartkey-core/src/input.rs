@@ -703,17 +703,37 @@ impl InputMethodCore {
 
             // Escape: dismiss ghost text and notify engine of rejection.
             Key::Escape => {
-                if self.in_hypothesis_phase() {
-                    // Hypothesis phase: cancel preedit, nothing was committed.
-                    self.reset_word();
-                    vec![Action::HideGhost]
-                } else if !self.ghost.is_empty() {
+                if !self.ghost.is_empty() {
+                    // Literal-space escape: dismiss ONLY the completion and
+                    // KEEP the typed word — Escape then Space/Return commits
+                    // the word verbatim.  (Previously the hypothesis-phase arm
+                    // won and reset_word() silently discarded the typed
+                    // prefix; a locked composing preedit was hidden whole,
+                    // leaving the typed word invisible but still pending.)
                     // F6: calibration observation — top prediction was rejected.
                     if let Some(top) = self.last_predictions.first() {
                         self.engine.observe_calibration(top.confidence, false);
                     }
                     self.engine.on_prediction_rejected();
                     self.ghost.clear();
+                    // Also drop the candidate list so the dismissed prediction
+                    // cannot be re-committed by the aggressive unique-match
+                    // Space path right after the user rejected it.
+                    self.last_predictions.clear();
+                    self.anticipatory_ghost_active = false;
+                    if self.dual_buffer.is_some() && !self.current_word.is_empty() {
+                        // Composing: re-show the preedit with the typed word only.
+                        vec![Action::ShowComposing {
+                            typed: self.current_word.clone(),
+                            ghost: String::new(),
+                        }]
+                    } else {
+                        vec![Action::HideGhost]
+                    }
+                } else if self.in_hypothesis_phase() {
+                    // Hypothesis phase, no completion shown: cancel the
+                    // preedit, nothing was committed.
+                    self.reset_word();
                     vec![Action::HideGhost]
                 } else {
                     vec![Action::ForwardKey]
@@ -1998,6 +2018,94 @@ mod tests {
             "anticipatory ghost must not be committed by Space, got {actions:?}"
         );
         assert!(has_action(&actions, &Action::ForwardKey));
+    }
+
+    /// Literal-space escape: Escape dismisses ONLY the completion and keeps
+    /// the typed word; the following Space commits the word verbatim (the
+    /// dismissed completion must not come back via any accept path).
+    #[test]
+    fn test_escape_then_space_commits_typed_word_literal() {
+        let mut core = test_core();
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hel".to_string();
+        core.ghost = "lo".to_string();
+        // Seed a unique candidate so the aggressive Space path WOULD fire if
+        // the dismissal failed to clear it.
+        core.last_predictions = vec![Prediction {
+            word: "hello".to_string(),
+            score: 1.0,
+            confidence: 0.9,
+        }];
+
+        let actions = core.handle_key(press(Key::Escape));
+        assert!(
+            has_action(
+                &actions,
+                &Action::ShowComposing {
+                    typed: "hel".to_string(),
+                    ghost: String::new(),
+                }
+            ),
+            "Escape must keep the typed word visible in the preedit, got {actions:?}"
+        );
+        assert_eq!(core.current_word(), "hel");
+        assert!(core.last_predictions.is_empty());
+
+        let actions = core.handle_key(press(Key::Space));
+        assert!(
+            has_action(&actions, &Action::CommitText("hel".to_string())),
+            "Space after Escape must commit the typed word verbatim, got {actions:?}"
+        );
+        assert!(
+            !has_action(&actions, &Action::CommitText("hello".to_string())),
+            "the dismissed completion must not come back on Space"
+        );
+        assert!(has_action(&actions, &Action::ForwardKey));
+    }
+
+    /// Regression: Escape with a visible completion in HYPOTHESIS phase must
+    /// dismiss only the completion — the old hypothesis-first arm reset the
+    /// whole preedit and silently discarded the typed word.
+    #[test]
+    fn test_escape_hypothesis_with_ghost_keeps_typed_word() {
+        let mut core = test_core();
+        let mut db = DualBuffer::from_config(&core.config.dual_buffer);
+        db.push('h', 'h');
+        db.push('e', 'e');
+        assert!(!db.is_locked(), "precondition: hypothesis phase");
+        core.dual_buffer = Some(db);
+        core.current_word = "he".to_string();
+        core.ghost = "llo".to_string();
+
+        let actions = core.handle_key(press(Key::Escape));
+        assert!(
+            has_action(
+                &actions,
+                &Action::ShowComposing {
+                    typed: "he".to_string(),
+                    ghost: String::new(),
+                }
+            ),
+            "Escape in hypothesis phase must keep the typed word, got {actions:?}"
+        );
+        assert_eq!(core.current_word(), "he");
+    }
+
+    /// Guard: Escape with NO completion in hypothesis phase keeps the old
+    /// cancel semantics — the preedit word is abandoned.
+    #[test]
+    fn test_escape_no_ghost_hypothesis_cancels_preedit() {
+        let mut core = test_core();
+        let mut db = DualBuffer::from_config(&core.config.dual_buffer);
+        db.push('h', 'h');
+        assert!(!db.is_locked());
+        core.dual_buffer = Some(db);
+        core.current_word = "h".to_string();
+        core.ghost = String::new();
+
+        let actions = core.handle_key(press(Key::Escape));
+        assert!(has_action(&actions, &Action::HideGhost));
+        assert_eq!(core.current_word(), "");
     }
 
     /// Guard: Space with a composing prefix and NO visible completion keeps

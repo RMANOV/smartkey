@@ -224,6 +224,26 @@ def test_enter_accept_lands_full_word_and_forwards_delimiter():
     assert consumed is False, "the Return delimiter must be forwarded to the app"
 
 
+# --- Literal-space escape: Escape keeps the typed word; Space commits it ------
+def test_escape_then_space_commits_typed_word_literal_space():
+    # With the Rust fix, Escape on a visible completion re-shows the composing
+    # preedit with the typed word only; the following Space commits that word
+    # verbatim (no resurrected completion) and forwards the delimiter.
+    eng, rec = build_engine(
+        scripts=[
+            [("composing", "hel\x00lo")],  # typed "hel", completion "lo"
+            [("composing", "hel\x00")],  # Escape: typed-only preedit
+            [("hide", ""), ("commit", "hel"), ("forward", "")],  # literal space
+        ]
+    )
+    assert eng.do_process_key_event(ord("l"), 38, 0) is True
+
+    assert eng.do_process_key_event(ske.IBus.KEY_Escape, 1, 0) is True
+    consumed = eng.do_process_key_event(ske.IBus.KEY_space, 57, 0)
+    assert rec.commits == ["hel"], f"must commit the typed word only, got {rec.commits}"
+    assert consumed is False, "the literal space must reach the app"
+
+
 # --- Telemetry: boundary accepts are logged as accepted, not word_boundary ----
 def _capture_replay_events(eng):
     events: list[tuple[str, dict]] = []
