@@ -210,8 +210,9 @@ if _DEBUG:
 
     _log_dir = pathlib.Path.home() / ".local" / "share" / "smartkey"
     _log_dir.mkdir(parents=True, exist_ok=True)
-    _PRED_LOG = (_log_dir / "predictions.log").open("a", buffering=1)
-    _REPLAY_LOG = (_log_dir / "replay.jsonl").open("a", buffering=1)
+    # Block-buffered: the OS flushes off the hot path; idle points flush too.
+    _PRED_LOG = (_log_dir / "predictions.log").open("a")
+    _REPLAY_LOG = (_log_dir / "replay.jsonl").open("a")
 
 # Keystroke diagnostic trace (spec 2026-07-12).  Import must never take the
 # engine down; a missing module simply means tracing stays off.
@@ -310,7 +311,21 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._active_prediction: dict[str, object] | None = None
 
         # Keystroke diagnostic trace (off unless SMARTKEY_DEBUG / marker file).
-        self._trace = KeystrokeTrace() if KeystrokeTrace is not None else None
+        # Buffer flushes are deferred through GLib.idle_add so they run after
+        # the key event completes — never inside the hot path.
+        scheduler = None
+        if _HAS_IBUS:
+            try:
+                from gi.repository import GLib  # noqa: PLC0415
+
+                scheduler = GLib.idle_add
+            except ImportError:
+                scheduler = None
+        self._trace = (
+            KeystrokeTrace(schedule_flush=scheduler)
+            if KeystrokeTrace is not None
+            else None
+        )
         # Last composing prefix shown to the user — the accept event compares
         # it (typed_lang) against what actually got committed (committed_lang).
         self._last_composing_typed: str = ""
@@ -453,7 +468,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             {key: value for key, value in payload.items() if value is not None}
         )
         _REPLAY_LOG.write(json.dumps(record, ensure_ascii=False) + "\n")
-        _REPLAY_LOG.flush()
 
     def _track_prediction_shown(self, ghost: str) -> None:
         preds = self._core.predictions()
@@ -837,7 +851,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     )
                     pts.append("shown")
                     _PRED_LOG.write(" | ".join(pts) + "\n")
-                    _PRED_LOG.flush()
             elif action_type == "hide":
                 # A full-word composing preedit must survive until the
                 # following commit/replace has cleared it explicitly.  Hiding
@@ -855,7 +868,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     _PRED_LOG.write(
                         str(time.time()) + " | TAB_ACCEPT | " + payload + "\n"
                     )
-                    _PRED_LOG.flush()
             elif action_type == "replace":
                 decoded = ffi_decode_replace_payload(payload)
                 if decoded is None:
@@ -896,7 +908,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     )
                     pts2.append("shown")
                     _PRED_LOG.write(" | ".join(pts2) + "\n")
-                    _PRED_LOG.flush()
             elif action_type == "forward":
                 consumed = False
         return consumed

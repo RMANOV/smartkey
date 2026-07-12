@@ -138,7 +138,13 @@ class KeystrokeTrace:
         level: int | None = None,
         directory: Path | None = None,
         ring_size: int = RING_SIZE,
+        schedule_flush=None,
     ) -> None:
+        """``schedule_flush(callback)`` defers ``callback`` OFF the hot path
+        (the engine passes ``GLib.idle_add``).  Without a scheduler the ring
+        is only written by explicit ``flush()`` calls at idle points
+        (focus-out/reset/disable); ``emit()`` itself NEVER touches the file
+        system — that is the flush-outside-hot-path invariant."""
         self.level = resolve_level() if level is None else level
         self.enabled = self.level != LEVEL_OFF
         self._seq = 0
@@ -148,6 +154,8 @@ class KeystrokeTrace:
         self.dir = Path(directory) if directory is not None else resolve_dir()
         self._ring: deque = deque(maxlen=ring_size)
         self._since_flush = 0
+        self._schedule_flush = schedule_flush
+        self._flush_pending = False
         self._file: Path | None = None
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -180,10 +188,27 @@ class KeystrokeTrace:
         record.update(fields)
         self._ring.append(record)
         self._since_flush += 1
-        if self._since_flush >= FLUSH_EVERY:
-            self.flush()
+        # NO file I/O here — emit only appends to the in-memory ring.  Once
+        # the buffer grows, REQUEST a deferred flush (e.g. GLib.idle_add),
+        # which runs after the key event has been fully handled.
+        if (
+            self._since_flush >= FLUSH_EVERY
+            and not self._flush_pending
+            and self._schedule_flush is not None
+        ):
+            self._flush_pending = True
+            try:
+                self._schedule_flush(self._deferred_flush)
+            except Exception:  # noqa: BLE001 — tracing must never break input
+                self._flush_pending = False
 
     # -- off the hot path ---------------------------------------------------
+    def _deferred_flush(self) -> bool:
+        """Scheduler callback (GLib.idle_add compatible: returns False)."""
+        self._flush_pending = False
+        self.flush()
+        return False
+
     def flush(self) -> None:
         """Append buffered events to the session file (idle points only)."""
         if not self.enabled or not self._ring or self._file is None:

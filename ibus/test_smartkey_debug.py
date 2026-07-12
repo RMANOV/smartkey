@@ -239,6 +239,39 @@ def test_cli_wipe_and_status(tmp_path, monkeypatch, capsys):
     assert str(tmp_path) in out
 
 
+# --- Flush stays OFF the hot path --------------------------------------------------
+def test_emit_never_touches_the_file_without_flush(tmp_path):
+    # The Codex re-gate BLOCK: emit() must do ZERO file I/O.  Even far past
+    # the flush threshold, bytes land only on an explicit/deferred flush.
+    trace = KeystrokeTrace(level=LEVEL_STRUCTURAL, directory=tmp_path)
+    for _ in range(smartkey_debug.FLUSH_EVERY * 4):
+        trace.begin_keystroke()
+        trace.emit("key_in", keyval=1)
+    assert trace._file.stat().st_size == 0, "emit() must never write the file"  # noqa: SLF001
+    trace.flush()
+    assert trace._file.stat().st_size > 0  # noqa: SLF001
+
+
+def test_threshold_requests_deferred_flush_once(tmp_path):
+    scheduled: list = []
+    trace = KeystrokeTrace(
+        level=LEVEL_STRUCTURAL,
+        directory=tmp_path,
+        schedule_flush=scheduled.append,
+    )
+    for _ in range(smartkey_debug.FLUSH_EVERY + 10):
+        trace.begin_keystroke()
+        trace.emit("key_in", keyval=1)
+    assert len(scheduled) == 1, "one pending deferred flush, no re-arm storm"
+    assert trace._file.stat().st_size == 0, "nothing written until the callback runs"  # noqa: SLF001
+    assert scheduled[0]() is False  # GLib.idle_add contract: don't repeat
+    assert trace._file.stat().st_size > 0  # noqa: SLF001
+    # After the deferred flush ran, the next threshold crossing re-arms.
+    for _ in range(smartkey_debug.FLUSH_EVERY):
+        trace.emit("key_in", keyval=1)
+    assert len(scheduled) == 2
+
+
 # --- Hot-path budget --------------------------------------------------------------
 def test_emit_overhead_within_budget(tmp_path):
     off = KeystrokeTrace(level=LEVEL_OFF, directory=tmp_path / "off")
