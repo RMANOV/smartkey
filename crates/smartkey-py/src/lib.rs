@@ -228,6 +228,12 @@ impl PyInputMethodCore {
             .map(|p| (p.word.clone(), p.score, p.confidence))
             .collect()
     }
+
+    /// Diagnostic snapshot for the adapter's keystroke trace:
+    /// `(dual_buffer_present, locked, hypothesis_phase)`.
+    fn debug_state(&self) -> (bool, bool, bool) {
+        self.inner.debug_state()
+    }
 }
 
 #[pymodule]

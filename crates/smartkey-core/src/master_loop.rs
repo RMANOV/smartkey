@@ -235,6 +235,12 @@ impl MasterLoop {
         self.core.has_ghost()
     }
 
+    /// Diagnostic snapshot for the adapter's keystroke trace:
+    /// `(dual_buffer_present, locked, hypothesis_phase)`.
+    pub fn debug_state(&self) -> (bool, bool, bool) {
+        self.core.debug_state()
+    }
+
     pub fn ghost_text(&self) -> &str {
         self.core.ghost_text()
     }

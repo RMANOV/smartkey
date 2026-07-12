@@ -12,3 +12,9 @@ press-releases/
 corpus/raw/
 corpus/*.bin
 .firecrawl/
+
+# Keystroke debug traces (smartkey_debug.py) live OUTSIDE the repo by design;
+# this is a belt-and-braces net so a trace/dump can never be committed.
+trace-*.jsonl
+dump-*.jsonl
+keystroke-logs/
