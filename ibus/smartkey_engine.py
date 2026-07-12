@@ -199,7 +199,10 @@ else:
 # ---------------------------------------------------------------------------
 _IS_WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
 
-_DEBUG = os.environ.get("SMARTKEY_DEBUG") == "1"
+# Legacy content logs (predictions.log / replay.jsonl) carry verbatim words,
+# so they are gated on the CONTENT level only: SMARTKEY_DEBUG=1 now means
+# "structural keystroke trace, no content" (see smartkey_debug.py).
+_DEBUG = os.environ.get("SMARTKEY_DEBUG") == "full"
 _PRED_LOG = None
 _REPLAY_LOG = None
 if _DEBUG:
@@ -209,6 +212,19 @@ if _DEBUG:
     _log_dir.mkdir(parents=True, exist_ok=True)
     _PRED_LOG = (_log_dir / "predictions.log").open("a", buffering=1)
     _REPLAY_LOG = (_log_dir / "replay.jsonl").open("a", buffering=1)
+
+# Keystroke diagnostic trace (spec 2026-07-12).  Import must never take the
+# engine down; a missing module simply means tracing stays off.
+try:
+    from smartkey_debug import KeystrokeTrace, lang_class
+except ImportError:  # engine imported from a different sys.path root
+    try:
+        from ibus.smartkey_debug import KeystrokeTrace, lang_class  # type: ignore
+    except ImportError:
+        KeystrokeTrace = None  # type: ignore[assignment,misc]
+
+        def lang_class(_text: object) -> str:  # type: ignore[misc]
+            return "empty"
 
 _CONFIG_DIR = (
     Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "smartkey"
@@ -292,6 +308,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._session_id = f"{int(time.time() * 1000)}-{os.getpid()}"
         self._prediction_seq = 0
         self._active_prediction: dict[str, object] | None = None
+
+        # Keystroke diagnostic trace (off unless SMARTKEY_DEBUG / marker file).
+        self._trace = KeystrokeTrace() if KeystrokeTrace is not None else None
+        # Last composing prefix shown to the user — the accept event compares
+        # it (typed_lang) against what actually got committed (committed_lang).
+        self._last_composing_typed: str = ""
 
         # Load corpus.
         self._load_corpus()
@@ -530,32 +552,20 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         prediction_id = int(pending_prediction["prediction_id"])
         action_types = {action_type for action_type, _ in actions}
+        # Tab-only accept (2026-07-12): Space/Return commits are the TYPED
+        # word, never an acceptance — they fall through to the rejection
+        # bookkeeping below (reason="word_boundary").
         accepted = keyval == IBus.KEY_Tab and "commit" in action_types
         auto_accepted = keyval == IBus.KEY_space and "replace" in action_types
-        # Word-boundary accept: with a completion pending, Space/Return only
-        # produce a ``commit`` when the core accepted it (a dismissed
-        # anticipatory ghost yields hide+forward, no commit).
-        boundary_accepted = (
-            keyval in (IBus.KEY_space, IBus.KEY_Return)
-            and "commit" in action_types
-        )
 
-        if accepted or auto_accepted or boundary_accepted:
-            if accepted:
-                reason = "tab"
-            elif auto_accepted:
-                reason = "space_autocommit"
-            elif keyval == IBus.KEY_space:
-                reason = "space_accept"
-            else:
-                reason = "enter_accept"
+        if accepted or auto_accepted:
             self._log_replay_event(
                 "accepted",
                 prediction_id=prediction_id,
                 word=pending_prediction.get("word"),
                 ghost=pending_prediction.get("ghost"),
                 confidence=pending_prediction.get("confidence"),
-                reason=reason,
+                reason="tab" if accepted else "space_autocommit",
             )
             self._clear_active_prediction_if(prediction_id)
             return
@@ -585,6 +595,103 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._clear_active_prediction_if(prediction_id)
 
     # -----------------------------------------------------------------------
+    # Keystroke diagnostic trace (spec 2026-07-12).
+    # -----------------------------------------------------------------------
+    _KEYNAMES = {
+        0xFF09: "Tab",
+        0xFF1B: "Escape",
+        0xFF08: "BackSpace",
+        0x0020: "space",
+        0xFF0D: "Return",
+        0xFF51: "Left",
+        0xFF53: "Right",
+        0xFF52: "Up",
+        0xFF54: "Down",
+    }
+
+    @classmethod
+    def _keyname(cls, keyval: int) -> str:
+        name = cls._KEYNAMES.get(keyval)
+        if name is not None:
+            return name
+        if 0x21 <= keyval <= 0x7E or 0x80 <= keyval <= 0x2FFFF:
+            try:
+                return chr(keyval)
+            except ValueError:
+                pass
+        return hex(keyval)
+
+    def _trace_key_result(
+        self,
+        keyval: int,
+        key_release: bool,
+        actions: list[tuple[str, str]],
+        result: bool,
+    ) -> None:
+        """Record the core verdict, dispatched actions, accept and outcome
+        for the current keystroke.  No-op unless tracing is enabled."""
+        trace = getattr(self, "_trace", None)
+        if trace is None or not trace.enabled:
+            return
+
+        dual_present = locked = hypothesis = None
+        debug_state = getattr(self._core, "debug_state", None)
+        if callable(debug_state):
+            try:
+                dual_present, locked, hypothesis = debug_state()
+            except Exception:  # noqa: BLE001 — trace must never break input
+                pass
+        try:
+            predictions = [
+                (word, round(score, 4), round(conf, 4))
+                for word, score, conf in self._core.predictions()[:3]
+            ]
+        except Exception:  # noqa: BLE001
+            predictions = []
+        active = self._active_prediction or {}
+        trace.emit(
+            "core",
+            verdict="consume" if result else "forward",
+            dual_buffer_present=dual_present,
+            locked=locked,
+            hypothesis_phase=hypothesis,
+            predictions=predictions,
+            ghost=active.get("ghost"),
+        )
+
+        committed: list[str] = []
+        for action_type, payload in actions:
+            trace.emit(
+                "action",
+                action_name=action_type,
+                payload_len=len(payload),
+                payload_text=payload,
+            )
+            if action_type == "commit":
+                committed.append(payload)
+            elif action_type == "replace":
+                decoded = ffi_decode_replace_payload(payload)
+                if decoded is not None:
+                    committed.append(decoded[1])
+
+        if committed and not key_release:
+            committed_text = "".join(committed)
+            typed_prefix = getattr(self, "_last_composing_typed", "")
+            trace.emit(
+                "accept",
+                key=self._keyname(keyval),
+                committed_text=committed_text,
+                typed_prefix=typed_prefix,
+                committed_lang=lang_class(committed_text),
+                typed_lang=lang_class(typed_prefix),
+            )
+        trace.emit(
+            "outcome",
+            committed_to_app_len=sum(len(text) for text in committed),
+            committed_to_app="".join(committed),
+        )
+
+    # -----------------------------------------------------------------------
     # Ghost text display (IBus-specific).
     # -----------------------------------------------------------------------
     def _show_ghost(self, text: str) -> None:
@@ -604,6 +711,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self.update_preedit_text(ibus_text, text_len, True)
         self._preedit_active = True
         self._preedit_mode = "ghost"
+        self._last_composing_typed = ""
 
     def _clear_ghost(self) -> None:
         """Remove any displayed ghost text."""
@@ -643,6 +751,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self.update_preedit_text(ibus_text, typed_len, True)
         self._preedit_active = True
         self._preedit_mode = "composing"
+        self._last_composing_typed = typed
 
     # -----------------------------------------------------------------------
     # Qt-safe commit helper.
@@ -817,7 +926,24 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         """
         log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)
 
+        trace = getattr(self, "_trace", None)
+        tracing = trace is not None and trace.enabled
+        if tracing:
+            trace.begin_keystroke()
+            trace.emit(
+                "key_in",
+                keycode=keycode,
+                keyval=keyval,
+                keyname=self._keyname(keyval),
+                mods=state,
+                is_release=bool(state & (1 << 30)),
+                cursor_pos=self._surrounding_cursor_pos,
+                surrounding_text=self._surrounding_text,
+            )
+
         if self._is_spurious_zero_key_event(keyval, keycode, state):
+            if tracing:
+                trace.emit("core", verdict="consume_spurious")
             return True
 
         key_release = bool(state & (1 << 30))  # IBUS_RELEASE_MASK
@@ -844,6 +970,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._finalize_prediction_outcome(
                 keyval, key_release, actions, pending_prediction
             )
+            if tracing:
+                self._trace_key_result(keyval, key_release, actions, result)
             # Honor the core's forward/consume decision uniformly.  ``result`` is
             # False exactly when the core emitted a ForwardKey (key not
             # consumed).  A composing-edit backspace already returns no
@@ -878,6 +1006,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._finalize_prediction_outcome(
             keyval, key_release, actions, pending_prediction
         )
+        if tracing:
+            self._trace_key_result(keyval, key_release, actions, result)
         # Honor the core's forward/consume decision uniformly (see the keycode
         # path above): return ``result`` rather than swallowing a
         # core-forwarded backspace on mere ``preedit_was_active``.
@@ -895,6 +1025,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._execute_actions(actions)
         self._active_prediction = None
         self._sync_surrounding_text(None, None)
+        # Idle point: flush any buffered trace events off the hot path.
+        trace = getattr(self, "_trace", None)
+        if trace is not None and trace.enabled:
+            trace.flush()
         # Debounced auto-save: persist personal profile at most once per 60s.
         now = time.monotonic()
         if now - self._last_save >= 60.0:
@@ -909,6 +1043,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._execute_actions(actions)
         self._active_prediction = None
         self._sync_surrounding_text(None, None)
+        trace = getattr(self, "_trace", None)
+        if trace is not None and trace.enabled:
+            trace.flush()
 
     def do_enable(self) -> None:
         pass  # Rust core handles enabled state via kill switch.
@@ -918,6 +1055,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._execute_actions(actions)
         self._active_prediction = None
         self._sync_surrounding_text(None, None)
+        trace = getattr(self, "_trace", None)
+        if trace is not None and trace.enabled:
+            trace.flush()
         # Save personal profile on engine disable (session end).
         try:
             self._core.save_personal()

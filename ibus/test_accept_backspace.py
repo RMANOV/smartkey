@@ -116,6 +116,8 @@ def build_engine(scripts: list[list[tuple[str, str]]]):
     eng._prediction_seq = 0
     eng._surrounding_text = None
     eng._surrounding_cursor_pos = None
+    eng._trace = None
+    eng._last_composing_typed = ""
 
     rec = Recorder()
     eng.commit_text = lambda text_obj: rec.commits.append(text_obj.s)
@@ -191,36 +193,36 @@ def test_tab_accept_commits_full_word_in_composing():
     assert eng._preedit_active is False
 
 
-# --- Bug (b) adapter side: Space/Enter accept land the word AND the delimiter --
-def test_space_accept_lands_full_word_and_forwards_delimiter():
-    # With the Rust fix, Space on a visible completion emits
-    # [hide, commit(full_word), forward]: the adapter lands the word and
-    # returns False so IBus delivers the space itself to the app.
+# --- Tab-only accept: Space/Enter land the TYPED word + the delimiter ---------
+def test_space_lands_typed_word_and_forwards_delimiter():
+    # Tab-only accept (2026-07-12): with a completion visible, Space commits
+    # the TYPED word only — [hide, commit(typed), forward] from the core —
+    # and returns False so IBus delivers the space itself to the app.
     eng, rec = build_engine(
         scripts=[
             [("composing", "hel\x00lo")],
-            [("hide", ""), ("commit", "hello"), ("forward", "")],
+            [("hide", ""), ("commit", "hel"), ("forward", "")],
         ]
     )
     assert eng.do_process_key_event(ord("l"), 38, 0) is True
 
     consumed = eng.do_process_key_event(ske.IBus.KEY_space, 57, 0)
-    assert rec.commits == ["hello"], f"must commit the accepted word, got {rec.commits}"
+    assert rec.commits == ["hel"], f"must commit the typed word, got {rec.commits}"
     assert consumed is False, "the Space delimiter must be forwarded to the app"
     assert eng._preedit_active is False
 
 
-def test_enter_accept_lands_full_word_and_forwards_delimiter():
+def test_enter_lands_typed_word_and_forwards_delimiter():
     eng, rec = build_engine(
         scripts=[
             [("composing", "hel\x00lo")],
-            [("hide", ""), ("commit", "hello"), ("forward", "")],
+            [("hide", ""), ("commit", "hel"), ("forward", "")],
         ]
     )
     assert eng.do_process_key_event(ord("l"), 38, 0) is True
 
     consumed = eng.do_process_key_event(ske.IBus.KEY_Return, 28, 0)
-    assert rec.commits == ["hello"]
+    assert rec.commits == ["hel"]
     assert consumed is False, "the Return delimiter must be forwarded to the app"
 
 
@@ -255,37 +257,39 @@ def _capture_replay_events(eng):
     return events
 
 
-def test_prediction_outcome_space_commit_logged_as_accept():
+def test_prediction_outcome_space_typed_commit_logged_as_word_boundary():
+    # Tab-only accept: Space committing the TYPED word is a word-boundary
+    # REJECTION of the pending completion, never an acceptance.
     eng, _rec = build_engine(
         scripts=[
             [("composing", "hel\x00lo")],
-            [("hide", ""), ("commit", "hello"), ("forward", "")],
+            [("hide", ""), ("commit", "hel"), ("forward", "")],
         ]
     )
     events = _capture_replay_events(eng)
     eng.do_process_key_event(ord("l"), 38, 0)
     eng.do_process_key_event(ske.IBus.KEY_space, 57, 0)
 
-    accepted = [payload for event, payload in events if event == "accepted"]
-    assert len(accepted) == 1, f"expected one accepted event, got {events}"
-    assert accepted[0]["reason"] == "space_accept"
-    assert not [e for e, _ in events if e == "rejected"]
+    rejected = [payload for event, payload in events if event == "rejected"]
+    assert len(rejected) == 1, f"expected one rejected event, got {events}"
+    assert rejected[0]["reason"] == "word_boundary"
+    assert not [e for e, _ in events if e == "accepted"]
 
 
-def test_prediction_outcome_enter_commit_logged_as_accept():
+def test_prediction_outcome_tab_commit_logged_as_accept():
     eng, _rec = build_engine(
         scripts=[
             [("composing", "hel\x00lo")],
-            [("hide", ""), ("commit", "hello"), ("forward", "")],
+            [("hide", ""), ("commit", "hello")],
         ]
     )
     events = _capture_replay_events(eng)
     eng.do_process_key_event(ord("l"), 38, 0)
-    eng.do_process_key_event(ske.IBus.KEY_Return, 28, 0)
+    eng.do_process_key_event(_KEY_TAB, 23, 0)
 
     accepted = [payload for event, payload in events if event == "accepted"]
     assert len(accepted) == 1
-    assert accepted[0]["reason"] == "enter_accept"
+    assert accepted[0]["reason"] == "tab"
 
 
 def test_prediction_outcome_dismissed_anticipatory_space_stays_reject():
