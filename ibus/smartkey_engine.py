@@ -210,7 +210,7 @@ if _DEBUG:
 
     _log_dir = pathlib.Path.home() / ".local" / "share" / "smartkey"
     _log_dir.mkdir(parents=True, exist_ok=True)
-    # Block-buffered: the OS flushes off the hot path; idle points flush too.
+    # Block-buffered: the OS flushes off the hot path (no per-write flush).
     _PRED_LOG = (_log_dir / "predictions.log").open("a")
     _REPLAY_LOG = (_log_dir / "replay.jsonl").open("a")
 
