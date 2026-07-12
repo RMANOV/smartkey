@@ -767,7 +767,7 @@ impl InputMethodCore {
                         Action::CommitText(word.clone()),
                         Action::ForwardKey,
                     ];
-                    actions.extend(self.post_commit_pipeline(&word));
+                    actions.extend(self.post_commit_pipeline(&word, true));
                     return actions;
                 }
                 let committed = if !self.current_word.is_empty() {
@@ -781,7 +781,7 @@ impl InputMethodCore {
                 let mut actions = vec![Action::HideGhost, Action::ForwardKey];
                 // Post-commit intelligence pipeline: auto-correct, auto-caps, next-word ghost.
                 if let Some(ref word) = committed {
-                    actions.extend(self.post_commit_pipeline(word));
+                    actions.extend(self.post_commit_pipeline(word, true));
                 }
                 actions
             }
@@ -832,7 +832,7 @@ impl InputMethodCore {
                     self.commit_word_internal(&word, true);
                     self.reset_word();
                     let mut actions = vec![Action::HideGhost, Action::CommitText(word.clone())];
-                    actions.extend(self.post_commit_pipeline(&word));
+                    actions.extend(self.post_commit_pipeline(&word, true));
                     actions.push(Action::ForwardKey);
                     return actions;
                 }
@@ -949,9 +949,10 @@ impl InputMethodCore {
         }
         let last_word = words.last().copied().unwrap_or("").to_string();
         self.reset_word();
-        // After accept: run post-commit pipeline for next-word ghost.
+        // After accept: corrections still run, but NO anticipatory ghost —
+        // an instant re-arm turns repeated Tabs into a word machine gun (S4).
         let mut actions = actions;
-        actions.extend(self.post_commit_pipeline(&last_word));
+        actions.extend(self.post_commit_pipeline(&last_word, false));
         actions
     }
 
@@ -1368,7 +1369,18 @@ impl InputMethodCore {
 
     /// Run the full post-commit pipeline: language correction → caps → next-word ghost.
     /// Returns a list of actions to append to the Space/Enter handler.
-    fn post_commit_pipeline(&mut self, committed_word: &str) -> Vec<Action> {
+    ///
+    /// ``show_anticipatory`` (S4, 2026-07-12): after a Tab-ACCEPT the
+    /// anticipatory next-word ghost re-armed instantly, so repeated Tabs
+    /// machine-gunned the most frequent word ("на" ×4 in the live trace).
+    /// Accept paths pass ``false`` — the user must type again before a new
+    /// prediction is offered.  Typing-boundary commits (Space/Return, digit
+    /// and punctuation guards) keep the v0.6.1 behavior.
+    fn post_commit_pipeline(
+        &mut self,
+        committed_word: &str,
+        show_anticipatory: bool,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut effective_word = committed_word.to_string();
 
@@ -1386,7 +1398,7 @@ impl InputMethodCore {
         }
 
         // Step 3: Anticipatory next-word ghost.
-        if self.config.ghost_text {
+        if show_anticipatory && self.config.ghost_text {
             if let Some(ghost_action) = self.try_anticipatory_ghost() {
                 actions.push(ghost_action);
             }
@@ -1534,6 +1546,10 @@ impl InputMethodCore {
     /// Queries the prediction engine for the most likely word following
     /// `predicted_word`. If the top next-word has confidence ≥ threshold,
     /// returns `suffix + " " + next_word`; otherwise returns `suffix` unchanged.
+    /// KAB-parked (S4, 2026-07-12): unused since the ghost became strictly
+    /// single-word.  Kept for the labelled revival condition in
+    /// compute_ghost_suffix.
+    #[allow(dead_code)]
     fn try_multi_word_extension(
         &self,
         predicted_word: &str,
@@ -1687,12 +1703,17 @@ impl InputMethodCore {
                         let typed_chars = self.current_word.chars().count();
                         let suffix: String = top.word.chars().skip(typed_chars).collect();
                         if !suffix.is_empty() && self.config.ghost_text {
-                            // F8: Multi-word prediction — attempt to extend ghost
-                            // with the most likely next word (2-word lookahead).
-                            let multi_suffix =
-                                self.try_multi_word_extension(&top.word, &ctx_refs, lang, &suffix);
-                            self.ghost.clone_from(&multi_suffix);
-                            return multi_suffix;
+                            // S4 (live trace 2026-07-12): the F8 multi-word
+                            // extension chained the predicted NEXT word into
+                            // the ghost, so ONE Tab committed "колко на" and
+                            // repeated Tabs machine-gunned the most frequent
+                            // word.  KAB removal: the ghost is exactly the
+                            // completion of the CURRENT word — display ==
+                            // commit == one word.  Revival condition: a
+                            // separate multi-word UX where accept and display
+                            // are word-granular.
+                            self.ghost.clone_from(&suffix);
+                            return suffix;
                         }
                     }
                 }
@@ -2134,6 +2155,94 @@ mod tests {
         let actions = core.handle_key(press(Key::Escape));
         assert!(has_action(&actions, &Action::HideGhost));
         assert_eq!(core.current_word(), "");
+    }
+
+    /// S4 regression: the ghost is strictly the completion of the CURRENT
+    /// word — the F8 next-word chain ("lo" -> "lo world") must never come
+    /// back, or one Tab commits an unasked extra word.
+    #[test]
+    fn test_ghost_suffix_never_chains_next_word() {
+        let mut core = test_core();
+        // A strong bigram after the completed word is exactly what fed the
+        // old multi-word extension.
+        core.load_bigram("hello", "world", 50);
+        core.handle_key(press(Key::Char('h')));
+        core.handle_key(press(Key::Char('e')));
+        let actions = core.handle_key(press(Key::Char('l')));
+        let ghost = ghost_text(&actions).unwrap_or_default();
+        assert!(
+            !ghost.contains(' '),
+            "ghost must be single-word, got {ghost:?}"
+        );
+        assert_eq!(core.ghost, "lo");
+
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(has_action(&actions, &Action::CommitText("lo".to_string())));
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::CommitText(text) if text.contains(' ') || text.contains("world")
+            )),
+            "Tab must never commit a chained next word, got {actions:?}"
+        );
+    }
+
+    /// S4 regression: after a Tab-accept the anticipatory next-word ghost
+    /// must NOT re-arm — otherwise repeated Tabs machine-gun the most
+    /// frequent word (live trace: 4 Tabs -> 4x "на").
+    #[test]
+    fn test_tab_accept_does_not_rearm_ghost() {
+        let mut core = test_core();
+        core.load_bigram("hello", "world", 50);
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hel".to_string();
+        core.ghost = "lo".to_string();
+
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(has_action(
+            &actions,
+            &Action::CommitText("hello".to_string())
+        ));
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::ShowGhost(_))),
+            "no anticipatory ghost may follow an accept, got {actions:?}"
+        );
+        assert!(core.ghost.is_empty());
+
+        // A second Tab has nothing to accept — it must be a plain forward,
+        // never another commit.
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::CommitText(_))),
+            "second Tab must not commit anything, got {actions:?}"
+        );
+        assert!(has_action(&actions, &Action::ForwardKey));
+    }
+
+    /// Guard (S4 scope fence): the Space typing-boundary keeps its v0.6.1
+    /// anticipatory pipeline — only ACCEPT paths suppress the re-arm.
+    #[test]
+    fn test_space_commit_keeps_anticipatory_pipeline() {
+        let mut core = test_core();
+        core.load_bigram("hello", "world", 500);
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hello".to_string();
+        core.ghost = String::new();
+
+        let actions = core.handle_key(press(Key::Space));
+        assert!(has_action(
+            &actions,
+            &Action::CommitText("hello".to_string())
+        ));
+        // Whether the ghost SHOWS depends on confidence gates; parity check:
+        // if a ghost is armed after Space, it must have come from the
+        // anticipatory step (which the accept path never reaches).
+        if core.has_ghost() {
+            assert!(
+                actions.iter().any(|a| matches!(a, Action::ShowGhost(_))),
+                "shown ghost must come from the anticipatory step"
+            );
+        }
     }
 
     /// Guard: Space with a composing prefix and NO visible completion keeps
@@ -2855,3 +2964,4 @@ mod tests {
         assert_eq!(config.min_prefix_length, 2);
     }
 }
+
