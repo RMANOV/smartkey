@@ -13,7 +13,7 @@ byte-for-byte identical.
 | Level | How | What is logged |
 |---|---|---|
 | off | (default) | nothing |
-| structural | `SMARTKEY_DEBUG=1` or `./smartkey-debug enable` | verdicts, state, lengths, **script classes (cyr/lat/…)** — no typed text |
+| structural | `SMARTKEY_DEBUG=1` or `./smartkey-debug enable` | verdicts, state, lengths, **script classes (cyr/lat/…)** — no typed text: printable keys appear only as `key_class=char` + `key_lang`; raw keyname/keyval/keycode are kept for special keys (Tab/BackSpace/…) only |
 | full | `SMARTKEY_DEBUG=full` or `./smartkey-debug enable full` | + verbatim typed/ghost/committed/predictions (plaintext banner on start) |
 
 Script classes are always logged: `committed_lang=lat` while `typed_lang=cyr`

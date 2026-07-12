@@ -217,12 +217,17 @@ if _DEBUG:
 # Keystroke diagnostic trace (spec 2026-07-12).  Import must never take the
 # engine down; a missing module simply means tracing stays off.
 try:
-    from smartkey_debug import KeystrokeTrace, lang_class
+    from smartkey_debug import LEVEL_FULL, KeystrokeTrace, lang_class
 except ImportError:  # engine imported from a different sys.path root
     try:
-        from ibus.smartkey_debug import KeystrokeTrace, lang_class  # type: ignore
+        from ibus.smartkey_debug import (  # type: ignore
+            LEVEL_FULL,
+            KeystrokeTrace,
+            lang_class,
+        )
     except ImportError:
         KeystrokeTrace = None  # type: ignore[assignment,misc]
+        LEVEL_FULL = 2
 
         def lang_class(_text: object) -> str:  # type: ignore[misc]
             return "empty"
@@ -568,18 +573,20 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         action_types = {action_type for action_type, _ in actions}
         # Tab-only accept (2026-07-12): Space/Return commits are the TYPED
         # word, never an acceptance — they fall through to the rejection
-        # bookkeeping below (reason="word_boundary").
+        # bookkeeping below (reason="word_boundary").  The old
+        # "space_autocommit" reason died with the aggressive path; a Space
+        # ``replace`` now only means a post-commit caps/translit correction
+        # of the typed word, which must not be logged as an acceptance.
         accepted = keyval == IBus.KEY_Tab and "commit" in action_types
-        auto_accepted = keyval == IBus.KEY_space and "replace" in action_types
 
-        if accepted or auto_accepted:
+        if accepted:
             self._log_replay_event(
                 "accepted",
                 prediction_id=prediction_id,
                 word=pending_prediction.get("word"),
                 ghost=pending_prediction.get("ghost"),
                 confidence=pending_prediction.get("confidence"),
-                reason="tab" if accepted else "space_autocommit",
+                reason="tab",
             )
             self._clear_active_prediction_if(prediction_id)
             return
@@ -691,9 +698,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if committed and not key_release:
             committed_text = "".join(committed)
             typed_prefix = getattr(self, "_last_composing_typed", "")
+            # Same printable-key privacy rule as key_in: a composing-guard
+            # commit can be triggered by a printable char (digit/punct).
+            keyname = self._keyname(keyval)
+            if len(keyname) == 1 and trace.level < LEVEL_FULL:
+                keyname = f"char:{lang_class(keyname)}"
             trace.emit(
                 "accept",
-                key=self._keyname(keyval),
+                key=keyname,
                 committed_text=committed_text,
                 typed_prefix=typed_prefix,
                 committed_lang=lang_class(committed_text),
@@ -941,16 +953,23 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         tracing = trace is not None and trace.enabled
         if tracing:
             trace.begin_keystroke()
-            trace.emit(
-                "key_in",
-                keycode=keycode,
-                keyval=keyval,
-                keyname=self._keyname(keyval),
-                mods=state,
-                is_release=bool(state & (1 << 30)),
-                cursor_pos=self._surrounding_cursor_pos,
-                surrounding_text=self._surrounding_text,
-            )
+            # Privacy: a printable key IS the typed text.  At structural
+            # level only its class + script class are logged; the raw
+            # keyname/keyval/keycode (all reconstruct the keystream) are
+            # reserved for special keys or level=full.
+            keyname = self._keyname(keyval)
+            is_printable = len(keyname) == 1
+            fields: dict[str, object] = {
+                "mods": state,
+                "is_release": bool(state & (1 << 30)),
+                "cursor_pos": self._surrounding_cursor_pos,
+                "surrounding_text": self._surrounding_text,
+                "key_class": "char" if is_printable else "special",
+                "key_lang": lang_class(keyname) if is_printable else "empty",
+            }
+            if not is_printable or trace.level >= LEVEL_FULL:
+                fields.update(keycode=keycode, keyval=keyval, keyname=keyname)
+            trace.emit("key_in", **fields)
 
         if self._is_spurious_zero_key_event(keyval, keycode, state):
             if tracing:

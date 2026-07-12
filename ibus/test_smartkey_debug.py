@@ -187,6 +187,51 @@ def test_lang_class_catches_space_inject_signature(tmp_path):
     assert accept["committed_lang"] != accept["typed_lang"], "inject signature"
 
 
+def test_structural_printable_keystream_not_reconstructible(tmp_path):
+    # ADVOCATE MAJOR M1: at level=1 the old key_in carried keyname=chr(keyval)
+    # + raw keyval for EVERY key — the whole keystream was verbatim
+    # reconstructible.  Drive real printable keyvals and assert the trace
+    # carries only class + script class.
+    eng, _rec = build_engine(scripts=[[("forward", "")] for _ in "tajna"])
+    trace = _attach_trace(eng, tmp_path, LEVEL_STRUCTURAL)
+    for ch in "tajna":
+        eng.do_process_key_event(ord(ch), 20, 0)
+
+    events = _read_events(trace)
+    key_ins = [e for e in events if e["event"] == "key_in"]
+    assert len(key_ins) == len("tajna")
+    for event in key_ins:
+        assert "keyname" not in event, "printable keyname leaks the keystream"
+        assert "keyval" not in event, "raw keyval reconstructs the keystream"
+        assert "keycode" not in event, "raw keycode reconstructs the keystream"
+        assert event["key_class"] == "char"
+        assert event["key_lang"] == "lat"
+    text = trace._file.read_text(encoding="utf-8")  # noqa: SLF001
+    for ch in "tajn":
+        assert f'"{ch}"' not in text, f"char {ch!r} visible at structural level"
+
+
+def test_structural_special_keys_keep_names_full_keeps_chars(tmp_path):
+    # Special keys are not content: their names stay even at structural.
+    eng, _rec = build_engine(
+        scripts=[[("forward", "")], [("hide", ""), ("forward", "")]]
+    )
+    trace = _attach_trace(eng, tmp_path, LEVEL_STRUCTURAL)
+    eng.do_process_key_event(_KEY_TAB, 23, 0)
+    eng.do_process_key_event(_KEY_BACKSPACE, 22, 0)
+    events = _read_events(trace)
+    names = [e.get("keyname") for e in events if e["event"] == "key_in"]
+    assert names == ["Tab", "BackSpace"]
+
+    # At level=full the printable keyname is present (diagnosis needs it).
+    eng2, _rec2 = build_engine(scripts=[[("forward", "")]])
+    trace2 = _attach_trace(eng2, tmp_path / "full", LEVEL_FULL)
+    eng2.do_process_key_event(ord("x"), 53, 0)
+    events2 = _read_events(trace2)
+    key_in = next(e for e in events2 if e["event"] == "key_in")
+    assert key_in["keyname"] == "x" and key_in["keyval"] == ord("x")
+
+
 # --- Debug dir guardrails --------------------------------------------------------
 def test_debug_dir_inside_repo_is_refused(monkeypatch):
     repo = smartkey_debug.repo_root()
