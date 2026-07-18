@@ -486,6 +486,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             "prediction_id": self._prediction_seq,
             "word": top_word,
             "ghost": ghost,
+            # Typed prefix at show time — used to key session rejection memory.
+            "prefix": self._core_current_word(),
             "score": top_score,
             "confidence": top_confidence,
         }
@@ -613,7 +615,58 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             confidence=pending_prediction.get("confidence"),
             reason=reason,
         )
+        if reason in ("continued_typing", "word_boundary"):
+            self._feed_rejection_memory(reason, pending_prediction)
         self._clear_active_prediction_if(prediction_id)
+
+    def _core_current_word(self) -> str:
+        """The live typed prefix from the core, or "" on an older native module."""
+        getter = getattr(self._core, "current_word", None)
+        if not callable(getter):
+            return ""
+        try:
+            return getter() or ""
+        except Exception:  # pragma: no cover - defensive; never break input
+            return ""
+
+    def _feed_rejection_memory(
+        self,
+        reason: str,
+        pending_prediction: dict[str, object],
+    ) -> None:
+        """Record a typed-through / word-boundary rejection into session memory.
+
+        Guarded with ``hasattr`` so an older native module (without the API)
+        keeps working.  A word-boundary commit while a ghost was still pending
+        is always a genuine rejection (the user committed a shorter word).  For
+        continued typing we only count it when the new prefix *diverged* from
+        the completion — typing the completion out by hand is acceptance, not
+        rejection, and must never be suppressed.
+        """
+        recorder = getattr(self._core, "record_ghost_rejection", None)
+        if not callable(recorder):
+            return
+        prefix = str(pending_prediction.get("prefix") or "")
+        completion = str(pending_prediction.get("word") or "")
+        if not prefix or not completion:
+            return
+        if reason == "continued_typing":
+            live = self._core_current_word()
+            # Empty (can't tell) or still a prefix of the completion → the user
+            # is completing it, not rejecting it.  Err toward NOT suppressing.
+            if not live or completion.lower().startswith(live.lower()):
+                return
+        elif reason == "word_boundary":
+            # A multi-word ghost can keep the prediction pending even after the
+            # first word was typed in full.  Committing that exact word is an
+            # acceptance, not a rejection.
+            committed = str(pending_prediction.get("pre_key_word") or "")
+            if committed and committed.lower() == completion.lower():
+                return
+        try:
+            recorder(prefix, completion)
+        except Exception:  # pragma: no cover - defensive; never break input
+            log.debug("smartkey: record_ghost_rejection failed", exc_info=True)
 
     # -----------------------------------------------------------------------
     # Keystroke diagnostic trace (spec 2026-07-12).
@@ -982,6 +1035,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             if self._active_prediction is not None
             else None
         )
+        if pending_prediction is not None:
+            # Word being typed *before* this key acts — lets a word-boundary
+            # rejection tell "committed a shorter word" (reject) apart from
+            # "typed the completion out in full then a boundary" (accept).
+            pending_prediction["pre_key_word"] = self._core_current_word()
         if not key_release:
             self._refresh_surrounding_text()
 
