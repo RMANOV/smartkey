@@ -199,6 +199,12 @@ else:
 # ---------------------------------------------------------------------------
 _IS_WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
 
+# IBUS_CAP_SURROUNDING_TEXT (1 << 5): the client can service
+# delete_surrounding_text().  Clients that do not advertise it may silently
+# ignore the delete, which duplicates the committed word on a post-commit
+# replace (live trace: "spri" -> "spriспри").
+_CAP_SURROUNDING_TEXT = 1 << 5
+
 # Legacy content logs (predictions.log / replay.jsonl) carry verbatim words,
 # so they are gated on the CONTENT level only: SMARTKEY_DEBUG=1 now means
 # "structural keystroke trace, no content" (see smartkey_debug.py).
@@ -943,17 +949,21 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     # The current word exists only in the composing preedit;
                     # never delete already-committed browser text for it.
                     self._safe_commit(text)
-                else:
+                elif self._client_supports_surrounding_text():
                     if self._preedit_active:
                         self._clear_ghost()
-                    if self._caps & 0x20:  # SURROUNDING_TEXT capability
-                        self.delete_surrounding_text(-replace_len, replace_len)
-                    else:
-                        # Fallback: backspace key events for apps without
-                        # surrounding text support (GTK4 Wayland, Electron, etc.)
-                        for _ in range(replace_len):
-                            self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
+                    self.delete_surrounding_text(-replace_len, replace_len)
                     self._safe_commit(text)
+                else:
+                    # Raw-wins (defect A): without a confirmed surrounding-text
+                    # capability the delete can be silently ignored, duplicating
+                    # the already-committed word ("spri" -> "spriспри" in the
+                    # live trace).  Keep the user's raw characters instead.
+                    log.debug(
+                        "smartkey: skipping post-commit replace %r "
+                        "(client lacks surrounding-text capability)",
+                        text,
+                    )
                 composing_resolution_pending = False
             elif action_type == "composing":
                 decoded = ffi_decode_composing_payload(payload)
@@ -979,6 +989,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
     def do_set_capabilities(self, caps: int) -> None:
         self._caps = caps
+
+    def _client_supports_surrounding_text(self) -> bool:
+        """True only when the IBus client positively advertises surrounding text.
+
+        Conservative by design: an unknown/zero capability set returns False so
+        a post-commit replace is skipped rather than risking a delete the client
+        ignores (which duplicated committed text in the live trace).
+        """
+        return bool(self._caps & _CAP_SURROUNDING_TEXT)
 
     def do_set_surrounding_text(
         self, text: object, cursor_pos: int, anchor_pos: int
