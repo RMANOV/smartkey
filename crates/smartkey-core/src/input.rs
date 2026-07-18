@@ -139,6 +139,13 @@ pub struct InputConfig {
     pub use_hedge: bool,
     /// Enable neural reranker for nonlinear feature interactions (Phase 3).
     pub use_reranker: bool,
+    // ── Raw-wins policy (defect A) ───────────────────────────────
+    /// Allow the post-commit pipeline to REWRITE already-committed text via
+    /// `ReplaceWord` (language auto-correction + auto-capitalization).
+    /// Default `false`: the user's typed characters are authoritative and are
+    /// never silently rewritten after commit. Anticipatory next-word ghosting
+    /// is independent of this flag.
+    pub post_commit_autocorrect: bool,
     // ── Dual buffer (v0.5.0) ─────────────────────────────────────
     /// Enable layout-agnostic dual-buffer input.
     pub dual_buffer: DualBufferConfig,
@@ -168,6 +175,7 @@ impl Default for InputConfig {
             use_kneser_ney: true,
             use_hedge: true,
             use_reranker: true,
+            post_commit_autocorrect: false,
             dual_buffer: DualBufferConfig::default(),
         }
     }
@@ -185,6 +193,9 @@ impl InputConfig {
             }
             if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
                 config.ghost_text = b;
+            }
+            if let Some(b) = v.get("post_commit_autocorrect").and_then(|v| v.as_bool()) {
+                config.post_commit_autocorrect = b;
             }
             if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
                 config.max_candidates = (n as usize).max(1);
@@ -288,6 +299,9 @@ impl InputConfig {
         }
         if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
             config.ghost_text = b;
+        }
+        if let Some(b) = v.get("post_commit_autocorrect").and_then(|v| v.as_bool()) {
+            config.post_commit_autocorrect = b;
         }
         if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
             if n < 1 {
@@ -1394,17 +1408,24 @@ impl InputMethodCore {
         let mut actions = Vec::new();
         let mut effective_word = committed_word.to_string();
 
-        // Step 1: Language auto-correction.
-        if let Some(correction) = self.try_language_correction(&effective_word) {
-            if let Action::ReplaceWord { ref text, .. } = correction {
-                effective_word = text.clone();
+        // Steps 1 & 2 REWRITE already-committed text via ReplaceWord. Under the
+        // raw-wins policy (defect A, default) the user's typed characters are
+        // authoritative and must never be silently rewritten post-commit — the
+        // live trace showed this both mis-correcting and, in some clients,
+        // duplicating text. Gate both behind the opt-in flag.
+        if self.config.post_commit_autocorrect {
+            // Step 1: Language auto-correction.
+            if let Some(correction) = self.try_language_correction(&effective_word) {
+                if let Action::ReplaceWord { ref text, .. } = correction {
+                    effective_word = text.clone();
+                }
+                actions.push(correction);
             }
-            actions.push(correction);
-        }
 
-        // Step 2: Auto-capitalization.
-        if let Some(cap_action) = self.try_auto_capitalize(&effective_word) {
-            actions.push(cap_action);
+            // Step 2: Auto-capitalization.
+            if let Some(cap_action) = self.try_auto_capitalize(&effective_word) {
+                actions.push(cap_action);
+            }
         }
 
         // Step 3: Anticipatory next-word ghost.
@@ -2033,6 +2054,51 @@ mod tests {
         );
         assert!(has_action(&actions, &Action::CommitText("hel".to_string())));
         assert!(has_action(&actions, &Action::ForwardKey));
+    }
+
+    /// Raw-wins (defect A): a core whose only vocabulary is the BG
+    /// transliteration target of a Latin word. Under flag-on, committing the
+    /// Latin word would trigger language auto-correction to Cyrillic.
+    fn raw_wins_core(post_commit_autocorrect: bool) -> InputMethodCore {
+        let config = InputConfig {
+            post_commit_autocorrect,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
+        // transliterate("zdrave") == "здраве" (verified in lang_detect tests).
+        core.load_word("здраве", 500_000);
+        core
+    }
+
+    /// Default (raw-wins): Space commits the TYPED word and never emits a
+    /// post-commit ReplaceWord — the user's raw characters stand.
+    #[test]
+    fn raw_wins_default_does_not_replace_typed_word_on_space() {
+        let mut core = raw_wins_core(false);
+        core.current_word = "zdrave".to_string();
+        let actions = core.handle_key(press(Key::Space));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })),
+            "raw-wins default must not rewrite the typed word, got {actions:?}"
+        );
+    }
+
+    /// Flag-on: the legacy language auto-correction is preserved — the same
+    /// Space commit emits the ReplaceWord rewrite to the Cyrillic form.
+    #[test]
+    fn post_commit_autocorrect_flag_restores_language_correction_on_space() {
+        let mut core = raw_wins_core(true);
+        core.current_word = "zdrave".to_string();
+        let actions = core.handle_key(press(Key::Space));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { text, .. } if text == "здраве")),
+            "flag-on must restore language correction, got {actions:?}"
+        );
     }
 
     /// Anti-desync + anti-double: Tab commits EXACTLY the last displayed
