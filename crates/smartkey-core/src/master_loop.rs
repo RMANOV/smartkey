@@ -202,6 +202,14 @@ impl MasterLoop {
             self.anticipated = false;
             self.core.clear_hints();
             self.frustration.reset_word();
+            // A typed-through boundary (Space/Return/punctuation) resolves the
+            // ghost's fate; the adapter records that rejection, so the cache
+            // must not linger and be re-attributed to a later ABANDON (that is
+            // the double-count path). Tab-accept keeps it so a following
+            // REJECT (accept-then-delete) can still attribute the completion.
+            if !is_tab {
+                self.last_shown_ghost = None;
+            }
         }
 
         // Remember the ghost currently on screen (post-suppression) so a later
@@ -371,8 +379,19 @@ impl MasterLoop {
     /// the ghost is suppressed for the rest of the session. Called by the
     /// platform adapter for "typed through" / word-boundary rejections that
     /// never surface as a Rust-side frustration signal.
+    ///
+    /// This resolves the current ghost's fate, so the frustration cache is
+    /// invalidated: the same outcome cannot also be recorded by a later
+    /// REJECT/ABANDON (one user rejection → at most one record).
     pub fn record_ghost_rejection(&mut self, prefix: &str, completion: &str) {
         self.rejections.record(prefix, completion);
+        self.last_shown_ghost = None;
+    }
+
+    /// Whether `completion` is currently suppressed for the typed `prefix`
+    /// (K=2 rejections reached this session). Read-only; for diagnostics/tests.
+    pub fn is_ghost_suppressed(&self, prefix: &str, completion: &str) -> bool {
+        self.rejections.is_suppressed(prefix, completion)
     }
 
     /// Number of distinct prefixes tracked by the session rejection memory.
@@ -628,8 +647,12 @@ impl MasterLoop {
 
     /// Record the last displayed ghost into the session rejection memory.
     /// No-op when no ghost is currently attributed.
+    ///
+    /// Consume-once: the cache is TAKEN, not cloned, so a single shown ghost
+    /// can seed at most one frustration-derived record — a later signal cannot
+    /// double-count the same (prefix, completion).
     fn record_last_ghost_rejection(&mut self) {
-        if let Some((prefix, completion)) = self.last_shown_ghost.clone() {
+        if let Some((prefix, completion)) = self.last_shown_ghost.take() {
             self.rejections.record(&prefix, &completion);
         }
     }
@@ -921,6 +944,56 @@ mod tests {
         );
     }
 
+    /// Pre-registered scope pin (defect B, suppression_threshold 3 -> 2): a
+    /// persisted CorrectionMemory entry with EXACTLY count=2 must now trigger
+    /// the override — it would NOT have under the old threshold of 3.
+    #[test]
+    fn persisted_correction_count_two_triggers_override() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let profile_path = dir.path().join("master_loop_profile.json");
+
+        let mut corrections = CorrectionMemory::new();
+        let ctx_hash = CorrectionMemory::context_hash(None, None);
+        corrections.record(ctx_hash, "hello", "help");
+        corrections.record(ctx_hash, "hello", "help"); // exactly 2 (== K)
+
+        let mut profile = PersonalProfile::new(
+            test_cvm_snapshot(),
+            PersonalMarkovSnapshot {
+                bigrams: vec![],
+                trigrams: vec![],
+            },
+            None,
+        );
+        profile.corrections = Some(corrections.to_snapshot());
+
+        std::fs::write(
+            &profile_path,
+            serde_json::to_string_pretty(&profile).expect("profile should serialize"),
+        )
+        .expect("profile should write");
+
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 100);
+        ml.load_word("help", 80);
+        ml.load_personal(&profile_path)
+            .expect("profile should load into master loop");
+
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        let actions = ml.handle_key(make_key(Key::Char('l')));
+
+        assert_eq!(
+            ml.predictions().first().map(|p| p.word.as_str()),
+            Some("help"),
+            "count=2 persisted correction must override under threshold=2"
+        );
+        assert_eq!(ghost_text(&actions).as_deref(), Some("p"));
+    }
+
     #[test]
     fn surrounding_text_biases_predictions() {
         let mut ml = MasterLoop::new(InputConfig {
@@ -1007,6 +1080,38 @@ mod tests {
             ghost_text(&actions).as_deref(),
             Some("lo"),
             "a single rejection must not suppress the ghost"
+        );
+    }
+
+    /// Regression (double-count lifecycle): a SINGLE user rejection recorded at
+    /// a word boundary must not be re-counted by a later ABANDON that inherits
+    /// a stale ghost cache — otherwise one rejection reaches K=2 and suppression
+    /// would fire on the 2nd attempt instead of the 3rd.
+    #[test]
+    fn word_boundary_record_then_abandon_counts_once() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 100);
+
+        // Ghost shown for "hel", then the user types through the boundary
+        // (Space). handle_key commits; the adapter then records the
+        // word_boundary rejection exactly once.
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        ml.handle_key(make_key(Key::Char('l')));
+        ml.handle_key(make_key(Key::Space));
+        ml.record_ghost_rejection("hel", "hello");
+
+        // A later, unrelated ABANDON (Escape on the anticipatory ghost, then a
+        // keystroke) must NOT re-record the same (prefix, completion).
+        ml.handle_key(make_key(Key::Escape));
+        ml.handle_key(make_key(Key::Char('q')));
+
+        assert!(
+            !ml.is_ghost_suppressed("hel", "hello"),
+            "one word-boundary rejection must stay at count 1, not double to K=2"
         );
     }
 
