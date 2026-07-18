@@ -1,0 +1,54 @@
+# O1 / PHASE-A RECEIPT 4 — ROLLBACK DRY-RUN (destructive commands NOT executed)
+
+worktree HEAD: 47acd8a12ec16b9e5aeb60a63f4bf43550f04405   git 2.54.0
+prediction_scope = ngram_component ONLY (ensemble firewalled out of the measured path)
+
+## Exact executable rollback — validated absolute paths, in order
+
+```bash
+# (a) remove the linked worktree (deletes the whole dir, incl. untracked lab_corpus/):
+git -C /home/rmanov/smartkey-phase-a-lab worktree remove --force /home/rmanov/smartkey-o1-lab
+
+# (b) delete the work branch:
+git -C /home/rmanov/smartkey-phase-a-lab branch -D agent/o1-p1-calibration
+
+# (c) remove the pinned corpus copies — SUBSUMED by (a) (see validation below);
+#     only needed as a fallback if (a) was skipped or the dir persists:
+rm -rf /home/rmanov/smartkey-o1-lab/lab_corpus
+
+# (d) remove the scratch data outputs (OUTSIDE the repo; not touched by (a)):
+rm -rf /tmp/claude-1000/-home-rmanov-smartkey-phase-a-lab/179f182b-c6aa-4af8-b4ef-df37d19ebd44/scratchpad/o1-phasea-data
+```
+
+## Path + effect validation (read-only; destructive commands NOT run)
+
+Validated 2026-07-19 against the live filesystem:
+
+```
+-C repo   /home/rmanov/smartkey-phase-a-lab                                     EXISTS (dir)
+worktree  /home/rmanov/smartkey-o1-lab                                          EXISTS (dir)
+branch    agent/o1-p1-calibration                                              present
+corpus    /home/rmanov/smartkey-o1-lab/lab_corpus                              EXISTS (dir)
+scratch   /tmp/.../179f182b-c6aa-4af8-b4ef-df37d19ebd44/scratchpad/o1-phasea-data  EXISTS (dir)
+```
+
+- `lab_corpus/` is **inside** the worktree (verified: the path resolves under
+  `/home/rmanov/smartkey-o1-lab/`). `git worktree remove --force` deletes the
+  entire working-tree directory including untracked files, so **(a) SUBSUMES (c)** —
+  (c) is a fallback only.
+- git 2.54 `worktree remove` has **no `--dry-run` flag**; `--force` removes even a
+  dirty/untracked tree (usage: `git worktree remove [-f] <worktree>`).
+- Effect of (a): the `~/smartkey-o1-lab` directory (all committed-on-branch work +
+  untracked lab_corpus/) is deleted. Base commit `47acd8a` and all repo history stay
+  intact; the branch's commits remain reachable via reflog until gc.
+- Effect of (b): deletes branch `agent/o1-p1-calibration`.
+- Effect of (d): removes the scratch data dir (event DBs, salt, sweep receipts) that
+  lives OUTSIDE the repo and is untouched by (a)/(b).
+
+The four commands above were **NOT executed**. This is a dry-run validation only.
+
+## Not part of rollback
+
+Push-URL restore (`git remote set-url --push origin <url>`) is **NOT** part of
+rollback. The push URL stays `DISABLED` and its restoration remains
+**operator-gated** (explicit operator GO only). Isolation is plumbing, not will.

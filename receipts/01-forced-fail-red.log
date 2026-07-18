@@ -1,0 +1,67 @@
+O1 / PHASE-A RECEIPT 1 — FORCED-FAIL RED (injected miscalibration)
+generated: 2026-07-18T21:46:38+03:00   worktree HEAD: 47acd8a12ec16b9e5aeb60a63f4bf43550f04405
+prediction_scope = ngram_component ONLY (ensemble firewalled out of the measured path)
+injection: overconfidence probability skew — scoring-half realized hit-rate depressed by Δ=0.35,
+           reported p_top3 held honest; the FIT-half isotonic map then overshoots -> §5 gap FAIL clause.
+command: python3 -m phase_a.corpus_replay --events 8000 --seed 20260719 --fresh --inject-skew 0.35 --db $DATA/gate_red.db
+==================================================================================
+{
+  "db_path": "/tmp/claude-1000/-home-rmanov-smartkey-phase-a-lab/179f182b-c6aa-4af8-b4ef-df37d19ebd44/scratchpad/o1-phasea-data/gate_red.db",
+  "n_events": 8000,
+  "resolutions": 8000,
+  "raw_hit_rate": 0.3545,
+  "distinct_contexts_used": 2534,
+  "freq_table_hash": "05a454f49b68ad9e81fff789d85ce76cbbfa5a3f63acdceeb0285a0fc08c1b39",
+  "corpus_files": [
+    "/home/rmanov/smartkey-o1-lab/lab_corpus/corpus_bg.json",
+    "/home/rmanov/smartkey-o1-lab/lab_corpus/corpus_en.json",
+    "/home/rmanov/smartkey-o1-lab/lab_corpus/corpus_tech.json"
+  ],
+  "sweep_days": 15,
+  "window_days": 14,
+  "inject_skew": 0.35,
+  "harness_version": "o1-phase-a-harness/1.0.0",
+  "prediction_scope": "ngram_component"
+}
+----------------------------------------------------------------------------------
+command: python3 -m phase_a.analyze --synthetic --db $DATA/gate_red.db   (exit: 0=PASS 2=FAIL 3=INCONCLUSIVE)
+==================================================================================
+========================================================================
+ O1 / PHASE-A ANALYSIS REPORT  (synthetic data)
+ prediction_scope: ngram_component  (n-gram component ONLY; ensemble firewalled out)
+ db: /tmp/claude-1000/-home-rmanov-smartkey-phase-a-lab/179f182b-c6aa-4af8-b4ef-df37d19ebd44/scratchpad/o1-phasea-data/gate_red.db
+ freq-table hash (n-gram version pin): 05a454f49b68ad9e...
+========================================================================
+ events (total)      : 8000
+ resolutions         : 8000   (>= 5000 for PASS)
+ unresolved          : 0  (0.00%)   (FAIL if > 5%)
+ latency p99         : 78 us   (budget 20000 us)
+ events > 20ms       : 0.000%   (PASS <=1% / FAIL >1%)
+ watchdog missed days: 0   (in-band alarm raised: False)
+ split               : fit=4000  score=4000
+------------------------------------------------------------------------
+ surviving buckets (gate on CALIBRATED p; raw p is baseline only):
+  #  raw_p[lo..hi]         n     raw_p̄   |raw-hit|   cal_p̄   hit     |cal-hit|
+  0  [0.01807..0.11029]     806  0.0468   |0.047|    0.0390  0.0000   0.0390
+  1  [0.11088..0.30821]     889  0.1998   |0.200|    0.2052  0.0000   0.2052  <-- FAIL gap
+  2  [0.30943..0.56627]     763  0.4460   |0.349|    0.4678  0.0970   0.3708  <-- FAIL gap
+  3  [0.56679..0.91126]     769  0.7433   |0.353|    0.7704  0.3901   0.3802  <-- FAIL gap
+  4  [0.91178..1.00000]     773  0.9905   |0.364|    0.9938  0.6261   0.3677  <-- FAIL gap
+------------------------------------------------------------------------
+ VERDICT: FAIL
+   - |mean_p-hit_rate|>0.1 in 4 buckets (>= 3)
+========================================================================
+ note: low raw hit-rate is NOT failure (~20-35% top-3 expected for BG;
+ Phase-A tests the plumbing, not the model). Green kills nothing above; red
+ kills/redesigns the n-gram plumbing.
+
+Phase-A green ≠ ensemble/live-predictor calibration (prediction_scope=ngram_component ONLY: no Hedge/calibrator/neural-reranker/PPM/BPE in the measured path).
+Phase-A green ≠ proof of team tier.
+ANALYZE_EXIT=2
+----------------------------------------------------------------------------------
+CONTRAST — the SAME harness, SAME corpus, NO injection -> PASS (exit 0):
+ resolutions         : 12000   (>= 5000 for PASS)
+ events > 20ms       : 0.000%   (PASS <=1% / FAIL >1%)
+ watchdog missed days: 0   (in-band alarm raised: False)
+ VERDICT: PASS
+CLEAN_ANALYZE_EXIT=0

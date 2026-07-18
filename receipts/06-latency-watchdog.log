@@ -1,0 +1,47 @@
+O1 / PHASE-A RECEIPT 6 — LATENCY (<=1% >20ms) + WATCHDOG (0 missed) on the corpus copies
+generated: 2026-07-18T21:46:44+03:00   worktree HEAD: 47acd8a12ec16b9e5aeb60a63f4bf43550f04405
+prediction_scope = ngram_component ONLY. latency_us = per-event decision + durable-write cost.
+source: clean lab run over pinned lab_corpus/ (12000 resolutions, simulated 14-day window).
+==================================================================================
+# analyze JSON (latency + watchdog fields):
+{
+  "prediction_scope": "ngram_component",
+  "total_events": 12000,
+  "resolutions": 12000,
+  "unresolved_frac": 0.0,
+  "over_budget_frac": 0.0,
+  "latency_p99_us": 96,
+  "missed_watchdog": 0,
+  "alarm_raised": false,
+  "verdict": "PASS"
+}
+----------------------------------------------------------------------------------
+# latency distribution (us) direct from the event log:
+ n_events        : 12000
+ latency min     : 0 us
+ latency p50     : 32 us
+ latency p99     : 96 us
+ latency p99.9   : 167 us
+ latency max     : 349 us
+ events > 20ms   : 0  (0.0000%)   gate: <=1% for PASS
+----------------------------------------------------------------------------------
+# daily sweep receipt + 48h watchdog (0 missed):
+ latency p99       : 96 us   (budget 20000)
+ events > 20ms     : 0.000%
+ no-LLM invariant  : OK
+ watchdog          : OK
+ running raw-p bucket table:
+   bucket   n     raw_p̄    hit_rate
+     0     2207   0.0465    0.0476
+     1     2497   0.1980    0.1906
+     2     2496   0.4333    0.4443
+     3     2400   0.7376    0.7450
+     4     2400   0.9878    0.9917
+==============================================================
+Phase-A green ≠ ensemble/live-predictor calibration (prediction_scope=ngram_component ONLY: no Hedge/calibrator/neural-reranker/PPM/BPE in the measured path).
+Phase-A green ≠ proof of team tier.
+--- watchdog ---
+watchdog OK: last sweep 0.0h ago
+Phase-A green ≠ ensemble/live-predictor calibration (prediction_scope=ngram_component ONLY: no Hedge/calibrator/neural-reranker/PPM/BPE in the measured path).
+Phase-A green ≠ proof of team tier.
+WATCHDOG_EXIT=0
