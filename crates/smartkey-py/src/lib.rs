@@ -234,6 +234,19 @@ impl PyInputMethodCore {
     fn debug_state(&self) -> (bool, bool, bool) {
         self.inner.debug_state()
     }
+
+    /// The word currently being typed (the live prefix). The adapter reads
+    /// this to attribute ghost rejections to the exact typed prefix.
+    fn current_word(&self) -> String {
+        self.inner.current_word().to_string()
+    }
+
+    /// Record a session-scoped ghost rejection: the user rejected
+    /// `completion` for the typed `prefix`. After K=2 such rejections the
+    /// completion is no longer offered for that prefix this session.
+    fn record_ghost_rejection(&mut self, prefix: &str, completion: &str) {
+        self.inner.record_ghost_rejection(prefix, completion);
+    }
 }
 
 #[pymodule]

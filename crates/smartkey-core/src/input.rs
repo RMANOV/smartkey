@@ -1039,6 +1039,16 @@ impl InputMethodCore {
         &self.ghost
     }
 
+    /// Clear the visible ghost completion suffix.
+    ///
+    /// Used by `MasterLoop` to enforce session-scoped rejection suppression
+    /// after a completion has already been computed. Leaves `last_predictions`
+    /// intact so telemetry still sees what *would* have been offered; only the
+    /// on-screen ghost is removed.
+    pub fn clear_ghost(&mut self) {
+        self.ghost.clear();
+    }
+
     /// The last two committed words (prev1, prev2) for context hashing.
     pub fn context_words(&self) -> (Option<&str>, Option<&str>) {
         let prev1 = self.context.back().map(|s| s.as_str());
@@ -2964,4 +2974,3 @@ mod tests {
         assert_eq!(config.min_prefix_length, 2);
     }
 }
-

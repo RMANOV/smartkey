@@ -19,6 +19,7 @@ use crate::frustration::{FrustrationDetector, FrustrationSignal};
 use crate::input::{Action, InputConfig, InputMethodCore, KeyEvent};
 use crate::lang_detect::{DetectedLanguage, LangId};
 use crate::light_profile::LightProfile;
+use crate::rejection_memory::RejectionMemory;
 
 /// State machine phases for the master loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,9 @@ pub struct MasterLoop {
     phase: Phase,
     frustration: FrustrationDetector,
     corrections: CorrectionMemory,
+    /// Session-scoped suppression of ghosts the user keeps rejecting.
+    /// Never persisted — decays when the engine process exits.
+    rejections: RejectionMemory,
     light_profile: LightProfile,
     context_sampler: Box<dyn ContextSampler>,
     /// Words remaining for ghost suppression after frustration.
@@ -87,6 +91,9 @@ pub struct MasterLoop {
     surrounding_text: Option<String>,
     /// Cursor position inside `surrounding_text` when provided by the platform.
     surrounding_cursor_pos: Option<usize>,
+    /// The `(typed_prefix, completion)` of the ghost most recently shown, so a
+    /// later frustration signal (REJECT/ABANDON) can record it as a rejection.
+    last_shown_ghost: Option<(String, String)>,
 }
 
 impl MasterLoop {
@@ -96,6 +103,7 @@ impl MasterLoop {
             phase: Phase::Anticipating,
             frustration: FrustrationDetector::new(),
             corrections: CorrectionMemory::new(),
+            rejections: RejectionMemory::new(),
             light_profile: LightProfile::default(),
             context_sampler: Box::new(NullContextSampler),
             suppress_countdown: 0,
@@ -105,6 +113,7 @@ impl MasterLoop {
             anticipated: false,
             surrounding_text: None,
             surrounding_cursor_pos: None,
+            last_shown_ghost: None,
         }
     }
 
@@ -154,6 +163,10 @@ impl MasterLoop {
         };
         let mut actions = self.core.handle_key(event.clone());
         self.apply_correction_override(&mut actions);
+        // Session-scoped rejection memory: drop a ghost the user has already
+        // rejected K times for this exact prefix. Runs *after* the correction
+        // override so both the normal ghost and the replacement are covered.
+        self.enforce_rejection_suppression(&mut actions);
 
         if resets_context {
             self.anticipated = false;
@@ -162,6 +175,7 @@ impl MasterLoop {
             self.frustration.reset_word();
             self.last_tab_accept = None;
             self.last_accepted_prediction = None;
+            self.last_shown_ghost = None;
         }
 
         // Track Tab acceptance time for REJECT detection.
@@ -190,6 +204,10 @@ impl MasterLoop {
             self.frustration.reset_word();
         }
 
+        // Remember the ghost currently on screen (post-suppression) so a later
+        // REJECT/ABANDON can attribute the rejection to the right completion.
+        self.note_shown_ghost(&actions);
+
         actions
     }
 
@@ -203,6 +221,7 @@ impl MasterLoop {
         self.frustration.reset_word();
         self.surrounding_text = None;
         self.surrounding_cursor_pos = None;
+        self.last_shown_ghost = None;
         self.core.focus_lost()
     }
 
@@ -216,6 +235,7 @@ impl MasterLoop {
         self.frustration.reset_word();
         self.surrounding_text = None;
         self.surrounding_cursor_pos = None;
+        self.last_shown_ghost = None;
         self.core.reset()
     }
 
@@ -345,6 +365,21 @@ impl MasterLoop {
         self.corrections.to_snapshot().entries.len()
     }
 
+    /// Record that the user rejected `completion` for the typed `prefix`.
+    ///
+    /// Session-scoped: after K=2 rejections of the same (prefix, completion)
+    /// the ghost is suppressed for the rest of the session. Called by the
+    /// platform adapter for "typed through" / word-boundary rejections that
+    /// never surface as a Rust-side frustration signal.
+    pub fn record_ghost_rejection(&mut self, prefix: &str, completion: &str) {
+        self.rejections.record(prefix, completion);
+    }
+
+    /// Number of distinct prefixes tracked by the session rejection memory.
+    pub fn rejection_prefix_count(&self) -> usize {
+        self.rejections.len()
+    }
+
     // ======================================================================
     // Internal: Anticipation
     // ======================================================================
@@ -462,6 +497,8 @@ impl MasterLoop {
                         self.corrections.record(ctx_hash, accepted, current);
                     }
                 }
+                // Accepted-then-deleted is an explicit rejection of that ghost.
+                self.record_last_ghost_rejection();
             }
             FrustrationSignal::RapidDelete { severity, .. } => {
                 self.light_profile.record_reject();
@@ -488,6 +525,7 @@ impl MasterLoop {
                 self.suppress_countdown = 1;
                 // Escape + manual typing = explicit rejection of the ghost.
                 self.record_ghost_as_negative();
+                self.record_last_ghost_rejection();
             }
         }
     }
@@ -532,6 +570,67 @@ impl MasterLoop {
             actions[idx] = override_action;
         } else {
             actions.push(override_action);
+        }
+    }
+
+    /// Suppress the about-to-be-shown ghost if the user has already rejected
+    /// this exact completion for the current typed prefix K times this session.
+    ///
+    /// Rewrites the outgoing ghost action so nothing is offered:
+    ///   * `ShowGhost` → `HideGhost`
+    ///   * `ShowComposing { typed, .. }` → `ShowComposing { typed, ghost: "" }`
+    ///     (keeps the typed preedit intact — only the completion is dropped).
+    fn enforce_rejection_suppression(&mut self, actions: &mut [Action]) {
+        let Some(completion) = self.core.predictions().first().map(|p| p.word.clone()) else {
+            return;
+        };
+        let prefix = self.core.current_word().to_string();
+        if prefix.is_empty() || !self.rejections.is_suppressed(&prefix, &completion) {
+            return;
+        }
+
+        self.core.clear_ghost();
+        for action in actions.iter_mut() {
+            match action {
+                Action::ShowGhost(_) => *action = Action::HideGhost,
+                Action::ShowComposing { typed, ghost } => {
+                    if !ghost.is_empty() {
+                        *action = Action::ShowComposing {
+                            typed: std::mem::take(typed),
+                            ghost: String::new(),
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Cache the ghost currently on screen as `(typed_prefix, completion)` so a
+    /// subsequent frustration signal can record which completion was rejected.
+    /// Left unchanged when the turn shows no ghost, so it survives an
+    /// intervening Escape/commit until the context is reset.
+    fn note_shown_ghost(&mut self, actions: &[Action]) {
+        let shows_ghost = actions
+            .iter()
+            .any(|action| matches!(action, Action::ShowGhost(_) | Action::ShowComposing { .. }));
+        if !shows_ghost {
+            return;
+        }
+        let prefix = self.core.current_word();
+        if prefix.is_empty() {
+            return;
+        }
+        if let Some(completion) = self.core.predictions().first().map(|p| p.word.clone()) {
+            self.last_shown_ghost = Some((prefix.to_string(), completion));
+        }
+    }
+
+    /// Record the last displayed ghost into the session rejection memory.
+    /// No-op when no ghost is currently attributed.
+    fn record_last_ghost_rejection(&mut self) {
+        if let Some((prefix, completion)) = self.last_shown_ghost.clone() {
+            self.rejections.record(&prefix, &completion);
         }
     }
 
@@ -847,6 +946,97 @@ mod tests {
         assert!(
             world_pos.unwrap() < worry_pos.unwrap(),
             "surrounding text should rank 'world' above 'worry'"
+        );
+    }
+
+    #[test]
+    fn rejection_memory_suppresses_ghost_after_two_rejections() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 100);
+
+        // Baseline: "hel" offers the "hello" completion as a ghost.
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        let baseline = ml.handle_key(make_key(Key::Char('l')));
+        assert_eq!(ghost_text(&baseline).as_deref(), Some("lo"));
+        // Smart-caps capitalizes the sentence-initial completion; rejection
+        // memory normalizes case, so recording lowercase still matches.
+        assert_eq!(
+            ml.predictions().first().map(|p| p.word.as_str()),
+            Some("Hello")
+        );
+
+        // The user rejects "Hello" for prefix "hel" twice (K=2).
+        ml.record_ghost_rejection("hel", "hello");
+        ml.record_ghost_rejection("hel", "hello");
+
+        // Fresh word, same prefix → the ghost must now be suppressed.
+        ml.focus_lost();
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        let suppressed = ml.handle_key(make_key(Key::Char('l')));
+        assert!(
+            ghost_text(&suppressed).is_none(),
+            "ghost should be suppressed after two rejections, got {suppressed:?}"
+        );
+        assert!(suppressed
+            .iter()
+            .any(|action| matches!(action, Action::HideGhost)));
+        assert!(!ml.has_ghost());
+        assert_eq!(ml.ghost_text(), "");
+    }
+
+    #[test]
+    fn single_rejection_does_not_suppress_ghost() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 100);
+
+        // Only one rejection — below the K=2 threshold.
+        ml.record_ghost_rejection("hel", "hello");
+
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        let actions = ml.handle_key(make_key(Key::Char('l')));
+        assert_eq!(
+            ghost_text(&actions).as_deref(),
+            Some("lo"),
+            "a single rejection must not suppress the ghost"
+        );
+    }
+
+    #[test]
+    fn abandon_signal_feeds_rejection_memory() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 100);
+
+        // Show a ghost, then Escape + type manually twice (ABANDON) to reject
+        // the "hello" completion at prefix "hel" the required K=2 times.
+        for _ in 0..2 {
+            ml.handle_key(make_key(Key::Char('h')));
+            ml.handle_key(make_key(Key::Char('e')));
+            ml.handle_key(make_key(Key::Char('l')));
+            ml.handle_key(make_key(Key::Escape));
+            ml.handle_key(make_key(Key::Char('x')));
+            ml.focus_lost();
+        }
+
+        // The abandon signals should have recorded the rejection.
+        assert!(ml.rejection_prefix_count() >= 1);
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        let actions = ml.handle_key(make_key(Key::Char('l')));
+        assert!(
+            ghost_text(&actions).is_none(),
+            "abandon-recorded rejections should suppress the ghost, got {actions:?}"
         );
     }
 

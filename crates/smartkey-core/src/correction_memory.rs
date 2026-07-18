@@ -43,7 +43,9 @@ impl CorrectionMemory {
         Self {
             entries: HashMap::new(),
             max_entries: 500,
-            suppression_threshold: 3,
+            // K=2: aligns with the session-scoped RejectionMemory so a
+            // completion the user has rejected twice is suppressed/replaced.
+            suppression_threshold: 2,
             access_counter: 0,
         }
     }
@@ -138,8 +140,7 @@ mod tests {
         let mut mem = CorrectionMemory::new();
         let hash = CorrectionMemory::context_hash(Some("the"), Some("quick"));
         mem.record(hash, "fox", "cat");
-        mem.record(hash, "fox", "cat");
-        // Only 2 corrections — threshold is 3, should not suppress yet
+        // Only 1 correction — threshold is 2, should not suppress yet
         assert!(mem.check(hash, "fox").is_none());
     }
 
@@ -149,8 +150,7 @@ mod tests {
         let hash = CorrectionMemory::context_hash(Some("the"), Some("quick"));
         mem.record(hash, "fox", "cat");
         mem.record(hash, "fox", "cat");
-        mem.record(hash, "fox", "cat");
-        // 3 corrections — should now suppress
+        // 2 corrections — should now suppress
         let result = mem.check(hash, "fox");
         assert_eq!(result, Some("cat".to_string()));
     }
