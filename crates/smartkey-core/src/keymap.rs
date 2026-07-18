@@ -44,6 +44,38 @@ pub fn is_alpha_scancode(code: u16) -> bool {
     )
 }
 
+/// Scancodes that are PUNCTUATION in EN QWERTY but LETTERS in BG phonetic
+/// (26/27/41/43 → ш/щ/ч/ю). Caps Lock must case-fold the BG interpretation of
+/// these while leaving the EN punctuation ('[' ']' '`' '\\') untouched.
+pub fn is_bg_only_letter_scancode(code: u16) -> bool {
+    matches!(code, 26 | 27 | 41 | 43)
+}
+
+/// Map a scancode to both EN and BG interpretations honoring a Caps Lock latch.
+///
+/// Caps case-folds LETTER keys only (standard semantics; digits/punctuation are
+/// unaffected):
+///   - shared A-Z positions: both sides (same letter on both layouts);
+///   - BG-only letter positions (ш/щ/ч/ю): the BG side ONLY — the EN
+///     punctuation on those keys is left exactly as Shift alone produced it.
+pub fn scancode_to_both_caps(code: u16, shift: bool, caps: bool) -> Option<(char, char)> {
+    // Shared letters flip on both sides; everything else keeps plain Shift here.
+    let effective_shift = if caps && is_alpha_scancode(code) {
+        !shift
+    } else {
+        shift
+    };
+    let (en, bg) = scancode_to_both(code, effective_shift)?;
+
+    // BG-only letters: re-case the BG side alone (caps XOR shift == !shift here,
+    // since this branch only runs when caps is set), keeping the EN punctuation.
+    if caps && is_bg_only_letter_scancode(code) {
+        let bg = bg_phonetic(code, !shift)?;
+        return Some((en, bg));
+    }
+    Some((en, bg))
+}
+
 /// Resolve a scancode to a platform-neutral special key, if applicable.
 ///
 /// Used by the RawCode handler to route special keys through the existing
@@ -382,5 +414,71 @@ mod tests {
         assert_eq!(scancode_to_char(44, true, Layout::Bg), Some('З'));
         assert_eq!(scancode_to_char(17, true, Layout::Bg), Some('В'));
         assert_eq!(scancode_to_char(41, true, Layout::Bg), Some('Ч'));
+    }
+
+    #[test]
+    fn caps_folds_shared_letters_on_both_sides() {
+        // scancode 30 = a/а. Caps → 'A'/'А'; Caps+Shift → back to 'a'/'а'.
+        assert_eq!(scancode_to_both_caps(30, false, true), Some(('A', 'А')));
+        assert_eq!(scancode_to_both_caps(30, true, true), Some(('a', 'а')));
+    }
+
+    #[test]
+    fn caps_folds_bg_only_letters_on_bg_side_only() {
+        // scancode 26 = '[' (EN) / 'ш' (BG). Caps must uppercase the BG letter
+        // to 'Ш' while leaving the EN '[' punctuation untouched.
+        assert_eq!(scancode_to_both_caps(26, false, true), Some(('[', 'Ш')));
+        // Caps + Shift → BG lowercase 'ш'; EN keeps its Shift form '{'.
+        assert_eq!(scancode_to_both_caps(26, true, true), Some(('{', 'ш')));
+        // All four BG-only letter positions covered on the BG side.
+        assert_eq!(
+            scancode_to_both_caps(26, false, true).map(|(_, b)| b),
+            Some('Ш')
+        );
+        assert_eq!(
+            scancode_to_both_caps(27, false, true).map(|(_, b)| b),
+            Some('Щ')
+        );
+        assert_eq!(
+            scancode_to_both_caps(41, false, true).map(|(_, b)| b),
+            Some('Ч')
+        );
+        assert_eq!(
+            scancode_to_both_caps(43, false, true).map(|(_, b)| b),
+            Some('Ю')
+        );
+        // ...and their EN punctuation is never touched by caps.
+        assert_eq!(
+            scancode_to_both_caps(27, false, true).map(|(e, _)| e),
+            Some(']')
+        );
+        assert_eq!(
+            scancode_to_both_caps(41, false, true).map(|(e, _)| e),
+            Some('`')
+        );
+        assert_eq!(
+            scancode_to_both_caps(43, false, true).map(|(e, _)| e),
+            Some('\\')
+        );
+    }
+
+    #[test]
+    fn caps_does_not_affect_digits_or_shared_punctuation() {
+        // scancode 2 = '1'/'1' — caps must not make '!'.
+        assert_eq!(scancode_to_both_caps(2, false, true), Some(('1', '1')));
+        // scancode 39 = ';'/';' — shared punctuation, unaffected by caps.
+        assert_eq!(scancode_to_both_caps(39, false, true), Some((';', ';')));
+    }
+
+    #[test]
+    fn caps_off_matches_plain_resolution() {
+        assert_eq!(
+            scancode_to_both_caps(30, false, false),
+            scancode_to_both(30, false)
+        );
+        assert_eq!(
+            scancode_to_both_caps(26, true, false),
+            scancode_to_both(26, true)
+        );
     }
 }

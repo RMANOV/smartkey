@@ -619,15 +619,10 @@ impl InputMethodCore {
         // a regular Key before entering the main match.
         let event = if let Key::RawCode(code) = event.key {
             let shift = event.modifiers.contains(Modifiers::SHIFT);
-            // Caps Lock inverts shift for LETTER keys only (standard semantics);
-            // digits and punctuation are unaffected by the latch.
-            let effective_shift = if event.modifiers.contains(Modifiers::CAPS_LOCK)
-                && keymap::is_alpha_scancode(code)
-            {
-                !shift
-            } else {
-                shift
-            };
+            // Caps Lock case-folds LETTER keys only (both the shared A-Z keys
+            // and the BG-only ш/щ/ч/ю positions on their BG side); digits and
+            // punctuation are unaffected. See keymap::scancode_to_both_caps.
+            let caps = event.modifiers.contains(Modifiers::CAPS_LOCK);
             // Special keys (Tab, Space, etc.) → rewrite to their Key variant.
             if let Some(special) = keymap::scancode_to_special(code) {
                 let key = match special {
@@ -649,7 +644,7 @@ impl InputMethodCore {
                     key,
                     modifiers: event.modifiers,
                 }
-            } else if let Some((en_ch, bg_ch)) = keymap::scancode_to_both(code, effective_shift) {
+            } else if let Some((en_ch, bg_ch)) = keymap::scancode_to_both_caps(code, shift, caps) {
                 if en_ch != bg_ch && self.config.dual_buffer.enabled {
                     // Dual-interpretable character → handle via dual buffer.
                     return self.handle_dual_buffer_key(en_ch, bg_ch);
