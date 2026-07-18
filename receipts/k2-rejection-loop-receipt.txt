@@ -1,0 +1,27 @@
+SmartKey — K=2 Rejection-Loop Structural Receipt
+=================================================
+generated: 2026-07-18T21:51:25Z
+vehicle:   headless lab driver (receipts/k2_rejection_loop.py); NO live-engine interaction
+
+Pipeline exercised (REAL, end-to-end):
+  do_process_key_event -> _execute_actions -> _finalize_prediction_outcome
+  core:  worktree-built smartkey_py (Rust MasterLoop + RejectionMemory), the
+         actual suppression logic — not a stub
+  ibus:  module _FakeIBus fallback (no display server, no GObject)
+  data:  in-memory corpus {"hello": 100000}; NO personal profile; NO disk;
+         SMARTKEY_PHASEA_DATA -> throwaway tempdir
+  config: {"ghost_text_separation_margin": 0.0}
+
+Semantics under test: K=2 — the same completion rejected for the same typed
+input twice is not offered on the 3rd attempt (session-scoped, decays with the
+process).
+
+Sequence:
+  attempt 1: type 'h','e','l'  -> ghost for 'hello' SHOWN   (core actions on 'l': [('ghost', 'lo'), ('forward', '')])
+             reject via Space (commit 'hel')          -> recorded rejection #1 of ('hel','hello')
+  attempt 2: type 'h','e','l'  -> ghost for 'hello' SHOWN   (core actions on 'l': [('ghost', 'lo'), ('forward', '')])
+             reject via Space (commit 'hel')          -> recorded rejection #2 of ('hel','hello')
+  attempt 3: type 'h','e','l'  -> ghost for 'hello' SUPPRESSED   (core actions on 'l': [('hide', ''), ('forward', '')])
+
+Verdict: attempts (ghost shown?) = [True, True, False]  (expected [True, True, False])
+RESULT: PASS — ghost SUPPRESSED on the 3rd attempt after K=2 rejections
