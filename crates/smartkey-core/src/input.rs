@@ -33,6 +33,8 @@ bitflags::bitflags! {
         const ALT     = 0x04;
         const SUPER   = 0x08;
         const SHIFT   = 0x10;
+        /// Caps Lock latch (IBus LOCK_MASK). Inverts shift for letter keys only.
+        const CAPS_LOCK = 0x20;
     }
 }
 
@@ -617,6 +619,15 @@ impl InputMethodCore {
         // a regular Key before entering the main match.
         let event = if let Key::RawCode(code) = event.key {
             let shift = event.modifiers.contains(Modifiers::SHIFT);
+            // Caps Lock inverts shift for LETTER keys only (standard semantics);
+            // digits and punctuation are unaffected by the latch.
+            let effective_shift = if event.modifiers.contains(Modifiers::CAPS_LOCK)
+                && keymap::is_alpha_scancode(code)
+            {
+                !shift
+            } else {
+                shift
+            };
             // Special keys (Tab, Space, etc.) → rewrite to their Key variant.
             if let Some(special) = keymap::scancode_to_special(code) {
                 let key = match special {
@@ -638,7 +649,7 @@ impl InputMethodCore {
                     key,
                     modifiers: event.modifiers,
                 }
-            } else if let Some((en_ch, bg_ch)) = keymap::scancode_to_both(code, shift) {
+            } else if let Some((en_ch, bg_ch)) = keymap::scancode_to_both(code, effective_shift) {
                 if en_ch != bg_ch && self.config.dual_buffer.enabled {
                     // Dual-interpretable character → handle via dual buffer.
                     return self.handle_dual_buffer_key(en_ch, bg_ch);
@@ -2099,6 +2110,46 @@ mod tests {
                 .any(|a| matches!(a, Action::ReplaceWord { text, .. } if text == "здраве")),
             "flag-on must restore language correction, got {actions:?}"
         );
+    }
+
+    /// Caps Lock modeling (defect A / R3): dual buffer disabled so a RawCode
+    /// letter key resolves to a single deterministic character.
+    fn caps_core() -> InputMethodCore {
+        let config = InputConfig {
+            dual_buffer: DualBufferConfig {
+                enabled: false,
+                ..DualBufferConfig::default()
+            },
+            ..InputConfig::default()
+        };
+        InputMethodCore::new(config)
+    }
+
+    #[test]
+    fn caps_lock_uppercases_letter_keycode() {
+        let mut core = caps_core();
+        // scancode 30 = the 'a' key; Caps Lock on, no Shift → 'A'.
+        core.handle_key(press_with(Key::RawCode(30), Modifiers::CAPS_LOCK));
+        assert_eq!(core.current_word, "A");
+    }
+
+    #[test]
+    fn caps_lock_plus_shift_lowercases_letter_keycode() {
+        let mut core = caps_core();
+        // Caps XOR Shift = false → lowercase 'a'.
+        core.handle_key(press_with(
+            Key::RawCode(30),
+            Modifiers::CAPS_LOCK | Modifiers::SHIFT,
+        ));
+        assert_eq!(core.current_word, "a");
+    }
+
+    #[test]
+    fn caps_lock_does_not_affect_digit_keycode() {
+        let mut core = caps_core();
+        // scancode 2 = the '1' key; Caps Lock must NOT make it '!'.
+        core.handle_key(press_with(Key::RawCode(2), Modifiers::CAPS_LOCK));
+        assert_eq!(core.current_word, "1");
     }
 
     /// Anti-desync + anti-double: Tab commits EXACTLY the last displayed

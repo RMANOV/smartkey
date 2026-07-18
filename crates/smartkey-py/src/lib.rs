@@ -94,6 +94,9 @@ fn raw_mods_to_modifiers(raw: u32) -> Modifiers {
     if raw & (1 << 0) != 0 {
         m |= Modifiers::SHIFT;
     } // SHIFT_MASK
+    if raw & (1 << 1) != 0 {
+        m |= Modifiers::CAPS_LOCK;
+    } // LOCK_MASK (Caps Lock)
     m
 }
 
