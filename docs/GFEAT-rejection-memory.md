@@ -47,7 +47,19 @@ session.
 5. **No false suppression.** Typing the completion out by hand (matching the
    ghost) is never recorded as a rejection, so good completions are not
    suppressed. Enforced by the divergence check in the adapter's
-   `_feed_rejection_memory`.
+   `_is_genuine_ghost_rejection`. **Telemetry alignment:** the replay log also
+   honors this — a manually completed ghost is written as event `completed`
+   with reason `completed_manually`, never as `rejected`; only a genuine
+   divergent/boundary rejection is logged `rejected` and fed to the memory.
+6. **One record per rejection.** A single user rejection produces at most one
+   recorded count. The frustration cache (`last_shown_ghost`) is consume-once
+   and is cleared on any derived record and on typed-through boundary commits,
+   so a boundary rejection cannot be re-counted by a later ABANDON. Verified by
+   `word_boundary_record_then_abandon_counts_once`.
+
+Punctuation word-boundaries (e.g. `.` `,` `!`) that commit the current word are
+in scope of criterion 1's "type through / word boundary" and are recorded on the
+same footing as Space/Return when they flow through the divergence guard.
 
 ## No-LLM-in-loop statement
 

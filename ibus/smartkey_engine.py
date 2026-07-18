@@ -540,6 +540,33 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 return False
         return False
 
+    @staticmethod
+    def _keyval_to_char(keyval: int) -> str:
+        """The unicode character a printable keyval produces, or '' if none."""
+        if 0x21 <= keyval <= 0x7E:
+            return chr(keyval)
+        if _HAS_IBUS and hasattr(IBus, "keyval_to_unicode"):
+            uni = IBus.keyval_to_unicode(keyval)
+            if uni and uni != "\0":
+                return uni
+        if 0x80 <= keyval <= 0xEFFF:
+            try:
+                return chr(keyval)
+            except (ValueError, OverflowError):
+                return ""
+        return ""
+
+    @classmethod
+    def _is_punctuation_boundary(cls, keyval: int) -> bool:
+        """A printable punctuation key that delimits a word (e.g. . , ! ? ;).
+
+        Such a key commits the word being typed, so — like Space/Return — an
+        unaccepted ghost at that moment is a word-boundary rejection.  Letters
+        and digits (which continue the word) are excluded.
+        """
+        ch = cls._keyval_to_char(keyval)
+        return len(ch) == 1 and ch.isprintable() and not ch.isalnum() and not ch.isspace()
+
     def _should_log_reject(self, keyval: int, key_release: bool) -> bool:
         if key_release or keyval in (IBus.KEY_Tab, IBus.KEY_Right):
             return False
@@ -608,21 +635,35 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             reason = "navigation"
         elif keyval == IBus.KEY_BackSpace:
             reason = "backspace"
-        elif keyval in (IBus.KEY_space, IBus.KEY_Return):
+        elif keyval in (IBus.KEY_space, IBus.KEY_Return) or self._is_punctuation_boundary(
+            keyval
+        ):
+            # Space/Return AND word-delimiting punctuation all commit the word;
+            # an unaccepted ghost here is a boundary rejection (guarded below by
+            # the pre-key word so a fully-typed completion is not counted).
             reason = "word_boundary"
         else:
             reason = "continued_typing"
 
+        # Typed-through / boundary outcomes are a REJECTION only when the user
+        # diverged from the ghost.  Typing the completion out by hand is an
+        # acceptance-by-typing (GFEAT #5): telemetry must NOT call it "rejected"
+        # and it must never be recorded as a rejection.
+        typed_through = reason in ("continued_typing", "word_boundary")
+        genuine = typed_through and self._is_genuine_ghost_rejection(
+            reason, pending_prediction
+        )
+        manual_completion = typed_through and not genuine
         self._log_replay_event(
-            "rejected",
+            "completed" if manual_completion else "rejected",
             prediction_id=prediction_id,
             word=pending_prediction.get("word"),
             ghost=pending_prediction.get("ghost"),
             confidence=pending_prediction.get("confidence"),
-            reason=reason,
+            reason="completed_manually" if manual_completion else reason,
         )
-        if reason in ("continued_typing", "word_boundary"):
-            self._feed_rejection_memory(reason, pending_prediction)
+        if genuine:
+            self._feed_rejection_memory(pending_prediction)
         self._clear_active_prediction_if(prediction_id)
 
     def _core_current_word(self) -> str:
@@ -635,19 +676,40 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         except Exception:  # pragma: no cover - defensive; never break input
             return ""
 
-    def _feed_rejection_memory(
+    def _is_genuine_ghost_rejection(
         self,
         reason: str,
         pending_prediction: dict[str, object],
-    ) -> None:
-        """Record a typed-through / word-boundary rejection into session memory.
+    ) -> bool:
+        """Whether a typed-through / word-boundary outcome is a REAL rejection.
 
+        Continued typing counts only when the new prefix DIVERGED from the
+        completion; a word-boundary commit counts unless the user typed the
+        completion out in full.  Both distinguish a rejection from
+        acceptance-by-typing (GFEAT #5).
+        """
+        completion = str(pending_prediction.get("word") or "")
+        if not completion:
+            return False
+        if reason == "continued_typing":
+            live = self._core_current_word()
+            # Empty (can't tell) or still a prefix of the completion → the user
+            # is completing it, not rejecting it.  Err toward NOT a rejection.
+            return bool(live) and not completion.lower().startswith(live.lower())
+        if reason == "word_boundary":
+            # A multi-word ghost can keep the prediction pending even after the
+            # first word was typed in full.  Committing that exact word is an
+            # acceptance, not a rejection.
+            committed = str(pending_prediction.get("pre_key_word") or "")
+            return not (committed and committed.lower() == completion.lower())
+        return False
+
+    def _feed_rejection_memory(self, pending_prediction: dict[str, object]) -> None:
+        """Record a CONFIRMED-genuine rejection into session memory.
+
+        Genuineness is decided by the caller via `_is_genuine_ghost_rejection`.
         Guarded with ``hasattr`` so an older native module (without the API)
-        keeps working.  A word-boundary commit while a ghost was still pending
-        is always a genuine rejection (the user committed a shorter word).  For
-        continued typing we only count it when the new prefix *diverged* from
-        the completion — typing the completion out by hand is acceptance, not
-        rejection, and must never be suppressed.
+        keeps working.
         """
         recorder = getattr(self._core, "record_ghost_rejection", None)
         if not callable(recorder):
@@ -656,19 +718,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         completion = str(pending_prediction.get("word") or "")
         if not prefix or not completion:
             return
-        if reason == "continued_typing":
-            live = self._core_current_word()
-            # Empty (can't tell) or still a prefix of the completion → the user
-            # is completing it, not rejecting it.  Err toward NOT suppressing.
-            if not live or completion.lower().startswith(live.lower()):
-                return
-        elif reason == "word_boundary":
-            # A multi-word ghost can keep the prediction pending even after the
-            # first word was typed in full.  Committing that exact word is an
-            # acceptance, not a rejection.
-            committed = str(pending_prediction.get("pre_key_word") or "")
-            if committed and committed.lower() == completion.lower():
-                return
         try:
             recorder(prefix, completion)
         except Exception:  # pragma: no cover - defensive; never break input
