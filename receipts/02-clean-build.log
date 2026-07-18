@@ -1,0 +1,55 @@
+O1 / PHASE-A RECEIPT 2 — CLEAN BASE BUILD / TEST LOG   (base 47acd8a, worktree HEAD 47acd8a12ec16b9e5aeb60a63f4bf43550f04405)
+generated: 2026-07-18T21:47:32+03:00
+NOTE: this harness is pure Python and touches ZERO Rust; the workspace below is the
+      unmodified base — proving the build/clippy/tests stay green (nothing broken).
+toolchain: cargo 1.87.0 (99624be96 2025-05-06) / rustc 1.87.0 (17067e9ac 2025-05-09)
+==================================================================================
+## cargo build --workspace
+   Compiling smartkey-mac v0.5.0 (/home/rmanov/smartkey-o1-lab/crates/smartkey-mac)
+   Compiling smartkey-py v0.5.0 (/home/rmanov/smartkey-o1-lab/crates/smartkey-py)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 26.92s
+EXIT=0
+----------------------------------------------------------------------------------
+## cargo clippy --all-targets   (0 new warnings)
+    Checking smartkey-py v0.5.0 (/home/rmanov/smartkey-o1-lab/crates/smartkey-py)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.33s
+EXIT=0
+clippy warning lines: 0   error lines: 0
+----------------------------------------------------------------------------------
+## cargo test --workspace
+     Running unittests src/lib.rs (target/debug/deps/smartkey_core-9ecae7d57e32eb53)
+test result: ok. 397 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+     Running tests/ffi_contract.rs (target/debug/deps/ffi_contract-1749065fc4e74780)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/integration.rs (target/debug/deps/integration-c5fafba6718844f6)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+     Running tests/virtual_typer.rs (target/debug/deps/virtual_typer-37743590ef318433)
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 127.80s
+     Running unittests src/lib.rs (target/debug/deps/smartkey_mac-25c7fcc7375c61f2)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/smartkey_playground-a31475d2cfa26755)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/smartkey_eval.rs (target/debug/deps/smartkey_eval-4a7ce9acee0bf618)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/presets_smoke.rs (target/debug/deps/presets_smoke-9caa67307e3626cc)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 394.47s
+     Running unittests src/lib.rs (target/debug/deps/smartkey_py-acc916da37be4b45)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/smartkey_win-c841cf4bc473b6d1)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/register.rs (target/debug/deps/smartkey_register-4cdecab9bced3aec)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+TOTAL: 445 passed / 0 failed
+EXIT=0
+----------------------------------------------------------------------------------
+## python setup (system interpreter; no live venv touched)
+python: Python 3.14.4  numpy: 2.3.5  sklearn: 1.8.0
+py_compile phase_a/*.py tests/*.py:
+  py_compile OK (exit 0)
+pytest tests/test_o1_phasea.py:
+...............                                                          [100%]
+15 passed in 4.45s
