@@ -34,7 +34,7 @@ from phase_a.analyze import analyze  # noqa: E402
 from phase_a.constants import PREDICTION_SCOPE  # noqa: E402
 from phase_a.freqmodel import FreqModel  # noqa: E402
 from phase_a.harness import connect  # noqa: E402
-from phase_a.paths import alarm_file, lab_corpus_files  # noqa: E402
+from phase_a.paths import alarm_file, lab_corpus_files, receipts_dir  # noqa: E402
 from phase_a.sweep import run_sweep, run_watchdog  # noqa: E402
 
 
@@ -173,8 +173,13 @@ def test_synthetic_sweep_cannot_cover_real_campaign(tmp_path):
 
 def test_foreign_real_sweep_cannot_cover_selected_run_id(tmp_path):
     db = tmp_path / "foreign-real-cannot-cover.db"
-    selected_ts = _add_campaign(db, "real-selected", synthetic=False)
-    foreign_ts = _add_campaign(db, "real-foreign", synthetic=False)
+    base_ts = time.time() - 60.0
+    selected_ts = _add_campaign(
+        db, "real-selected", synthetic=False, ts=base_ts
+    )
+    foreign_ts = _add_campaign(
+        db, "real-foreign", synthetic=False, ts=base_ts
+    )
     _add_scoped_sweep(
         db,
         "real-foreign",
@@ -274,6 +279,23 @@ def test_run_sweep_stamps_and_counts_only_selected_campaign(tmp_path):
     assert "campaign_run_id: real-selected" in receipt
 
 
+def test_run_sweep_preserves_receipts_for_multiple_campaigns(tmp_path):
+    db = tmp_path / "campaign-receipts.db"
+    base_ts = time.time() - 60.0
+    _add_campaign(db, "real-first", synthetic=False, ts=base_ts)
+    _add_campaign(db, "real-second", synthetic=False, ts=base_ts)
+    before = set(receipts_dir().glob("sweep-*-real-*.txt"))
+
+    run_sweep(db, campaign_run_id="real-first")
+    run_sweep(db, campaign_run_id="real-second")
+
+    created = set(receipts_dir().glob("sweep-*-real-*.txt")) - before
+    assert len(created) == 2
+    contents = {path.read_text(encoding="utf-8") for path in created}
+    assert any("campaign_run_id: real-first" in text for text in contents)
+    assert any("campaign_run_id: real-second" in text for text in contents)
+
+
 def test_watchdog_counts_selected_raw_events_even_when_analysis_excludes_them(
     tmp_path,
 ):
@@ -299,3 +321,11 @@ def test_watchdog_rejects_explicit_unknown_campaign(tmp_path):
 
     with pytest.raises(ValueError, match="campaign 'typo' not found in real scope"):
         run_watchdog(db, campaign_run_id="typo")
+
+
+def test_analyze_rejects_explicit_unknown_campaign(tmp_path):
+    db = tmp_path / "unknown-analysis-campaign.db"
+    _add_campaign(db, "real-known", synthetic=False)
+
+    with pytest.raises(ValueError, match="campaign 'typo' not found in real scope"):
+        analyze(db, campaign_run_id="typo")
