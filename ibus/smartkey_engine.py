@@ -342,7 +342,31 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._last_composing_typed: str = ""
 
         # Load corpus.
+        self._o1_corpus_loaded: list[str] = []
         self._load_corpus()
+
+        # O1 live-run collector (docs/O1-SHIM-DESIGN-2026-07-19.md): passive
+        # ngram-component tap, config-gated (default OFF — ships dark, A.1).
+        # Any init failure disables the shim and never affects input (A.4).
+        self._o1 = None
+        o1_cfg = user_cfg.get("o1_shim") if isinstance(user_cfg, dict) else None
+        if (
+            isinstance(o1_cfg, dict)
+            and o1_cfg.get("enabled")
+            and callable(getattr(self._core, "o1_snapshot", None))
+        ):
+            try:
+                from .o1_shim import O1Collector  # noqa: PLC0415
+
+                self._o1 = O1Collector(
+                    self._core,
+                    o1_cfg,
+                    self._o1_corpus_loaded,
+                    o1_cfg.get("engine_commit"),
+                )
+            except Exception:
+                log.exception("smartkey: o1 collector init failed — shim disabled")
+                self._o1 = None
 
     # -----------------------------------------------------------------------
     # Corpus loading.
@@ -407,6 +431,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             try:
                 self._core.load_corpus_file(str(path))
                 loaded_count += 1
+                self._o1_corpus_loaded.append(str(path))
             except (OSError, ValueError):
                 log.warning("Failed to load corpus %s", path, exc_info=True)
 
@@ -665,6 +690,31 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if genuine:
             self._feed_rejection_memory(pending_prediction)
         self._clear_active_prediction_if(prediction_id)
+
+    def _o1_notify(
+        self,
+        keyval: int,
+        key_release: bool,
+        actions: list[tuple[str, str]],
+        pending_prediction: dict[str, object] | None,
+        o1_pre_word: str,
+    ) -> None:
+        """O1 shim word-commit boundary (docs/O1-SHIM-DESIGN-2026-07-19.md §1).
+
+        A Tab-accept commits the full predicted word; a boundary key commits
+        the typed word captured pre-key. Every commit path feeds the collector
+        so a pending snapshot always resolves against the IMMEDIATELY next
+        committed word — never a later one. Never raises (A.4)."""
+        o1 = getattr(self, "_o1", None)
+        if o1 is None or key_release:
+            return
+        if keyval == IBus.KEY_Tab and any(t == "commit" for t, _ in actions):
+            word = str((pending_prediction or {}).get("word") or "")
+            if word:
+                o1.on_word_commit(word)
+            return
+        if o1_pre_word:
+            o1.on_word_commit(o1_pre_word)
 
     def _core_current_word(self) -> str:
         """The live typed prefix from the core, or "" on an older native module."""
@@ -1098,6 +1148,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return True
 
         key_release = bool(state & (1 << 30))  # IBUS_RELEASE_MASK
+        # O1 shim: the typed word about to be committed by a boundary key —
+        # captured BEFORE the core consumes the key (passive read, A.1).
+        # getattr: tests may construct the engine without full __init__.
+        o1_pre_word = ""
+        if (
+            getattr(self, "_o1", None) is not None
+            and not key_release
+            and (
+                keyval in (IBus.KEY_space, IBus.KEY_Return)
+                or self._is_punctuation_boundary(keyval)
+            )
+        ):
+            o1_pre_word = self._core_current_word()
         pending_prediction = (
             dict(self._active_prediction)
             if self._active_prediction is not None
@@ -1126,6 +1189,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._finalize_prediction_outcome(
                 keyval, key_release, actions, pending_prediction
             )
+            self._o1_notify(keyval, key_release, actions, pending_prediction, o1_pre_word)
             if tracing:
                 self._trace_key_result(keyval, key_release, actions, result)
             # Honor the core's forward/consume decision uniformly.  ``result`` is
@@ -1162,6 +1226,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._finalize_prediction_outcome(
             keyval, key_release, actions, pending_prediction
         )
+        self._o1_notify(keyval, key_release, actions, pending_prediction, o1_pre_word)
         if tracing:
             self._trace_key_result(keyval, key_release, actions, result)
         # Honor the core's forward/consume decision uniformly (see the keycode
@@ -1180,6 +1245,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         actions = self._core.focus_lost()
         self._execute_actions(actions)
         self._active_prediction = None
+        o1 = getattr(self, "_o1", None)
+        if o1 is not None:
+            o1.on_abandon()
         self._sync_surrounding_text(None, None)
         # Idle point: flush any buffered trace events off the hot path.
         trace = getattr(self, "_trace", None)
@@ -1198,6 +1266,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         actions = self._core.reset()
         self._execute_actions(actions)
         self._active_prediction = None
+        o1 = getattr(self, "_o1", None)
+        if o1 is not None:
+            o1.on_abandon()
         self._sync_surrounding_text(None, None)
         trace = getattr(self, "_trace", None)
         if trace is not None and trace.enabled:

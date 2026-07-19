@@ -247,20 +247,34 @@ def check_corpus_pin() -> tuple[bool, str]:
 
 
 def check_data_guard() -> tuple[bool, str]:
-    """data_dir() must refuse a path inside the live/operator tree."""
+    """data_dir() must refuse a path inside EITHER forbidden root — the live
+    tree (~/smartkey) AND the operator config (~/.config/smartkey). Dual-root
+    observed-refusal probe per shim spec A.3 (inherited 465110c2018f(a)):
+    each root gets its own executed probe; declaration/import ≠ proof."""
     old = os.environ.get("SMARTKEY_PHASEA_DATA")
-    os.environ["SMARTKEY_PHASEA_DATA"] = str(Path.home() / "smartkey" / "should-refuse")
-    blocked = False
+    probes = {
+        "live": Path.home() / "smartkey" / "should-refuse",
+        "config": Path.home() / ".config" / "smartkey" / "should-refuse",
+    }
+    refused: dict[str, bool] = {}
     try:
-        data_dir()
-    except RuntimeError:
-        blocked = True
+        for name, probe in probes.items():
+            os.environ["SMARTKEY_PHASEA_DATA"] = str(probe)
+            try:
+                data_dir()
+                refused[name] = False
+            except RuntimeError:
+                refused[name] = True
     finally:
         if old is not None:
             os.environ["SMARTKEY_PHASEA_DATA"] = old
         else:
             os.environ.pop("SMARTKEY_PHASEA_DATA", None)
-    return blocked, f"live_path_refused={blocked}"
+    ok = all(refused.values()) and len(refused) == 2
+    return ok, (
+        f"live_path_refused={refused.get('live')} "
+        f"config_path_refused={refused.get('config')}"
+    )
 
 
 CHECKS = [
@@ -274,7 +288,7 @@ CHECKS = [
     ("8 live sweep + watchdog", check_live_sweep_watchdog),
     ("9 scope firewall (no ensemble/PyO3 import)", check_scope_firewall_static),
     ("10 corpus pin matches frozen sha256", check_corpus_pin),
-    ("11 data guard refuses live tree", check_data_guard),
+    ("11 data guard refuses live + operator config roots", check_data_guard),
 ]
 
 
