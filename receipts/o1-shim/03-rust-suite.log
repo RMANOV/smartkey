@@ -1,0 +1,32 @@
+     Running unittests src/lib.rs (target/debug/deps/smartkey_core-9ecae7d57e32eb53)
+test result: ok. 424 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+     Running tests/ffi_contract.rs (target/debug/deps/ffi_contract-1749065fc4e74780)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/integration.rs (target/debug/deps/integration-c5fafba6718844f6)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+     Running tests/virtual_typer.rs (target/debug/deps/virtual_typer-37743590ef318433)
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 97.51s
+     Running unittests src/lib.rs (target/debug/deps/smartkey_mac-25c7fcc7375c61f2)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/smartkey_playground-a31475d2cfa26755)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/smartkey_eval.rs (target/debug/deps/smartkey_eval-4a7ce9acee0bf618)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/presets_smoke.rs (target/debug/deps/presets_smoke-9caa67307e3626cc)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 240.81s
+     Running unittests src/lib.rs (target/debug/deps/smartkey_py-acc916da37be4b45)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/smartkey_win-c841cf4bc473b6d1)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/register.rs (target/debug/deps/smartkey_register-4cdecab9bced3aec)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests smartkey_core
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests smartkey_mac
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests smartkey_playground
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests smartkey_win
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s
+DONE
