@@ -935,8 +935,8 @@ impl InputMethodCore {
         self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked())
     }
 
-    /// Accept the visible ghost completion (shared by Tab and the
-    /// Space/Return word-boundary accept).
+    /// Accept the visible ghost completion when the user presses Tab.
+    /// Space/Return commit only the typed word and never call this path.
     ///
     /// Full-word composing (b3a2cb2) keeps the ENTIRE typed word in the
     /// preedit until commit, regardless of dual-buffer lock state — "lock is
