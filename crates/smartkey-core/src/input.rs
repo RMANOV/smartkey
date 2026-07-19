@@ -486,6 +486,20 @@ impl InputMethodCore {
         self.lang_detector.clear_prior();
     }
 
+    // -- O1 shim (delegate to engine; docs/O1-SHIM-DESIGN-2026-07-19.md) --
+
+    pub fn o1_ngram_snapshot(
+        &self,
+        ctx: &str,
+        uni_top3_cache: &[String],
+    ) -> (Vec<String>, crate::o1_shim::O1Numbers) {
+        self.engine.o1_ngram_snapshot(ctx, uni_top3_cache)
+    }
+
+    pub fn o1_global_unigram_top3(&self) -> Vec<String> {
+        self.engine.o1_global_unigram_top3()
+    }
+
     // -- corpus loading (delegate to engine) ----------------------------
 
     pub fn load_word(&mut self, word: &str, freq: u32) {

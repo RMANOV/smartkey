@@ -16,6 +16,13 @@ use smartkey_core::MasterLoop;
 #[pyclass(unsendable)]
 struct PyInputMethodCore {
     inner: MasterLoop,
+    /// O1 shim: pending snapshot top-3. Held in core memory only to compute
+    /// the `{0,1}` outcome bit — candidate words never cross the FFI and are
+    /// never persisted (docs/O1-SHIM-DESIGN-2026-07-19.md).
+    o1_pending: Option<Vec<String>>,
+    /// O1 shim: compute-once cache of the global unigram top-3 back-off list
+    /// (`FreqModel._unigram_top3` parity: precomputed once, then frozen).
+    o1_uni_top3: Option<Vec<String>>,
 }
 
 /// Convert an `Action` to a Python-friendly `(type, payload)` tuple.
@@ -111,6 +118,8 @@ impl PyInputMethodCore {
         };
         Self {
             inner: MasterLoop::new(config),
+            o1_pending: None,
+            o1_uni_top3: None,
         }
     }
 
@@ -249,6 +258,38 @@ impl PyInputMethodCore {
     /// completion is no longer offered for that prefix this session.
     fn record_ghost_rejection(&mut self, prefix: &str, completion: &str) {
         self.inner.record_ghost_rejection(prefix, completion);
+    }
+
+    /// O1 shim (docs/O1-SHIM-DESIGN-2026-07-19.md): take one ngram-component
+    /// snapshot at a word boundary. The top-3 stays in core memory; the FFI
+    /// returns numbers only: `(n_candidates, p_top3, core_latency_us)`.
+    fn o1_snapshot(&mut self, ctx: &str) -> (u32, f64, u64) {
+        if self.o1_uni_top3.is_none() {
+            self.o1_uni_top3 = Some(self.inner.o1_global_unigram_top3());
+        }
+        let cache = self.o1_uni_top3.as_deref().unwrap_or(&[]);
+        let (top3, numbers) = self.inner.o1_ngram_snapshot(ctx, cache);
+        self.o1_pending = Some(top3);
+        (
+            numbers.n_candidates,
+            numbers.p_top3,
+            numbers.core_latency_us,
+        )
+    }
+
+    /// O1 shim: resolve the pending snapshot against the committed token.
+    /// Returns the `{0,1}` outcome bit, or `None` when nothing is pending.
+    /// The stored top-3 is discarded either way.
+    fn o1_resolve(&mut self, token: &str) -> Option<u8> {
+        self.o1_pending
+            .take()
+            .map(|top3| u8::from(top3.iter().any(|w| w == token)))
+    }
+
+    /// O1 shim: drop any pending snapshot without resolving (focus loss /
+    /// reset) so a stale top-3 can never resolve against an unrelated word.
+    fn o1_abandon(&mut self) {
+        self.o1_pending = None;
     }
 }
 
