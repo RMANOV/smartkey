@@ -52,13 +52,16 @@ module set; the p it records comes from raw counts only.
 
 `latency_us` for a live row = monotonic elapsed time
 (`time.perf_counter_ns()`, integer µs, adapter-side) from immediately
-BEFORE the `o1_snapshot(ctx)` FFI call to immediately AFTER the in-memory
-enqueue of the prediction row returns.
+BEFORE the `o1_snapshot(ctx)` FFI call to immediately AFTER the prediction
+row (including this latency value) is fully constructed — i.e. up to the
+point just before the queue push.
 
 - Interval CONTAINS: PyO3 crossing, core raw-table query (top3 + p_top3),
-  context-hash HMAC computation, queue push.
-- Interval EXCLUDES: the background writer's SQLite INSERT/UPDATE/commit
-  (async, outside the hot path per Δ2), and the resolution step.
+  context-hash HMAC computation, row construction.
+- Interval EXCLUDES: the queue push itself (sub-µs; excluded so the row
+  can carry its own final latency without a hot-path read-back race), the
+  background writer's SQLite INSERT/UPDATE/commit (async, outside the hot
+  path per Δ2), and the resolution step.
 - Measurement point: the word-commit boundary in the adapter — the only
   place the shim adds hot-path work; this is the full cost the shim adds
   to a live keystroke path per event, measured conservatively
@@ -171,6 +174,14 @@ spec hash `68a343b4…`, this design artifact's hash, focused test receipts,
 clean runtime log with zero forbidden-root DB attempts, dual-root refusal
 probe output, G-FEAT threshold anchor (issued by primary ADVOCATE at
 registration — f97b70580a21 §5).
+
+Deploy-procedure condition (pre-registered by primary ADVOCATE
+d9c2df7e8c50 after the UX-deploy SIGBUS shutdown coredumps; folds into
+the G-FEAT threshold): the shim `.so` swap MUST use (a) atomic
+write+rename — new inode, the old process keeps the old inode until exit
+(preferred) — OR (b) a confirmed-dead prior engine PID BEFORE the `.so`
+write. The A.5 receipt declares which was used with evidence. No new code
+is required for this; it binds the operator deploy procedure.
 
 Focused tests (all with `SMARTKEY_PHASEA_DATA` in an isolated temp dir):
   T1 schema/privacy: live rows carry no token columns; resolver/class
