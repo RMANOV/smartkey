@@ -1048,6 +1048,13 @@ impl InputMethodCore {
         &self.ghost
     }
 
+    /// Remove only the visible completion suffix while retaining the candidate
+    /// list for outcome telemetry and diagnostics.
+    pub fn clear_ghost(&mut self) {
+        self.ghost.clear();
+        self.anticipatory_ghost_active = false;
+    }
+
     /// The last two committed words (prev1, prev2) for context hashing.
     pub fn context_words(&self) -> (Option<&str>, Option<&str>) {
         let prev1 = self.context.back().map(|s| s.as_str());

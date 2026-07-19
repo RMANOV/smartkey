@@ -234,6 +234,16 @@ impl PyInputMethodCore {
     fn debug_state(&self) -> (bool, bool, bool) {
         self.inner.debug_state()
     }
+
+    /// Prefix currently being composed, used to attribute a displayed ghost.
+    fn current_word(&self) -> String {
+        self.inner.current_word().to_string()
+    }
+
+    /// Feed one adapter-confirmed rejection into process-local memory.
+    fn record_ghost_rejection(&mut self, prefix: &str, completion: &str) {
+        self.inner.record_ghost_rejection(prefix, completion);
+    }
 }
 
 #[pymodule]

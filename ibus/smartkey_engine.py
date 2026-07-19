@@ -486,6 +486,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             "prediction_id": self._prediction_seq,
             "word": top_word,
             "ghost": ghost,
+            "prefix": self._core_current_word(),
             "score": top_score,
             "confidence": top_confidence,
         }
@@ -531,6 +532,36 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             except (ValueError, OverflowError):
                 return False
         return False
+
+    @staticmethod
+    def _keyval_to_char(keyval: int) -> str:
+        if 0x21 <= keyval <= 0x7E:
+            return chr(keyval)
+        if _HAS_IBUS and hasattr(IBus, "keyval_to_unicode"):
+            uni = IBus.keyval_to_unicode(keyval)
+            if uni and uni != "\0":
+                return uni
+        if 0x80 <= keyval <= 0xEFFF:
+            try:
+                return chr(keyval)
+            except (ValueError, OverflowError):
+                return ""
+        if 0x01000000 <= keyval <= 0x0110FFFF:
+            try:
+                return chr(keyval & 0x00FFFFFF)
+            except (ValueError, OverflowError):
+                return ""
+        return ""
+
+    @classmethod
+    def _is_punctuation_boundary(cls, keyval: int) -> bool:
+        ch = cls._keyval_to_char(keyval)
+        return (
+            len(ch) == 1
+            and ch.isprintable()
+            and not ch.isalnum()
+            and not ch.isspace()
+        )
 
     def _should_log_reject(self, keyval: int, key_release: bool) -> bool:
         if key_release or keyval in (IBus.KEY_Tab, IBus.KEY_Right):
@@ -600,20 +631,75 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             reason = "navigation"
         elif keyval == IBus.KEY_BackSpace:
             reason = "backspace"
-        elif keyval in (IBus.KEY_space, IBus.KEY_Return):
+        elif (
+            keyval in (IBus.KEY_space, IBus.KEY_Return)
+            or self._is_punctuation_boundary(keyval)
+            or ("commit" in action_types and "forward" in action_types)
+        ):
             reason = "word_boundary"
         else:
             reason = "continued_typing"
 
+        typed_through = reason in ("continued_typing", "word_boundary")
+        genuine = typed_through and self._is_genuine_ghost_rejection(
+            reason, pending_prediction
+        )
+        manual_completion = typed_through and not genuine
         self._log_replay_event(
-            "rejected",
+            "completed" if manual_completion else "rejected",
             prediction_id=prediction_id,
             word=pending_prediction.get("word"),
             ghost=pending_prediction.get("ghost"),
             confidence=pending_prediction.get("confidence"),
-            reason=reason,
+            reason="completed_manually" if manual_completion else reason,
         )
+        if genuine:
+            self._feed_rejection_memory(pending_prediction)
         self._clear_active_prediction_if(prediction_id)
+
+    def _core_current_word(self) -> str:
+        getter = getattr(self._core, "current_word", None)
+        if not callable(getter):
+            return ""
+        try:
+            return getter() or ""
+        except Exception:  # noqa: BLE001 -- diagnostics must never break input
+            return ""
+
+    def _is_genuine_ghost_rejection(
+        self,
+        reason: str,
+        pending_prediction: dict[str, object],
+    ) -> bool:
+        completion = str(pending_prediction.get("word") or "")
+        if not completion:
+            return False
+        if reason == "continued_typing":
+            live_prefix = self._core_current_word()
+            return bool(live_prefix) and not completion.casefold().startswith(
+                live_prefix.casefold()
+            )
+        if reason == "word_boundary":
+            committed = str(pending_prediction.get("pre_key_word") or "")
+            return not (
+                committed and committed.casefold() == completion.casefold()
+            )
+        return False
+
+    def _feed_rejection_memory(
+        self, pending_prediction: dict[str, object]
+    ) -> None:
+        recorder = getattr(self._core, "record_ghost_rejection", None)
+        if not callable(recorder):
+            return
+        prefix = str(pending_prediction.get("prefix") or "")
+        completion = str(pending_prediction.get("word") or "")
+        if not prefix or not completion:
+            return
+        try:
+            recorder(prefix, completion)
+        except Exception:  # noqa: BLE001 -- feedback must never break input
+            log.debug("smartkey: record_ghost_rejection failed", exc_info=True)
 
     # -----------------------------------------------------------------------
     # Keystroke diagnostic trace (spec 2026-07-12).
@@ -1003,6 +1089,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             if self._active_prediction is not None
             else None
         )
+        if pending_prediction is not None:
+            pending_prediction["pre_key_word"] = self._core_current_word()
         if not key_release:
             self._refresh_surrounding_text()
 

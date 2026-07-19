@@ -27,6 +27,7 @@ pub mod ngram;
 pub mod paths;
 pub mod personal;
 pub mod ppm;
+pub mod rejection_memory;
 pub mod reranker;
 pub mod session_cache;
 pub mod tech_vocab;
