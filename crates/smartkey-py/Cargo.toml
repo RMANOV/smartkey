@@ -12,4 +12,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 smartkey-core = { path = "../smartkey-core" }
-pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
