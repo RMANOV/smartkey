@@ -148,13 +148,12 @@ fn en_qwerty(code: u16, shift: bool) -> Option<char> {
 }
 
 // ======================================================================
-// BG Phonetic layout (evdev scancodes)
+// BG traditional phonetic layout (evdev scancodes)
 // ======================================================================
 //
-// Letter keys use the standard BG Phonetic mapping (consistent with
-// `lang_detect::phonetic_map`). Non-letter keys (numbers, punctuation)
-// return the same characters as EN QWERTY — those keys don't vary
-// between layouts for our dual-buffer purposes.
+// Letter keys follow xkeyboard-config's `bg(phonetic)` variant. This is a
+// physical keyboard map, intentionally separate from the legacy text
+// transliteration helper in `lang_detect`.
 
 fn bg_phonetic(code: u16, shift: bool) -> Option<char> {
     let (lower, upper) = match code {
@@ -173,7 +172,7 @@ fn bg_phonetic(code: u16, shift: bool) -> Option<char> {
         13 => ('=', '+'),
         // QWERTY row → Cyrillic phonetic
         16 => ('я', 'Я'), // q → я
-        17 => ('ш', 'Ш'), // w → ш
+        17 => ('в', 'В'), // w → в
         18 => ('е', 'Е'), // e → е
         19 => ('р', 'Р'), // r → р
         20 => ('т', 'Т'), // t → т
@@ -182,8 +181,8 @@ fn bg_phonetic(code: u16, shift: bool) -> Option<char> {
         23 => ('и', 'И'), // i → и
         24 => ('о', 'О'), // o → о
         25 => ('п', 'П'), // p → п
-        26 => ('[', '{'), // brackets — same as EN
-        27 => (']', '}'),
+        26 => ('ш', 'Ш'), // [ → ш
+        27 => ('щ', 'Щ'), // ] → щ
         // Home row → Cyrillic phonetic
         30 => ('а', 'А'), // a → а
         31 => ('с', 'С'), // s → с
@@ -196,17 +195,17 @@ fn bg_phonetic(code: u16, shift: bool) -> Option<char> {
         38 => ('л', 'Л'), // l → л
         39 => (';', ':'), // punctuation — same as EN
         40 => ('\'', '"'),
-        41 => ('`', '~'),
+        41 => ('ч', 'Ч'), // ` → ч
         // Bottom row → Cyrillic phonetic
-        43 => ('\\', '|'), // backslash — same as EN
-        44 => ('з', 'З'),  // z → з
-        45 => ('ь', 'Ь'),  // x → ь
-        46 => ('ц', 'Ц'),  // c → ц
-        47 => ('в', 'В'),  // v → в
-        48 => ('б', 'Б'),  // b → б
-        49 => ('н', 'Н'),  // n → н
-        50 => ('м', 'М'),  // m → м
-        51 => (',', '<'),  // comma — same as EN
+        43 => ('ю', 'Ю'), // backslash → ю
+        44 => ('з', 'З'), // z → з
+        45 => ('ь', 'Ь'), // x → ь
+        46 => ('ц', 'Ц'), // c → ц
+        47 => ('ж', 'Ж'), // v → ж
+        48 => ('б', 'Б'), // b → б
+        49 => ('н', 'Н'), // n → н
+        50 => ('м', 'М'), // m → м
+        51 => (',', '<'), // comma — same as EN
         52 => ('.', '>'),
         53 => ('/', '?'),
         _ => return None,
@@ -234,9 +233,51 @@ mod tests {
     fn test_bg_phonetic_letters() {
         assert_eq!(scancode_to_char(16, false, Layout::Bg), Some('я'));
         assert_eq!(scancode_to_char(16, true, Layout::Bg), Some('Я'));
+        assert_eq!(scancode_to_char(17, false, Layout::Bg), Some('в'));
+        assert_eq!(scancode_to_char(47, false, Layout::Bg), Some('ж'));
         assert_eq!(scancode_to_char(30, false, Layout::Bg), Some('а'));
         assert_eq!(scancode_to_char(44, false, Layout::Bg), Some('з'));
         assert_eq!(scancode_to_char(35, false, Layout::Bg), Some('х'));
+    }
+
+    #[test]
+    fn test_bg_traditional_phonetic_non_alpha_letters() {
+        assert_eq!(scancode_to_char(26, false, Layout::Bg), Some('ш'));
+        assert_eq!(scancode_to_char(27, false, Layout::Bg), Some('щ'));
+        assert_eq!(scancode_to_char(41, false, Layout::Bg), Some('ч'));
+        assert_eq!(scancode_to_char(43, false, Layout::Bg), Some('ю'));
+    }
+
+    #[test]
+    fn test_failed_live_smoke_words_map_exactly() {
+        let map = |codes: &[u16]| -> String {
+            codes
+                .iter()
+                .map(|code| scancode_to_char(*code, false, Layout::Bg).unwrap())
+                .collect()
+        };
+
+        assert_eq!(map(&[17, 18, 41, 18]), "вече");
+        assert_eq!(map(&[25, 19, 24, 48, 17, 30, 50, 18]), "пробваме");
+        assert_eq!(
+            map(&[37, 38, 30, 17, 23, 30, 20, 22, 19, 30, 20, 30]),
+            "клавиатурата"
+        );
+    }
+
+    #[test]
+    fn test_browser_phrase_maps_to_single_cyrillic_words() {
+        let map = |codes: &[u16]| -> String {
+            codes
+                .iter()
+                .map(|code| scancode_to_char(*code, false, Layout::Bg).unwrap())
+                .collect()
+        };
+
+        assert_eq!(map(&[32, 30]), "да");
+        assert_eq!(map(&[34, 38, 18, 32, 30]), "гледа");
+        assert_eq!(map(&[32, 49, 23]), "дни");
+        assert_eq!(map(&[49, 30, 25, 19, 18, 32]), "напред");
     }
 
     #[test]
@@ -249,6 +290,7 @@ mod tests {
                 "number scancode {code} should be same on both layouts"
             );
         }
+        assert_eq!(scancode_to_both(2, true), Some(('!', '!')));
     }
 
     #[test]
@@ -297,11 +339,11 @@ mod tests {
     }
 
     #[test]
-    fn test_phonetic_consistency() {
-        // Verify BG phonetic mapping matches lang_detect::phonetic_map for all letters.
+    fn test_xkb_traditional_phonetic_mapping() {
+        // Match xkeyboard-config's `bg(phonetic)` physical letter positions.
         let letter_scancodes = [
             (16, 'q', 'я'),
-            (17, 'w', 'ш'),
+            (17, 'w', 'в'),
             (18, 'e', 'е'),
             (19, 'r', 'р'),
             (20, 't', 'т'),
@@ -322,7 +364,7 @@ mod tests {
             (44, 'z', 'з'),
             (45, 'x', 'ь'),
             (46, 'c', 'ц'),
-            (47, 'v', 'в'),
+            (47, 'v', 'ж'),
             (48, 'b', 'б'),
             (49, 'n', 'н'),
             (50, 'm', 'м'),
@@ -339,6 +381,7 @@ mod tests {
     fn test_shift_variants_bg() {
         assert_eq!(scancode_to_char(30, true, Layout::Bg), Some('А'));
         assert_eq!(scancode_to_char(44, true, Layout::Bg), Some('З'));
-        assert_eq!(scancode_to_char(17, true, Layout::Bg), Some('Ш'));
+        assert_eq!(scancode_to_char(17, true, Layout::Bg), Some('В'));
+        assert_eq!(scancode_to_char(41, true, Layout::Bg), Some('Ч'));
     }
 }

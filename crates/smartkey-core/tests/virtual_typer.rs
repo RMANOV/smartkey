@@ -246,22 +246,22 @@ fn test_hello_detected_as_english() {
     );
 }
 
-/// "zdravej" on QWERTY maps to "здравей" on BG Phonetic, which is a common
+/// "zdrawej" on QWERTY maps to "здравей" on BG traditional phonetic, which is a common
 /// Bulgarian greeting. The BG corpus should have a high frequency for
-/// "здравей" while the EN corpus has essentially no "zdravej" entry.
+/// "здравей" while the EN corpus has essentially no "zdrawej" entry.
 /// The dual buffer should therefore pick BG as the winner.
 #[test]
-fn test_zdravej_detected_as_bulgarian() {
+fn test_zdrawej_detected_as_bulgarian() {
     let mut vt = VirtualTyper::new();
-    // Type "zdravej" via scancodes — the dual buffer sees both:
-    //   EN: "zdravej"
+    // Type "zdrawej" via scancodes — the dual buffer sees both:
+    //   EN: "zdrawej"
     //   BG: "здравей"
-    vt.type_word_en("zdravej");
+    vt.type_word_en("zdrawej");
 
     let word = vt.current_word();
     assert!(
         !word.is_empty(),
-        "current_word should be non-empty after typing 'zdravej'"
+        "current_word should be non-empty after typing 'zdrawej'"
     );
 
     // Either the BG winner ("здравей" — Cyrillic) or a corpus situation where
@@ -283,7 +283,7 @@ fn test_zdravej_detected_as_bulgarian() {
 
     assert!(
         is_cyrillic_winner || has_cyrillic_pred,
-        "typing 'zdravej' should yield a Cyrillic winner or predictions; \
+        "typing 'zdrawej' should yield a Cyrillic winner or predictions; \
          current_word={:?}, predictions={:?}",
         word,
         preds.iter().map(|p| &p.word).collect::<Vec<_>>()
@@ -417,11 +417,11 @@ fn test_dual_buffer_replace_action_possible() {
 /// BG interpretation wins decisively after the third character.
 #[test]
 fn test_dual_buffer_flip_emits_replace_with_controlled_corpus() {
-    // Use the real VirtualTyper (real corpus) and type "zdravej".
+    // Use the real VirtualTyper (real corpus) and type "zdrawej".
     // The dual buffer should eventually replace the interim EN text.
     let mut vt = VirtualTyper::new();
 
-    let all_actions: Vec<Action> = vt.type_word_en("zdravej").into_iter().flatten().collect();
+    let all_actions: Vec<Action> = vt.type_word_en("zdrawej").into_iter().flatten().collect();
 
     // After typing a 7-char word with a BG-dominant corpus result, we expect
     // either a ReplaceWord (flip) or CommitText (per-char dual buffer output).
