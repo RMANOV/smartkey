@@ -22,7 +22,5 @@ keystroke-logs/
 # Local product specifications and implementation concepts are private inputs.
 # Public branches contain code, tests, and separately approved marketing only.
 /.private-specs/
-/docs/GFEAT-rejection-memory.md
-/docs/O1-SHIM-DESIGN-*.md
-/phase_a/README-O1.md
 /receipts/
+/lab_corpus/

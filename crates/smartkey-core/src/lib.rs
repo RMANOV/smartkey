@@ -24,6 +24,7 @@ pub mod light_profile;
 pub mod markov;
 pub mod master_loop;
 pub mod ngram;
+pub mod o1_shim;
 pub mod paths;
 pub mod personal;
 pub mod ppm;

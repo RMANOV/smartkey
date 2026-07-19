@@ -259,6 +259,20 @@ impl MasterLoop {
         self.core.predictions()
     }
 
+    // -- passive calibration tap (delegates to the core) ----------------
+
+    pub fn o1_ngram_snapshot(
+        &self,
+        ctx: &str,
+        uni_top3_cache: &[String],
+    ) -> (Vec<String>, crate::o1_shim::O1Numbers) {
+        self.core.o1_ngram_snapshot(ctx, uni_top3_cache)
+    }
+
+    pub fn o1_global_unigram_top3(&self) -> Vec<String> {
+        self.core.o1_global_unigram_top3()
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.core.is_enabled()
     }

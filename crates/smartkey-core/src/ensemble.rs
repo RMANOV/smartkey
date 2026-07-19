@@ -546,6 +546,21 @@ impl SmartKeyEngine {
     /// When Hedge is active, applies a neutral update so decay-toward-defaults fires
     /// on schedule (proportional to rejection events). EMA path is a no-op since EMA
     /// only reacts to positive feedback (Tab).
+    /// Return an n-gram-only snapshot from the raw corpus tables. The transient
+    /// candidates remain in process memory and are never serialized here.
+    pub fn o1_ngram_snapshot(
+        &self,
+        ctx: &str,
+        uni_top3_cache: &[String],
+    ) -> (Vec<String>, crate::o1_shim::O1Numbers) {
+        crate::o1_shim::snapshot(&self.lang_models.get_or_all(None), ctx, uni_top3_cache)
+    }
+
+    /// Return the global unigram top-three fallback list for reuse by callers.
+    pub fn o1_global_unigram_top3(&self) -> Vec<String> {
+        crate::o1_shim::global_unigram_top3(&self.lang_models.get_or_all(None))
+    }
+
     pub fn on_prediction_rejected(&mut self) {
         if self.use_hedge {
             self.commit_count += 1;
