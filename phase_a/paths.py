@@ -80,8 +80,22 @@ def synthetic_db_path() -> Path:
     return data_dir() / "selftest_synthetic.db"
 
 
-def alarm_file() -> Path:
-    return data_dir() / "WATCHDOG-ALARM.txt"
+def alarm_file(
+    campaign_run_id: str | None = None,
+    *,
+    synthetic: bool | None = None,
+) -> Path:
+    """Return the watchdog alarm path for one campaign/scope.
+
+    The no-argument path is retained only for legacy/manual artifacts. Gate
+    code always supplies both provenance fields so an alarm from a synthetic
+    or foreign campaign cannot alter another campaign's verdict.
+    """
+    if campaign_run_id is None or synthetic is None:
+        return data_dir() / "WATCHDOG-ALARM.txt"
+    digest = hashlib.sha256(campaign_run_id.encode("utf-8")).hexdigest()[:16]
+    scope = "synthetic" if synthetic else "real"
+    return data_dir() / f"WATCHDOG-ALARM-{scope}-{digest}.txt"
 
 
 def receipts_dir() -> Path:
