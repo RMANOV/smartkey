@@ -139,6 +139,10 @@ pub struct InputConfig {
     pub use_hedge: bool,
     /// Enable neural reranker for nonlinear feature interactions (Phase 3).
     pub use_reranker: bool,
+    /// Allow post-commit language/capitalization rewrites of text that the
+    /// user already typed.  Off by default: raw input is authoritative, and
+    /// predictions may be accepted only through the explicit accept path.
+    pub post_commit_autocorrect: bool,
     // ── Dual buffer (v0.5.0) ─────────────────────────────────────
     /// Enable layout-agnostic dual-buffer input.
     pub dual_buffer: DualBufferConfig,
@@ -168,6 +172,7 @@ impl Default for InputConfig {
             use_kneser_ney: true,
             use_hedge: true,
             use_reranker: true,
+            post_commit_autocorrect: false,
             dual_buffer: DualBufferConfig::default(),
         }
     }
@@ -185,6 +190,9 @@ impl InputConfig {
             }
             if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
                 config.ghost_text = b;
+            }
+            if let Some(b) = v.get("post_commit_autocorrect").and_then(|v| v.as_bool()) {
+                config.post_commit_autocorrect = b;
             }
             if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
                 config.max_candidates = (n as usize).max(1);
@@ -288,6 +296,9 @@ impl InputConfig {
         }
         if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
             config.ghost_text = b;
+        }
+        if let Some(b) = v.get("post_commit_autocorrect").and_then(|v| v.as_bool()) {
+            config.post_commit_autocorrect = b;
         }
         if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
             if n < 1 {
@@ -924,8 +935,8 @@ impl InputMethodCore {
         self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked())
     }
 
-    /// Accept the visible ghost completion (shared by Tab and the
-    /// Space/Return word-boundary accept).
+    /// Accept the visible ghost completion when the user presses Tab.
+    /// Space/Return commit only the typed word and never call this path.
     ///
     /// Full-word composing (b3a2cb2) keeps the ENTIRE typed word in the
     /// preedit until commit, regardless of dual-buffer lock state — "lock is
@@ -1302,14 +1313,20 @@ impl InputMethodCore {
 
         let typed_freq = self.engine.word_frequency(&word.to_lowercase(), typed_lang);
 
-        // Transliterate to the other language.
+        // Transliterate to the other language.  A partial transliteration is
+        // never a valid replacement: BG-only letters such as ч/щ/ю are not in
+        // the legacy ASCII phonetic table, and dropping them produced live
+        // corruptions such as "чака" -> "aka" and "защо" -> "zao".
         let other_word = if typed_lang == LangId::En {
             transliterate(word)
         } else {
             reverse_transliterate(word)
         };
 
-        if other_word.is_empty() || other_word.len() < 2 {
+        if other_word.is_empty()
+            || other_word.chars().count() < 2
+            || other_word.chars().count() != word.chars().count()
+        {
             return None;
         }
 
@@ -1415,17 +1432,22 @@ impl InputMethodCore {
         let mut actions = Vec::new();
         let mut effective_word = committed_word.to_string();
 
-        // Step 1: Language auto-correction.
-        if let Some(correction) = self.try_language_correction(&effective_word) {
-            if let Action::ReplaceWord { ref text, .. } = correction {
-                effective_word = text.clone();
+        // Steps 1 and 2 rewrite text that is already committed.  Keep them
+        // behind an explicit opt-in so Space/Return can never silently replace
+        // the raw word the user typed (live-falsified on Bulgarian ч/ш/щ).
+        if self.config.post_commit_autocorrect {
+            // Step 1: Language auto-correction.
+            if let Some(correction) = self.try_language_correction(&effective_word) {
+                if let Action::ReplaceWord { ref text, .. } = correction {
+                    effective_word = text.clone();
+                }
+                actions.push(correction);
             }
-            actions.push(correction);
-        }
 
-        // Step 2: Auto-capitalization.
-        if let Some(cap_action) = self.try_auto_capitalize(&effective_word) {
-            actions.push(cap_action);
+            // Step 2: Auto-capitalization.
+            if let Some(cap_action) = self.try_auto_capitalize(&effective_word) {
+                actions.push(cap_action);
+            }
         }
 
         // Step 3: Anticipatory next-word ghost.
@@ -2054,6 +2076,75 @@ mod tests {
         );
         assert!(has_action(&actions, &Action::CommitText("hel".to_string())));
         assert!(has_action(&actions, &Action::ForwardKey));
+    }
+
+    /// Live regression: Bulgarian letters on EN punctuation positions must
+    /// remain part of the composed word, and Space must commit the exact raw
+    /// word without a post-commit rewrite.
+    #[test]
+    fn bg_punctuation_position_letters_commit_exact_words() {
+        let cases: [(&str, &[u16]); 4] = [
+            ("чака", &[41, 30, 37, 30]),
+            ("защо", &[44, 30, 27, 24]),
+            ("шина", &[26, 23, 49, 30]),
+            ("юнак", &[43, 49, 30, 37]),
+        ];
+
+        for (word, codes) in cases {
+            let mut core = InputMethodCore::new(InputConfig::default());
+            core.load_word(word, 1_000_000);
+            for code in codes {
+                core.handle_key(press_raw(*code));
+            }
+            let actions = core.handle_key(press_raw(57));
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, Action::CommitText(text) if text == word)),
+                "Space must commit exact Bulgarian word {word:?}, got {actions:?}"
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::ReplaceWord { .. })),
+                "raw-wins default must not rewrite {word:?}, got {actions:?}"
+            );
+        }
+    }
+
+    /// Defense in depth for the opt-in legacy rewrite: transliteration must be
+    /// lossless.  Missing ч/щ/ю mappings previously shortened words and could
+    /// turn "чака" into "aka" when that Latin token was frequent.
+    #[test]
+    fn post_commit_autocorrect_rejects_lossy_bg_transliteration() {
+        let config = InputConfig {
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
+        core.load_word("aka", 1_000_000);
+        core.current_word = "чака".to_string();
+
+        let actions = core.handle_key(press(Key::Space));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { text, .. } if text == "aka")),
+            "lossy reverse transliteration must never replace the raw word: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn post_commit_autocorrect_is_explicit_opt_in() {
+        assert!(!InputConfig::default().post_commit_autocorrect);
+        assert!(
+            InputConfig::from_json(r#"{"post_commit_autocorrect":true}"#).post_commit_autocorrect
+        );
+        assert!(
+            InputConfig::try_from_json(r#"{"post_commit_autocorrect":true}"#)
+                .expect("valid config")
+                .post_commit_autocorrect
+        );
     }
 
     /// Anti-desync + anti-double: Tab commits EXACTLY the last displayed

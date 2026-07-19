@@ -53,17 +53,34 @@ def _fresh(path: Path) -> Path:
     return path
 
 
-def _sim_daily_sweeps(db_path: Path, first_ts: float, last_ts: float) -> None:
+def _sim_daily_sweeps(
+    db_path: Path,
+    first_ts: float,
+    last_ts: float,
+    *,
+    run_id: str,
+) -> None:
     conn = connect(db_path)
     d = _dt.date.fromtimestamp(first_ts)
     d1 = _dt.date.fromtimestamp(last_ts)
     while d <= d1:
         noon = time.mktime(d.timetuple()) + 43200
         conn.execute(
-            "INSERT INTO sweeps (sweep_date, ran_ts, events, resolutions, "
-            "latency_p99_us, over_budget_pct, watchdog_status, receipt) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (d.isoformat(), noon, 0, 0, 0, 0.0, "OK", "simulated daily sweep"),
+            "INSERT INTO sweeps (run_id, synthetic, sweep_date, ran_ts, events, "
+            "resolutions, latency_p99_us, over_budget_pct, watchdog_status, receipt) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                run_id,
+                1,
+                d.isoformat(),
+                noon,
+                0,
+                0,
+                0,
+                0.0,
+                "OK",
+                "simulated daily sweep",
+            ),
         )
         d += _dt.timedelta(days=1)
     conn.commit()
@@ -74,12 +91,13 @@ def _craft_db(name: str, rows: list[tuple], with_sweeps: bool) -> Path:
     """Direct-insert a crafted synthetic DB for gate-clause reachability.
     rows: list of (ts, p, outcome_or_None, latency_us)."""
     path = _fresh(data_dir() / f"selftest_gate_{name}.db")
+    run_id = f"craft-{name}"
     conn = connect(path)
     conn.execute(
         "INSERT INTO run_metadata (run_id, created_ts, synthetic, freq_table_hash, "
         "freq_table_files, p_model, engine_commit, harness_version, scope, notes) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (f"craft-{name}", time.time(), 1, "crafted", "[]", "crafted", None,
+        (run_id, time.time(), 1, "crafted", "[]", "crafted", None,
          "selftest", "ngram_component", name),
     )
     for ts, p, outcome, lat in rows:
@@ -87,12 +105,12 @@ def _craft_db(name: str, rows: list[tuple], with_sweeps: bool) -> Path:
             "INSERT INTO events (run_id, ts, context_hash, n_candidates, p_top3, "
             "latency_us, outcome, class, resolver, synthetic) "
             "VALUES (?,?,?,?,?,?,?,?,?,1)",
-            (f"craft-{name}", ts, "ch", 3, p, lat, outcome, EVENT_CLASS, RESOLVER),
+            (run_id, ts, "ch", 3, p, lat, outcome, EVENT_CLASS, RESOLVER),
         )
     conn.commit()
     if with_sweeps:
         conn.close()
-        _sim_daily_sweeps(path, rows[0][0], rows[-1][0])
+        _sim_daily_sweeps(path, rows[0][0], rows[-1][0], run_id=run_id)
     else:
         conn.close()
     return path
@@ -158,8 +176,9 @@ def check_missed_watchdog_fail() -> tuple[bool, str]:
     import random
     rows = _clean_calib_rows(2000, random.Random(5), time.time() - 3 * 86400, span_days=3)
     db = _craft_db("missedwd", rows, with_sweeps=False)
-    if alarm_file().exists():
-        alarm_file().unlink()
+    af = alarm_file("craft-missedwd", synthetic=True)
+    if af.exists():
+        af.unlink()
     res = analyze(db, synthetic=True)
     ok = res.verdict == "FAIL" and any("watchdog" in r for r in res.reasons)
     return ok, f"verdict={res.verdict} missed_wd={res.missed_watchdog} reasons={res.reasons}"
@@ -169,9 +188,10 @@ def check_inband_alarm_distinction() -> tuple[bool, str]:
     import random
     rows = _clean_calib_rows(2000, random.Random(6), time.time() - 3 * 86400, span_days=3)
     db = _craft_db("inbandalarm", rows, with_sweeps=False)
-    alarm_file().write_text("in-band alarm present\n", encoding="utf-8")
+    af = alarm_file("craft-inbandalarm", synthetic=True)
+    af.write_text("in-band alarm present\n", encoding="utf-8")
     res = analyze(db, synthetic=True)
-    alarm_file().unlink(missing_ok=True)
+    af.unlink(missing_ok=True)
     ok = res.verdict != "FAIL" or not any("without in-band alarm" in r for r in res.reasons)
     return ok, f"verdict={res.verdict} reasons={res.reasons}"
 
