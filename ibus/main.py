@@ -106,7 +106,15 @@ def main() -> None:
         / "smartkey"
     )
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_level = logging.DEBUG if os.environ.get("SMARTKEY_DEBUG") else logging.WARNING
+    # logging.DEBUG makes the engine log verbatim action payloads to
+    # smartkey.log — content capture, so it is gated on the CONTENT level
+    # only ("full"), same as the legacy content logs.  SMARTKEY_DEBUG=1
+    # (structural keystroke trace) must stay content-free end to end.
+    log_level = (
+        logging.DEBUG
+        if os.environ.get("SMARTKEY_DEBUG") == "full"
+        else logging.WARNING
+    )
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s smartkey: %(message)s",

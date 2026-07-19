@@ -16,6 +16,11 @@ use smartkey_core::MasterLoop;
 #[pyclass(unsendable)]
 struct PyInputMethodCore {
     inner: MasterLoop,
+    /// Pending top-three used only to compute the next binary outcome.
+    /// Candidate strings never cross the Python boundary.
+    o1_pending: Option<Vec<String>>,
+    /// Compute-once global unigram fallback list.
+    o1_uni_top3: Option<Vec<String>>,
 }
 
 /// Convert an `Action` to a Python-friendly `(type, payload)` tuple.
@@ -108,6 +113,8 @@ impl PyInputMethodCore {
         };
         Self {
             inner: MasterLoop::new(config),
+            o1_pending: None,
+            o1_uni_top3: None,
         }
     }
 
@@ -227,6 +234,50 @@ impl PyInputMethodCore {
             .iter()
             .map(|p| (p.word.clone(), p.score, p.confidence))
             .collect()
+    }
+
+    /// Diagnostic snapshot for the adapter's keystroke trace:
+    /// `(dual_buffer_present, locked, hypothesis_phase)`.
+    fn debug_state(&self) -> (bool, bool, bool) {
+        self.inner.debug_state()
+    }
+
+    /// Prefix currently being composed, used to attribute a displayed ghost.
+    fn current_word(&self) -> String {
+        self.inner.current_word().to_string()
+    }
+
+    /// Feed one adapter-confirmed rejection into process-local memory.
+    fn record_ghost_rejection(&mut self, prefix: &str, completion: &str) {
+        self.inner.record_ghost_rejection(prefix, completion);
+    }
+
+    /// Take an n-gram-only snapshot. Only counts, probability mass, and
+    /// timing cross the Python boundary.
+    fn o1_snapshot(&mut self, ctx: &str) -> (u32, f64, u64) {
+        if self.o1_uni_top3.is_none() {
+            self.o1_uni_top3 = Some(self.inner.o1_global_unigram_top3());
+        }
+        let cache = self.o1_uni_top3.as_deref().unwrap_or(&[]);
+        let (top3, numbers) = self.inner.o1_ngram_snapshot(ctx, cache);
+        self.o1_pending = Some(top3);
+        (
+            numbers.n_candidates,
+            numbers.p_top3,
+            numbers.core_latency_us,
+        )
+    }
+
+    /// Resolve and discard the pending snapshot against the next token.
+    fn o1_resolve(&mut self, token: &str) -> Option<u8> {
+        self.o1_pending
+            .take()
+            .map(|top3| u8::from(top3.iter().any(|word| word == token)))
+    }
+
+    /// Discard pending state at a focus, reset, or disable boundary.
+    fn o1_abandon(&mut self) {
+        self.o1_pending = None;
     }
 }
 

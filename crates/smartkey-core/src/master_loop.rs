@@ -19,6 +19,7 @@ use crate::frustration::{FrustrationDetector, FrustrationSignal};
 use crate::input::{Action, InputConfig, InputMethodCore, KeyEvent};
 use crate::lang_detect::{DetectedLanguage, LangId};
 use crate::light_profile::LightProfile;
+use crate::rejection_memory::RejectionMemory;
 
 /// State machine phases for the master loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,8 @@ pub struct MasterLoop {
     phase: Phase,
     frustration: FrustrationDetector,
     corrections: CorrectionMemory,
+    /// Bounded, process-local memory of repeatedly rejected ghost pairs.
+    rejections: RejectionMemory,
     light_profile: LightProfile,
     context_sampler: Box<dyn ContextSampler>,
     /// Words remaining for ghost suppression after frustration.
@@ -87,6 +90,8 @@ pub struct MasterLoop {
     surrounding_text: Option<String>,
     /// Cursor position inside `surrounding_text` when provided by the platform.
     surrounding_cursor_pos: Option<usize>,
+    /// Most recently displayed `(typed prefix, full completion)` pair.
+    last_shown_ghost: Option<(String, String)>,
 }
 
 impl MasterLoop {
@@ -96,6 +101,7 @@ impl MasterLoop {
             phase: Phase::Anticipating,
             frustration: FrustrationDetector::new(),
             corrections: CorrectionMemory::new(),
+            rejections: RejectionMemory::new(),
             light_profile: LightProfile::default(),
             context_sampler: Box::new(NullContextSampler),
             suppress_countdown: 0,
@@ -105,6 +111,7 @@ impl MasterLoop {
             anticipated: false,
             surrounding_text: None,
             surrounding_cursor_pos: None,
+            last_shown_ghost: None,
         }
     }
 
@@ -145,6 +152,14 @@ impl MasterLoop {
 
         // ── Phase 2: DELEGATE to core ────────────────────────────────
         let is_tab = matches!(event.key, crate::input::Key::Tab);
+        let is_backspace = matches!(event.key, crate::input::Key::Backspace);
+        // An accepted ghost is attributable to one immediate Backspace only.
+        // Any other next key starts a new interaction and must not let a later
+        // ABANDON reject the already accepted completion.
+        if !is_tab && !is_backspace && self.last_tab_accept.is_some() {
+            self.last_tab_accept = None;
+            self.last_shown_ghost = None;
+        }
         // Capture prediction BEFORE delegation — handle_key(Tab) clears
         // last_predictions via reset_word(), so reading after is always None.
         let pre_tab_prediction = if is_tab {
@@ -154,6 +169,7 @@ impl MasterLoop {
         };
         let mut actions = self.core.handle_key(event.clone());
         self.apply_correction_override(&mut actions);
+        self.enforce_rejection_suppression(&mut actions);
 
         if resets_context {
             self.anticipated = false;
@@ -162,6 +178,7 @@ impl MasterLoop {
             self.frustration.reset_word();
             self.last_tab_accept = None;
             self.last_accepted_prediction = None;
+            self.last_shown_ghost = None;
         }
 
         // Track Tab acceptance time for REJECT detection.
@@ -179,6 +196,14 @@ impl MasterLoop {
             self.phase = Phase::Correcting;
             self.handle_frustration(signal);
         }
+        if is_backspace {
+            // REJECT is a single-event decision. If this Backspace did not
+            // qualify, discard the accepted-ghost attribution as stale.
+            if !matches!(signal, Some(FrustrationSignal::Reject { .. })) {
+                self.last_shown_ghost = None;
+            }
+            self.last_tab_accept = None;
+        }
 
         // Word committed? → LEARNING phase.
         if self.core.current_word().is_empty() && self.session_commits_changed() {
@@ -188,7 +213,16 @@ impl MasterLoop {
             self.anticipated = false;
             self.core.clear_hints();
             self.frustration.reset_word();
+            // Boundary outcomes are recorded by the adapter after this call.
+            // Clear the Rust-side cache to prevent a later ABANDON from
+            // double-counting the same rejection. Tab keeps its attribution
+            // for the immediate accepted-then-deleted path above.
+            if !is_tab {
+                self.last_shown_ghost = None;
+            }
         }
+
+        self.note_shown_ghost(&actions);
 
         actions
     }
@@ -203,6 +237,7 @@ impl MasterLoop {
         self.frustration.reset_word();
         self.surrounding_text = None;
         self.surrounding_cursor_pos = None;
+        self.last_shown_ghost = None;
         self.core.focus_lost()
     }
 
@@ -216,11 +251,26 @@ impl MasterLoop {
         self.frustration.reset_word();
         self.surrounding_text = None;
         self.surrounding_cursor_pos = None;
+        self.last_shown_ghost = None;
         self.core.reset()
     }
 
     pub fn predictions(&self) -> &[Prediction] {
         self.core.predictions()
+    }
+
+    // -- passive calibration tap (delegates to the core) ----------------
+
+    pub fn o1_ngram_snapshot(
+        &self,
+        ctx: &str,
+        uni_top3_cache: &[String],
+    ) -> (Vec<String>, crate::o1_shim::O1Numbers) {
+        self.core.o1_ngram_snapshot(ctx, uni_top3_cache)
+    }
+
+    pub fn o1_global_unigram_top3(&self) -> Vec<String> {
+        self.core.o1_global_unigram_top3()
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -233,6 +283,12 @@ impl MasterLoop {
 
     pub fn has_ghost(&self) -> bool {
         self.core.has_ghost()
+    }
+
+    /// Diagnostic snapshot for the adapter's keystroke trace:
+    /// `(dual_buffer_present, locked, hypothesis_phase)`.
+    pub fn debug_state(&self) -> (bool, bool, bool) {
+        self.core.debug_state()
     }
 
     pub fn ghost_text(&self) -> &str {
@@ -337,6 +393,33 @@ impl MasterLoop {
     /// Access the correction memory (read-only).
     pub fn correction_count(&self) -> usize {
         self.corrections.to_snapshot().entries.len()
+    }
+
+    /// Record one confirmed rejection from a platform adapter.
+    pub fn record_ghost_rejection(&mut self, prefix: &str, completion: &str) {
+        self.rejections.record(prefix, completion);
+
+        // Consume only matching attribution. A diverging key can show a new
+        // ghost before the adapter reports the prior rejection; clearing that
+        // newer pair would make a subsequent rejection invisible.
+        let matches_cached =
+            self.last_shown_ghost
+                .as_ref()
+                .is_some_and(|(cached_prefix, cached_completion)| {
+                    Self::same_normalized(cached_prefix, prefix)
+                        && Self::same_normalized(cached_completion, completion)
+                });
+        if matches_cached {
+            self.last_shown_ghost = None;
+        }
+    }
+
+    pub fn is_ghost_suppressed(&self, prefix: &str, completion: &str) -> bool {
+        self.rejections.is_suppressed(prefix, completion)
+    }
+
+    pub fn rejection_prefix_count(&self) -> usize {
+        self.rejections.len()
     }
 
     // ======================================================================
@@ -456,6 +539,7 @@ impl MasterLoop {
                         self.corrections.record(ctx_hash, accepted, current);
                     }
                 }
+                self.record_last_ghost_rejection();
             }
             FrustrationSignal::RapidDelete { severity, .. } => {
                 self.light_profile.record_reject();
@@ -482,6 +566,7 @@ impl MasterLoop {
                 self.suppress_countdown = 1;
                 // Escape + manual typing = explicit rejection of the ghost.
                 self.record_ghost_as_negative();
+                self.record_last_ghost_rejection();
             }
         }
     }
@@ -527,6 +612,62 @@ impl MasterLoop {
         } else {
             actions.push(override_action);
         }
+    }
+
+    fn enforce_rejection_suppression(&mut self, actions: &mut [Action]) {
+        let Some(completion) = self.core.predictions().first().map(|p| p.word.clone()) else {
+            return;
+        };
+        let prefix = self.core.current_word().to_string();
+        if prefix.is_empty() || !self.rejections.is_suppressed(&prefix, &completion) {
+            return;
+        }
+
+        self.core.clear_ghost();
+        // Suppression hides any shorter-prefix ghost that was on screen while
+        // the user reached this exact prefix. It is no longer attributable.
+        self.last_shown_ghost = None;
+        for action in actions {
+            match action {
+                Action::ShowGhost(_) => *action = Action::HideGhost,
+                Action::ShowComposing { typed, ghost } if !ghost.is_empty() => {
+                    *action = Action::ShowComposing {
+                        typed: std::mem::take(typed),
+                        ghost: String::new(),
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn note_shown_ghost(&mut self, actions: &[Action]) {
+        let displays_completion = actions.iter().any(|action| match action {
+            Action::ShowGhost(ghost) => !ghost.is_empty(),
+            Action::ShowComposing { ghost, .. } => !ghost.is_empty(),
+            _ => false,
+        });
+        if !displays_completion {
+            return;
+        }
+
+        let prefix = self.core.current_word();
+        if prefix.is_empty() {
+            return;
+        }
+        if let Some(completion) = self.core.predictions().first().map(|p| p.word.clone()) {
+            self.last_shown_ghost = Some((prefix.to_string(), completion));
+        }
+    }
+
+    fn record_last_ghost_rejection(&mut self) {
+        if let Some((prefix, completion)) = self.last_shown_ghost.take() {
+            self.rejections.record(&prefix, &completion);
+        }
+    }
+
+    fn same_normalized(left: &str, right: &str) -> bool {
+        left.trim().to_lowercase() == right.trim().to_lowercase()
     }
 
     // ======================================================================
@@ -814,6 +955,89 @@ mod tests {
             ml.predictions().first().map(|p| p.word.as_str()),
             Some("help")
         );
+    }
+
+    #[test]
+    fn rejection_memory_suppresses_exact_pair_after_two_records() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 100);
+
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        let baseline = ml.handle_key(make_key(Key::Char('l')));
+        assert_eq!(ghost_text(&baseline).as_deref(), Some("lo"));
+
+        ml.record_ghost_rejection("hel", "hello");
+        assert!(!ml.is_ghost_suppressed("hel", "hello"));
+        ml.record_ghost_rejection("hel", "hello");
+        assert!(ml.is_ghost_suppressed("hel", "hello"));
+
+        ml.focus_lost();
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        let suppressed = ml.handle_key(make_key(Key::Char('l')));
+        assert!(ghost_text(&suppressed).is_none());
+        assert!(suppressed
+            .iter()
+            .any(|action| matches!(action, Action::HideGhost)));
+        assert!(!ml.has_ghost());
+        assert!(ml.last_shown_ghost.is_none());
+    }
+
+    #[test]
+    fn abandon_records_the_displayed_pair_once() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 100);
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        ml.handle_key(make_key(Key::Char('l')));
+
+        ml.handle_key(make_key(Key::Escape));
+        ml.handle_key(make_key(Key::Char('x')));
+
+        assert_eq!(ml.rejection_prefix_count(), 1);
+        assert!(!ml.is_ghost_suppressed("hel", "hello"));
+        assert!(ml.last_shown_ghost.is_none());
+    }
+
+    #[test]
+    fn adapter_record_does_not_clear_a_newer_displayed_pair() {
+        let mut ml = default_loop();
+        ml.last_shown_ghost = Some(("new".into(), "newer".into()));
+
+        ml.record_ghost_rejection("old", "older");
+        assert_eq!(
+            ml.last_shown_ghost.as_ref(),
+            Some(&("new".to_string(), "newer".to_string()))
+        );
+
+        ml.record_ghost_rejection(" NEW ", "NEWER");
+        assert!(ml.last_shown_ghost.is_none());
+    }
+
+    #[test]
+    fn boundary_record_cannot_be_counted_again_by_later_abandon() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 100);
+        ml.handle_key(make_key(Key::Char('h')));
+        ml.handle_key(make_key(Key::Char('e')));
+        ml.handle_key(make_key(Key::Char('l')));
+        ml.handle_key(make_key(Key::Space));
+        ml.record_ghost_rejection("hel", "hello");
+
+        ml.handle_key(make_key(Key::Escape));
+        ml.handle_key(make_key(Key::Char('q')));
+
+        assert!(!ml.is_ghost_suppressed("hel", "hello"));
     }
 
     #[test]
