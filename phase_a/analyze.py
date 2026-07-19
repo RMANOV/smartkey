@@ -183,6 +183,12 @@ def analyze(
         synthetic=synthetic,
     )
     selected_run_id = selection.campaign_run_id
+    if campaign_run_id is not None and selected_run_id is None:
+        conn.close()
+        raise ValueError(
+            f"campaign {campaign_run_id!r} not found in "
+            f"{'synthetic' if synthetic else 'real'} scope"
+        )
     all_rows = [
         (row["ts"], row["p_top3"], row["latency_us"], row["outcome"])
         for row in selection.analysis_rows

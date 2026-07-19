@@ -1297,7 +1297,8 @@ impl InputMethodCore {
     fn try_language_correction(&self, word: &str) -> Option<Action> {
         use crate::lang_detect::{reverse_transliterate, transliterate, LangId};
 
-        if word.chars().count() < 2 {
+        let typed_chars = word.chars().count();
+        if typed_chars < 2 {
             return None;
         }
 
@@ -1323,10 +1324,8 @@ impl InputMethodCore {
             reverse_transliterate(word)
         };
 
-        if other_word.is_empty()
-            || other_word.chars().count() < 2
-            || other_word.chars().count() != word.chars().count()
-        {
+        let other_chars = other_word.chars().count();
+        if other_word.is_empty() || other_chars < 2 || other_chars != typed_chars {
             return None;
         }
 
@@ -1337,9 +1336,8 @@ impl InputMethodCore {
         // Only correct if the other language is overwhelmingly more likely.
         // Safety: if both exist, don't correct (ambiguous).
         if other_freq > 0.0 && (typed_freq < 1.0 || other_freq / typed_freq.max(1.0) >= 5.0) {
-            let replace_len = word.chars().count();
             return Some(Action::ReplaceWord {
-                replace_len,
+                replace_len: typed_chars,
                 text: other_word,
             });
         }

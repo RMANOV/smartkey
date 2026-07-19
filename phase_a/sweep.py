@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import time
 from pathlib import Path
 
@@ -144,7 +145,10 @@ def run_sweep(
     af = alarm_file(selected_run_id, synthetic=synthetic)
     if af.exists():
         af.unlink()
-    (receipts_dir() / f"sweep-{today}.txt").write_text(receipt + "\n", encoding="utf-8")
+    scope = "synthetic" if synthetic else "real"
+    campaign_digest = hashlib.sha256(selected_run_id.encode("utf-8")).hexdigest()[:16]
+    receipt_path = receipts_dir() / f"sweep-{today}-{scope}-{campaign_digest}.txt"
+    receipt_path.write_text(receipt + "\n", encoding="utf-8")
     return receipt
 
 
