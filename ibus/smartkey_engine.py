@@ -838,12 +838,33 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             coalesced.append((action_type, payload))
         return coalesced
 
+    @staticmethod
+    def _drop_forward_race_ghost(
+        actions: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """Do not install a fresh preedit before a forwarded boundary lands.
+
+        Returning ``False`` is what lets IBus deliver Space, Return, digits or
+        punctuation to the client.  Every action in this list executes before
+        that return, so a same-batch next-word ghost can intercept the key in
+        browser/Electron/GTK clients.  The Rust core enforces this invariant;
+        retain the adapter guard for mixed-version upgrades and future paths.
+        """
+        resolves_composing = any(
+            action_type in {"commit", "replace"} for action_type, _ in actions
+        )
+        forwards_key = any(action_type == "forward" for action_type, _ in actions)
+        if not (resolves_composing and forwards_key):
+            return actions
+        return [action for action in actions if action[0] != "ghost"]
+
     # -----------------------------------------------------------------------
     # Action dispatcher — translates Rust actions to IBus API calls.
     # -----------------------------------------------------------------------
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
         actions = self._coalesce_same_batch_commit_replace(actions)
+        actions = self._drop_forward_race_ghost(actions)
         composing_resolution_pending = (
             self._preedit_active
             and getattr(self, "_preedit_mode", None) == "composing"

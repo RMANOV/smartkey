@@ -767,7 +767,12 @@ impl InputMethodCore {
                         Action::CommitText(word.clone()),
                         Action::ForwardKey,
                     ];
-                    actions.extend(self.post_commit_pipeline(&word, true));
+                    // A forwarded boundary is delivered to the client only
+                    // after this action batch returns.  Showing a next-word
+                    // preedit in the same batch races that delimiter: GTK,
+                    // Electron and browser clients can apply the Space/Return
+                    // to the new ghost instead of to the committed word.
+                    actions.extend(self.post_commit_pipeline(&word, false));
                     return actions;
                 }
                 let committed = if !self.current_word.is_empty() {
@@ -781,7 +786,7 @@ impl InputMethodCore {
                 let mut actions = vec![Action::HideGhost, Action::ForwardKey];
                 // Post-commit intelligence pipeline: auto-correct, auto-caps, next-word ghost.
                 if let Some(ref word) = committed {
-                    actions.extend(self.post_commit_pipeline(word, true));
+                    actions.extend(self.post_commit_pipeline(word, false));
                 }
                 actions
             }
@@ -832,7 +837,11 @@ impl InputMethodCore {
                     self.commit_word_internal(&word, true);
                     self.reset_word();
                     let mut actions = vec![Action::HideGhost, Action::CommitText(word.clone())];
-                    actions.extend(self.post_commit_pipeline(&word, true));
+                    // The punctuation key is forwarded only after the adapter
+                    // finishes this batch.  Never install a fresh preedit in
+                    // front of it; otherwise characters such as `!` can be
+                    // consumed by the replacement preedit in some clients.
+                    actions.extend(self.post_commit_pipeline(&word, false));
                     actions.push(Action::ForwardKey);
                     return actions;
                 }
@@ -1373,9 +1382,10 @@ impl InputMethodCore {
     /// ``show_anticipatory`` (S4, 2026-07-12): after a Tab-ACCEPT the
     /// anticipatory next-word ghost re-armed instantly, so repeated Tabs
     /// machine-gunned the most frequent word ("на" ×4 in the live trace).
-    /// Accept paths pass ``false`` — the user must type again before a new
-    /// prediction is offered.  Typing-boundary commits (Space/Return, digit
-    /// and punctuation guards) keep the v0.6.1 behavior.
+    /// Accept paths pass ``false``. Forwarded typing boundaries also pass
+    /// ``false`` because the platform adapter cannot install a fresh preedit
+    /// until the client has processed the delimiter. The user must type again
+    /// before a new prediction is offered.
     fn post_commit_pipeline(
         &mut self,
         committed_word: &str,
@@ -2219,10 +2229,10 @@ mod tests {
         assert!(has_action(&actions, &Action::ForwardKey));
     }
 
-    /// Guard (S4 scope fence): the Space typing-boundary keeps its v0.6.1
-    /// anticipatory pipeline — only ACCEPT paths suppress the re-arm.
+    /// Client-ordering regression: Space must not install the next-word ghost
+    /// before the forwarded delimiter has reached the application.
     #[test]
-    fn test_space_commit_keeps_anticipatory_pipeline() {
+    fn test_space_commit_does_not_rearm_ghost_before_forward() {
         let mut core = test_core();
         core.load_bigram("hello", "world", 500);
         core.dual_buffer = Some(locked_dual_buffer(&core));
@@ -2234,15 +2244,32 @@ mod tests {
             &actions,
             &Action::CommitText("hello".to_string())
         ));
-        // Whether the ghost SHOWS depends on confidence gates; parity check:
-        // if a ghost is armed after Space, it must have come from the
-        // anticipatory step (which the accept path never reaches).
-        if core.has_ghost() {
-            assert!(
-                actions.iter().any(|a| matches!(a, Action::ShowGhost(_))),
-                "shown ghost must come from the anticipatory step"
-            );
-        }
+        assert!(has_action(&actions, &Action::ForwardKey));
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::ShowGhost(_))),
+            "no fresh preedit may race the forwarded Space, got {actions:?}"
+        );
+        assert!(!core.has_ghost());
+    }
+
+    #[test]
+    fn test_return_commit_does_not_rearm_ghost_before_forward() {
+        let mut core = test_core();
+        core.load_bigram("hello", "world", 500);
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hello".to_string();
+
+        let actions = core.handle_key(press(Key::Return));
+        assert!(has_action(
+            &actions,
+            &Action::CommitText("hello".to_string())
+        ));
+        assert!(has_action(&actions, &Action::ForwardKey));
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::ShowGhost(_))),
+            "no fresh preedit may race the forwarded Return, got {actions:?}"
+        );
+        assert!(!core.has_ghost());
     }
 
     /// Guard: Space with a composing prefix and NO visible completion keeps
@@ -2539,6 +2566,13 @@ mod tests {
         }
     }
 
+    fn press_raw_with(code: u16, modifiers: Modifiers) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers,
+        }
+    }
+
     /// Build a bilingual core for dual buffer tests.
     fn test_core_dual() -> InputMethodCore {
         let core = test_core_bilingual();
@@ -2662,6 +2696,29 @@ mod tests {
             core.current_word().is_empty(),
             "current word should be empty"
         );
+    }
+
+    #[test]
+    fn test_exclamation_during_composing_commits_word_and_forwards_without_ghost() {
+        let mut core = test_core_dual();
+        core.load_bigram("hello", "world", 500);
+        core.handle_key(press_raw(35)); // h -> composing starts
+        core.handle_key(press_raw(18)); // e -> composing continues
+        assert!(core.dual_buffer.is_some(), "dual buffer should be active");
+
+        // Shift+evdev 2 is `!` on both supported layouts.
+        let actions = core.handle_key(press_raw_with(2, Modifiers::SHIFT));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::CommitText(_))),
+            "punctuation must first land the composed word, got {actions:?}"
+        );
+        assert!(has_action(&actions, &Action::ForwardKey));
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::ShowGhost(_))),
+            "no fresh preedit may intercept the forwarded `!`, got {actions:?}"
+        );
+        assert!(core.dual_buffer.is_none());
+        assert!(core.current_word().is_empty());
     }
 
     #[test]
@@ -2964,4 +3021,3 @@ mod tests {
         assert_eq!(config.min_prefix_length, 2);
     }
 }
-

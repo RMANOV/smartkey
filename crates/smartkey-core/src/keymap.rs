@@ -290,6 +290,7 @@ mod tests {
                 "number scancode {code} should be same on both layouts"
             );
         }
+        assert_eq!(scancode_to_both(2, true), Some(('!', '!')));
     }
 
     #[test]

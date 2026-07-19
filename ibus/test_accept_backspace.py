@@ -226,6 +226,52 @@ def test_enter_lands_typed_word_and_forwards_delimiter():
     assert consumed is False, "the Return delimiter must be forwarded to the app"
 
 
+def test_same_event_next_word_ghost_cannot_race_forwarded_space():
+    # Mixed-version defense: even if an older native core appends a next-word
+    # ghost to the boundary batch, the adapter must not show it before IBus has
+    # delivered the Space to the client.
+    eng, rec = build_engine(
+        scripts=[
+            [("composing", "hel\x00lo")],
+            [
+                ("hide", ""),
+                ("commit", "hel"),
+                ("forward", ""),
+                ("ghost", "world"),
+            ],
+        ]
+    )
+    assert eng.do_process_key_event(ord("l"), 38, 0) is True
+
+    consumed = eng.do_process_key_event(ske.IBus.KEY_space, 57, 0)
+    assert rec.commits == ["hel"]
+    assert consumed is False
+    assert not any(text == "world" and visible for text, visible in rec.preedits)
+    assert eng._preedit_active is False
+
+
+def test_exclamation_lands_composed_word_then_reaches_client_without_new_ghost():
+    eng, rec = build_engine(
+        scripts=[
+            [("composing", "hel\x00lo")],
+            [
+                ("hide", ""),
+                ("commit", "hel"),
+                ("ghost", "world"),
+                ("forward", ""),
+            ],
+        ]
+    )
+    assert eng.do_process_key_event(ord("l"), 38, 0) is True
+
+    # IBus SHIFT_MASK is bit 0; keycode 2 is the evdev number-row `1`/`!` key.
+    consumed = eng.do_process_key_event(ord("!"), 2, 1)
+    assert rec.commits == ["hel"]
+    assert consumed is False, "returning False is the contract that forwards `!`"
+    assert not any(text == "world" and visible for text, visible in rec.preedits)
+    assert eng._preedit_active is False
+
+
 # --- Literal-space escape: Escape keeps the typed word; Space commits it ------
 def test_escape_then_space_commits_typed_word_literal_space():
     # With the Rust fix, Escape on a visible completion re-shows the composing
