@@ -21,7 +21,8 @@ keystroke-logs/
 
 # Local product specifications and implementation concepts are private inputs.
 # Public branches contain code, tests, and separately approved marketing only.
+# DEBUG.md is deliberately NOT listed: it documents the shipped `smartkey-debug`
+# tool and its trace levels, which a user needs in order to run it safely.
 /.private-specs/
 /receipts/
 /lab_corpus/
-/DEBUG.md

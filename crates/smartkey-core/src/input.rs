@@ -143,6 +143,10 @@ pub struct InputConfig {
     pub use_hedge: bool,
     /// Enable neural reranker for nonlinear feature interactions (Phase 3).
     pub use_reranker: bool,
+    /// Allow post-commit language/capitalization rewrites of text that the
+    /// user already typed.  Off by default: raw input is authoritative, and
+    /// predictions may be accepted only through the explicit accept path.
+    pub post_commit_autocorrect: bool,
     // ── Dual buffer (v0.5.0) ─────────────────────────────────────
     /// Enable layout-agnostic dual-buffer input.
     pub dual_buffer: DualBufferConfig,
@@ -172,6 +176,7 @@ impl Default for InputConfig {
             use_kneser_ney: true,
             use_hedge: true,
             use_reranker: true,
+            post_commit_autocorrect: false,
             dual_buffer: DualBufferConfig::default(),
         }
     }
@@ -189,6 +194,9 @@ impl InputConfig {
             }
             if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
                 config.ghost_text = b;
+            }
+            if let Some(b) = v.get("post_commit_autocorrect").and_then(|v| v.as_bool()) {
+                config.post_commit_autocorrect = b;
             }
             if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
                 config.max_candidates = (n as usize).max(1);
@@ -292,6 +300,9 @@ impl InputConfig {
         }
         if let Some(b) = v.get("ghost_text").and_then(|v| v.as_bool()) {
             config.ghost_text = b;
+        }
+        if let Some(b) = v.get("post_commit_autocorrect").and_then(|v| v.as_bool()) {
+            config.post_commit_autocorrect = b;
         }
         if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
             if n < 1 {
@@ -804,6 +815,9 @@ impl InputMethodCore {
                 let mut actions = vec![Action::HideGhost, Action::ForwardKey];
                 // Post-commit intelligence pipeline: auto-correct, auto-caps, next-word ghost.
                 if let Some(ref word) = committed {
+                    // Same client-ordering rule as the composing branch above:
+                    // never install a fresh preedit in front of the forwarded
+                    // Space/Return.
                     actions.extend(self.post_commit_pipeline(word, false));
                 }
                 actions
@@ -1334,14 +1348,20 @@ impl InputMethodCore {
 
         let typed_freq = self.engine.word_frequency(&word.to_lowercase(), typed_lang);
 
-        // Transliterate to the other language.
+        // Transliterate to the other language.  A partial transliteration is
+        // never a valid replacement: BG-only letters such as ч/щ/ю are not in
+        // the legacy ASCII phonetic table, and dropping them produced live
+        // corruptions such as "чака" -> "aka" and "защо" -> "zao".
         let other_word = if typed_lang == LangId::En {
             transliterate(word)
         } else {
             reverse_transliterate(word)
         };
 
-        if other_word.is_empty() || other_word.len() < 2 {
+        if other_word.is_empty()
+            || other_word.chars().count() < 2
+            || other_word.chars().count() != word.chars().count()
+        {
             return None;
         }
 
@@ -1435,10 +1455,18 @@ impl InputMethodCore {
     /// ``show_anticipatory`` (S4, 2026-07-12): after a Tab-ACCEPT the
     /// anticipatory next-word ghost re-armed instantly, so repeated Tabs
     /// machine-gunned the most frequent word ("на" ×4 in the live trace).
-    /// Accept paths pass ``false``. Forwarded typing boundaries also pass
-    /// ``false`` because the platform adapter cannot install a fresh preedit
-    /// until the client has processed the delimiter. The user must type again
-    /// before a new prediction is offered.
+    /// Accept paths pass ``false`` — the user must type again before a new
+    /// prediction is offered.
+    ///
+    /// Typing-boundary commits (Space/Return, digit and punctuation guards)
+    /// originally kept the v0.6.1 behavior and passed ``true``; PR #7 turned
+    /// them off as well, because the platform adapter cannot install a fresh
+    /// preedit until the client has processed the forwarded delimiter — GTK,
+    /// Electron and browser clients otherwise apply the delimiter to the new
+    /// ghost instead of to the committed word (the browser typing-duplication
+    /// class).  Every call site therefore passes ``false`` today; the parameter
+    /// is kept because the anticipatory step itself is unchanged and the
+    /// suppression is a per-call-site policy, not a removal.
     fn post_commit_pipeline(
         &mut self,
         committed_word: &str,
@@ -1447,17 +1475,22 @@ impl InputMethodCore {
         let mut actions = Vec::new();
         let mut effective_word = committed_word.to_string();
 
-        // Step 1: Language auto-correction.
-        if let Some(correction) = self.try_language_correction(&effective_word) {
-            if let Action::ReplaceWord { ref text, .. } = correction {
-                effective_word = text.clone();
+        // Steps 1 and 2 rewrite text that is already committed.  Keep them
+        // behind an explicit opt-in so Space/Return can never silently replace
+        // the raw word the user typed (live-falsified on Bulgarian ч/ш/щ).
+        if self.config.post_commit_autocorrect {
+            // Step 1: Language auto-correction.
+            if let Some(correction) = self.try_language_correction(&effective_word) {
+                if let Action::ReplaceWord { ref text, .. } = correction {
+                    effective_word = text.clone();
+                }
+                actions.push(correction);
             }
-            actions.push(correction);
-        }
 
-        // Step 2: Auto-capitalization.
-        if let Some(cap_action) = self.try_auto_capitalize(&effective_word) {
-            actions.push(cap_action);
+            // Step 2: Auto-capitalization.
+            if let Some(cap_action) = self.try_auto_capitalize(&effective_word) {
+                actions.push(cap_action);
+            }
         }
 
         // Step 3: Anticipatory next-word ghost.
@@ -2148,6 +2181,75 @@ mod tests {
         assert!(has_action(&actions, &Action::ForwardKey));
     }
 
+    /// Live regression: Bulgarian letters on EN punctuation positions must
+    /// remain part of the composed word, and Space must commit the exact raw
+    /// word without a post-commit rewrite.
+    #[test]
+    fn bg_punctuation_position_letters_commit_exact_words() {
+        let cases: [(&str, &[u16]); 4] = [
+            ("чака", &[41, 30, 37, 30]),
+            ("защо", &[44, 30, 27, 24]),
+            ("шина", &[26, 23, 49, 30]),
+            ("юнак", &[43, 49, 30, 37]),
+        ];
+
+        for (word, codes) in cases {
+            let mut core = InputMethodCore::new(InputConfig::default());
+            core.load_word(word, 1_000_000);
+            for code in codes {
+                core.handle_key(press_raw(*code));
+            }
+            let actions = core.handle_key(press_raw(57));
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, Action::CommitText(text) if text == word)),
+                "Space must commit exact Bulgarian word {word:?}, got {actions:?}"
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::ReplaceWord { .. })),
+                "raw-wins default must not rewrite {word:?}, got {actions:?}"
+            );
+        }
+    }
+
+    /// Defense in depth for the opt-in legacy rewrite: transliteration must be
+    /// lossless.  Missing ч/щ/ю mappings previously shortened words and could
+    /// turn "чака" into "aka" when that Latin token was frequent.
+    #[test]
+    fn post_commit_autocorrect_rejects_lossy_bg_transliteration() {
+        let config = InputConfig {
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
+        core.load_word("aka", 1_000_000);
+        core.current_word = "чака".to_string();
+
+        let actions = core.handle_key(press(Key::Space));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { text, .. } if text == "aka")),
+            "lossy reverse transliteration must never replace the raw word: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn post_commit_autocorrect_is_explicit_opt_in() {
+        assert!(!InputConfig::default().post_commit_autocorrect);
+        assert!(
+            InputConfig::from_json(r#"{"post_commit_autocorrect":true}"#).post_commit_autocorrect
+        );
+        assert!(
+            InputConfig::try_from_json(r#"{"post_commit_autocorrect":true}"#)
+                .expect("valid config")
+                .post_commit_autocorrect
+        );
+    }
+
     /// Anti-desync + anti-double: Tab commits EXACTLY the last displayed
     /// composition (typed + ghost) as a single CommitText — never a doubled
     /// word, never a prediction differing from what was shown.
@@ -2383,6 +2485,38 @@ mod tests {
             "no fresh preedit may race the forwarded Return, got {actions:?}"
         );
         assert!(!core.has_ghost());
+    }
+
+    /// Guard (S4 scope fence, live line): the anticipatory pipeline itself was
+    /// never dismantled — only specific call sites stopped asking for it.  The
+    /// two client-ordering guards above are the stricter statement for the
+    /// Space boundary (PR #7 suppresses the re-arm there too, so no ghost is
+    /// armed and this parity check holds vacuously); this test survives them
+    /// because it pins something they do not: *if* a ghost is ever armed at a
+    /// boundary again, it must have come from the anticipatory step and not
+    /// from an accept path leaking into the commit batch.
+    #[test]
+    fn test_space_commit_keeps_anticipatory_pipeline() {
+        let mut core = test_core();
+        core.load_bigram("hello", "world", 500);
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hello".to_string();
+        core.ghost = String::new();
+
+        let actions = core.handle_key(press(Key::Space));
+        assert!(has_action(
+            &actions,
+            &Action::CommitText("hello".to_string())
+        ));
+        // Whether the ghost SHOWS depends on confidence gates; parity check:
+        // if a ghost is armed after Space, it must have come from the
+        // anticipatory step (which the accept path never reaches).
+        if core.has_ghost() {
+            assert!(
+                actions.iter().any(|a| matches!(a, Action::ShowGhost(_))),
+                "shown ghost must come from the anticipatory step"
+            );
+        }
     }
 
     /// Guard: Space with a composing prefix and NO visible completion keeps
