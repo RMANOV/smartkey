@@ -29,6 +29,16 @@ pub struct Prediction {
     pub confidence: f64,
 }
 
+/// Lowercase `s` only when it actually contains uppercase — the common
+/// (already-lowercase) path stays allocation-free.
+fn fold_case(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.chars().any(char::is_uppercase) {
+        std::borrow::Cow::Owned(s.to_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 /// Default blend factor for personal Markov vs corpus Markov.
 const DEFAULT_PERSONAL_MARKOV_DELTA: f64 = 0.2;
 
@@ -704,13 +714,18 @@ impl SmartKeyEngine {
     ///
     /// Uses per-language models directly for precise scoring: EN prefix against
     /// the EN model, BG prefix against the BG model. No cross-contamination.
+    /// Case is folded first: the tries store lowercase forms, so a Shift-held
+    /// or Caps-Lock-latched prefix would otherwise score 0/0 on BOTH sides and
+    /// silently hand the word to the default (EN) winner.
     pub fn score_both(&self, en_prefix: &str, bg_prefix: &str) -> (f64, f64) {
+        let en_prefix = fold_case(en_prefix);
+        let bg_prefix = fold_case(bg_prefix);
         let en = self
             .lang_models
             .get(LangId::En)
             .and_then(|m| {
                 m.trie
-                    .prefix_search(en_prefix, 1)
+                    .prefix_search(&en_prefix, 1)
                     .first()
                     .map(|e| e.frequency as f64)
             })
@@ -720,7 +735,7 @@ impl SmartKeyEngine {
             .get(LangId::Bg)
             .and_then(|m| {
                 m.trie
-                    .prefix_search(bg_prefix, 1)
+                    .prefix_search(&bg_prefix, 1)
                     .first()
                     .map(|e| e.frequency as f64)
             })
@@ -801,7 +816,15 @@ impl SmartKeyEngine {
 
         // Step 1b: fuzzy fallback — if exact prefix returned fewer than `limit`
         // candidates, fill the gap with fuzzy matches from all relevant models.
-        let (fuzzy_candidates, discount_map) = if candidates.len() < limit && !prefix.is_empty() {
+        //
+        // The prefix must be LONGER than the edit budget, otherwise the walk
+        // degenerates: every depth-1 node is already within `fuzzy_max_edits`
+        // of the query, the prune never engages, and we visit every node of
+        // every trie for a result set that is pure noise anyway (a 2-char
+        // query "corrected" by 2 edits carries no information).
+        let (fuzzy_candidates, discount_map) = if candidates.len() < limit
+            && prefix.chars().count() > self.fuzzy_max_edits as usize
+        {
             let fuzzy_slots = candidate_pool.saturating_sub(candidates.len());
             let exact_words: HashSet<&str> = candidates.iter().map(|c| c.word.as_str()).collect();
 
@@ -1419,6 +1442,34 @@ mod tests {
         assert!(
             preds.iter().any(|p| p.word == "hello"),
             "'hello' should appear for 'hallo': got {:?}",
+            preds.iter().map(|p| &p.word).collect::<Vec<_>>()
+        );
+    }
+
+    /// FIX 4: the fuzzy walk must not run when the query is no longer than the
+    /// edit budget.  At that length every depth-1 node is already inside the
+    /// budget, the prune never engages, and the whole trie is visited to
+    /// produce matches that carry no information.
+    #[test]
+    fn test_fuzzy_skipped_when_prefix_within_edit_budget() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word("ab", 100); // edit distance 2 from "-" and from "x"
+        engine.load_word("hello", 100);
+
+        for short in ["-", "x", "xy"] {
+            let preds = engine.predict(short, &[], 5, None);
+            assert!(
+                preds.iter().all(|p| p.word != "ab"),
+                "fuzzy must not run for the {short:?} query, got {:?}",
+                preds.iter().map(|p| &p.word).collect::<Vec<_>>()
+            );
+        }
+
+        // Longer than the budget → fuzzy still works (regression guard).
+        let preds = engine.predict("hallo", &[], 5, None);
+        assert!(
+            preds.iter().any(|p| p.word == "hello"),
+            "fuzzy must still run above the edit budget, got {:?}",
             preds.iter().map(|p| &p.word).collect::<Vec<_>>()
         );
     }

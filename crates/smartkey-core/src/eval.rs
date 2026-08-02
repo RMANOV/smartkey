@@ -88,17 +88,32 @@ impl PredictionMetrics {
         self.total_commits += 1;
     }
 
-    /// Record a `predict()` call latency sample.
     /// Total number of word commits recorded.
     pub fn commit_count(&self) -> usize {
         self.total_commits as usize
     }
 
+    /// Record a `predict()` call latency sample.
     pub fn record_latency(&mut self, duration: Duration) {
         if self.latency_samples.len() >= LATENCY_WINDOW {
             self.latency_samples.pop_front();
         }
         self.latency_samples.push_back(duration);
+    }
+
+    /// How many `predict()` calls are in the rolling latency window.
+    ///
+    /// Exposed so a test can assert a call did *not* happen. A latency budget
+    /// checked with a stopwatch is a statement about the machine that ran it; the
+    /// same budget checked as "the expensive call was never made" is a statement
+    /// about the code, and it cannot go red because CI was busy. The punctuation
+    /// guard in `input.rs` is verified that way.
+    ///
+    /// The window is bounded by `LATENCY_WINDOW`, so this saturates rather than
+    /// counting forever — right for the before/after comparison it exists for,
+    /// wrong for a lifetime total.
+    pub fn latency_sample_count(&self) -> usize {
+        self.latency_samples.len()
     }
 
     /// Compute a summary snapshot of all metrics.

@@ -94,6 +94,72 @@ _ATTR_UNDERLINE_SINGLE = _ibus_enum_value(
 )
 
 # ---------------------------------------------------------------------------
+# Sensitive-input policy (IBus content type).
+# ---------------------------------------------------------------------------
+# IBus.InputPurpose mirrors GtkInputPurpose / the Wayland text-input-v3
+# content purposes.  Every purpose this adapter has positively AUDITED as
+# ordinary-or-secret is listed here; anything else (a newer enum member, a
+# malformed value, an unset value) is treated as sensitive.  The list is
+# deliberately explicit rather than read off the live enum: a purpose added by
+# a future IBus is one nobody here has classified yet, and guessing "ordinary"
+# is exactly the failure mode this policy exists to prevent.
+# Verified against the installed IBus typelib: FREE_FORM..DATETIME == 0..13.
+_KNOWN_PURPOSES = frozenset(
+    _ibus_enum_value("InputPurpose", _name, "INPUT_PURPOSE_" + _name, _fallback)
+    for _name, _fallback in (
+        ("FREE_FORM", 0),
+        ("ALPHA", 1),
+        ("DIGITS", 2),
+        ("NUMBER", 3),
+        ("PHONE", 4),
+        ("URL", 5),
+        ("EMAIL", 6),
+        ("NAME", 7),
+        ("PASSWORD", 8),
+        ("PIN", 9),
+        ("TERMINAL", 10),
+        ("DATE", 11),
+        ("TIME", 12),
+        ("DATETIME", 13),
+    )
+)
+_PURPOSE_PASSWORD = _ibus_enum_value(
+    "InputPurpose", "PASSWORD", "INPUT_PURPOSE_PASSWORD", 8
+)
+_PURPOSE_PIN = _ibus_enum_value("InputPurpose", "PIN", "INPUT_PURPOSE_PIN", 9)
+_SENSITIVE_PURPOSES = frozenset({_PURPOSE_PASSWORD, _PURPOSE_PIN})
+# Hints that declare secrecy on their own, with the purpose left at FREE_FORM:
+#   PRIVATE      — "do not store this text" (Wayland ``sensitive_data``),
+#   HIDDEN_TEXT  — the client renders the text hidden, i.e. a password box.
+# Either one is honoured independently of the purpose.
+_HINT_PRIVATE = _ibus_enum_value("InputHints", "PRIVATE", "INPUT_HINT_PRIVATE", 1 << 11)
+_HINT_HIDDEN_TEXT = _ibus_enum_value(
+    "InputHints", "HIDDEN_TEXT", "INPUT_HINT_HIDDEN_TEXT", 1 << 12
+)
+_SENSITIVE_HINTS = _HINT_PRIVATE | _HINT_HIDDEN_TEXT
+
+# IBus modifier bits used by the phantom-key filter.
+_MOD_CONTROL = 1 << 2  # IBus.ModifierType.CONTROL_MASK
+_MOD_ALT = 1 << 3  # IBus.ModifierType.MOD1_MASK
+_MOD_RELEASE = 1 << 30  # IBus.ModifierType.RELEASE_MASK
+# The inert zero-key callback storm always carries this hardware code.
+_SPURIOUS_KEYCODE = 240
+
+
+def _sensitive_until_declared() -> bool:
+    """Opt-in strict mode: treat a never-declared content type as sensitive.
+
+    IBus content-purpose callbacks are advisory and adapter-specific — plenty
+    of clients never send one at all — so defaulting "never declared" to
+    sensitive would disable SmartKey wholesale rather than protect anything.
+    Every *declared* ambiguity still fails safe (see
+    ``SmartKeyEngine._classify_content_type``); this switch extends the same
+    policy to the undeclared case for operators who want the strictest stance.
+    """
+    return os.environ.get("SMARTKEY_SENSITIVE_UNTIL_DECLARED") == "1"
+
+
+# ---------------------------------------------------------------------------
 # Rust prediction engine via PyO3.
 # ---------------------------------------------------------------------------
 try:
@@ -304,6 +370,18 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         # IBus client capabilities (set by do_set_capabilities callback).
         self._caps: int = 0
+
+        # Sensitive-input state (see do_set_content_type).  ``_content_type_key``
+        # is the decision-relevant projection of the last declared content type
+        # so that a mere re-send, or a hints change we do not act on, is not
+        # mistaken for a field switch.
+        self._sensitive: bool = _sensitive_until_declared()
+        self._content_type_key: tuple[int, int] | None = None
+        self._keys_since_content_type: int = 0
+
+        # Phantom keycode-240 storm bookkeeping (see _note_spurious_zero_key).
+        self._spurious_zero_key_count: int = 0
+        self._spurious_zero_key_logged: float = 0.0
 
         # Preedit lifecycle tracking.  Ghost-only and full-word composing
         # preedits need different commit ordering in browser/Qt clients.
@@ -596,16 +674,46 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return True
         return self._is_printable_keyval(keyval)
 
-    @staticmethod
-    def _is_spurious_zero_key_event(keyval: int, keycode: int, state: int) -> bool:
+    # A deliberate chord (CTRL/ALT) or a key RELEASE must never be swallowed
+    # by the phantom filter, however inert the event looks.
+    _REAL_KEY_GUARD_MASK = _MOD_CONTROL | _MOD_ALT | _MOD_RELEASE
+
+    @classmethod
+    def _is_spurious_zero_key_event(cls, keyval: int, keycode: int, state: int) -> bool:
         """Recognize the inert IBus/GTK zero-key callback storm.
 
-        Fedora/GTK can emit repeated ``keyval=0, keycode=240, state=16``
-        callbacks while a preedit is active.  They are not printable or
-        release events; forwarding them can starve real browser key events.
-        Consume only this exact event class and leave all real keys untouched.
+        Fedora/GTK can emit a ~25 Hz burst of ``keyval=0, keycode=240``
+        callbacks while a preedit is active.  They carry no key symbol at all,
+        so forwarding them can starve real browser key events.
+
+        The identifying signature is ``keyval == 0 and keycode == 240`` on a
+        PRESS.  The modifier mask is incidental — NumLock, CapsLock, Shift, a
+        held mouse button and Super all ride along — so it is masked out of
+        the decision rather than compared.  The previous ``state in (16, 272)``
+        equality let every other combination through: across the recorded
+        traces 10 180 events matched and 63 leaked (mods 18, 19, 1040 and
+        67108947), each forwarded with an empty outcome.  Only a genuine
+        CTRL/ALT chord or a release event is excluded here, so no real key can
+        be consumed by this predicate.
         """
-        return keyval == 0 and keycode == 240 and state in (16, 272)
+        if keyval != 0 or keycode != _SPURIOUS_KEYCODE:
+            return False
+        return not state & cls._REAL_KEY_GUARD_MASK
+
+    # Log at most one phantom-storm line per interval: a 25 Hz storm should
+    # show up in the log without becoming the log.
+    _SPURIOUS_LOG_INTERVAL = 60.0
+
+    def _note_spurious_zero_key(self) -> None:
+        """Count a consumed phantom event; report the running total, rate-limited."""
+        count = getattr(self, "_spurious_zero_key_count", 0) + 1
+        self._spurious_zero_key_count = count
+        now = time.monotonic()
+        if now - getattr(self, "_spurious_zero_key_logged", 0.0) >= (
+            self._SPURIOUS_LOG_INTERVAL
+        ):
+            self._spurious_zero_key_logged = now
+            log.debug("smartkey: consumed %d phantom keycode-240 event(s)", count)
 
     def _clear_active_prediction_if(self, prediction_id: int) -> None:
         if (
@@ -993,6 +1101,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     # Action dispatcher — translates Rust actions to IBus API calls.
     # -----------------------------------------------------------------------
+    # The core reporting one of these means the word it was holding is no
+    # longer in flight: every ``HideGhost`` it emits follows a ``reset_word()``
+    # or a commit, and ``CommitText``/``ReplaceWord`` resolve the word by
+    # definition.  ``forward`` is deliberately absent — the core emits a bare
+    # ForwardKey for a CTRL chord or a release while the dual buffer still
+    # holds the word.
+    _COMPOSITION_RESOLVING_ACTIONS = frozenset({"commit", "replace", "hide"})
+
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
         actions = self._coalesce_same_batch_commit_replace(actions)
@@ -1001,8 +1117,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._preedit_active
             and getattr(self, "_preedit_mode", None) == "composing"
         )
+        composition_resolved = False
         consumed = True
         for idx, (action_type, payload) in enumerate(actions):
+            if action_type in self._COMPOSITION_RESOLVING_ACTIONS:
+                composition_resolved = True
             if action_type == "ghost":
                 self._show_ghost(payload)
                 self._track_prediction_shown(payload)
@@ -1075,15 +1194,235 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     _PRED_LOG.write(" | ".join(pts2) + "\n")
             elif action_type == "forward":
                 consumed = False
+        if composition_resolved:
+            # Word boundary, not just a focus boundary: the mid-composition
+            # fail-safe must stop counting keys the core has already resolved,
+            # or the counter stays truthy for the rest of the field and the
+            # client's next content-type change is escalated to sensitive long
+            # after the word committed.
+            self._keys_since_content_type = 0
         return consumed
 
     def do_set_capabilities(self, caps: int) -> None:
         self._caps = caps
 
+    # -----------------------------------------------------------------------
+    # Sensitive input (IBus content type).
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _coerce_content_flag(value: object) -> int | None:
+        """Best-effort int for an IBus enum/flags argument; None if unusable.
+
+        ``bool`` is rejected on purpose: it is an ``int`` subclass, so a client
+        (or a binding bug) passing True/False would otherwise be read as
+        purpose 1/0 — i.e. as an ordinary text field.
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @classmethod
+    def _classify_content_type(
+        cls, purpose: object, hints: object
+    ) -> tuple[bool, tuple[int, int]]:
+        """Return ``(sensitive, decision_key)`` for a declared content type.
+
+        Fail safe: only a purpose this adapter positively recognises as
+        ordinary text yields ``sensitive=False``.  An unset, malformed or
+        unrecognised purpose is treated as sensitive, because an IBus
+        content-purpose callback is advisory and adapter-specific — reading
+        "I do not understand this" as "ordinary text" is the failure mode
+        that must not exist.
+
+        ``decision_key`` is the decision-relevant projection of the content
+        type (normalised purpose + the secrecy hints).  Hints the adapter does
+        not act on are projected away, so a client toggling e.g. spellcheck
+        mid-word is not mistaken for a field switch.  Unrecognised purposes
+        collapse to ``-1`` so that two different unknown values do not look
+        like a field switch to each other either.
+        """
+        purpose_value = cls._coerce_content_flag(purpose)
+        hints_value = cls._coerce_content_flag(hints) or 0
+        secret_hint = bool(hints_value & _SENSITIVE_HINTS)
+        if purpose_value is None or purpose_value not in _KNOWN_PURPOSES:
+            return True, (-1, int(secret_hint))
+        return (
+            secret_hint or purpose_value in _SENSITIVE_PURPOSES,
+            (purpose_value, int(secret_hint)),
+        )
+
+    def _composition_in_flight(self) -> bool:
+        """True while typing in this context may still be unresolved.
+
+        Two independent signals, because either can be true without the other:
+
+        * a live preedit — the visible half;
+        * keystrokes seen since the last content-type declaration that the core
+          has **not** yet resolved with a commit/replace/hide.  The Rust dual
+          buffer can hold a word with nothing on screen, so the preedit flag
+          alone would miss it.
+
+        The counter is zeroed by ``_execute_actions`` on every such resolution
+        as well as at focus/reset/disable boundaries; it therefore reports "a
+        word is still open", not "a key was pressed at some point in this
+        field".
+        """
+        return bool(
+            getattr(self, "_preedit_active", False)
+            or getattr(self, "_keys_since_content_type", 0)
+        )
+
+    def _reset_for_sensitive_switch(self) -> None:
+        """Drop every trace of the in-flight word across a sensitivity switch.
+
+        The dual buffer holds the engine's *interpretation* of the keystrokes
+        (it can be the transliterated hypothesis rather than the literal keys),
+        so the pending word is discarded rather than committed: replaying it
+        could push a transliterated fragment of a secret into the client, or
+        the previous field's word into a password box.  The price is one lost
+        preedit word when a content type changes mid-word — deliberate, and
+        the safe direction.
+        """
+        try:
+            self._core.reset()  # actions discarded on purpose — see docstring
+        except Exception:  # noqa: BLE001 — the kill switch must never fail open
+            log.warning(
+                "smartkey: core reset failed on content-type switch", exc_info=True
+            )
+        if getattr(self, "_preedit_active", False):
+            try:
+                self._clear_ghost()
+            except Exception:  # noqa: BLE001 — the kill switch must never fail open
+                # ``hide_preedit_text()`` is a D-Bus round trip and can fail.
+                # Letting it abort the reset would leave the previous field's
+                # word in ``_last_composing_typed``/``_active_prediction`` and
+                # a stale preedit displayed over the now-sensitive field; the
+                # unconditional assignments below run either way.
+                log.warning(
+                    "smartkey: preedit takedown failed on content-type switch",
+                    exc_info=True,
+                )
+        self._preedit_active = False
+        self._preedit_mode = None
+        self._last_composing_typed = ""
+        self._active_prediction = None
+        self._keys_since_content_type = 0
+        try:
+            self._sync_surrounding_text(None, None)
+        except Exception:  # noqa: BLE001
+            log.debug("smartkey: could not clear surrounding text", exc_info=True)
+
+    # NOTE: there is deliberately no ``_forget_content_type()``.  One existed
+    # and was removed; see the lifetime section of ``do_set_content_type``.
+
+    def do_set_content_type(self, purpose: object, hints: object) -> None:
+        """IBus content-type callback — the sensitive-field kill switch.
+
+        Without this callback the adapter treated a password box like ordinary
+        prose: password input may have been captured where the client delivered
+        it through IBus — composed through the dual buffer (which can commit
+        the Cyrillic hypothesis for a Latin keystroke), fed to the predictor,
+        learned into the personal profile and the OOV trie, and written to the
+        keystroke trace at ``LEVEL=full``.
+
+        The callback is ADVISORY and adapter-specific, so the policy here is
+        deliberately asymmetric: any ambiguity in the PURPOSE turns sensitive
+        mode ON, and only an explicit, recognised, non-sensitive purpose
+        declared outside a live composition turns it back off.  The HINTS axis
+        deliberately fails the other way — unusable hints read as "no secrecy
+        hint" (``_classify_content_type``), because hints are optional and
+        routinely unset, so failing safe on them would disable every ordinary
+        field.
+
+        WHAT THIS COVERS, STATED PRECISELY.  This protects password fields in
+        clients that correctly publish a ContentType.  It is NOT a general
+        guarantee that SmartKey never sees a password, and it must not be
+        described as one.  Three gaps are open by construction:
+
+        * A client that never calls ``set_content_type`` — the callback simply
+          never fires, and the field is handled as prose.  Whether GTK, Qt,
+          Electron and terminal emulators each publish it is a per-client fact,
+          not something this adapter can assert.
+        * A field that gets its focus before its declaration.  The declaration
+          race is one keystroke wide at worst; ``SMARTKEY_SENSITIVE_UNTIL_DECLARED=1``
+          closes it at the cost of one dead keystroke per undeclared field.
+        * Anything that does not go through IBus at all — a browser password
+          manager, a client with its own input handling, an X11 grab.
+
+        The honest claim is a large reduction in exposure with a named
+        boundary, and the boundary is the client's behaviour.
+
+        LIFETIME.  The declaration is STICKY: it survives ``do_focus_out`` and
+        is replaced only by another declaration.  This is not the obvious
+        choice, and an earlier revision did the opposite — expire on focus-out
+        — on the reasoning that ``_sensitive`` is a fact about ONE input
+        context while this adapter object outlives it.  That reasoning is
+        sound; the mechanism it assumed is not.
+
+        IBus deduplicates this callback.  ``ibus_input_context_set_content_type``
+        reads the proxy's cached ``ContentType`` property, compares it with
+        ``g_variant_equal``, and issues the D-Bus call ONLY when they differ
+        (verified against the installed ``libibus-1.0.so.5`` — the ``g_variant_equal``
+        and ``g_dbus_proxy_get_cached_property`` relocations are both there in
+        that function, and the ``g_dbus_proxy_call`` is on the unequal branch).
+        So a client does not re-declare on every focus-in; it declares when the
+        type *changes*.  Expiring on focus-out therefore reopens the password
+        field itself: focus away from the password box and back, no new
+        declaration arrives, and the engine is live inside it.
+
+        What un-sticks the flag is an ordinary declaration.  Moving to a field
+        whose content type differs from the cached one makes IBus send it, and
+        an explicit recognised non-sensitive purpose clears ``_sensitive``.  The
+        residual is the mirror of the discarded design's: a client that
+        declares PASSWORD and then hands focus to a client that never declares
+        anything at all keeps SmartKey inert.  That direction is safe and
+        recoverable — one declaration restores it — whereas the other direction
+        types into a password box.
+
+        IBus 1.5.34 does expose a per-context focus API
+        (``focus_in_id(object_path, client)`` / ``focus_out_id(object_path)``,
+        selected by the ``has-focus-id`` GObject property, default False), which
+        would let one engine instance track this per context properly.  Opting
+        in means re-plumbing the focus path of the live IME — far wider than
+        this policy warrants.
+
+        No chain-up: IBus 1.5.34 exposes no ``content-type`` GObject property,
+        and its default ``set_content_type`` vfunc is a no-op (verified — it
+        does not even update ``get_content_type()``), so there is nothing for
+        the parent to do.
+        """
+        sensitive, decision_key = self._classify_content_type(purpose, hints)
+
+        # Fail safe: a content type that changes while a word is still in
+        # flight means the composition may already belong to a different field
+        # than the one it was started in.  Treat that window as sensitive and
+        # drop the state instead of guessing which field wins.
+        if (
+            getattr(self, "_content_type_key", None) != decision_key
+            and self._composition_in_flight()
+        ):
+            sensitive = True
+
+        self._content_type_key = decision_key
+        if sensitive == getattr(self, "_sensitive", False):
+            return
+        self._sensitive = sensitive
+        # Entering AND leaving a sensitive field both clear the buffers:
+        # nothing composed before the switch may survive it in either
+        # direction.
+        self._reset_for_sensitive_switch()
+
     def do_set_surrounding_text(
         self, text: object, cursor_pos: int, anchor_pos: int
     ) -> None:
         _ = anchor_pos
+        if getattr(self, "_sensitive", False):
+            # A sensitive field's contents must never reach the core, the
+            # predictor or the trace.
+            return
         self._sync_surrounding_text(
             self._decode_surrounding_text(text),
             cursor_pos,
@@ -1100,6 +1439,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         engine for layout-agnostic input.  Falls back to the keyval path
         (``handle_key()``) when keycode is unavailable.
         """
+        # Sensitive field: hard stop BEFORE anything else — no trace event, no
+        # surrounding-text read, no core call, and therefore no composing, no
+        # transliteration, no prediction and no learning.  Returning False
+        # hands the untouched key straight back to IBus for the client.
+        if getattr(self, "_sensitive", False):
+            return False
+
         log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)
 
         trace = getattr(self, "_trace", None)
@@ -1114,7 +1460,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             is_printable = len(keyname) == 1
             fields: dict[str, object] = {
                 "mods": state,
-                "is_release": bool(state & (1 << 30)),
+                "is_release": bool(state & _MOD_RELEASE),
                 "cursor_pos": self._surrounding_cursor_pos,
                 "surrounding_text": self._surrounding_text,
                 "key_class": "char" if is_printable else "special",
@@ -1125,11 +1471,21 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             trace.emit("key_in", **fields)
 
         if self._is_spurious_zero_key_event(keyval, keycode, state):
+            self._note_spurious_zero_key()
             if tracing:
                 trace.emit("core", verdict="consume_spurious")
             return True
 
-        key_release = bool(state & (1 << 30))  # IBUS_RELEASE_MASK
+        key_release = bool(state & _MOD_RELEASE)  # IBUS_RELEASE_MASK
+        if not key_release:
+            # Fail-safe input for do_set_content_type: a content type that
+            # changes after the user has started typing into this context is
+            # treated as a mid-composition switch even when no preedit is
+            # currently visible (the dual buffer can hold state without one).
+            self._keys_since_content_type = (
+                getattr(self, "_keys_since_content_type", 0) + 1
+            )
+
         # Capture the word before a key that can terminate composition. The
         # post-core action list decides whether a commit actually happened.
         o1_pre_word = ""
@@ -1220,9 +1576,40 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     def do_focus_in(self) -> None:
         self._core.focus_gained()
+        if getattr(self, "_sensitive", False):
+            # Never pull a sensitive field's contents into the core.
+            return
         self._refresh_surrounding_text()
 
     def do_focus_out(self) -> None:
+        # The sensitivity declaration deliberately SURVIVES focus-out, because a
+        # sticky flag is the correct mirror of how IBus actually delivers
+        # ContentType.
+        #
+        # `ibus_input_context_set_content_type` is deduplicated against the
+        # proxy's cached property — verified by disassembling the installed
+        # libibus-1.0.so.5, whose call sequence is
+        # g_dbus_proxy_get_cached_property -> g_variant_new -> g_variant_equal
+        # -> (only when unequal) g_dbus_proxy_call -> set_cached_property.  The
+        # daemon does the same in bus/engineproxy.c.  So the engine is told the
+        # content type only when it CHANGES relative to what this proxy was last
+        # told.
+        #
+        # Clearing the flag here would desynchronise us from that cache and
+        # re-open the exact hole this feature exists to close: leave a password
+        # field, come back to the SAME field, the pushed (PASSWORD, 0) equals
+        # the cache, the Set is suppressed, do_set_content_type never fires, and
+        # the password flows into the dual buffer, the predictor,
+        # learn()/learn_oov_word() and the trace.
+        #
+        # Stickiness does not strand correctly declaring clients either:
+        # BusInputContext holds per-context purpose/hints defaulting to
+        # FREE_FORM (0, 0) and pushes them at every focus-in, so a client that
+        # publishes an ordinary field pushes a value that DIFFERS from
+        # (PASSWORD, 0); do_set_content_type(0, 0) then clears sensitivity.
+        #
+        # Only the in-flight keystroke counter is a genuinely per-context value.
+        self._keys_since_content_type = 0
         actions = self._core.focus_lost()
         self._execute_actions(actions)
         self._active_prediction = None
@@ -1243,8 +1630,36 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             except OSError:
                 log.warning("smartkey: failed to save personal profile", exc_info=True)
 
+    @staticmethod
+    def _cancel_safe(actions: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Strip text-producing actions from a CANCEL path.
+
+        IBus ``Reset`` and ``Disable`` mean *discard the composition*. The
+        preedit is rendered with ``PREEDIT_CLEAR``, so those characters were
+        never in the application; a ``commit``/``replace`` here would turn the
+        user's cancel into an insertion.
+
+        The core is expected to return no such action on this path, and a
+        regression test pins that. This filter is the second lock: the core and
+        this adapter live in separate worktrees, and the defect this guards
+        against was invisible to either one's test suite alone — it appeared
+        only when both changes were replayed together. Neither side can
+        reintroduce it on its own now.
+        """
+        dropped = [a for a in actions if a[0] in ("commit", "replace")]
+        if dropped:
+            log.warning(
+                "smartkey: dropped %d text-producing action(s) on a cancel path; "
+                "the core should not emit these from reset()",
+                len(dropped),
+            )
+        return [a for a in actions if a[0] not in ("commit", "replace")]
+
     def do_reset(self) -> None:
-        actions = self._core.reset()
+        # Composition boundary, not a context boundary: the declared content
+        # type survives (see do_focus_out).
+        self._keys_since_content_type = 0
+        actions = self._cancel_safe(self._core.reset())
         self._execute_actions(actions)
         self._active_prediction = None
         collector = getattr(self, "_o1", None)
@@ -1259,7 +1674,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         pass  # Rust core handles enabled state via kill switch.
 
     def do_disable(self) -> None:
-        actions = self._core.reset()
+        # Same asymmetry as do_reset: an IME switch inside a password box must
+        # not drop that box's declaration — and, like do_reset, this is a cancel
+        # path, so no text may be produced from it.
+        self._keys_since_content_type = 0
+        actions = self._cancel_safe(self._core.reset())
         self._execute_actions(actions)
         self._active_prediction = None
         collector = getattr(self, "_o1", None)
