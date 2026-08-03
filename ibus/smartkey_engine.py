@@ -1101,13 +1101,56 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     # Action dispatcher — translates Rust actions to IBus API calls.
     # -----------------------------------------------------------------------
-    # The core reporting one of these means the word it was holding is no
-    # longer in flight: every ``HideGhost`` it emits follows a ``reset_word()``
-    # or a commit, and ``CommitText``/``ReplaceWord`` resolve the word by
-    # definition.  ``forward`` is deliberately absent — the core emits a bare
-    # ForwardKey for a CTRL chord or a release while the dual buffer still
-    # holds the word.
-    _COMPOSITION_RESOLVING_ACTIONS = frozenset({"commit", "replace", "hide"})
+    # These two resolve the word BY DEFINITION, whatever else is in the batch.
+    # ``forward`` is deliberately absent — the core emits a bare ForwardKey for
+    # a CTRL chord or a release while the dual buffer still holds the word.
+    #
+    # ``hide`` is absent too, and that is a correction. An earlier revision
+    # counted it, reasoning that every ``HideGhost`` follows a ``reset_word()``
+    # or a commit. It does not: the core emits a bare ``HideGhost`` mid-word
+    # whenever the prefix has no ghost suffix.
+    #
+    # Measured against the real native module, because the two core entry
+    # points differ and only one is affected:
+    #
+    #   process_keycode('x','q','z')  -> ['composing'] each; counter 1,2,3
+    #   handle_key('x','q','z')       -> ['hide','forward'] each,
+    #                                    with current_word() 'x','xq','xqz'
+    #
+    # So the dual-buffer path is fine and the KEYVAL COMPAT path is not — the
+    # branch taken when the client sends ``keycode == 0`` or the installed
+    # native module predates ``process_keycode``. There, every letter of an
+    # out-of-vocabulary word zeroed ``_keys_since_content_type``, so
+    # ``_composition_in_flight()`` reported "nothing open" while the core was
+    # still holding the word, and a content type arriving mid-word was not
+    # escalated to sensitive. ``hide`` is still honoured, but only once the core
+    # itself confirms the word is gone: see ``_composition_resolved_by``.
+    _COMPOSITION_RESOLVING_ACTIONS = frozenset({"commit", "replace"})
+
+    def _composition_resolved_by(self, actions: list[tuple[str, str]]) -> bool:
+        """True when this batch means the core is no longer holding a word.
+
+        ``commit``/``replace`` answer on their own. A bare ``hide`` is
+        ambiguous, so ask the only component that knows — the core. When it
+        cannot be asked (an older native module, or a fake in a test), the
+        answer is False: leaving the counter running keeps the fail-safe armed,
+        and the cost of a false "still composing" is one content-type change
+        treated as sensitive, against the cost of a false "resolved", which is
+        the kill switch not firing inside a password field.
+        """
+        if any(a[0] in self._COMPOSITION_RESOLVING_ACTIONS for a in actions):
+            return True
+        if not any(a[0] == "hide" for a in actions):
+            return False
+        current_word = getattr(self._core, "current_word", None)
+        if current_word is None:
+            return False
+        try:
+            return not current_word()
+        except Exception:  # noqa: BLE001
+            log.debug("smartkey: current_word() failed, keeping the fail-safe armed",
+                      exc_info=True)
+            return False
 
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
@@ -1117,11 +1160,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._preedit_active
             and getattr(self, "_preedit_mode", None) == "composing"
         )
-        composition_resolved = False
+        # Decided on the batch, before dispatch: the core's own view of the
+        # in-flight word is the tie-breaker for a bare ``hide``, and dispatch
+        # does not change it.
+        composition_resolved = self._composition_resolved_by(actions)
         consumed = True
         for idx, (action_type, payload) in enumerate(actions):
-            if action_type in self._COMPOSITION_RESOLVING_ACTIONS:
-                composition_resolved = True
             if action_type == "ghost":
                 self._show_ghost(payload)
                 self._track_prediction_shown(payload)
