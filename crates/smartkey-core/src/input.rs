@@ -33,6 +33,10 @@ bitflags::bitflags! {
         const ALT     = 0x04;
         const SUPER   = 0x08;
         const SHIFT   = 0x10;
+        /// Caps Lock **latch state** (not the Caps_Lock key itself).
+        /// Inverts Shift for letter keys only — digits and punctuation are
+        /// unaffected by the lock latch on every platform we target.
+        const CAPS_LOCK = 0x20;
     }
 }
 
@@ -627,7 +631,11 @@ impl InputMethodCore {
         // Convert hardware scancode to either a dual-buffer operation or
         // a regular Key before entering the main match.
         let event = if let Key::RawCode(code) = event.key {
-            let shift = event.modifiers.contains(Modifiers::SHIFT);
+            // Caps Lock inverts Shift, but only on letter keys — the lock latch
+            // must never uppercase digits or punctuation.
+            let shift = event.modifiers.contains(Modifiers::SHIFT)
+                ^ (event.modifiers.contains(Modifiers::CAPS_LOCK)
+                    && keymap::is_alpha_scancode(code));
             // Special keys (Tab, Space, etc.) → rewrite to their Key variant.
             if let Some(special) = keymap::scancode_to_special(code) {
                 let key = match special {
@@ -671,18 +679,14 @@ impl InputMethodCore {
             Key::Tab => {
                 if !self.ghost.is_empty() {
                     self.accept_ghost_completion()
-                } else if self.dual_buffer.is_some() && !self.current_word.is_empty() {
+                } else if let Some(commit) = self.flush_preedit() {
                     // Composing, no ghost: the prefix lives only in the preedit,
                     // so commit it before forwarding Tab — otherwise a locked
                     // dual buffer would forward Tab and abandon the typed word.
                     let prefix = self.current_word.clone();
                     self.commit_word_internal(&prefix, true);
                     self.reset_word();
-                    vec![
-                        Action::HideGhost,
-                        Action::CommitText(prefix),
-                        Action::ForwardKey,
-                    ]
+                    vec![Action::HideGhost, commit, Action::ForwardKey]
                 } else {
                     vec![Action::ForwardKey]
                 }
@@ -829,8 +833,17 @@ impl InputMethodCore {
                             return vec![Action::HideGhost];
                         }
                         // Full-word composing: re-score and update preedit.
-                        let (ef, bf) = self.engine.score_both(db.en_text(), db.bg_text());
-                        db.update_scores(ef, bf);
+                        // Re-scoring is only legal while the buffer is still in
+                        // the hypothesis phase — `handle_dual_buffer_key` gates
+                        // the identical call the same way.  Under a LOCKED
+                        // buffer `update_scores` rewrites `locked_lang` and
+                        // flips the whole word's alphabet, so a single deletion
+                        // could turn Cyrillic into Latin mid-word (live trace:
+                        // 15 flips on BackSpace, 9 of them locked→locked).
+                        if !db.is_locked() {
+                            let (ef, bf) = self.engine.score_both(db.en_text(), db.bg_text());
+                            db.update_scores(ef, bf);
+                        }
                         self.current_word = db.winner_text().to_string();
                         let ghost = self.compute_ghost_suffix();
                         return vec![Action::ShowComposing {
@@ -994,13 +1007,10 @@ impl InputMethodCore {
 
     /// Called when the input field loses focus.
     pub fn focus_lost(&mut self) -> Vec<Action> {
-        let mut actions = Vec::new();
-        // If in hypothesis phase, commit the preedit prefix to the app.
-        if let Some(ref db) = self.dual_buffer {
-            if !db.is_locked() && !self.current_word.is_empty() {
-                actions.push(Action::CommitText(self.current_word.clone()));
-            }
-        }
+        // Flush the preedit to the application BEFORE learning from it —
+        // the lock gate that used to sit here made the engine learn a word
+        // the application never received.
+        let mut actions = Vec::from_iter(self.flush_preedit());
         if !self.current_word.is_empty() {
             let word = std::mem::take(&mut self.current_word);
             self.commit_word_internal(&word, true);
@@ -1021,15 +1031,37 @@ impl InputMethodCore {
     /// session cache so stale predictions do not bleed into the new cursor
     /// location after navigation.
     pub fn cursor_moved(&mut self) -> Vec<Action> {
+        // The in-flight word lives ONLY in the preedit; clearing state without
+        // flushing it destroys characters the application never received.
+        let mut actions = Vec::from_iter(self.flush_preedit());
         self.reset_word();
         self.context.clear();
         self.lang_detector.reset();
         self.engine.clear_session_cache();
         self.active_hints = None;
-        vec![Action::HideGhost]
+        actions.push(Action::HideGhost);
+        actions
     }
 
-    /// Reset internal state (e.g. on engine reset request).
+    /// Reset internal state — the CANCEL path. Discards the in-flight preedit.
+    ///
+    /// Deliberately NOT symmetric with [`Self::focus_lost`] and
+    /// [`Self::cursor_moved`], which flush. The asymmetry follows the platform
+    /// contract, not a preference:
+    ///
+    /// * IBus `Reset` means *clear the composition*. It is raised by Escape, by
+    ///   a client-side context reset and by an IME switch, and the adapter
+    ///   renders the preedit with `PREEDIT_CLEAR` — so those characters were
+    ///   never in the application. Emitting `CommitText` here turns a cancel
+    ///   into an insertion: the user presses Escape and gets the word anyway.
+    /// * Focus loss and cursor navigation are not cancels. The word is real, the
+    ///   application never received it, and discarding it silently loses typing.
+    ///   Those two paths flush; this one must not.
+    ///
+    /// An earlier revision flushed here too. A combined core+adapter replay
+    /// caught `do_reset` committing a pending preedit — invisible to either
+    /// worktree alone, because the core change and the adapter that executes its
+    /// actions live in different worktrees.
     pub fn reset(&mut self) -> Vec<Action> {
         self.reset_word();
         vec![Action::HideGhost]
@@ -1458,6 +1490,29 @@ impl InputMethodCore {
         actions
     }
 
+    /// Commit action for the in-flight composing preedit, if there is one.
+    ///
+    /// Full-word composing keeps the ENTIRE typed word in the preedit until an
+    /// explicit commit, so the application has received **nothing** while a
+    /// dual buffer is alive.  Every exit path that clears state must call this
+    /// first, otherwise the word is destroyed.
+    ///
+    /// The dual-buffer lock is an internal scoring signal, **not** a commit
+    /// trigger: a locked buffer holds exactly as much unflushed text as an
+    /// unlocked one, which is why there is deliberately no `is_locked()` gate
+    /// here (72.5% of boundary commits in the live trace came from the locked
+    /// state — gating on the lock discarded almost all of them).
+    ///
+    /// The caller owns the surrounding `reset_word()` / `HideGhost` /
+    /// `commit_word_internal()`.
+    fn flush_preedit(&self) -> Option<Action> {
+        if self.dual_buffer.is_some() && !self.current_word.is_empty() {
+            Some(Action::CommitText(self.current_word.clone()))
+        } else {
+            None
+        }
+    }
+
     fn reset_word(&mut self) {
         self.current_word.clear();
         self.ghost.clear();
@@ -1651,6 +1706,43 @@ impl InputMethodCore {
             self.config.min_prefix_length
         };
         if self.current_word.chars().count() < effective_min {
+            self.ghost.clear();
+            self.last_predictions.clear();
+            return String::new();
+        }
+
+        // Perf gate (§12.4: ≤1% of decisions over 20 ms).  A prefix with no
+        // letters cannot complete to a word, but it DOES drive a Levenshtein-2
+        // walk of every trie: with a one-character query every depth-1 node is
+        // inside the edit budget and the only prune never engages.  Measured on
+        // the live trace: '-' n=41 median 32.30 ms / max 41.40, '=' max 53.30,
+        // '!' median 30.50 — against letters n=1619 median 0.50 ms, p99 3.10,
+        // ZERO samples over 20 ms.  47 of the 49 gate breaches are this one key
+        // class.  This is the whole prediction call site for punctuation and
+        // digits: `update_predictions()` (Char + Backspace) funnels through it,
+        // while the dual-buffer call sites only ever hold letters.
+        //
+        // WHAT THIS COSTS, ACCEPTED EXPLICITLY.  The mechanism above is about
+        // prefix LENGTH — any query at or under the edit budget defeats the
+        // prune, including a one-letter one.  This guard is deliberately
+        // narrower than the mechanism: it drops only prefixes with no letter at
+        // all, which is where 47 of the 49 measured breaches were, and leaves
+        // short letter prefixes predicting.  The exchange is not free:
+        //
+        //   * A word whose prefix so far is all digits or punctuation gets no
+        //     prediction until its first letter arrives — "3" in "3D", the
+        //     leading run of "5-year".  The prediction reappears at "3D"; the
+        //     loss is bounded by that run, never by the whole word.
+        //   * A vocabulary entry that begins with a digit is unreachable by
+        //     completion for as long as the prefix stays letter-free.
+        //
+        // That is accepted over the alternatives.  A minimum-length guard would
+        // also silence one-letter prefixes, which are the highest-value
+        // completions there are.  Raising the prune's aggressiveness inside
+        // `ensemble.rs` changes ranking for every query, letters included, and
+        // no evaluation has been run for that.  Revisit here only with a
+        // measured accuracy comparison, not on the strength of the mechanism.
+        if !self.current_word.chars().any(char::is_alphabetic) {
             self.ghost.clear();
             self.last_predictions.clear();
             return String::new();
@@ -2808,6 +2900,140 @@ mod tests {
         );
     }
 
+    // ── Caps Lock (FIX 1) ────────────────────────────────────────────
+
+    /// Live regression (trace seq 2909–2927): pressing Caps_Lock latched
+    /// `IBUS_LOCK_MASK`, which never reached `Modifiers`, so an eight-letter
+    /// Bulgarian word composed and committed entirely in lowercase.
+    #[test]
+    fn test_caps_lock_composes_and_commits_uppercase() {
+        let mut core = test_core_dual();
+        // "zdrawej" on BG phonetic → "здравей" (in the bilingual test corpus).
+        // evdev: z=44 d=32 r=19 a=30 w=17 e=18 j=36
+        for code in [44u16, 32, 19, 30, 17, 18, 36] {
+            core.handle_key(press_raw_with(code, Modifiers::CAPS_LOCK));
+        }
+        assert_eq!(
+            core.current_word(),
+            "ЗДРАВЕЙ",
+            "Caps Lock must compose uppercase (and stay Cyrillic)"
+        );
+
+        let actions = core.handle_key(press_raw_with(57, Modifiers::CAPS_LOCK)); // Space
+        assert!(
+            has_action(&actions, &Action::CommitText("ЗДРАВЕЙ".to_string())),
+            "committed text must be uppercase, got {actions:?}"
+        );
+    }
+
+    /// Caps Lock is a *letter* latch: it must never uppercase digits or
+    /// punctuation — that is what the `is_alpha_scancode` guard buys.
+    #[test]
+    fn test_caps_lock_does_not_shift_digits_or_punctuation() {
+        // evdev 2 = '1'/'!', 12 = '-'/'_', 51 = ','/'<'
+        for (code, expected) in [(2u16, "1"), (12, "-"), (51, ",")] {
+            let mut core = test_core_dual();
+            core.handle_key(press_raw_with(code, Modifiers::CAPS_LOCK));
+            assert_eq!(
+                core.current_word(),
+                expected,
+                "Caps Lock must not shift scancode {code}"
+            );
+        }
+        // Shift alone still shifts them.
+        let mut core = test_core_dual();
+        core.handle_key(press_raw_with(2, Modifiers::SHIFT));
+        assert_eq!(core.current_word(), "!", "Shift must still reach digits");
+    }
+
+    /// Shift and Caps Lock cancel out on letters (standard latch semantics).
+    #[test]
+    fn test_caps_lock_plus_shift_yields_lowercase_letter() {
+        let mut core = test_core_dual();
+        core.handle_key(press_raw_with(
+            35, // h / х
+            Modifiers::CAPS_LOCK | Modifiers::SHIFT,
+        ));
+        assert_eq!(
+            core.current_word(),
+            "h",
+            "Shift ^ CapsLock must produce a lowercase letter"
+        );
+    }
+
+    // ── Backspace vs the dual-buffer lock (FIX 2) ────────────────────
+
+    /// A LOCKED buffer must never be re-scored on Backspace.  `update_scores`
+    /// rewrites `locked_lang` when the shorter prefix has a different winner,
+    /// so one deletion flipped the alphabet of the entire word.  Live trace:
+    /// 15 mid-word script flips on BackSpace, 9 of them locked→locked.
+    /// `handle_dual_buffer_key` already gates the identical call on
+    /// `!was_locked`; the Backspace arm did not.
+    #[test]
+    fn test_backspace_under_lock_keeps_locked_alphabet() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        // 4-char prefix: BG-only.  3-char prefix: EN too — so deleting one
+        // character is exactly the case that used to flip the word.
+        core.load_word_lang("зднк", 5_000_000, LangId::Bg);
+        core.load_word_lang("zdn", 5_000_000, LangId::En);
+
+        let mut db = DualBuffer::from_config(&core.config.dual_buffer);
+        for (en, bg) in [('z', 'з'), ('d', 'д'), ('n', 'н'), ('k', 'к')] {
+            db.push(en, bg);
+        }
+        db.update_scores(0.0, 5_000_000.0);
+        assert!(db.is_locked(), "precondition: buffer must lock");
+        assert_eq!(
+            db.winner_text(),
+            "зднк",
+            "precondition: BG must own the word"
+        );
+        core.current_word = db.winner_text().to_string();
+        core.dual_buffer = Some(db);
+
+        let actions = core.handle_key(press(Key::Backspace));
+
+        assert_eq!(
+            core.current_word(),
+            "здн",
+            "locked Cyrillic buffer must stay Cyrillic after Backspace, got {actions:?}"
+        );
+        assert!(
+            core.dual_buffer.as_ref().is_some_and(DualBuffer::is_locked),
+            "the lock must survive the deletion"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::ShowComposing { typed, .. } if typed == "здн"
+            )),
+            "preedit must be redrawn in the locked alphabet, got {actions:?}"
+        );
+    }
+
+    /// The hypothesis phase must keep re-scoring on Backspace — the FIX 2
+    /// guard must not freeze an unlocked buffer.
+    #[test]
+    fn test_backspace_unlocked_still_rescores() {
+        let mut core = test_core_dual();
+        // "mn" → BG "мн" (много, 2.95M) beats EN "mn" (5 370); 2 chars is
+        // below min_lock_chars (4), so the buffer is still unlocked.
+        core.handle_key(press_raw(50)); // m / м
+        core.handle_key(press_raw(49)); // n / н
+        core.handle_key(press_raw(34)); // g / г  → "mng" / "мнг": neither scores
+        assert!(
+            !core.dual_buffer.as_ref().unwrap().is_locked(),
+            "precondition: buffer must still be in the hypothesis phase"
+        );
+
+        core.handle_key(press_raw(14)); // Backspace → back to "mn" / "мн"
+        assert_eq!(
+            core.current_word(),
+            "мн",
+            "unlocked buffer must re-score after Backspace"
+        );
+    }
+
     #[test]
     fn test_exclamation_during_composing_commits_word_and_forwards_without_ghost() {
         let mut core = test_core_dual();
@@ -2846,6 +3072,262 @@ mod tests {
         core.handle_key(press_raw(14));
         assert_eq!(core.current_word(), "");
         assert!(core.dual_buffer.is_none());
+    }
+
+    // ── Preedit flush on exit paths (FIX 3) ──────────────────────────
+
+    /// Build a core whose composing preedit holds a LOCKED Cyrillic word that
+    /// the application has not received a single character of.
+    fn composing_locked_core() -> InputMethodCore {
+        let mut core = test_core_dual();
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "здрав".to_string();
+        core
+    }
+
+    fn commit_index(actions: &[Action]) -> Option<usize> {
+        actions
+            .iter()
+            .position(|a| matches!(a, Action::CommitText(t) if t == "здрав"))
+    }
+
+    fn hide_index(actions: &[Action]) -> Option<usize> {
+        actions.iter().position(|a| *a == Action::HideGhost)
+    }
+
+    /// Navigation away from a LOCKED composing preedit must flush the word to
+    /// the application first.  `cursor_moved()` used to `reset_word()` straight
+    /// into `[HideGhost]`, destroying text the app never saw.
+    ///
+    /// NOTE: the older `navigation_key_clears_stale_context` test cannot catch
+    /// this — it types via `Key::Char`, so no dual buffer ever exists.
+    #[test]
+    fn test_navigation_flushes_locked_preedit() {
+        let mut core = composing_locked_core();
+        let actions = core.handle_key(press(Key::Left));
+
+        let ci = commit_index(&actions)
+            .unwrap_or_else(|| panic!("Key::Left must commit the composing word, got {actions:?}"));
+        let hi = hide_index(&actions).expect("HideGhost must still be emitted");
+        assert!(
+            ci < hi,
+            "CommitText must precede HideGhost, got {actions:?}"
+        );
+        assert!(has_action(&actions, &Action::ForwardKey));
+        assert!(core.dual_buffer.is_none(), "state must still be cleared");
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// Same for the direct `cursor_moved()` entry point.
+    #[test]
+    fn test_cursor_moved_flushes_locked_preedit() {
+        let mut core = composing_locked_core();
+        let actions = core.cursor_moved();
+        let ci = commit_index(&actions)
+            .unwrap_or_else(|| panic!("cursor_moved must flush the preedit, got {actions:?}"));
+        let hi = hide_index(&actions).expect("HideGhost must still be emitted");
+        assert!(
+            ci < hi,
+            "CommitText must precede HideGhost, got {actions:?}"
+        );
+    }
+
+    /// `reset()` is the CANCEL path and must NOT commit.
+    ///
+    /// IBus raises Reset for Escape, a client-side context reset and an IME
+    /// switch. The adapter runs those actions in both `do_reset` and
+    /// `do_disable`, and renders the preedit with `PREEDIT_CLEAR` — so the
+    /// characters were never in the application. A flush here turns "the user
+    /// cancelled" into "the word was typed", which is text injection.
+    #[test]
+    fn test_reset_discards_locked_preedit_instead_of_committing() {
+        let mut core = composing_locked_core();
+        let actions = core.reset();
+        assert!(
+            commit_index(&actions).is_none(),
+            "Reset is a cancel; committing here injects discarded text: {actions:?}"
+        );
+        hide_index(&actions).expect("HideGhost must still be emitted");
+        assert!(core.dual_buffer.is_none());
+        assert!(core.current_word.is_empty());
+    }
+
+    /// The other half of the split: the non-cancel exits still flush, so a real
+    /// word is never silently lost. This pair is the contract — neither test is
+    /// meaningful without the other.
+    #[test]
+    fn test_focus_loss_and_navigation_still_flush_the_preedit() {
+        for (label, mut core) in [
+            ("focus_lost", composing_locked_core()),
+            ("cursor_moved", composing_locked_core()),
+        ] {
+            let actions = if label == "focus_lost" {
+                core.focus_lost()
+            } else {
+                core.cursor_moved()
+            };
+            let ci = commit_index(&actions)
+                .unwrap_or_else(|| panic!("{label} must flush the preedit, got {actions:?}"));
+            let hi = hide_index(&actions).expect("HideGhost must still be emitted");
+            assert!(
+                ci < hi,
+                "{label}: CommitText must precede HideGhost: {actions:?}"
+            );
+        }
+    }
+
+    /// `focus_lost()` learned the word unconditionally but only COMMITTED it
+    /// while unlocked — so the engine trained on text the application never
+    /// received.  Both halves must now fire regardless of the lock.
+    #[test]
+    fn test_focus_lost_flushes_locked_preedit() {
+        let mut core = composing_locked_core();
+        let actions = core.focus_lost();
+        let ci = commit_index(&actions)
+            .unwrap_or_else(|| panic!("focus_lost must flush the preedit, got {actions:?}"));
+        let hi = hide_index(&actions).expect("HideGhost must still be emitted");
+        assert!(
+            ci < hi,
+            "CommitText must precede HideGhost, got {actions:?}"
+        );
+    }
+
+    /// The flush must be a no-op when there is no composing preedit — plain
+    /// `Key::Char` typing is already forwarded character by character, so
+    /// re-committing it would double the text.
+    #[test]
+    fn test_exits_do_not_double_commit_forwarded_chars() {
+        for exit in ["cursor_moved", "reset", "focus_lost"] {
+            let mut core = test_core();
+            core.handle_key(press(Key::Char('h')));
+            core.handle_key(press(Key::Char('e')));
+            assert!(core.dual_buffer.is_none(), "precondition: no dual buffer");
+
+            let actions = match exit {
+                "cursor_moved" => core.cursor_moved(),
+                "reset" => core.reset(),
+                _ => core.focus_lost(),
+            };
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::CommitText(t) if t == "he")),
+                "{exit} must not re-commit already-forwarded characters, got {actions:?}"
+            );
+        }
+    }
+
+    // ── Punctuation latency (FIX 4) ──────────────────────────────────
+
+    /// A corpus wide enough that a full Levenshtein-2 walk of the trie is
+    /// unmistakable in wall-clock terms, plus a couple of very short words
+    /// that a 1-char fuzzy query WOULD match (distance ≤ 2).
+    fn wide_corpus_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        let letters: Vec<char> = ('a'..='z').collect();
+        let mut n: usize = 7;
+        for _ in 0..20_000 {
+            let mut word = String::with_capacity(6);
+            for k in 0..6 {
+                n = n.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                word.push(letters[(n >> (8 + k)) % 26]);
+            }
+            core.load_word(&word, 1 + (n % 500) as u32);
+        }
+        // Reachable from a 1-char query by ≤ 2 edits.
+        core.load_word("ab", 900);
+        core.load_word("cd", 900);
+        core
+    }
+
+    /// Ratified performance gate §12.4: ≤1% of decisions over 20 ms.
+    ///
+    /// Punctuation at a word boundary used to walk every node of every trie
+    /// (`ensemble.rs` fuzzy fallback with a one-character query).  Live
+    /// measurement: '-' n=41 median 32.30 ms / max 41.40 ms, '=' max 53.30 ms,
+    /// '!' median 30.50 ms — 47 of the 49 gate breaches — against letters
+    /// n=1619 median 0.50 ms, p99 3.10 ms, zero samples over 20 ms.
+    ///
+    /// Benchmark-style: real synthetic corpus (20 002 words), real key path.
+    ///
+    /// The gate is asserted STRUCTURALLY — the expensive call is proven not to
+    /// happen — rather than with a stopwatch.  A wall-clock threshold is a
+    /// statement about the machine that ran it: it passes on a quiet laptop and
+    /// goes red on a loaded CI box, which trains people to re-run red builds.
+    /// `latency_sample_count()` only moves when `engine.predict()` is entered,
+    /// so pinning it at zero pins the guard itself.  The timing measurement is
+    /// kept, one test down, but not as the gate.
+    #[test]
+    fn test_punctuation_key_never_reaches_the_predictor() {
+        let mut core = wide_corpus_core();
+        // Warm the engine on the normal (letter) path first — this is what makes
+        // the assertion meaningful: the counter is already moving.
+        core.handle_key(press(Key::Char('a')));
+        core.handle_key(press(Key::Space));
+        let warmed = core.metrics().latency_sample_count();
+        assert!(warmed > 0, "the letter path must have recorded a sample");
+
+        for ch in ['-', '=', '!', '.', '/'] {
+            core.handle_key(press(Key::Char(ch)));
+            assert!(
+                core.predictions().is_empty(),
+                "a letter-free prefix must not run prediction at all ({ch:?})"
+            );
+            assert_eq!(
+                core.metrics().latency_sample_count(),
+                warmed,
+                "{ch:?} entered engine.predict() — the guard is bypassed, and \
+                 that call is the 30-50 ms full-trie Levenshtein-2 walk"
+            );
+            core.handle_key(press(Key::Space)); // reset for the next key
+        }
+    }
+
+    /// The same path, measured rather than asserted.
+    ///
+    /// `#[ignore]` on purpose: this is a machine-dependent measurement, not a
+    /// contract, and it must never be the thing that fails a build.  Run it
+    /// deliberately when touching the fuzzy walk or the guard:
+    /// `cargo test -p smartkey-core -- --ignored --nocapture punctuation_latency`.
+    #[test]
+    #[ignore = "timing measurement, not a contract — see the structural test above"]
+    fn punctuation_latency_measurement() {
+        let mut core = wide_corpus_core();
+        core.handle_key(press(Key::Char('a')));
+        core.handle_key(press(Key::Space));
+
+        let mut worst = std::time::Duration::ZERO;
+        for ch in ['-', '=', '!', '.', '/'] {
+            let t0 = Instant::now();
+            core.handle_key(press(Key::Char(ch)));
+            worst = worst.max(t0.elapsed());
+            core.handle_key(press(Key::Space));
+        }
+        println!(
+            "worst letter-free keystroke: {:.3} ms (§12.4 budget 20 ms)",
+            worst.as_secs_f64() * 1000.0
+        );
+    }
+
+    /// The guard must be narrow: a word that merely *contains* punctuation or
+    /// digits still predicts normally.
+    #[test]
+    fn test_prediction_still_runs_for_mixed_alphanumeric_prefix() {
+        let mut core = test_core();
+        core.load_word("utf8mb4", 500);
+        for ch in "utf8".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert!(
+            core.predictions()
+                .iter()
+                .any(|p| p.word.eq_ignore_ascii_case("utf8mb4")),
+            "a prefix with at least one letter must still predict, got {:?}",
+            core.predictions()
+                .iter()
+                .map(|p| &p.word)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
