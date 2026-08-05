@@ -52,7 +52,7 @@ from .constants import (
 )
 from .harness import connect
 from .paths import alarm_file, default_db_path
-from .validity import select_campaign_rows
+from .validity import select_campaign_rows, select_campaign_sweep_rows
 
 
 @dataclass
@@ -136,9 +136,17 @@ def _merge_small(buckets: list[list[int]], min_count: int, min_buckets: int) -> 
 # ---------------------------------------------------------------------------
 # Watchdog coverage
 # ---------------------------------------------------------------------------
-def _watchdog_status(conn: sqlite3.Connection, first_ts: float, last_ts: float) -> tuple[int, bool]:
+def _watchdog_status(
+    conn: sqlite3.Connection,
+    first_ts: float,
+    last_ts: float,
+    campaign_run_id: str | None,
+    *,
+    synthetic: bool,
+) -> tuple[int, bool]:
+    scoped_alarm = alarm_file(campaign_run_id, synthetic=synthetic)
     if first_ts <= 0 or last_ts <= 0:
-        return 0, alarm_file().exists()
+        return 0, scoped_alarm.exists()
     d0 = _dt.date.fromtimestamp(first_ts)
     d1 = _dt.date.fromtimestamp(last_ts)
     expected = set()
@@ -146,9 +154,13 @@ def _watchdog_status(conn: sqlite3.Connection, first_ts: float, last_ts: float) 
     while d <= d1:
         expected.add(d.isoformat())
         d += _dt.timedelta(days=1)
-    rows = conn.execute("SELECT sweep_date, watchdog_status FROM sweeps").fetchall()
-    swept = {r[0] for r in rows}
-    alarm_raised = alarm_file().exists() or any(r[1] == "ALARM" for r in rows)
+    rows = select_campaign_sweep_rows(
+        conn, campaign_run_id, synthetic=synthetic
+    )
+    swept = {row["sweep_date"] for row in rows}
+    alarm_raised = scoped_alarm.exists() or any(
+        row["watchdog_status"] == "ALARM" for row in rows
+    )
     return len(expected - swept), alarm_raised
 
 
@@ -164,39 +176,35 @@ def analyze(
     conn = connect(db_path, readonly=True)
     scope = "synthetic" if synthetic else "real"
 
-    excluded: dict[str, int] = {}
-    hold_flags: list[str] = []
-    raw_events = 0
-    if synthetic:
-        all_rows = conn.execute(
-            "SELECT ts, p_top3, latency_us, outcome FROM events "
-            "WHERE synthetic=1 ORDER BY ts"
-        ).fetchall()
-        raw_events = len(all_rows)
-        fh_row = conn.execute(
-            "SELECT freq_table_hash, run_id FROM run_metadata WHERE synthetic=1 "
-            "ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        selected_run_id = fh_row[1] if fh_row else None
-    else:
-        selection = select_campaign_rows(conn, campaign_run_id, window)
-        selected_run_id = selection.campaign_run_id
-        all_rows = [
-            (row["ts"], row["p_top3"], row["latency_us"], row["outcome"])
-            for row in selection.analysis_rows
-        ]
-        raw_events = len(selection.raw_rows)
-        excluded = dict(selection.excluded)
-        hold_flags = list(selection.hold_flags)
-        fh_row = (
-            conn.execute(
-                "SELECT freq_table_hash, run_id FROM run_metadata WHERE run_id=? "
-                "ORDER BY id DESC LIMIT 1",
-                (selected_run_id,),
-            ).fetchone()
-            if selected_run_id is not None
-            else None
+    selection = select_campaign_rows(
+        conn,
+        campaign_run_id,
+        window,
+        synthetic=synthetic,
+    )
+    selected_run_id = selection.campaign_run_id
+    if campaign_run_id is not None and selected_run_id is None:
+        conn.close()
+        raise ValueError(
+            f"campaign {campaign_run_id!r} not found in "
+            f"{'synthetic' if synthetic else 'real'} scope"
         )
+    all_rows = [
+        (row["ts"], row["p_top3"], row["latency_us"], row["outcome"])
+        for row in selection.analysis_rows
+    ]
+    raw_events = len(selection.raw_rows)
+    excluded = dict(selection.excluded)
+    hold_flags = list(selection.hold_flags)
+    fh_row = (
+        conn.execute(
+            "SELECT freq_table_hash, run_id FROM run_metadata WHERE run_id=? "
+            "AND synthetic=? ORDER BY id DESC LIMIT 1",
+            (selected_run_id, 1 if synthetic else 0),
+        ).fetchone()
+        if selected_run_id is not None
+        else None
+    )
     freq_table_hash = fh_row[0] if fh_row else ""
 
     res = AnalysisResult(
@@ -224,7 +232,11 @@ def analyze(
     res.unresolved_frac = res.unresolved / res.total_events if res.total_events else 0.0
 
     res.missed_watchdog, res.alarm_raised = _watchdog_status(
-        conn, all_rows[0][0], all_rows[-1][0]
+        conn,
+        all_rows[0][0],
+        all_rows[-1][0],
+        selected_run_id,
+        synthetic=synthetic,
     )
     conn.close()
 
@@ -330,8 +342,8 @@ def format_report(res: AnalysisResult, db_path: str | Path) -> str:
     L.append(f" O1 / PHASE-A ANALYSIS REPORT  ({res.scope} data)")
     L.append(f" prediction_scope: {res.prediction_scope}  (n-gram component ONLY; ensemble firewalled out)")
     L.append(f" db: {db_path}")
+    L.append(f" campaign_run_id: {res.campaign_run_id}")
     if res.scope == "real":
-        L.append(f" campaign_run_id: {res.campaign_run_id}")
         L.append(f" raw rows in DB       : {res.raw_events}")
         if res.excluded:
             L.append(f" excluded by selector : {res.excluded}")

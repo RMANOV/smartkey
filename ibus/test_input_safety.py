@@ -1010,3 +1010,94 @@ def test_current_native_core_reset_crosses_the_adapter_without_committing():
         f"{rec.commits!r}"
     )
     assert native.debug_state()[0] is False, "native reset left the dual buffer alive"
+
+
+def test_a_bare_hide_mid_word_does_not_disarm_the_composition_fail_safe():
+    """The core emits HideGhost mid-word; that must not read as "resolved".
+
+    ``_composition_in_flight()`` is the fail-safe for a content type that
+    arrives while a word is still being composed: the window is treated as
+    sensitive because the composition may already belong to a different field.
+    An earlier revision counted every ``hide`` as a resolution and zeroed the
+    counter — but the core emits a bare ``HideGhost`` whenever the prefix has
+    no ghost suffix.
+
+    Path matters, and only one of the two is affected. Measured against the
+    real module: ``process_keycode`` returns ``['composing']`` and the counter
+    accumulates correctly, while ``handle_key`` returns ``['hide','forward']``
+    with a non-empty ``current_word()``. So this pins the KEYVAL COMPAT path —
+    the branch taken when the client sends ``keycode == 0`` or the installed
+    native module predates ``process_keycode``. Passing ``keycode=0`` below is
+    not a shortcut; it is the only way to reach the defect.
+
+    Driven through the real PyO3 core, because the premise ("the core really
+    does emit a bare hide here") is a fact about the Rust side, not about a
+    fake — a scripted core would prove only that the script was followed.
+    """
+    if not ske._HAS_CORE:
+        if os.environ.get("SMARTKEY_REQUIRE_NATIVE_TESTS") == "1":
+            pytest.fail("current-checkout smartkey_py is required for the native seam test")
+        pytest.skip("smartkey_py is not built in this local Python environment")
+
+    native = ske.PyInputMethodCore(json.dumps({"use_ppm": False, "use_reranker": False}))
+    native.load_word("hello", 1_000)
+
+    eng, _rec = build_engine()
+    eng._core = native
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+
+    # keycode=0 -> the keyval compat path, where the bare hide actually occurs.
+    eng.do_process_key_event(ord("x"), 0, 0)
+
+    assert native.current_word() == "x", "premise broken: the core dropped the word"
+    # Assert the COUNTER, not only `_composition_in_flight()`. That helper ORs
+    # in `_preedit_active`, which masks the defect: an early version of this
+    # test asserted the helper, and a mutation run restoring the pre-fix
+    # behaviour still passed. The counter is the half that tracks the dual
+    # buffer's invisible word, and it is the half that broke.
+    assert eng._keys_since_content_type > 0, (
+        "a bare hide mid-word zeroed the key counter: the core is still holding "
+        f"{native.current_word()!r}, so the mid-composition fail-safe is disarmed"
+    )
+    assert eng._composition_in_flight()
+
+
+def test_a_hide_after_the_word_is_gone_still_counts_as_resolved():
+    """The other direction: the fix must not pin the counter on forever.
+
+    Once the core reports no word, a hide IS a resolution, and the counter has
+    to fall — otherwise every later content-type change in the field is
+    escalated to sensitive long after the word committed, and SmartKey goes
+    inert for the rest of the field.
+    """
+    eng, _rec = build_engine()
+
+    class _ResolvedCore(SpyCore):
+        def current_word(self):
+            return ""
+
+    eng._core = _ResolvedCore()
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    eng._keys_since_content_type = 3
+
+    eng._execute_actions([("hide", "")])
+
+    assert eng._keys_since_content_type == 0, (
+        "a hide with no word left in the core must clear the counter"
+    )
+
+
+def test_an_unaskable_core_keeps_the_fail_safe_armed():
+    """No ``current_word()`` (older native module, or a fake) -> stay armed."""
+    eng, _rec = build_engine()
+    eng._core = SpyCore()  # deliberately has no current_word
+    assert not hasattr(eng._core, "current_word"), "premise broken"
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    eng._keys_since_content_type = 2
+
+    eng._execute_actions([("hide", "")])
+
+    assert eng._keys_since_content_type == 2, (
+        "an unaskable core must not be read as 'resolved' — that is the unsafe "
+        "direction (kill switch silently not firing inside a password field)"
+    )

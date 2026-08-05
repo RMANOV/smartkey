@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import time
 from pathlib import Path
 
@@ -29,14 +30,15 @@ from .constants import (
 )
 from .harness import connect
 from .paths import alarm_file, default_db_path, receipts_dir
+from .validity import select_campaign_rows, select_campaign_sweep_rows
 
 
-def _invariant_violations(conn, syn: int) -> int:
+def _invariant_violations(conn, campaign_run_id: str, syn: int) -> int:
     like = " OR ".join(f"resolver LIKE '{p}%'" for p in ALLOWED_RESOLVER_PREFIXES)
     row = conn.execute(
-        f"SELECT COUNT(*) FROM events WHERE synthetic=? AND "
+        f"SELECT COUNT(*) FROM events WHERE run_id=? AND synthetic=? AND "
         f"(class != 'machine' OR NOT ({like}))",
-        (syn,),
+        (campaign_run_id, syn),
     ).fetchone()
     return int(row[0])
 
@@ -56,29 +58,45 @@ def _raw_bucket_table(p: np.ndarray, y: np.ndarray, n_buckets: int = 5) -> list[
     return lines
 
 
-def run_sweep(db_path: str | Path, synthetic: bool = False) -> str:
+def run_sweep(
+    db_path: str | Path,
+    synthetic: bool = False,
+    campaign_run_id: str | None = None,
+) -> str:
     syn = 1 if synthetic else 0
     conn = connect(db_path)
+    selection = select_campaign_rows(
+        conn, campaign_run_id, synthetic=synthetic
+    )
+    selected_run_id = selection.campaign_run_id
+    if selected_run_id is None:
+        conn.close()
+        raise ValueError(
+            f"no {'synthetic' if synthetic else 'real'} campaign metadata found"
+        )
     today = _dt.date.today().isoformat()
     now = time.time()
     day_start = time.mktime(_dt.date.today().timetuple())
 
-    rows = conn.execute(
-        "SELECT ts, p_top3, latency_us, outcome FROM events WHERE synthetic=?",
-        (syn,),
-    ).fetchall()
+    rows = [
+        (row["ts"], row["p_top3"], row["latency_us"], row["outcome"])
+        for row in selection.analysis_rows
+    ]
     total = len(rows)
     resolved = [r for r in rows if r[3] is not None]
     today_events = sum(1 for r in rows if r[0] >= day_start)
     lat = np.array([r[2] for r in rows], dtype=float) if rows else np.array([0.0])
     p99 = int(np.percentile(lat, 99))
     over = float(np.mean(lat > LATENCY_BUDGET_US)) if rows else 0.0
-    invariant_bad = _invariant_violations(conn, syn)
+    invariant_bad = _invariant_violations(conn, selected_run_id, syn)
 
     p = np.array([r[1] for r in resolved], dtype=float)
     y = np.array([r[3] for r in resolved], dtype=float)
 
-    prev = conn.execute("SELECT MAX(ran_ts) FROM sweeps").fetchone()[0]
+    prior_sweeps = select_campaign_sweep_rows(
+        conn, selected_run_id, synthetic=synthetic
+    )
+    prev = max((row["ran_ts"] for row in prior_sweeps), default=None)
     age_h = (now - prev) / 3600.0 if prev else None
     wd = "OK"
     if age_h is not None and age_h > WATCHDOG_MAX_AGE_H:
@@ -88,6 +106,7 @@ def run_sweep(db_path: str | Path, synthetic: bool = False) -> str:
     lines.append("=" * 62)
     lines.append(f" O1 / PHASE-A DAILY RECEIPT  {today}   ({'synthetic' if syn else 'real'})")
     lines.append(f" prediction_scope: {PREDICTION_SCOPE}  (n-gram component ONLY)")
+    lines.append(f" campaign_run_id: {selected_run_id}")
     lines.append("=" * 62)
     lines.append(f" events total      : {total}   (today: {today_events})")
     lines.append(f" resolutions       : {len(resolved)}")
@@ -104,29 +123,64 @@ def run_sweep(db_path: str | Path, synthetic: bool = False) -> str:
     receipt = "\n".join(lines)
 
     conn.execute(
-        "INSERT INTO sweeps (sweep_date, ran_ts, events, resolutions, "
-        "latency_p99_us, over_budget_pct, watchdog_status, receipt) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (today, now, total, len(resolved), p99, over, wd, receipt),
+        "INSERT INTO sweeps (run_id, synthetic, sweep_date, ran_ts, events, "
+        "resolutions, latency_p99_us, over_budget_pct, watchdog_status, receipt) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            selected_run_id,
+            syn,
+            today,
+            now,
+            total,
+            len(resolved),
+            p99,
+            over,
+            wd,
+            receipt,
+        ),
     )
     conn.commit()
     conn.close()
 
-    af = alarm_file()
+    af = alarm_file(selected_run_id, synthetic=synthetic)
     if af.exists():
         af.unlink()
-    (receipts_dir() / f"sweep-{today}.txt").write_text(receipt + "\n", encoding="utf-8")
+    scope = "synthetic" if synthetic else "real"
+    campaign_digest = hashlib.sha256(selected_run_id.encode("utf-8")).hexdigest()[:16]
+    receipt_path = receipts_dir() / f"sweep-{today}-{scope}-{campaign_digest}.txt"
+    receipt_path.write_text(receipt + "\n", encoding="utf-8")
     return receipt
 
 
-def run_watchdog(db_path: str | Path, synthetic: bool = False) -> int:
+def run_watchdog(
+    db_path: str | Path,
+    synthetic: bool = False,
+    campaign_run_id: str | None = None,
+) -> int:
     """48h watchdog. Returns 0 if fresh, 1 if a visible alarm was raised."""
-    syn = 1 if synthetic else 0
     conn = connect(db_path)
-    n_events = conn.execute(
-        "SELECT COUNT(*) FROM events WHERE synthetic=?", (syn,)
-    ).fetchone()[0]
-    last = conn.execute("SELECT MAX(ran_ts) FROM sweeps").fetchone()[0]
+    selection = select_campaign_rows(
+        conn, campaign_run_id, synthetic=synthetic
+    )
+    selected_run_id = selection.campaign_run_id
+    if campaign_run_id is not None and selected_run_id is None:
+        conn.close()
+        raise ValueError(
+            f"campaign {campaign_run_id!r} not found in "
+            f"{'synthetic' if synthetic else 'real'} scope"
+        )
+    n_events = (
+        conn.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id=? AND synthetic=?",
+            (selected_run_id, 1 if synthetic else 0),
+        ).fetchone()[0]
+        if selected_run_id is not None
+        else 0
+    )
+    sweep_rows = select_campaign_sweep_rows(
+        conn, selected_run_id, synthetic=synthetic
+    )
+    last = max((row["ran_ts"] for row in sweep_rows), default=None)
     conn.close()
     now = time.time()
 
@@ -134,7 +188,7 @@ def run_watchdog(db_path: str | Path, synthetic: bool = False) -> int:
         return 0
 
     stale = last is None or (now - last) / 3600.0 > WATCHDOG_MAX_AGE_H
-    af = alarm_file()
+    af = alarm_file(selected_run_id, synthetic=synthetic)
     if stale:
         age = "never" if last is None else f"{(now - last) / 3600.0:.1f}h ago"
         msg = "\n".join(
@@ -166,10 +220,21 @@ def main() -> int:
     ap.add_argument("cmd", choices=["sweep", "watchdog"], nargs="?", default="sweep")
     ap.add_argument("--db", default=str(default_db_path()))
     ap.add_argument("--synthetic", action="store_true")
+    ap.add_argument("--run-id", help="campaign run_id (default: latest in selected scope)")
     args = ap.parse_args()
     if args.cmd == "watchdog":
-        return run_watchdog(args.db, synthetic=args.synthetic)
-    print(run_sweep(args.db, synthetic=args.synthetic))
+        return run_watchdog(
+            args.db,
+            synthetic=args.synthetic,
+            campaign_run_id=args.run_id,
+        )
+    print(
+        run_sweep(
+            args.db,
+            synthetic=args.synthetic,
+            campaign_run_id=args.run_id,
+        )
+    )
     return 0
 
 

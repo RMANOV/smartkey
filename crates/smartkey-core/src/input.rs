@@ -951,8 +951,8 @@ impl InputMethodCore {
         self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked())
     }
 
-    /// Accept the visible ghost completion (shared by Tab and the
-    /// Space/Return word-boundary accept).
+    /// Accept the visible ghost completion when the user presses Tab.
+    /// Space/Return commit only the typed word and never call this path.
     ///
     /// Full-word composing (b3a2cb2) keeps the ENTIRE typed word in the
     /// preedit until commit, regardless of dual-buffer lock state — "lock is
@@ -1332,7 +1332,8 @@ impl InputMethodCore {
     fn try_language_correction(&self, word: &str) -> Option<Action> {
         use crate::lang_detect::{reverse_transliterate, transliterate, LangId};
 
-        if word.chars().count() < 2 {
+        let typed_chars = word.chars().count();
+        if typed_chars < 2 {
             return None;
         }
 
@@ -1358,10 +1359,8 @@ impl InputMethodCore {
             reverse_transliterate(word)
         };
 
-        if other_word.is_empty()
-            || other_word.chars().count() < 2
-            || other_word.chars().count() != word.chars().count()
-        {
+        let other_chars = other_word.chars().count();
+        if other_word.is_empty() || other_chars < 2 || other_chars != typed_chars {
             return None;
         }
 
@@ -1372,9 +1371,8 @@ impl InputMethodCore {
         // Only correct if the other language is overwhelmingly more likely.
         // Safety: if both exist, don't correct (ambiguous).
         if other_freq > 0.0 && (typed_freq < 1.0 || other_freq / typed_freq.max(1.0) >= 5.0) {
-            let replace_len = word.chars().count();
             return Some(Action::ReplaceWord {
-                replace_len,
+                replace_len: typed_chars,
                 text: other_word,
             });
         }
@@ -2247,6 +2245,46 @@ mod tests {
             InputConfig::try_from_json(r#"{"post_commit_autocorrect":true}"#)
                 .expect("valid config")
                 .post_commit_autocorrect
+        );
+    }
+
+    /// The gate itself must be load-bearing in BOTH directions.
+    ///
+    /// The losslessness guard cannot catch "цар" -> "car": both are three
+    /// characters, so the transliteration is not lossy and only the default-off
+    /// gate refuses it. Until this test existed, forcing the gate to `if true`
+    /// (restoring the live corruption) *or* to `if false` (deleting the whole
+    /// post-commit subsystem) both left the suite fully green — the one line
+    /// this merge cares most about was verified by nothing.
+    #[test]
+    fn post_commit_autocorrect_gate_is_load_bearing_both_ways() {
+        // Default (off): a lossless transliteration must still be refused.
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word("car", 5_000_000);
+        core.current_word = "цар".to_string();
+        let actions = core.handle_key(press(Key::Space));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })),
+            "default config must never rewrite text the user typed: {actions:?}"
+        );
+
+        // Opt-in (on): the same input must now produce the replacement, which
+        // proves the gate suppressed it above rather than some unrelated guard.
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        });
+        core.load_word("car", 5_000_000);
+        core.current_word = "цар".to_string();
+        let actions = core.handle_key(press(Key::Space));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::ReplaceWord { replace_len: 3, text } if text == "car"
+            )),
+            "opt-in must re-enable language correction: {actions:?}"
         );
     }
 
