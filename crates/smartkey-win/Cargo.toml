@@ -1,6 +1,6 @@
 [package]
 name = "smartkey-win"
-version = "0.5.0"
+version = "0.6.2"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "SmartKey Windows IME via Text Services Framework"
