@@ -1232,7 +1232,15 @@ impl InputMethodCore {
 
         self.ghost.clone_from(&suffix);
 
-        if self.in_hypothesis_phase() {
+        // Same rule as accept_ghost_completion (see its doc comment): whenever a
+        // dual buffer is active the typed prefix lives in the composing preedit,
+        // so the display action must carry it. `in_hypothesis_phase()` is
+        // `dual_buffer.is_some() && !locked` — once the buffer locked (the steady
+        // state for Bulgarian) it fell to ShowGhost(suffix), and the adapter
+        // replaces the whole preedit with the suffix alone: the typed prefix
+        // visually vanished mid-word. That bug was fixed on the accept path and
+        // left standing here.
+        if self.dual_buffer.is_some() {
             Some(Action::ShowComposing {
                 typed: self.current_word.clone(),
                 ghost: suffix,
@@ -2067,6 +2075,45 @@ mod tests {
             "must not commit only the ghost suffix (drops the typed prefix)"
         );
         assert!(has_action(&actions, &Action::HideGhost));
+    }
+
+    /// Same bug class as the Tab-accept fix above, on the correction-override
+    /// path: with a LOCKED dual buffer the typed prefix lives only in the
+    /// composing preedit, so the display action must carry it.
+    ///
+    /// `apply_prediction_override` tested `in_hypothesis_phase()`
+    /// (= `dual_buffer.is_some() && !locked`), so once the buffer locked — the
+    /// steady state for Bulgarian — it emitted `ShowGhost(suffix)`. The adapter
+    /// replaces the whole preedit with that payload, and the prefix the user had
+    /// typed visually disappeared mid-word.
+    #[test]
+    fn correction_override_keeps_typed_prefix_when_buffer_locked() {
+        let mut core = test_core();
+        core.load_word("hello", 1_000_000);
+        core.dual_buffer = Some(locked_dual_buffer(&core));
+        core.current_word = "hel".to_string();
+
+        let (_, locked, hypothesis) = core.debug_state();
+        assert!(locked, "test precondition: the dual buffer must be locked");
+        assert!(
+            !hypothesis,
+            "test precondition: a locked buffer is NOT the hypothesis phase — \
+             that is exactly the case the old check got wrong"
+        );
+
+        let action = core
+            .apply_prediction_override("hello")
+            .expect("override should produce a display action");
+
+        match action {
+            Action::ShowComposing { typed, ghost } => {
+                assert_eq!(typed, "hel", "the typed prefix must survive");
+                assert_eq!(ghost, "lo");
+            }
+            other => {
+                panic!("locked composing must keep the prefix via ShowComposing, got {other:?}")
+            }
+        }
     }
 
     /// Regression (accept bug): Tab with no ghost while a LOCKED dual buffer is

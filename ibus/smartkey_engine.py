@@ -92,6 +92,14 @@ _ATTR_TYPE_FOREGROUND = _ibus_enum_value(
 _ATTR_UNDERLINE_SINGLE = _ibus_enum_value(
     "AttrUnderline", "SINGLE", "ATTR_UNDERLINE_SINGLE", 1
 )
+# Ghost suffix carries a double underline so it is distinguishable from typed
+# text by more than colour alone. Space and Tab do opposite things to a visible
+# ghost — Tab takes it, Space discards it — and nothing in the preedit signalled
+# that a decision was pending. Live trace 2026-08-03/05: 204 Space commits vs 1
+# Tab in 37 hours, i.e. the affordance was never discovered.
+_ATTR_UNDERLINE_DOUBLE = _ibus_enum_value(
+    "AttrUnderline", "DOUBLE", "ATTR_UNDERLINE_DOUBLE", 2
+)
 
 # ---------------------------------------------------------------------------
 # Sensitive-input policy (IBus content type).
@@ -1008,7 +1016,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             attrs.append(
                 IBus.Attribute.new(
                     _ATTR_TYPE_UNDERLINE,
-                    _ATTR_UNDERLINE_SINGLE,
+                    _ATTR_UNDERLINE_DOUBLE,
                     typed_len,
                     total_len,
                 )

@@ -197,10 +197,17 @@ impl MasterLoop {
             self.handle_frustration(signal);
         }
         if is_backspace {
-            // REJECT is a single-event decision. If this Backspace did not
-            // qualify, discard the accepted-ghost attribution as stale.
+            // Backspace over a live ghost IS the rejection gesture — the most
+            // natural way a user says "not this word". Previously the
+            // attribution was discarded here as stale, so deleting a suggestion
+            // taught the engine nothing and the same completion came straight
+            // back (live trace 2026-08-03: "лг" -> ghost "бт", three times in
+            // ten seconds). Record it instead; record_last_ghost_rejection
+            // takes the value, so the slot is cleared either way.
+            //
+            // REJECT already recorded it inside handle_frustration above.
             if !matches!(signal, Some(FrustrationSignal::Reject { .. })) {
-                self.last_shown_ghost = None;
+                self.record_last_ghost_rejection();
             }
             self.last_tab_accept = None;
         }
@@ -545,9 +552,13 @@ impl MasterLoop {
                 self.light_profile.record_reject();
                 // Suppress ghost temporarily.
                 self.suppress_countdown = (severity * 2.0).min(255.0).ceil() as u8;
-                // Record negative example: if ghost was showing, the top prediction
-                // was wrong for this context — teach correction memory.
-                self.record_ghost_as_negative();
+                // NOT record_ghost_as_negative(): mid-deletion `current_word` is a
+                // half-erased fragment, not a word the user wanted. Teaching it to
+                // correction memory made the fragment hijack the top slot after
+                // three occurrences — and correction memory is PERSISTED, so the
+                // damage outlived restarts. Deleting a suggestion must make the
+                // engine quieter, never make it substitute something new.
+                // The rejection itself is recorded on the backspace path.
             }
             FrustrationSignal::Retype { severity, prefix } => {
                 // Wrong language detected — boost opposite language prior.
@@ -802,6 +813,79 @@ mod tests {
         ml.handle_key(make_key(Key::Char('a')));
         // If we got here without panic/overflow, the test passes
         assert!(ml.suppress_countdown <= 3);
+    }
+
+    /// Deleting the same suggestion twice must silence it.
+    ///
+    /// This is the gesture a user actually performs to say "not this word", and
+    /// until now it recorded nothing: the backspace arm discarded
+    /// `last_shown_ghost` as stale attribution, so `RejectionMemory` never saw a
+    /// single rejection and its threshold of 2 was unreachable by deletion.
+    /// Live trace 2026-08-03 shows the consequence — "лг" -> ghost "бт" offered
+    /// three times within ten seconds, deleted each time.
+    #[test]
+    fn deleting_a_suggestion_twice_suppresses_it() {
+        let mut ml = default_loop();
+
+        // First offer, then delete it.
+        ml.last_shown_ghost = Some(("лг".to_string(), "лгбт".to_string()));
+        ml.handle_key(make_key(Key::Backspace));
+        assert!(
+            !ml.is_ghost_suppressed("лг", "лгбт"),
+            "one rejection is below the threshold of 2 — must not suppress yet"
+        );
+
+        // Same completion offered again, deleted again.
+        ml.last_shown_ghost = Some(("лг".to_string(), "лгбт".to_string()));
+        ml.handle_key(make_key(Key::Backspace));
+        assert!(
+            ml.is_ghost_suppressed("лг", "лгбт"),
+            "after two deletions the completion must be suppressed"
+        );
+
+        // A different completion is untouched — suppression is per (prefix, word),
+        // not a blanket mute.
+        assert!(
+            !ml.is_ghost_suppressed("лг", "лгота"),
+            "suppression must not leak to other completions of the same prefix"
+        );
+    }
+
+    /// Deleting must make the engine quieter, never make it substitute.
+    ///
+    /// `RapidDelete` used to call `record_ghost_as_negative`, which wrote the
+    /// half-erased `current_word` into CorrectionMemory as "what the user really
+    /// wanted". That store is PERSISTED and hijacks the top slot after three
+    /// occurrences, so a mid-word delete burst permanently poisoned predictions.
+    #[test]
+    fn delete_burst_does_not_write_correction_memory() {
+        let mut ml = default_loop();
+        // A dictionary is mandatory here: record_ghost_as_negative writes only
+        // `if let Some(top) = predictions().first()`. Without loaded words there
+        // are no predictions, the write is skipped anyway, and the test passes
+        // even with the bug present — verified by falsification.
+        ml.load_word("работа", 1_000_000);
+        ml.load_word("работи", 900_000);
+
+        for c in "работ".chars() {
+            ml.handle_key(make_key(Key::Char(c)));
+        }
+        assert!(
+            !ml.predictions().is_empty(),
+            "test precondition: predictions must exist, else nothing can be recorded"
+        );
+
+        let before = ml.correction_count();
+        // Erase in a burst — RapidDelete fires on 3+ backspaces within a second.
+        for _ in 0..5 {
+            ml.handle_key(make_key(Key::Backspace));
+        }
+
+        assert_eq!(
+            ml.correction_count(),
+            before,
+            "a deletion burst must not teach correction memory a half-erased fragment"
+        );
     }
 
     #[test]
