@@ -539,6 +539,48 @@ def test_unusable_hints_fail_safe_even_with_a_known_purpose():
     assert eng._core.key_calls() == []
 
 
+def test_late_first_ordinary_declaration_keeps_the_current_field_usable():
+    """A first declaration describes this field; it is not a field switch.
+
+    Some clients deliver their initial ordinary ContentType after the first
+    key event.  With undeclared input enabled, that key can already be in the
+    composing preedit.  Treating ``None -> ordinary`` as a cross-field
+    transition latches sensitive mode, and IBus may never repeat the identical
+    declaration — every later key is then passed through untouched.
+    """
+    eng, rec = build_engine(
+        scripts=[
+            [("composing", "s\x00")],
+            [("composing", "se\x00")],
+        ]
+    )
+    assert eng._content_type_key is None
+    assert eng.do_process_key_event(ord("s"), 31, 0) is True
+    assert eng._preedit_active is True
+
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+
+    assert eng._sensitive is False
+    assert eng._preedit_active is True
+    assert rec.commits == []
+    assert eng.do_process_key_event(ord("e"), 18, 0) is True
+    assert len(eng._core.key_calls()) == 2
+
+
+def test_late_first_sensitive_declaration_still_cancels_the_composition():
+    eng, rec = build_engine(scripts=[[("composing", "h\x00")]])
+    assert eng.do_process_key_event(ord("h"), 35, 0) is True
+    assert eng._preedit_active is True
+
+    eng.do_set_content_type(PURPOSE_PASSWORD, HINT_NONE)
+
+    assert eng._sensitive is True
+    assert eng._preedit_active is False
+    assert rec.commits == []
+    assert eng.do_process_key_event(ord("x"), 45, 0) is False
+    assert len(eng._core.key_calls()) == 1
+
+
 def test_content_type_change_mid_composition_fails_safe():
     # A live preedit plus a content-type switch = the composition may already
     # belong to a different field than the one it started in.

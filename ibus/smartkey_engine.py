@@ -1587,7 +1587,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # than the one it was started in.  Treat that window as sensitive and
         # drop the state instead of guessing which field wins.
         transition_in_flight = (
-            getattr(self, "_content_type_key", None) != decision_key
+            previous_key is not None
+            and previous_key != decision_key
             and self._composition_in_flight()
         )
         if transition_in_flight:
