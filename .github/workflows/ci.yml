@@ -29,11 +29,18 @@ jobs:
         env:
           SMARTKEY_REQUIRE_NATIVE_TESTS: "1"
         run: |
-          python -m venv .venv-ci
-          . .venv-ci/bin/activate
-          python -m pip install --disable-pip-version-check maturin pytest
-          maturin develop -m crates/smartkey-py/Cargo.toml
-          python -m pytest -q ibus/
+          python -m venv "$RUNNER_TEMP/smartkey-ci-venv"
+          . "$RUNNER_TEMP/smartkey-ci-venv/bin/activate"
+          python -m pip install --disable-pip-version-check maturin pytest numpy scikit-learn
+          build_sha="$(git rev-parse --verify HEAD)"
+          test -z "$(git status --porcelain=v1 --untracked-files=normal)"
+          SMARTKEY_BUILD_GIT_SHA="$build_sha" \
+            SMARTKEY_BUILD_GIT_DIRTY=0 \
+            maturin develop -m crates/smartkey-py/Cargo.toml
+          SMARTKEY_EXPECT_BUILD_GIT_SHA="$build_sha" \
+            SMARTKEY_EXPECT_BUILD_GIT_DIRTY=0 \
+            PYTHONDONTWRITEBYTECODE=1 \
+            python -m pytest -q -p no:cacheprovider
 
   build-windows:
     name: Build (Windows)

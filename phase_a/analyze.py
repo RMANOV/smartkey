@@ -50,8 +50,8 @@ from .constants import (
     N_QUANTILE_BUCKETS,
     PREDICTION_SCOPE,
 )
-from .harness import connect
-from .paths import alarm_file, default_db_path
+from .harness import connect, validate_phasea_db
+from .paths import alarm_file, default_db_path, require_existing_db
 from .validity import select_campaign_rows, select_campaign_sweep_rows
 
 
@@ -389,26 +389,42 @@ def format_report(res: AnalysisResult, db_path: str | Path) -> str:
     return "\n".join(L)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="O1 / Phase-A analysis + gate")
-    ap.add_argument("--db", default=str(default_db_path()))
+    ap.add_argument(
+        "--db",
+        help=(
+            "event DB (required unless SMARTKEY_PHASEA_DB or "
+            "SMARTKEY_PHASEA_DATA selects a safe location)"
+        ),
+    )
     ap.add_argument("--synthetic", action="store_true", help="analyse the synthetic self-test DB")
     ap.add_argument("--run-id", help="real campaign run_id (default: latest)")
     ap.add_argument("--start-ts", type=float, help="inclusive campaign start timestamp")
     ap.add_argument("--end-ts", type=float, help="inclusive campaign end timestamp")
     ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    try:
+        if args.db is None:
+            args.db = str(default_db_path())
+        args.db = str(require_existing_db(args.db))
+        validate_phasea_db(args.db)
+    except (OSError, RuntimeError, ValueError) as exc:
+        ap.error(str(exc))
     if (args.start_ts is None) != (args.end_ts is None):
         ap.error("--start-ts and --end-ts must be provided together")
     selected_window = (
         (args.start_ts, args.end_ts) if args.start_ts is not None else None
     )
-    res = analyze(
-        args.db,
-        synthetic=args.synthetic,
-        campaign_run_id=args.run_id,
-        window=selected_window,
-    )
+    try:
+        res = analyze(
+            args.db,
+            synthetic=args.synthetic,
+            campaign_run_id=args.run_id,
+            window=selected_window,
+        )
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        ap.error(str(exc))
     if args.json:
         print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
         for line in FIREWALL_LINES:

@@ -134,6 +134,32 @@ def classify_row(
     return None
 
 
+def select_campaign_id(
+    conn: sqlite3.Connection,
+    campaign_run_id: str | None = None,
+    *,
+    synthetic: bool = False,
+) -> str | None:
+    """Select only the campaign identity, without materialising event rows."""
+    conn.row_factory = sqlite3.Row
+    expected_synthetic = 1 if synthetic else 0
+    if campaign_run_id is None:
+        row = conn.execute(
+            "SELECT m.run_id FROM run_metadata AS m WHERE m.synthetic=? "
+            "AND EXISTS (SELECT 1 FROM events AS e "
+            "WHERE e.run_id=m.run_id AND e.synthetic=m.synthetic) "
+            "ORDER BY m.created_ts DESC, m.id DESC LIMIT 1",
+            (expected_synthetic,),
+        ).fetchone()
+        return row["run_id"] if row else None
+    row = conn.execute(
+        "SELECT run_id FROM run_metadata WHERE run_id=? AND synthetic=? "
+        "ORDER BY created_ts DESC, id DESC LIMIT 1",
+        (campaign_run_id, expected_synthetic),
+    ).fetchone()
+    return row["run_id"] if row else None
+
+
 def select_campaign_rows(
     conn: sqlite3.Connection,
     campaign_run_id: str | None = None,
@@ -144,20 +170,9 @@ def select_campaign_rows(
     """Select one exact campaign/synthetic scope and classify every event."""
     conn.row_factory = sqlite3.Row
     expected_synthetic = 1 if synthetic else 0
-    if campaign_run_id is None:
-        latest = conn.execute(
-            "SELECT run_id FROM run_metadata WHERE synthetic=? "
-            "ORDER BY created_ts DESC, id DESC LIMIT 1",
-            (expected_synthetic,),
-        ).fetchone()
-        campaign_run_id = latest["run_id"] if latest else None
-    else:
-        matching_metadata = conn.execute(
-            "SELECT run_id FROM run_metadata WHERE run_id=? AND synthetic=? "
-            "ORDER BY created_ts DESC, id DESC LIMIT 1",
-            (campaign_run_id, expected_synthetic),
-        ).fetchone()
-        campaign_run_id = matching_metadata["run_id"] if matching_metadata else None
+    campaign_run_id = select_campaign_id(
+        conn, campaign_run_id, synthetic=synthetic
+    )
 
     try:
         log_rows = [
@@ -239,3 +254,22 @@ def select_campaign_sweep_rows(
             (campaign_run_id, 1 if synthetic else 0),
         )
     )
+
+
+def select_campaign_latest_sweep_ts(
+    conn: sqlite3.Connection,
+    campaign_run_id: str | None,
+    *,
+    synthetic: bool = False,
+) -> float | None:
+    """Latest scoped sweep without crediting or migrating legacy global rows."""
+    if campaign_run_id is None:
+        return None
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sweeps)")}
+    if not {"run_id", "synthetic"}.issubset(columns):
+        return None
+    row = conn.execute(
+        "SELECT MAX(ran_ts) FROM sweeps WHERE run_id=? AND synthetic=?",
+        (campaign_run_id, 1 if synthetic else 0),
+    ).fetchone()
+    return float(row[0]) if row and row[0] is not None else None

@@ -3,18 +3,13 @@
 cd /home/rmanov/smartkey
 export PYTHONPATH="/home/rmanov/smartkey/ibus:$PYTHONPATH"
 
-# Fail closed on fields that never declare a content type. The engine already
-# stops itself for PASSWORD/PIN purposes, but that depends on the client
-# declaring one — browser password managers, X11 grabs and apps with their own
-# input handling declare nothing, and SmartKey stayed fully live in them.
-# Cost: the first keystroke in an undeclared field is dropped.
-export SMARTKEY_SENSITIVE_UNTIL_DECLARED=1
+# Keep the undeclared-field policy opt-in. Strict mode cannot prove that every
+# IBus client will deliver an unhandled first key, so enabling it globally can
+# make the first key in a field appear lost. Declared PASSWORD/PIN and
+# PRIVATE/HIDDEN_TEXT fields still fail closed inside the engine.
+export SMARTKEY_SENSITIVE_UNTIL_DECLARED=0
 
-# TEMPORARY — verification only. Writes predictions.log and replay.jsonl with
-# your words IN PLAIN TEXT, plus further sinks under ~/.local/share/smartkey/
-# that `smartkey-debug wipe` does NOT clear. Phase-A calibration does NOT need
-# this: the O1 shim writes separately and hashed. Comment this out once the
-# three fixes are confirmed in the live trace.
-export SMARTKEY_DEBUG=full
+# Production mode: content logging stays off unless diagnostics are explicitly
+# enabled with `smartkey-debug` before the engine starts.
 
 exec /home/rmanov/smartkey/.venv/bin/python3 -m ibus.main "$@"

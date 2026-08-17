@@ -23,6 +23,7 @@ import hmac
 import json
 import sqlite3
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -142,14 +143,109 @@ def connect(db_path: str | Path, *, readonly: bool = False) -> sqlite3.Connectio
     db_path = Path(db_path)
     if readonly:
         return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        db_path.parent.mkdir(parents=True, mode=0o700)
+    except FileExistsError:
+        if not db_path.parent.is_dir():
+            raise
+    else:
+        # Repair only a directory this call created.  The caller may place a
+        # Phase-A DB in a pre-existing operator-owned directory; changing that
+        # directory's access policy would be an unrelated side effect.
+        db_path.parent.chmod(0o700)
     conn = sqlite3.connect(str(db_path))
+    db_path.chmod(0o600)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.executescript(SCHEMA)
     _migrate_sweeps_schema(conn)
     conn.commit()
+    for sidecar in (Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if sidecar.exists():
+            sidecar.chmod(0o600)
     return conn
+
+
+_PHASEA_IDENTITY = {
+    "run_metadata": {
+        "id",
+        "run_id",
+        "created_ts",
+        "synthetic",
+        "freq_table_hash",
+        "freq_table_files",
+        "p_model",
+        "engine_commit",
+        "harness_version",
+        "scope",
+        "notes",
+    },
+    "events": {
+        "id",
+        "run_id",
+        "ts",
+        "context_hash",
+        "n_candidates",
+        "p_top3",
+        "latency_us",
+        "outcome",
+        "class",
+        "resolver",
+        "resolved_ts",
+        "synthetic",
+    },
+    # collector_log belongs to the live IBus shim, not the core harness schema,
+    # so its absence must not make a synthetic/core Phase-A DB look foreign.
+    "sweeps": {
+        "id",
+        "sweep_date",
+        "ran_ts",
+        "events",
+        "resolutions",
+        "latency_p99_us",
+        "over_budget_pct",
+        "watchdog_status",
+        "receipt",
+    },
+}
+
+
+def validate_phasea_db(db_path: str | Path) -> None:
+    """Identify an existing Phase-A DB through a read-only schema signature."""
+    path = Path(db_path)
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            missing_tables = set(_PHASEA_IDENTITY) - tables
+            if missing_tables:
+                raise ValueError(
+                    "not a Phase-A database: missing required tables "
+                    + ", ".join(sorted(missing_tables))
+                )
+            for table, required in _PHASEA_IDENTITY.items():
+                columns = {
+                    str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+                }
+                missing_columns = required - columns
+                if missing_columns:
+                    raise ValueError(
+                        f"not a Phase-A database: {table} missing columns "
+                        + ", ".join(sorted(missing_columns))
+                    )
+        except BaseException:
+            with suppress(BaseException):
+                conn.close()
+            raise
+        else:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise ValueError(f"not a Phase-A database: {exc}") from exc
 
 
 class PhaseALogger:

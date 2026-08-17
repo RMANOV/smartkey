@@ -30,6 +30,10 @@ pub struct O1Numbers {
     pub n_candidates: u32,
     /// Raw normalised frequency mass of the deduplicated top-3 set.
     pub p_top3: f64,
+    /// Whether this snapshot used the global-unigram fallback rather than
+    /// context-specific bigram followers.  Adapters use this internal marker
+    /// to preserve the corpus-load fallback mass across online OOV learning.
+    pub used_unigram_fallback: bool,
     /// Core-internal query time in µs (diagnostics only — NOT the gated
     /// `latency_us`, which is measured adapter-side).
     pub core_latency_us: u64,
@@ -118,7 +122,8 @@ pub fn snapshot(
 ) -> (Vec<String>, O1Numbers) {
     let t0 = Instant::now();
     let (merged, ctx_total) = merged_followers(models, ctx);
-    let top3: Vec<String> = if merged.is_empty() {
+    let used_unigram_fallback = merged.is_empty();
+    let top3: Vec<String> = if used_unigram_fallback {
         uni_top3_cache.to_vec()
     } else {
         let mut ranked: Vec<(&str, u64)> = merged.iter().map(|(w, c)| (*w, *c)).collect();
@@ -142,6 +147,7 @@ pub fn snapshot(
     let numbers = O1Numbers {
         n_candidates: top3.len().min(3) as u32,
         p_top3,
+        used_unigram_fallback,
         core_latency_us: t0.elapsed().as_micros() as u64,
     };
     (top3, numbers)
@@ -166,6 +172,7 @@ mod tests {
         let (top3, nums) = snapshot(&[&m], "the", &[]);
         assert_eq!(top3, vec!["zebra", "cat", "dog"]); // 9, then 5-tie lexicographic
         assert_eq!(nums.n_candidates, 3);
+        assert!(!nums.used_unigram_fallback);
         // p = (9 + 5 + 5) / 22
         assert!((nums.p_top3 - 19.0 / 22.0).abs() < 1e-12);
     }
@@ -194,6 +201,7 @@ mod tests {
         assert_eq!(cache, vec!["the", "and", "for"]);
         let (top3, nums) = snapshot(&[&m], "unseen-context", &cache);
         assert_eq!(top3, cache);
+        assert!(nums.used_unigram_fallback);
         // p from unigram u/U: (100+80+60)/241
         assert!((nums.p_top3 - 240.0 / 241.0).abs() < 1e-12);
     }

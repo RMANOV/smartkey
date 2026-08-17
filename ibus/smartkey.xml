@@ -3,7 +3,7 @@
     <name>org.freedesktop.IBus.SmartKey</name>
     <description>SmartKey Predictive Input</description>
     <exec>/usr/lib/ibus-smartkey/ibus-engine-smartkey --ibus</exec>
-    <version>0.5.0</version>
+    <version>0.6.2</version>
     <author>SmartKey Contributors</author>
     <license>GPL-3.0-only</license>
     <homepage>https://github.com/RMANOV/smartkey</homepage>
@@ -21,7 +21,6 @@
             <description>Predictive text input with ghost text completion</description>
             <rank>80</rank>
             <symbol>SK</symbol>
-            <setup>/usr/lib/ibus-smartkey/ibus-setup-smartkey</setup>
         </engine>
     </engines>
 </component>

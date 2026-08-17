@@ -16,7 +16,10 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import hashlib
+import os
+import sqlite3
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
@@ -28,9 +31,63 @@ from .constants import (
     PREDICTION_SCOPE,
     WATCHDOG_MAX_AGE_H,
 )
-from .harness import connect
-from .paths import alarm_file, default_db_path, receipts_dir
-from .validity import select_campaign_rows, select_campaign_sweep_rows
+from .harness import connect, validate_phasea_db
+from .paths import alarm_file, default_db_path, receipts_dir, require_existing_db
+from .validity import (
+    select_campaign_id,
+    select_campaign_latest_sweep_ts,
+    select_campaign_rows,
+    select_campaign_sweep_rows,
+)
+
+
+def _implementation_hash() -> str:
+    """Hash the exact Phase-A code bytes that produce a sweep receipt."""
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parent
+    for name in ("constants.py", "harness.py", "paths.py", "sweep.py", "validity.py"):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update((root / name).read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _write_receipt_atomic(path: Path, receipt: str) -> None:
+    """Durably replace one receipt without exposing a partial file."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd: int | None = None
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        try:
+            handle.write(receipt + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            with suppress(BaseException):
+                handle.close()
+            raise
+        else:
+            handle.close()
+        os.replace(tmp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        except BaseException:
+            with suppress(BaseException):
+                os.close(directory_fd)
+            raise
+        else:
+            os.close(directory_fd)
+    except BaseException:
+        if fd is not None:
+            with suppress(BaseException):
+                os.close(fd)
+        with suppress(BaseException):
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 def _invariant_violations(conn, campaign_run_id: str, syn: int) -> int:
@@ -107,6 +164,7 @@ def run_sweep(
     lines.append(f" O1 / PHASE-A DAILY RECEIPT  {today}   ({'synthetic' if syn else 'real'})")
     lines.append(f" prediction_scope: {PREDICTION_SCOPE}  (n-gram component ONLY)")
     lines.append(f" campaign_run_id: {selected_run_id}")
+    lines.append(f" implementation hash: {_implementation_hash()}")
     lines.append("=" * 62)
     lines.append(f" events total      : {total}   (today: {today_events})")
     lines.append(f" resolutions       : {len(resolved)}")
@@ -122,33 +180,44 @@ def run_sweep(
         lines.append(line)
     receipt = "\n".join(lines)
 
-    conn.execute(
-        "INSERT INTO sweeps (run_id, synthetic, sweep_date, ran_ts, events, "
-        "resolutions, latency_p99_us, over_budget_pct, watchdog_status, receipt) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (
-            selected_run_id,
-            syn,
-            today,
-            now,
-            total,
-            len(resolved),
-            p99,
-            over,
-            wd,
-            receipt,
-        ),
+    scope = "synthetic" if synthetic else "real"
+    campaign_digest = hashlib.sha256(selected_run_id.encode("utf-8")).hexdigest()[:16]
+    receipt_path = receipts_dir() / (
+        f"sweep-{today}-{scope}-{campaign_digest}-{int(now * 1000)}.txt"
     )
-    conn.commit()
+    try:
+        conn.execute(
+            "INSERT INTO sweeps (run_id, synthetic, sweep_date, ran_ts, events, "
+            "resolutions, latency_p99_us, over_budget_pct, watchdog_status, receipt) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                selected_run_id,
+                syn,
+                today,
+                now,
+                total,
+                len(resolved),
+                p99,
+                over,
+                wd,
+                receipt,
+            ),
+        )
+        _write_receipt_atomic(receipt_path, receipt)
+        conn.commit()
+    except BaseException:
+        with suppress(BaseException):
+            conn.rollback()
+        with suppress(BaseException):
+            conn.close()
+        with suppress(BaseException):
+            receipt_path.unlink(missing_ok=True)
+        raise
     conn.close()
 
     af = alarm_file(selected_run_id, synthetic=synthetic)
     if af.exists():
         af.unlink()
-    scope = "synthetic" if synthetic else "real"
-    campaign_digest = hashlib.sha256(selected_run_id.encode("utf-8")).hexdigest()[:16]
-    receipt_path = receipts_dir() / f"sweep-{today}-{scope}-{campaign_digest}.txt"
-    receipt_path.write_text(receipt + "\n", encoding="utf-8")
     return receipt
 
 
@@ -158,11 +227,11 @@ def run_watchdog(
     campaign_run_id: str | None = None,
 ) -> int:
     """48h watchdog. Returns 0 if fresh, 1 if a visible alarm was raised."""
-    conn = connect(db_path)
-    selection = select_campaign_rows(
+    conn = connect(db_path, readonly=True)
+    conn.row_factory = sqlite3.Row
+    selected_run_id = select_campaign_id(
         conn, campaign_run_id, synthetic=synthetic
     )
-    selected_run_id = selection.campaign_run_id
     if campaign_run_id is not None and selected_run_id is None:
         conn.close()
         raise ValueError(
@@ -177,10 +246,11 @@ def run_watchdog(
         if selected_run_id is not None
         else 0
     )
-    sweep_rows = select_campaign_sweep_rows(
-        conn, selected_run_id, synthetic=synthetic
+    last = select_campaign_latest_sweep_ts(
+        conn,
+        selected_run_id,
+        synthetic=synthetic,
     )
-    last = max((row["ran_ts"] for row in sweep_rows), default=None)
     conn.close()
     now = time.time()
 
@@ -215,26 +285,47 @@ def run_watchdog(
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="O1 / Phase-A daily sweep / 48h watchdog")
     ap.add_argument("cmd", choices=["sweep", "watchdog"], nargs="?", default="sweep")
-    ap.add_argument("--db", default=str(default_db_path()))
+    ap.add_argument(
+        "--db",
+        help=(
+            "event DB (required unless SMARTKEY_PHASEA_DB or "
+            "SMARTKEY_PHASEA_DATA selects a safe location)"
+        ),
+    )
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--run-id", help="campaign run_id (default: latest in selected scope)")
-    args = ap.parse_args()
-    if args.cmd == "watchdog":
-        return run_watchdog(
+    args = ap.parse_args(argv)
+    try:
+        if args.db is None:
+            args.db = str(default_db_path())
+        args.db = str(require_existing_db(args.db))
+        validate_phasea_db(args.db)
+    except (OSError, RuntimeError, ValueError) as exc:
+        ap.error(str(exc))
+    try:
+        if args.cmd == "watchdog":
+            # Resolve the alarm root before the DB read so an unsafe artifact
+            # path cannot fail only after watchdog state has been evaluated.
+            alarm_file(args.run_id, synthetic=args.synthetic)
+            return run_watchdog(
+                args.db,
+                synthetic=args.synthetic,
+                campaign_run_id=args.run_id,
+            )
+        # Resolve both output roots before run_sweep inserts its receipt row.
+        receipts_dir()
+        alarm_file(args.run_id, synthetic=args.synthetic)
+        receipt = run_sweep(
             args.db,
             synthetic=args.synthetic,
             campaign_run_id=args.run_id,
         )
-    print(
-        run_sweep(
-            args.db,
-            synthetic=args.synthetic,
-            campaign_run_id=args.run_id,
-        )
-    )
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        ap.error(str(exc))
+    print(receipt)
     return 0
 
 

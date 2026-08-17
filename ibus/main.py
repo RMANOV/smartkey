@@ -49,7 +49,7 @@ _ENGINE_MODULE = _smartkey_engine
 _BUS_NAME = "org.freedesktop.IBus.SmartKey"
 _OBJECT_PATH = "/org/freedesktop/IBus/Engine/SmartKey"
 _ENGINE_NAME = "smartkey"
-_ENGINE_VERSION = "0.5.0"
+_ENGINE_VERSION = _ENGINE_MODULE._NATIVE_VERSION
 _ENGINE_LICENSE = "GPL-3.0-only"
 _ENGINE_AUTHOR = "SmartKey Contributors"
 _ENGINE_DESCRIPTION = "Predictive text input with ghost text completion"
@@ -105,7 +105,7 @@ def main() -> None:
         Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
         / "smartkey"
     )
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = _ENGINE_MODULE._prepare_private_log_path(log_dir / "smartkey.log")
     # logging.DEBUG makes the engine log verbatim action payloads to
     # smartkey.log — content capture, so it is gated on the CONTENT level
     # only ("full"), same as the legacy content logs.  SMARTKEY_DEBUG=1
@@ -118,7 +118,7 @@ def main() -> None:
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s smartkey: %(message)s",
-        filename=str(log_dir / "smartkey.log"),
+        filename=str(log_path),
     )
 
     # Initialise IBus.

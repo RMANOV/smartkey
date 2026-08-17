@@ -13,13 +13,14 @@ Levels (env ``SMARTKEY_DEBUG`` wins; else a LEVEL marker file written by
                           Prints a one-time plaintext-keystrokes banner.
 
 HARD privacy guardrails (these are the operator's keystrokes):
-  * Output only under $SMARTKEY_DEBUG_DIR (default
-    ~/.local/state/smartkey/debug/), dir 0700, files 0600.  A dir override
-    that resolves INSIDE the git repo is refused and falls back to the
-    default — a keystroke log must never be committable.
-  * Never network, never stdout of the engine; ring-buffered appends with
-    flush OFF the hot path; bounded total size + age auto-purge;
-    ``smartkey-debug wipe`` one-command purge.
+  * Trace output lives under $SMARTKEY_DEBUG_DIR (default
+    ~/.local/state/smartkey/debug/). Full mode also enables the three legacy
+    sinks under $XDG_DATA_HOME/smartkey. Both directories are 0700 and files
+    0600. A trace-dir override inside the git repo is refused.
+  * Never network, never stdout of the engine. Trace JSONL uses ring-buffered
+    appends with flush OFF the hot path plus a bounded size and age purge. The
+    legacy sinks are not rotated, so keep full mode brief.
+  * ``smartkey-debug wipe`` purges trace JSONL and all three legacy sinks.
 """
 
 from __future__ import annotations
@@ -55,9 +56,11 @@ PURGE_AFTER_HOURS = 48
 MAX_TOTAL_BYTES = 50 * 1024 * 1024  # cap the debug dir, oldest files first
 
 _BANNER = (
-    "SMARTKEY_DEBUG=full logs your keystrokes in PLAINTEXT to {path} — "
+    "SMARTKEY_DEBUG=full logs your keystrokes in PLAINTEXT to {path} and {legacy} — "
     "local only; wipe with `smartkey-debug wipe`"
 )
+
+LEGACY_CONTENT_LOG_NAMES = ("smartkey.log", "predictions.log", "replay.jsonl")
 
 
 def repo_root() -> Path | None:
@@ -72,6 +75,11 @@ def repo_root() -> Path | None:
 def default_dir() -> Path:
     state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     return Path(state) / "smartkey" / "debug"
+
+
+def legacy_log_dir() -> Path:
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(data) / "smartkey"
 
 
 def resolve_dir() -> Path:
@@ -170,7 +178,10 @@ class KeystrokeTrace:
             self.enabled = False
             return
         if self.level == LEVEL_FULL:
-            print(_BANNER.format(path=self.dir), file=sys.stderr)
+            print(
+                _BANNER.format(path=self.dir, legacy=legacy_log_dir()),
+                file=sys.stderr,
+            )
 
     # -- hot path -----------------------------------------------------------
     def begin_keystroke(self) -> int:
@@ -253,6 +264,15 @@ def _cli_files(directory: Path) -> list[Path]:
     return sorted(directory.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
 
 
+def _legacy_content_files() -> list[Path]:
+    directory = legacy_log_dir()
+    return [
+        directory / name
+        for name in LEGACY_CONTENT_LOG_NAMES
+        if (directory / name).is_file()
+    ]
+
+
 def main(argv: list[str]) -> int:
     directory = resolve_dir()
     cmd = argv[0] if argv else "status"
@@ -265,12 +285,12 @@ def main(argv: list[str]) -> int:
         marker.write_text(level + "\n", encoding="utf-8")
         os.chmod(marker, 0o600)
         print(f"debug level set to {level!r} (marker {marker})")
-        print("restart the engine (ibus restart / engine recycle) to apply")
+        print("switch to a fallback keyboard, then recycle only SmartKey to apply")
         return 0
 
     if cmd == "disable":
         (directory / "LEVEL").unlink(missing_ok=True)
-        print("debug disabled (marker removed); restart the engine to apply")
+        print("debug disabled; switch to a fallback keyboard, then recycle only SmartKey")
         return 0
 
     if cmd == "status":
@@ -281,12 +301,18 @@ def main(argv: list[str]) -> int:
         )
         files = _cli_files(directory) if directory.exists() else []
         total = sum(p.stat().st_size for p in files)
+        legacy_files = _legacy_content_files()
+        legacy_total = sum(p.stat().st_size for p in legacy_files)
         print(f"dir:    {directory}")
         print(f"env:    SMARTKEY_DEBUG={env!r}")
         print(f"marker: {marker_val!r}")
         print(f"level:  {resolve_level()} (0=off 1=structural 2=full)")
         print(f"files:  {len(files)} ({total} bytes)")
         for path in files[-5:]:
+            print(f"  {path.name}  {path.stat().st_size}B")
+        print(f"legacy dir:   {legacy_log_dir()}")
+        print(f"legacy files: {len(legacy_files)} ({legacy_total} bytes)")
+        for path in legacy_files:
             print(f"  {path.name}  {path.stat().st_size}B")
         return 0
 
@@ -326,7 +352,12 @@ def main(argv: list[str]) -> int:
             for path in directory.glob("*.jsonl"):
                 path.unlink(missing_ok=True)
                 removed += 1
-        print(f"wiped {removed} file(s) from {directory}")
+        for path in _legacy_content_files():
+            path.unlink(missing_ok=True)
+            removed += 1
+        print(
+            f"wiped {removed} file(s) from {directory} and {legacy_log_dir()}"
+        )
         return 0
 
     print(__doc__)

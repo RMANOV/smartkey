@@ -275,13 +275,20 @@ def test_purge_removes_stale_files(tmp_path):
 
 def test_cli_wipe_and_status(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SMARTKEY_DEBUG_DIR", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
     monkeypatch.delenv("SMARTKEY_DEBUG", raising=False)
     (tmp_path / "trace-x.jsonl").write_text("{}\n", encoding="utf-8")
+    legacy_dir = tmp_path / "xdg-data" / "smartkey"
+    legacy_dir.mkdir(parents=True)
+    for name in ("smartkey.log", "predictions.log", "replay.jsonl"):
+        (legacy_dir / name).write_text("private\n", encoding="utf-8")
     assert smartkey_debug.main(["wipe"]) == 0
     assert not list(tmp_path.glob("*.jsonl"))
+    assert not any(legacy_dir.iterdir())
     assert smartkey_debug.main(["status"]) == 0
     out = capsys.readouterr().out
     assert str(tmp_path) in out
+    assert str(legacy_dir) in out
 
 
 # --- Flush stays OFF the hot path --------------------------------------------------

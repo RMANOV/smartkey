@@ -8,6 +8,7 @@ IBus adapter.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import logging
 import os
@@ -145,6 +146,32 @@ _HINT_HIDDEN_TEXT = _ibus_enum_value(
     "InputHints", "HIDDEN_TEXT", "INPUT_HINT_HIDDEN_TEXT", 1 << 12
 )
 _SENSITIVE_HINTS = _HINT_PRIVATE | _HINT_HIDDEN_TEXT
+_KNOWN_HINT_VALUES = frozenset(
+    {0}
+    | {
+        _ibus_enum_value("InputHints", name, "INPUT_HINT_" + name, 1 << bit)
+        for name, bit in (
+            ("SPELLCHECK", 0),
+            ("NO_SPELLCHECK", 1),
+            ("WORD_COMPLETION", 2),
+            ("LOWERCASE", 3),
+            ("UPPERCASE_CHARS", 4),
+            ("UPPERCASE_WORDS", 5),
+            ("UPPERCASE_SENTENCES", 6),
+            ("INHIBIT_OSK", 7),
+            ("VERTICAL_WRITING", 8),
+            ("EMOJI", 9),
+            ("NO_EMOJI", 10),
+            ("PRIVATE", 11),
+            ("HIDDEN_TEXT", 12),
+            ("LATIN", 13),
+            ("MULTILINE", 14),
+        )
+    }
+)
+_KNOWN_HINT_MASK = 0
+for _known_hint in _KNOWN_HINT_VALUES:
+    _KNOWN_HINT_MASK |= _known_hint
 
 # IBus modifier bits used by the phantom-key filter.
 _MOD_CONTROL = 1 << 2  # IBus.ModifierType.CONTROL_MASK
@@ -167,19 +194,64 @@ def _sensitive_until_declared() -> bool:
     return os.environ.get("SMARTKEY_SENSITIVE_UNTIL_DECLARED") == "1"
 
 
+def _native_engine_commit(fallback: object = None) -> str | None:
+    """Describe the loaded native build; use config only for legacy modules."""
+    sha = _NATIVE_BUILD_GIT_SHA
+    if (
+        isinstance(sha, str)
+        and len(sha) == 40
+        and all(ch in "0123456789abcdef" for ch in sha)
+    ):
+        if _NATIVE_BUILD_DIRTY is True:
+            return f"{sha}+dirty"
+        if _NATIVE_BUILD_DIRTY is None:
+            return f"{sha}+dirty-unknown"
+        return sha
+    if _NATIVE_HAS_BUILD_PROVENANCE:
+        return None
+    return fallback if isinstance(fallback, str) else None
+
+
 # ---------------------------------------------------------------------------
 # Rust prediction engine via PyO3.
 # ---------------------------------------------------------------------------
+def _installed_native_version(fallback: str) -> str:
+    """Best available distribution version for legacy or absent extensions."""
+    try:
+        return importlib.metadata.version("smartkey-py")
+    except importlib.metadata.PackageNotFoundError:
+        return fallback
+
+
+def _loaded_native_version(native_module: object) -> str:
+    """Prefer an embedded version; consult dist-info only for a loaded legacy module."""
+    version = getattr(native_module, "__version__", None)
+    if isinstance(version, str) and version:
+        return version
+    return _installed_native_version("unknown")
+
+
 try:
     # Keep the core import independent from optional protocol helpers.  A
     # previously installed smartkey_py may expose PyInputMethodCore but predate
     # ffi_decode_* and process_keycode; that core can still provide a safe,
     # ordinary keyval path while the native extension is rebuilt.
+    import smartkey_py as _native_module  # type: ignore[import-untyped]
     from smartkey_py import PyInputMethodCore  # type: ignore[import-untyped]
 
+    _NATIVE_VERSION = _loaded_native_version(_native_module)
+    _NATIVE_HAS_BUILD_PROVENANCE = hasattr(
+        _native_module, "__build_git_sha__"
+    ) or hasattr(_native_module, "__build_dirty__")
+    _NATIVE_BUILD_GIT_SHA = getattr(_native_module, "__build_git_sha__", "unknown")
+    _NATIVE_BUILD_DIRTY = getattr(_native_module, "__build_dirty__", None)
     _HAS_CORE = True
 except ImportError:
     _HAS_CORE = False
+    _NATIVE_VERSION = "unavailable"
+    _NATIVE_HAS_BUILD_PROVENANCE = False
+    _NATIVE_BUILD_GIT_SHA = "unknown"
+    _NATIVE_BUILD_DIRTY = None
 
     class PyInputMethodCore:  # type: ignore[no-redef]
         """Stub when the native extension is not available."""
@@ -273,6 +345,31 @@ else:
 # ---------------------------------------------------------------------------
 _IS_WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
 
+
+def _open_private_text_log(path: str | Path):
+    """Open an append-only text sink with repaired 0700/0600 permissions."""
+    log_path = Path(path)
+    log_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    log_path.parent.chmod(0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(log_path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _prepare_private_log_path(path: str | Path) -> Path:
+    """Create/repair a private log path for logging.FileHandler."""
+    log_path = Path(path)
+    handle = _open_private_text_log(log_path)
+    handle.close()
+    return log_path
+
+
 # Legacy content logs (predictions.log / replay.jsonl) carry verbatim words,
 # so they are gated on the CONTENT level only: SMARTKEY_DEBUG=1 now means
 # "structural keystroke trace, no content" (see smartkey_debug.py).
@@ -280,13 +377,12 @@ _DEBUG = os.environ.get("SMARTKEY_DEBUG") == "full"
 _PRED_LOG = None
 _REPLAY_LOG = None
 if _DEBUG:
-    import pathlib
-
-    _log_dir = pathlib.Path.home() / ".local" / "share" / "smartkey"
-    _log_dir.mkdir(parents=True, exist_ok=True)
+    _log_dir = Path(
+        os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+    ) / "smartkey"
     # Block-buffered: the OS flushes off the hot path (no per-write flush).
-    _PRED_LOG = (_log_dir / "predictions.log").open("a")
-    _REPLAY_LOG = (_log_dir / "replay.jsonl").open("a")
+    _PRED_LOG = _open_private_text_log(_log_dir / "predictions.log")
+    _REPLAY_LOG = _open_private_text_log(_log_dir / "replay.jsonl")
 
 # Keystroke diagnostic trace (spec 2026-07-12).  Import must never take the
 # engine down; a missing module simply means tracing stays off.
@@ -386,6 +482,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._sensitive: bool = _sensitive_until_declared()
         self._content_type_key: tuple[int, int] | None = None
         self._keys_since_content_type: int = 0
+        self._undeclared_bypass_logged: bool = False
 
         # Phantom keycode-240 storm bookkeeping (see _note_spurious_zero_key).
         self._spurious_zero_key_count: int = 0
@@ -432,6 +529,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if (
             isinstance(o1_cfg, dict)
             and o1_cfg.get("enabled")
+            and bool(self._o1_corpus_loaded)
             and callable(getattr(self._core, "o1_snapshot", None))
         ):
             try:
@@ -441,7 +539,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     self._core,
                     o1_cfg,
                     self._o1_corpus_loaded,
-                    o1_cfg.get("engine_commit"),
+                    _native_engine_commit(o1_cfg.get("engine_commit")),
                 )
             except Exception:  # noqa: BLE001 -- optional tap must fail isolated
                 log.exception("smartkey: calibration collector init failed")
@@ -1207,7 +1305,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             elif action_type == "replace":
                 decoded = ffi_decode_replace_payload(payload)
                 if decoded is None:
-                    log.warning("smartkey: malformed replace payload %r", payload)
+                    log.warning(
+                        "smartkey: malformed replace payload (content omitted)"
+                    )
+                    if _DEBUG:
+                        log.debug(
+                            "smartkey: malformed replace payload %r", payload
+                        )
                     continue
                 replace_len, text = decoded
                 if composing_resolution_pending:
@@ -1229,7 +1333,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             elif action_type == "composing":
                 decoded = ffi_decode_composing_payload(payload)
                 if decoded is None:
-                    log.warning("smartkey: malformed composing payload %r", payload)
+                    log.warning(
+                        "smartkey: malformed composing payload (content omitted)"
+                    )
+                    if _DEBUG:
+                        log.debug(
+                            "smartkey: malformed composing payload %r", payload
+                        )
                     continue
                 typed, ghost = decoded
                 self._show_composing(typed, ghost)
@@ -1277,10 +1387,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return None
 
     @classmethod
-    def _classify_content_type(
+    def _content_type_decision(
         cls, purpose: object, hints: object
-    ) -> tuple[bool, tuple[int, int]]:
-        """Return ``(sensitive, decision_key)`` for a declared content type.
+    ) -> tuple[bool, tuple[int, int], str]:
+        """Return enforcement, stable decision key, and coarse classification.
 
         Fail safe: only a purpose this adapter positively recognises as
         ordinary text yields ``sensitive=False``.  An unset, malformed or
@@ -1297,14 +1407,34 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         like a field switch to each other either.
         """
         purpose_value = cls._coerce_content_flag(purpose)
-        hints_value = cls._coerce_content_flag(hints) or 0
-        secret_hint = bool(hints_value & _SENSITIVE_HINTS)
-        if purpose_value is None or purpose_value not in _KNOWN_PURPOSES:
-            return True, (-1, int(secret_hint))
-        return (
-            secret_hint or purpose_value in _SENSITIVE_PURPOSES,
-            (purpose_value, int(secret_hint)),
+        hints_value = cls._coerce_content_flag(hints)
+        purpose_known = purpose_value in _KNOWN_PURPOSES
+        hints_known = (
+            hints_value is not None
+            and hints_value >= 0
+            and hints_value & ~_KNOWN_HINT_MASK == 0
         )
+        secret_hint = bool((hints_value or 0) & _SENSITIVE_HINTS)
+        if not purpose_known or not hints_known:
+            purpose_key = purpose_value if purpose_known else -1
+            hints_key = int(secret_hint) if hints_known else -1
+            return True, (purpose_key, hints_key), "unknown"
+        sensitive = secret_hint or purpose_value in _SENSITIVE_PURPOSES
+        return (
+            sensitive,
+            (purpose_value, int(secret_hint)),
+            "sensitive" if sensitive else "ordinary",
+        )
+
+    @classmethod
+    def _classify_content_type(
+        cls, purpose: object, hints: object
+    ) -> tuple[bool, tuple[int, int]]:
+        """Compatibility wrapper returning only enforcement and decision key."""
+        sensitive, decision_key, _classification = cls._content_type_decision(
+            purpose, hints
+        )
+        return sensitive, decision_key
 
     def _composition_in_flight(self) -> bool:
         """True while typing in this context may still be unresolved.
@@ -1381,13 +1511,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         keystroke trace at ``LEVEL=full``.
 
         The callback is ADVISORY and adapter-specific, so the policy here is
-        deliberately asymmetric: any ambiguity in the PURPOSE turns sensitive
-        mode ON, and only an explicit, recognised, non-sensitive purpose
-        declared outside a live composition turns it back off.  The HINTS axis
-        deliberately fails the other way — unusable hints read as "no secrecy
-        hint" (``_classify_content_type``), because hints are optional and
-        routinely unset, so failing safe on them would disable every ordinary
-        field.
+        deliberately asymmetric: any ambiguity in PURPOSE or HINTS turns
+        sensitive mode ON, and only an explicit, recognised, non-sensitive
+        declaration outside a live composition turns it back off.  A valid
+        HINT_NONE value is ordinary; malformed values and future hint bits that
+        this adapter has not audited fail closed until their semantics are
+        understood.
 
         WHAT THIS COVERS, STATED PRECISELY.  This protects password fields in
         clients that correctly publish a ContentType.  It is NOT a general
@@ -1446,17 +1575,40 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         does not even update ``get_content_type()``), so there is nothing for
         the parent to do.
         """
-        sensitive, decision_key = self._classify_content_type(purpose, hints)
+        sensitive, decision_key, classification = self._content_type_decision(
+            purpose, hints
+        )
+        previous_key = getattr(self, "_content_type_key", None)
+        previous_sensitive = getattr(self, "_sensitive", False)
+        decision_changed = previous_key != decision_key
 
         # Fail safe: a content type that changes while a word is still in
         # flight means the composition may already belong to a different field
         # than the one it was started in.  Treat that window as sensitive and
         # drop the state instead of guessing which field wins.
-        if (
+        transition_in_flight = (
             getattr(self, "_content_type_key", None) != decision_key
             and self._composition_in_flight()
-        ):
+        )
+        if transition_in_flight:
             sensitive = True
+            log.warning(
+                "content-type transition discarded an in-flight composition "
+                "(structural event; no text logged)"
+            )
+
+        if transition_in_flight:
+            classification = "transition-guard"
+        trace = getattr(self, "_trace", None)
+        if trace is not None:
+            trace.emit(
+                "content_type",
+                seq=0,
+                classification=classification,
+                effective_sensitive=sensitive,
+                decision_changed=decision_changed,
+                state_changed=sensitive != previous_sensitive,
+            )
 
         self._content_type_key = decision_key
         if sensitive == getattr(self, "_sensitive", False):
@@ -1496,6 +1648,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # transliteration, no prediction and no learning.  Returning False
         # hands the untouched key straight back to IBus for the client.
         if getattr(self, "_sensitive", False):
+            if (
+                getattr(self, "_content_type_key", None) is None
+                and not getattr(self, "_undeclared_bypass_logged", False)
+            ):
+                log.warning(
+                    "input bypassed while waiting for an undeclared content type "
+                    "(structural event; no key content logged)"
+                )
+                self._undeclared_bypass_logged = True
             return False
 
         log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)

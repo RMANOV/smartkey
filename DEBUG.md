@@ -21,16 +21,22 @@ is exactly the Space-inject signature, visible even in structural mode.
 
 ## Privacy guardrails
 
-- Output only under `~/.local/state/smartkey/debug/` (override:
-  `SMARTKEY_DEBUG_DIR`; an override inside the repo is **refused**).
-  Dir 0700, files 0600. Never network, never the engine's stdout.
-- Bounded: flush off the hot path, 48h age purge + 50MB size cap at start.
-- `./smartkey-debug wipe` deletes every trace in one command.
+- Trace JSONL lives under `~/.local/state/smartkey/debug/` (override:
+  `SMARTKEY_DEBUG_DIR`; an override inside the repo is **refused**). Full mode
+  also enables `smartkey.log`, `predictions.log`, and `replay.jsonl` under
+  `$XDG_DATA_HOME/smartkey/` (normally `~/.local/share/smartkey/`). Both
+  directories are 0700 and files 0600. Never network, never engine stdout.
+- Trace JSONL is bounded: flush off the hot path, 48h age purge + 50MB size
+  cap at start. The three legacy full-mode sinks are not rotated; keep full
+  mode brief and use `wipe` when the capture is complete.
+- `./smartkey-debug wipe` deletes every trace and all three legacy content
+  sinks in one command. Recycle SmartKey afterward if it was still running.
 
 ## Repro recipe (accept/backspace class)
 
 1. `./smartkey-debug enable full`
-2. Restart the engine (engine recycle / ibus restart) — with env instead:
+2. Switch to a fallback keyboard and recycle only SmartKey (do not globally
+   restart IBus). With an explicit environment instead:
    `SMARTKEY_DEBUG=full <engine start>`.
 3. Type the repro phrase in the failing app (e.g. Bulgarian typing where a
    prediction got injected), then switch focus once (flushes the buffer).

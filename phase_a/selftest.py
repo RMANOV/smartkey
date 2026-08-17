@@ -22,10 +22,13 @@ Exit 0 iff every check passes.
 
 from __future__ import annotations
 
+import argparse
 import datetime as _dt
 import os
 import sqlite3
+import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from .analyze import analyze, format_report
@@ -314,7 +317,7 @@ CHECKS = [
 ]
 
 
-def main() -> int:
+def _run_selftest() -> int:
     print("=" * 72)
     print(" O1 / PHASE-A MACHINERY SELF-TEST (synthetic data, synthetic=1)")
     print(" prediction_scope: ngram_component  (n-gram component ONLY)")
@@ -342,6 +345,54 @@ def main() -> int:
     for line in FIREWALL_LINES:
         print(line)
     return 0 if all_ok else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="O1 / Phase-A machinery self-test using synthetic data"
+    )
+    ap.add_argument(
+        "--data-dir",
+        help="keep synthetic artifacts in this explicit scratch directory",
+    )
+    args = ap.parse_args(argv)
+
+    previous = os.environ.get("SMARTKEY_PHASEA_DATA")
+    scratch: tempfile.TemporaryDirectory[str] | None = None
+    if args.data_dir:
+        os.environ["SMARTKEY_PHASEA_DATA"] = str(Path(args.data_dir).expanduser())
+    elif previous is None:
+        scratch = tempfile.TemporaryDirectory(prefix="smartkey-phasea-selftest-")
+        os.environ["SMARTKEY_PHASEA_DATA"] = scratch.name
+
+    try:
+        # Resolve once up front so an unsafe explicit path produces one concise
+        # argparse error rather than eleven repeated test exceptions.
+        try:
+            data_dir()
+        except (OSError, RuntimeError) as exc:
+            ap.error(str(exc))
+        result = _run_selftest()
+    except BaseException:
+        # Environment/scratch cleanup is secondary.  It must never replace the
+        # actual self-test or argparse failure that brought us here.
+        with suppress(BaseException):
+            if previous is None:
+                os.environ.pop("SMARTKEY_PHASEA_DATA", None)
+            else:
+                os.environ["SMARTKEY_PHASEA_DATA"] = previous
+        if scratch is not None:
+            with suppress(BaseException):
+                scratch.cleanup()
+        raise
+    else:
+        if previous is None:
+            os.environ.pop("SMARTKEY_PHASEA_DATA", None)
+        else:
+            os.environ["SMARTKEY_PHASEA_DATA"] = previous
+        if scratch is not None:
+            scratch.cleanup()
+        return result
 
 
 if __name__ == "__main__":

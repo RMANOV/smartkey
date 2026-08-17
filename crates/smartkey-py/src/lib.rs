@@ -19,8 +19,10 @@ struct PyInputMethodCore {
     /// Pending top-three used only to compute the next binary outcome.
     /// Candidate strings never cross the Python boundary.
     o1_pending: Option<Vec<String>>,
-    /// Compute-once global unigram fallback list.
+    /// Corpus-load snapshot of the global unigram fallback list and its mass.
+    /// Online OOV learning intentionally does not invalidate either value.
     o1_uni_top3: Option<Vec<String>>,
+    o1_uni_p_top3: Option<f64>,
 }
 
 /// Convert an `Action` to a Python-friendly `(type, payload)` tuple.
@@ -105,6 +107,16 @@ fn raw_mods_to_modifiers(raw: u32) -> Modifiers {
     m
 }
 
+impl PyInputMethodCore {
+    fn invalidate_o1_unigram_cache(&mut self) {
+        // Explicit corpus mutation changes the Phase-A fallback, but an
+        // already captured snapshot must remain resolvable against its next
+        // token. Online OOV learning bypasses this method by design.
+        self.o1_uni_top3 = None;
+        self.o1_uni_p_top3 = None;
+    }
+}
+
 #[pymethods]
 impl PyInputMethodCore {
     #[new]
@@ -118,11 +130,13 @@ impl PyInputMethodCore {
             inner: MasterLoop::new(config),
             o1_pending: None,
             o1_uni_top3: None,
+            o1_uni_p_top3: None,
         }
     }
 
     fn load_word(&mut self, word: &str, freq: u32) {
         self.inner.load_word(word, freq);
+        self.invalidate_o1_unigram_cache();
     }
 
     fn load_bigram(&mut self, ctx: &str, word: &str, count: u32) {
@@ -137,7 +151,9 @@ impl PyInputMethodCore {
     fn load_corpus_file(&mut self, path: &str) -> PyResult<()> {
         self.inner
             .load_corpus_file(std::path::Path::new(path))
-            .map_err(pyo3::exceptions::PyIOError::new_err)
+            .map_err(pyo3::exceptions::PyIOError::new_err)?;
+        self.invalidate_o1_unigram_cache();
+        Ok(())
     }
 
     /// Process a key event. Returns list of `(action_type, payload)` tuples.
@@ -255,14 +271,29 @@ impl PyInputMethodCore {
         self.inner.record_ghost_rejection(prefix, completion);
     }
 
+    /// Precompute the corpus-load unigram fallback before live collection.
+    /// Returns true only when a new cache was built.
+    fn o1_prepare(&mut self) -> bool {
+        if self.o1_uni_top3.is_none() {
+            let top3 = self.inner.o1_global_unigram_top3();
+            let (_, numbers) = self.inner.o1_ngram_snapshot("", &top3);
+            debug_assert!(numbers.used_unigram_fallback);
+            self.o1_uni_p_top3 = Some(numbers.p_top3);
+            self.o1_uni_top3 = Some(top3);
+            return true;
+        }
+        false
+    }
+
     /// Take an n-gram-only snapshot. Only counts, probability mass, and
     /// timing cross the Python boundary.
     fn o1_snapshot(&mut self, ctx: &str) -> (u32, f64, u64) {
-        if self.o1_uni_top3.is_none() {
-            self.o1_uni_top3 = Some(self.inner.o1_global_unigram_top3());
-        }
+        let _ = self.o1_prepare();
         let cache = self.o1_uni_top3.as_deref().unwrap_or(&[]);
-        let (top3, numbers) = self.inner.o1_ngram_snapshot(ctx, cache);
+        let (top3, mut numbers) = self.inner.o1_ngram_snapshot(ctx, cache);
+        if numbers.used_unigram_fallback {
+            numbers.p_top3 = self.o1_uni_p_top3.unwrap_or(numbers.p_top3);
+        }
         self.o1_pending = Some(top3);
         (
             numbers.n_candidates,
@@ -285,9 +316,27 @@ impl PyInputMethodCore {
 }
 
 #[pymodule]
-fn smartkey_py(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn smartkey_py(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyInputMethodCore>()?;
     m.add_function(wrap_pyfunction!(ffi_decode_replace_payload, m)?)?;
     m.add_function(wrap_pyfunction!(ffi_decode_composing_payload, m)?)?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__build_git_sha__", env!("SMARTKEY_BUILD_GIT_SHA"))?;
+    match env!("SMARTKEY_BUILD_GIT_DIRTY") {
+        "0" => m.add("__build_dirty__", false)?,
+        "1" => m.add("__build_dirty__", true)?,
+        _ => m.add("__build_dirty__", py.None())?,
+    }
+    m.add(
+        "__all__",
+        vec![
+            "PyInputMethodCore",
+            "ffi_decode_replace_payload",
+            "ffi_decode_composing_payload",
+            "__version__",
+            "__build_git_sha__",
+            "__build_dirty__",
+        ],
+    )?;
     Ok(())
 }

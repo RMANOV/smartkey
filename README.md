@@ -154,21 +154,44 @@ cargo build --release
 python3 corpus/build_corpus.py ~/Documents/*.txt -o ~/.config/smartkey/corpus.json --min-freq 2
 ```
 
-### Install the PyO3 bridge
+### Build the PyO3 wheel
 
 ```bash
-pip install maturin
-maturin develop -m crates/smartkey-py/Cargo.toml --release
+repo_root="$(pwd -P)"
+build_sha="$(git -C "$repo_root" rev-parse --verify HEAD)"
+test -z "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=normal)"
+build_stage="$(mktemp -d /tmp/smartkey-build.XXXXXXXX)"
+python3 -m venv "$build_stage/venv"
+"$build_stage/venv/bin/python" -m pip install maturin
+mkdir -p "$build_stage/wheels"
+
+SMARTKEY_BUILD_GIT_SHA="$build_sha" \
+SMARTKEY_BUILD_GIT_DIRTY=0 \
+"$build_stage/venv/bin/maturin" build \
+  --manifest-path "$repo_root/crates/smartkey-py/Cargo.toml" \
+  --release --locked \
+  --interpreter "$build_stage/venv/bin/python" \
+  --out "$build_stage/wheels"
 ```
 
-### Register with IBus
+Do not use `maturin develop` against an environment used by a running
+SmartKey engine, and never replace its native `.so` while a SmartKey process
+maps it. A live upgrade must first select a verified fallback input engine,
+stop and verify the old SmartKey PID is gone, preserve a rollback wheel,
+install the isolated wheel, start a new PID, and verify that the wheel,
+installed file, and mapped inode have the same SHA-256.
+
+### Register with IBus (initial installation only)
 
 ```bash
 mkdir -p ~/.local/share/ibus/component/
 cp ibus/smartkey.xml ~/.local/share/ibus/component/
-ibus restart
 # Select "SmartKey Predictive" in IBus settings
 ```
+
+For an upgrade, do not perform a global `ibus restart`; recycle only the
+SmartKey engine after switching to a fallback keyboard so the native artifact
+cannot be replaced underneath a live process.
 
 ---
 

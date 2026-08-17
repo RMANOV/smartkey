@@ -66,7 +66,8 @@ def data_dir() -> Path:
                 f"SMARTKEY_PHASEA_DATA={d} resolves inside the live/operator tree "
                 f"{forbidden} — refusing (data outputs must stay in a scratch dir)."
             )
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    d.chmod(0o700)
     return d
 
 
@@ -74,6 +75,14 @@ def default_db_path() -> Path:
     """Lab event DB. Never the live events.db (data_dir() guards the root)."""
     env = os.environ.get("SMARTKEY_PHASEA_DB")
     return Path(env) if env else data_dir() / "events.db"
+
+
+def require_existing_db(path: str | Path) -> Path:
+    """Resolve an operator-selected event DB without ever creating it."""
+    db = Path(path).expanduser()
+    if not db.is_file():
+        raise ValueError(f"event DB does not exist: {db}")
+    return db
 
 
 def synthetic_db_path() -> Path:

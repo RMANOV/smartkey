@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import pathlib
 import subprocess
@@ -292,16 +293,169 @@ def test_sensitive_content_type_forwards_keys_without_touching_the_core(purpose,
     assert rec.forwarded_keys == []
 
 
-def test_sensitive_field_emits_zero_trace_events():
+def test_sensitive_field_keystrokes_emit_zero_trace_events():
     eng, _rec = build_engine()
     trace = FakeTrace(level=ske.LEVEL_FULL)
     eng._trace = trace
     eng.do_set_content_type(PURPOSE_PASSWORD, HINT_NONE)
+    trace.events.clear()
 
     _type(eng, "hunter2")
 
     assert trace.begins == 0, "no keystroke may even be opened in the trace"
     assert trace.events == [], f"the trace must stay empty, got {trace.events}"
+
+
+@pytest.mark.parametrize(
+    ("purpose", "hints", "classification", "effective_sensitive"),
+    (
+        (PURPOSE_FREE_FORM, HINT_NONE, "ordinary", False),
+        (PURPOSE_PASSWORD, HINT_NONE, "sensitive", True),
+        (PURPOSE_FREE_FORM, HINT_PRIVATE, "sensitive", True),
+        ("private-content-sentinel", HINT_NONE, "unknown", True),
+        (PURPOSE_FREE_FORM, None, "unknown", True),
+        (PURPOSE_FREE_FORM, "private-hint-sentinel", "unknown", True),
+        (PURPOSE_FREE_FORM, 1 << 30, "unknown", True),
+    ),
+)
+def test_content_type_observation_is_structural_even_at_full(
+    tmp_path, purpose, hints, classification, effective_sensitive
+):
+    eng, _rec = build_engine()
+    trace = ske.KeystrokeTrace(level=ske.LEVEL_FULL, directory=tmp_path)
+    eng._trace = trace
+
+    eng.do_set_content_type(purpose, hints)
+    trace.flush()
+
+    assert trace._file is not None
+    raw = trace._file.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event == {
+        "ts": event["ts"],
+        "seq": 0,
+        "event": "content_type",
+        "classification": classification,
+        "effective_sensitive": effective_sensitive,
+        "decision_changed": True,
+        "state_changed": effective_sensitive,
+    }
+    assert "private-content-sentinel" not in raw
+    assert "private-hint-sentinel" not in raw
+    assert trace._seq == 0
+
+
+def test_content_type_values_are_coerced_once_and_enforcement_matches_trace():
+    class _ChangingHint:
+        def __init__(self):
+            self.calls = 0
+
+        def __int__(self):
+            self.calls += 1
+            return HINT_NONE if self.calls == 1 else HINT_PRIVATE
+
+    hint = _ChangingHint()
+    eng, _rec = build_engine()
+    trace = FakeTrace(level=1)
+    eng._trace = trace
+
+    eng.do_set_content_type(PURPOSE_FREE_FORM, hint)
+
+    assert hint.calls == 1
+    assert eng._sensitive is False
+    assert trace.events[-1][1]["classification"] == "ordinary"
+    assert trace.events[-1][1]["effective_sensitive"] is False
+
+
+@pytest.mark.parametrize("hints", (None, "malformed-hint", 1 << 30))
+def test_unknown_hint_values_fail_sensitive(hints):
+    sensitive, _key = ske.SmartKeyEngine._classify_content_type(
+        PURPOSE_FREE_FORM, hints
+    )
+    assert sensitive is True
+
+
+@pytest.mark.parametrize("action_type", ("replace", "composing"))
+def test_malformed_action_warning_omits_payload_content(caplog, action_type):
+    sentinel = "typed-private-payload-sentinel"
+    eng, _rec = build_engine()
+    with caplog.at_level(logging.WARNING, logger="smartkey"):
+        eng._execute_actions([(action_type, sentinel)])
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(f"malformed {action_type} payload" in message for message in messages)
+    assert all(sentinel not in message for message in messages)
+
+
+def test_content_log_open_repairs_private_directory_and_file_modes(tmp_path):
+    log_dir = tmp_path / "smartkey"
+    log_dir.mkdir(mode=0o755)
+    log_path = log_dir / "smartkey.log"
+    log_path.write_text("legacy\n", encoding="utf-8")
+    log_path.chmod(0o644)
+
+    handle = ske._open_private_text_log(log_path)
+    try:
+        handle.write("new\n")
+        handle.flush()
+    finally:
+        handle.close()
+
+    assert log_dir.stat().st_mode & 0o777 == 0o700
+    assert log_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_content_type_observation_names_transition_guard_without_key_count():
+    eng, _rec = build_engine()
+    trace = FakeTrace(level=1)
+    eng._trace = trace
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    trace.events.clear()
+    eng._keys_since_content_type = 1
+
+    eng.do_set_content_type(PURPOSE_EMAIL, HINT_NONE)
+
+    assert trace.events == [
+        (
+            "content_type",
+            {
+                "seq": 0,
+                "classification": "transition-guard",
+                "effective_sensitive": True,
+                "decision_changed": True,
+                "state_changed": True,
+            },
+        )
+    ]
+
+
+def test_undeclared_sensitive_bypass_logs_once_without_key_content(caplog):
+    """The strict startup blind spot must be visible without logging a key."""
+    eng, _rec = build_engine(sensitive=True)
+    with caplog.at_level(logging.WARNING, logger="smartkey"):
+        _type(eng, "private")
+
+    messages = [record.getMessage() for record in caplog.records]
+    matching = [message for message in messages if "undeclared content type" in message]
+    assert len(matching) == 1, "one structural warning, not one log per key"
+    assert all("private" not in message for message in messages)
+
+
+def test_mid_composition_sensitive_escalation_logs_without_text(caplog):
+    prefix = "sensitiveprefix"
+    suffix = "secretsuffix"
+    eng, _rec = build_engine(scripts=[[('composing', f'{prefix}\x00{suffix}')]])
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    assert eng.do_process_key_event(ord("l"), 38, 0) is True
+
+    with caplog.at_level(logging.WARNING, logger="smartkey"):
+        eng.do_set_content_type(PURPOSE_EMAIL, HINT_NONE)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("in-flight composition" in message for message in messages)
+    assert all(prefix not in message and suffix not in message for message in messages)
 
 
 def test_sensitive_field_blocks_prediction_and_learning_entirely():
@@ -375,13 +529,14 @@ def test_unknown_or_unset_purpose_fails_safe(purpose, label):
     assert eng._core.key_calls() == []
 
 
-def test_unusable_hints_do_not_by_themselves_make_a_known_purpose_sensitive():
-    # Hints are optional and routinely unset; only the PURPOSE drives the
-    # fail-safe branch, otherwise every ordinary field would be disabled.
+def test_unusable_hints_fail_safe_even_with_a_known_purpose():
+    # IBus represents a real "no hints" declaration as numeric HINT_NONE.
+    # ``None`` is malformed callback input, not an ordinary declaration.
     eng, _rec = build_engine(scripts=[[("composing", "hel\x00lo")]])
     eng.do_set_content_type(PURPOSE_FREE_FORM, None)
-    assert eng._sensitive is False
-    assert eng.do_process_key_event(ord("l"), 38, 0) is True
+    assert eng._sensitive is True
+    assert eng.do_process_key_event(ord("l"), 38, 0) is False
+    assert eng._core.key_calls() == []
 
 
 def test_content_type_change_mid_composition_fails_safe():
@@ -789,7 +944,7 @@ def test_no_unaudited_ibus_input_hint_has_appeared():
     # Mirror tripwire on the privacy side: a hint this adapter has never seen
     # might be a new secrecy flag (PRIVATE and HIDDEN_TEXT both are).  Failing
     # here means "a human must classify it", not that anything is broken yet.
-    audited = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384}
+    audited = set(ske._KNOWN_HINT_VALUES)
     assert ske._HINT_PRIVATE in audited and ske._HINT_HIDDEN_TEXT in audited
     defined = _live_ibus_enum("InputHints")
     assert defined <= audited, (

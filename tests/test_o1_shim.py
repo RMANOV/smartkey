@@ -18,6 +18,22 @@ _REPO = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+
+def _native_module_path() -> pathlib.Path:
+    native = pathlib.Path(
+        os.environ.get(
+            "SMARTKEY_TEST_NATIVE_MODULE",
+            _REPO / "target" / "debug" / "libsmartkey_py.so",
+        )
+    )
+    if native.is_file():
+        return native
+    detail = f"native extension not built: {native}"
+    if os.environ.get("SMARTKEY_REQUIRE_NATIVE_TESTS") == "1":
+        pytest.fail(f"required {detail}", pytrace=False)
+    pytest.skip(detail)
+
+
 _O1_PATH = _REPO / "ibus" / "o1_shim.py"
 _spec = importlib.util.spec_from_file_location("o1_shim_test_mod", _O1_PATH)
 assert _spec and _spec.loader
@@ -60,10 +76,33 @@ class FakeO1Core:
         self.pending = None
 
 
+class PreparingO1Core(FakeO1Core):
+    """New-native fake that records startup cache preparation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prepare_calls = 0
+
+    def o1_prepare(self) -> bool:
+        self.prepare_calls += 1
+        return self.prepare_calls == 1
+
+
+def _corpus_marker(tmp_path: pathlib.Path) -> pathlib.Path:
+    corpus = tmp_path / "corpus_test.json"
+    corpus.write_text('{"unigrams":{"alpha":1}}', encoding="utf-8")
+    return corpus
+
+
 def _mk_collector(tmp_path, core=None, **cfg_extra):
     core = core or FakeO1Core()
     cfg = {"enabled": True, "data_dir": str(tmp_path / "o1data"), **cfg_extra}
-    collector = o1_shim.O1Collector(core, cfg, [], engine_commit="testsha")
+    collector = o1_shim.O1Collector(
+        core,
+        cfg,
+        [str(_corpus_marker(tmp_path))],
+        engine_commit="testsha",
+    )
     return collector, core
 
 
@@ -190,6 +229,33 @@ def test_t4_writer_init_failure_disables_tap(tmp_path, monkeypatch):
     assert core.snapshot_calls == []
 
 
+def test_t4_collector_prepares_new_native_before_starting_writer(tmp_path):
+    core = PreparingO1Core()
+    collector, _ = _mk_collector(tmp_path, core=core)
+    try:
+        assert core.prepare_calls == 1
+        assert collector._active is True
+    finally:
+        collector.close()
+
+
+def test_t4_collector_without_loaded_corpus_stays_inactive_and_does_not_prepare(
+    tmp_path,
+):
+    core = PreparingO1Core()
+    collector = o1_shim.O1Collector(
+        core,
+        {"enabled": True, "data_dir": str(tmp_path / "empty-o1data")},
+        [],
+        engine_commit="testsha",
+    )
+    try:
+        assert collector._active is False
+        assert core.prepare_calls == 0
+    finally:
+        collector.close()
+
+
 # ---------------------------------------------------------------------------
 # T5 — kill-switch: present at startup → tap never starts; created at
 # runtime → tap stops within one check interval and logs the activation.
@@ -202,6 +268,16 @@ def test_t5_kill_file_at_startup_keeps_tap_off(tmp_path):
     assert collector._active is False
     collector.on_word_commit("hello")
     assert core.snapshot_calls == []
+
+
+def test_t5_kill_file_is_checked_before_native_prepare(tmp_path):
+    data = tmp_path / "o1data"
+    data.mkdir(parents=True)
+    (data / "KILL").write_text("stop", encoding="utf-8")
+    core = PreparingO1Core()
+    collector, _ = _mk_collector(tmp_path, core=core)
+    assert collector._active is False
+    assert core.prepare_calls == 0
 
 
 def test_t5_kill_file_at_runtime_stops_tap(tmp_path):
@@ -228,16 +304,17 @@ def test_t5_writer_requests_kill_and_owner_clears_core(tmp_path):
     collector.close()
 
 
+def test_t5_required_native_module_cannot_silently_skip(tmp_path, monkeypatch):
+    missing = tmp_path / "missing-smartkey-native.so"
+    monkeypatch.setenv("SMARTKEY_TEST_NATIVE_MODULE", str(missing))
+    monkeypatch.setenv("SMARTKEY_REQUIRE_NATIVE_TESTS", "1")
+    with pytest.raises(pytest.fail.Exception, match="required native extension"):
+        _native_module_path()
+
+
 def test_t5_native_unsendable_core_is_never_called_by_writer(tmp_path):
     """Exercise the production PyO3 class across the writer-request path."""
-    native = pathlib.Path(
-        os.environ.get(
-            "SMARTKEY_TEST_NATIVE_MODULE",
-            _REPO / "target" / "debug" / "libsmartkey_py.so",
-        )
-    )
-    if not native.is_file():
-        pytest.skip(f"native extension not built: {native}")
+    native = _native_module_path()
     data_root = tmp_path / "native-o1"
     script = """
 import importlib.util
@@ -253,7 +330,14 @@ spec.loader.exec_module(module)
 from ibus.o1_shim import O1Collector
 
 core = module.PyInputMethodCore()
-collector = O1Collector(core, {"data_dir": sys.argv[3]}, [], "native-test")
+corpus = pathlib.Path(sys.argv[3]).parent / "native-corpus.json"
+corpus.write_text('{"unigrams":{"one":1}}', encoding="utf-8")
+collector = O1Collector(
+    core,
+    {"data_dir": sys.argv[3]},
+    [str(corpus)],
+    "native-test",
+)
 collector.on_word_commit("one")
 collector._kill_file.write_text("stop", encoding="utf-8")
 assert collector._kill_requested.wait(4.0)
@@ -264,6 +348,162 @@ collector.close()
 """
     proc = subprocess.run(
         [sys.executable, "-c", script, str(_REPO), str(native), str(data_root)],
+        cwd=_REPO,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+
+
+def test_t5_native_o1_prepare_refreshes_unigram_cache_after_corpus_change():
+    """Preparation must move cache construction off the first live boundary."""
+    native = _native_module_path()
+    script = """
+import importlib.util
+import json
+import pathlib
+import sys
+import tempfile
+
+native = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("smartkey_py", native)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+core = module.PyInputMethodCore()
+core.load_word("alpha", 100)
+core.load_word("gamma", 80)
+core.load_word("delta", 60)
+core.load_word("rare", 1)
+assert core.o1_prepare() is True
+assert core.o1_prepare() is False
+core.load_bigram("context", "alpha", 50)
+core.load_trigram("one", "two", "alpha", 25)
+assert core.o1_prepare() is False
+n_candidates, p_top3, _ = core.o1_snapshot("unseen-context")
+assert n_candidates == 3
+assert abs(p_top3 - 240 / 241) < 1e-12, p_top3
+
+# A corpus mutation invalidates only the prepared fallback: it must not erase
+# an already-captured outcome that still needs resolving against the next word.
+core.load_word("beta", 10_000)
+assert core.o1_resolve("alpha") == 1
+
+# Calling prepare again must rebuild before the next boundary rather than
+# serving stale data.
+assert core.o1_prepare() is True
+assert core.o1_prepare() is False
+
+# A failed corpus load changes nothing and must preserve the warm cache.
+try:
+    core.load_corpus_file("/definitely/missing/smartkey-corpus.json")
+except OSError:
+    pass
+else:
+    raise AssertionError("missing corpus unexpectedly loaded")
+assert core.o1_prepare() is False
+
+n_candidates, p_top3, _ = core.o1_snapshot("another-unseen-context")
+assert n_candidates == 3
+assert abs(p_top3 - 10_180 / 10_241) < 1e-12, p_top3
+assert core.o1_resolve("beta") == 1
+
+# A successful corpus load changes unigrams and must invalidate the cache.
+with tempfile.TemporaryDirectory() as scratch:
+    corpus = pathlib.Path(scratch) / "corpus_en.json"
+    corpus.write_text(
+        json.dumps({"unigrams": {"omega": 100_000}}),
+        encoding="utf-8",
+    )
+    core.load_corpus_file(str(corpus))
+assert core.o1_prepare() is True
+n_candidates, p_top3, _ = core.o1_snapshot("third-unseen-context")
+assert n_candidates == 3
+assert abs(p_top3 - 110_100 / 110_241) < 1e-12, p_top3
+assert core.o1_resolve("omega") == 1
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(native)],
+        cwd=_REPO,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+
+
+def test_t5_native_o1_fallback_is_pinned_against_online_oov_learning():
+    native = _native_module_path()
+    script = """
+import importlib.util
+import json
+import pathlib
+import sys
+
+native = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("smartkey_py", native)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+core = module.PyInputMethodCore(json.dumps({
+    "dual_buffer": {"enabled": False},
+    "use_ppm": False,
+    "use_reranker": False,
+}))
+core.load_word("alpha", 100)
+assert core.o1_prepare() is True
+
+# Commit a real OOV through the input path. It enters the online unigram table
+# at frequency 5, but Phase-A's fallback remains pinned to the loaded corpus.
+for char in "beta":
+    core.handle_key(ord(char), 0)
+actions = core.handle_key(0x20, 0)
+assert ("forward", "") in actions
+assert core.o1_prepare() is False
+
+n_candidates, p_top3, _latency_us = core.o1_snapshot("unseen-context")
+assert n_candidates == 1
+assert core.o1_resolve("alpha") == 1
+assert abs(p_top3 - 1.0) < 1e-12, p_top3
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(native)],
+        cwd=_REPO,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+
+
+def test_t5_native_module_exports_runtime_provenance():
+    native = _native_module_path()
+    script = """
+import importlib.util
+import pathlib
+import re
+import sys
+
+native = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("smartkey_py", native)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+assert module.__version__ == "0.6.2"
+assert module.__build_git_sha__ == "unknown" or re.fullmatch(
+    r"[0-9a-f]{40}", module.__build_git_sha__
+)
+assert module.__build_dirty__ is None or isinstance(module.__build_dirty__, bool)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(native)],
         cwd=_REPO,
         text=True,
         capture_output=True,
@@ -288,7 +528,12 @@ def test_t6_collector_refuses_forbidden_root_before_db_open():
     probe = pathlib.Path.home() / "smartkey" / "o1-shim-test-refuse"
     cfg = {"enabled": True, "data_dir": str(probe)}
     with pytest.raises(RuntimeError):
-        o1_shim.O1Collector(core, cfg, [], engine_commit=None)
+        o1_shim.O1Collector(
+            core,
+            cfg,
+            [str(_REPO / "corpus" / "corpus_en.json")],
+            engine_commit=None,
+        )
     # Refusal happened BEFORE any open: nothing was created under the root.
     assert not probe.exists()
     for suffix in ("events.db", "events.db-wal", "events.db-shm"):
@@ -430,6 +675,10 @@ def test_analyzer_and_reconciliation_share_real_campaign_population(tmp_path):
 # focus loss abandons. Real adapter class, fake IBus, spy collector.
 # ---------------------------------------------------------------------------
 def _load_engine_module():
+    # Full debug mode opens the operator's real content logs at import time.
+    # These tests exercise lifecycle only and must never inherit that setting.
+    previous_debug = os.environ.get("SMARTKEY_DEBUG")
+    os.environ["SMARTKEY_DEBUG"] = "0"
     os.environ.setdefault("SMARTKEY_PHASEA_DATA", str(pathlib.Path(
         os.environ.get("PYTEST_TMPDIR", "/tmp")) / "o1-engine-test-data"))
     fake_gi = types.ModuleType("gi")
@@ -441,12 +690,204 @@ def _load_engine_module():
     sys.modules["gi"] = fake_gi
     sys.modules.pop("gi.repository", None)
     path = _REPO / "ibus" / "smartkey_engine.py"
-    spec = importlib.util.spec_from_file_location("smartkey_engine_o1test", path)
+    spec = importlib.util.spec_from_file_location("ibus.smartkey_engine_o1test", path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        if previous_debug is None:
+            os.environ.pop("SMARTKEY_DEBUG", None)
+        else:
+            os.environ["SMARTKEY_DEBUG"] = previous_debug
     assert mod._HAS_IBUS is False
     return mod
+
+
+def test_engine_init_starts_o1_only_after_corpus_load(
+    tmp_path, monkeypatch
+):
+    """The engine must hand a proven loaded corpus to the collector."""
+    ske = _load_engine_module()
+    cfg = tmp_path / "smartkey.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "o1_shim": {
+                    "enabled": True,
+                    "data_dir": str(tmp_path / "phasea"),
+                    "engine_commit": "stale-config",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _InitCore:
+        def __init__(self):
+            self.calls = []
+
+        def load_personal(self):
+            self.calls.append("personal")
+
+        def o1_prepare(self):
+            self.calls.append("prepare")
+
+        def o1_snapshot(self, _ctx):
+            return (0, 0.0, 0)
+
+    core = _InitCore()
+    import ibus.o1_shim as engine_o1_shim
+
+    class _InitCollector:
+        def __init__(self, *args, **_kwargs):
+            core.calls.append("collector")
+            self.engine_commit = args[3]
+
+    monkeypatch.setattr(ske, "_CONFIG_FILE", cfg)
+    monkeypatch.setattr(ske, "PyInputMethodCore", lambda _config: core)
+    monkeypatch.setattr(engine_o1_shim, "O1Collector", _InitCollector)
+
+    def _fake_load_corpus(self):
+        core.calls.append("corpus")
+        self._o1_corpus_loaded.append(str(_corpus_marker(tmp_path)))
+
+    monkeypatch.setattr(ske.SmartKeyEngine, "_load_corpus", _fake_load_corpus)
+
+    eng = ske.SmartKeyEngine()
+
+    assert core.calls == ["personal", "corpus", "collector"]
+    assert isinstance(eng._o1, _InitCollector)
+    assert eng._o1.engine_commit == ske._native_engine_commit("stale-config")
+
+
+def test_collector_keeps_older_native_modules_without_prepare_compatible(tmp_path):
+    collector, _core = _mk_collector(tmp_path, core=FakeO1Core())
+    try:
+        assert collector._active is True
+    finally:
+        collector.close()
+
+
+def test_engine_init_keeps_older_native_module_collector_active(tmp_path, monkeypatch):
+    ske = _load_engine_module()
+    cfg = tmp_path / "smartkey.json"
+    cfg.write_text(
+        json.dumps(
+            {"o1_shim": {"enabled": True, "data_dir": str(tmp_path / "phasea")}}
+        ),
+        encoding="utf-8",
+    )
+    events = []
+
+    class _OldCore:
+        def load_personal(self):
+            events.append("personal")
+
+        def o1_snapshot(self, _ctx):
+            return (0, 0.0, 0)
+
+    class _Collector:
+        def __init__(self, *_args, **_kwargs):
+            events.append("collector")
+
+    import ibus.o1_shim as engine_o1_shim
+
+    monkeypatch.setattr(ske, "_CONFIG_FILE", cfg)
+    monkeypatch.setattr(ske, "PyInputMethodCore", lambda _config: _OldCore())
+
+    def _fake_load_corpus(self):
+        self._o1_corpus_loaded.append(str(_corpus_marker(tmp_path)))
+
+    monkeypatch.setattr(ske.SmartKeyEngine, "_load_corpus", _fake_load_corpus)
+    monkeypatch.setattr(engine_o1_shim, "O1Collector", _Collector)
+
+    eng = ske.SmartKeyEngine()
+
+    assert events == ["personal", "collector"]
+    assert isinstance(eng._o1, _Collector)
+
+
+def test_engine_init_does_not_start_o1_without_a_loaded_corpus(tmp_path, monkeypatch):
+    ske = _load_engine_module()
+    cfg = tmp_path / "smartkey.json"
+    cfg.write_text(
+        json.dumps(
+            {"o1_shim": {"enabled": True, "data_dir": str(tmp_path / "phasea")}}
+        ),
+        encoding="utf-8",
+    )
+    events = []
+
+    class _Core(PreparingO1Core):
+        def load_personal(self):
+            events.append("personal")
+
+    class _Collector:
+        def __init__(self, *_args, **_kwargs):
+            events.append("collector")
+
+    import ibus.o1_shim as engine_o1_shim
+
+    core = _Core()
+    monkeypatch.setattr(ske, "_CONFIG_FILE", cfg)
+    monkeypatch.setattr(ske, "PyInputMethodCore", lambda _config: core)
+    monkeypatch.setattr(ske.SmartKeyEngine, "_load_corpus", lambda _self: None)
+    monkeypatch.setattr(engine_o1_shim, "O1Collector", _Collector)
+
+    eng = ske.SmartKeyEngine()
+
+    assert events == ["personal"]
+    assert core.prepare_calls == 0
+    assert eng._o1 is None
+
+
+def _engine_init_with_prepare_error(tmp_path, monkeypatch, error):
+    ske = _load_engine_module()
+    cfg = tmp_path / "smartkey.json"
+    cfg.write_text(
+        json.dumps(
+            {"o1_shim": {"enabled": True, "data_dir": str(tmp_path / "phasea")}}
+        ),
+        encoding="utf-8",
+    )
+
+    class _Core(FakeO1Core):
+        def load_personal(self):
+            return None
+
+        def o1_prepare(self):
+            raise error
+
+    core = _Core()
+    corpus = _corpus_marker(tmp_path)
+
+    def _fake_load_corpus(self):
+        self._o1_corpus_loaded.append(str(corpus))
+
+    monkeypatch.setattr(ske, "_CONFIG_FILE", cfg)
+    monkeypatch.setattr(ske, "PyInputMethodCore", lambda _config: core)
+    monkeypatch.setattr(ske.SmartKeyEngine, "_load_corpus", _fake_load_corpus)
+    monkeypatch.setattr(ske, "KeystrokeTrace", None)
+    return ske.SmartKeyEngine
+
+
+def test_engine_isolates_native_prepare_panic(tmp_path, monkeypatch):
+    class _NativePanic(BaseException):
+        pass
+
+    engine_type = _engine_init_with_prepare_error(
+        tmp_path, monkeypatch, _NativePanic("scripted native panic")
+    )
+    eng = engine_type()
+    assert eng._o1 is None
+
+
+@pytest.mark.parametrize("process_exit", (KeyboardInterrupt(), SystemExit(7)))
+def test_engine_does_not_swallow_process_exit(tmp_path, monkeypatch, process_exit):
+    engine_type = _engine_init_with_prepare_error(tmp_path, monkeypatch, process_exit)
+    with pytest.raises(type(process_exit)):
+        engine_type()
 
 
 class _SpyCollector:

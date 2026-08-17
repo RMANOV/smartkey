@@ -79,6 +79,25 @@ def freq_table_provenance(corpus_files: list[str]) -> tuple[str, str]:
     return table_hash, json.dumps(files, ensure_ascii=False)
 
 
+def _prepare_core_for_collection(core: object) -> bool:
+    """Warm new native modules while keeping old ones usable.
+
+    PyO3 turns a Rust panic into a ``BaseException`` subclass. Convert that
+    into an ordinary initialization failure so the engine's optional-tap
+    boundary can disable collection, but never swallow process-control exits.
+    """
+    prepare = getattr(core, "o1_prepare", None)
+    if not callable(prepare):
+        return False
+    try:
+        prepare()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as exc:
+        raise RuntimeError("native O1 cache preparation failed") from exc
+    return True
+
+
 class O1Collector:
     """Async, fail-isolated event collector around the core's O1 FFI surface.
 
@@ -104,6 +123,10 @@ class O1Collector:
         self._writer_failed = threading.Event()
         self._writer_failure_detail = "writer failure"
 
+        if not corpus_files:
+            log.warning("o1: no corpus loaded at startup — tap stays off")
+            return
+
         # Resolve and guard the data root before any DB open. phase_a's
         # data_dir() raises on the live/operator trees (fail-closed); we set
         # the env var so every phase_a path helper agrees on the same root.
@@ -119,6 +142,8 @@ class O1Collector:
         if self._kill_file.exists():
             log.warning("o1: KILL file present at startup — tap stays off")
             return
+
+        _prepare_core_for_collection(self._core)
 
         table_hash, files_json = freq_table_provenance(corpus_files)
         self.run_id = f"{int(time.time() * 1000)}-live"
