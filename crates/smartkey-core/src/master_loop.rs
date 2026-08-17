@@ -78,9 +78,9 @@ pub struct MasterLoop {
     context_sampler: Box<dyn ContextSampler>,
     /// Words remaining for ghost suppression after frustration.
     suppress_countdown: u8,
-    /// When the last Tab-accept occurred (for REJECT detection).
-    last_tab_accept: Option<Instant>,
-    /// The prediction that was last accepted via Tab.
+    /// When the last terminal prediction accept occurred (for REJECT detection).
+    last_prediction_accept: Option<Instant>,
+    /// The prediction most recently accepted via Tab or final Right.
     last_accepted_prediction: Option<String>,
     /// Last known commit count from metrics (for change detection).
     last_known_commits: usize,
@@ -105,7 +105,7 @@ impl MasterLoop {
             light_profile: LightProfile::default(),
             context_sampler: Box::new(NullContextSampler),
             suppress_countdown: 0,
-            last_tab_accept: None,
+            last_prediction_accept: None,
             last_accepted_prediction: None,
             last_known_commits: 0,
             anticipated: false,
@@ -151,46 +151,54 @@ impl MasterLoop {
         }
 
         // ── Phase 2: DELEGATE to core ────────────────────────────────
-        let is_tab = matches!(event.key, crate::input::Key::Tab);
+        let is_accept_key = matches!(event.key, crate::input::Key::Tab | crate::input::Key::Right);
         let is_backspace = matches!(event.key, crate::input::Key::Backspace);
         // An accepted ghost is attributable to one immediate Backspace only.
         // Any other next key starts a new interaction and must not let a later
         // ABANDON reject the already accepted completion.
-        if !is_tab && !is_backspace && self.last_tab_accept.is_some() {
-            self.last_tab_accept = None;
+        if !is_backspace && self.last_prediction_accept.is_some() {
+            self.last_prediction_accept = None;
             self.last_shown_ghost = None;
         }
-        // Capture prediction BEFORE delegation — handle_key(Tab) clears
-        // last_predictions via reset_word(), so reading after is always None.
-        let pre_tab_prediction = if is_tab {
+        // Capture prediction and commit count BEFORE delegation. Terminal Tab
+        // and Right clear last_predictions/current_word inside the core, while
+        // a partial Right keeps both alive and must not count as acceptance.
+        let pre_accept_prediction = if is_accept_key && self.core.has_ghost() {
             self.core.predictions().first().map(|p| p.word.clone())
         } else {
             None
         };
+        let pre_commit_count = self.core.metrics().commit_count();
         let mut actions = self.core.handle_key(event.clone());
         self.apply_correction_override(&mut actions);
         self.enforce_rejection_suppression(&mut actions);
+        let terminal_accept = pre_accept_prediction.is_some()
+            && self.core.current_word().is_empty()
+            && self.core.metrics().commit_count() > pre_commit_count;
 
         if resets_context {
             self.anticipated = false;
             self.phase = Phase::Anticipating;
             self.core.clear_hints();
             self.frustration.reset_word();
-            self.last_tab_accept = None;
+            self.last_prediction_accept = None;
             self.last_accepted_prediction = None;
             self.last_shown_ghost = None;
         }
 
-        // Track Tab acceptance time for REJECT detection.
-        if is_tab && self.core.current_word().is_empty() {
-            self.last_tab_accept = Some(Instant::now());
-            self.last_accepted_prediction = pre_tab_prediction;
+        // Track terminal Tab/final-Right acceptance for learning and immediate
+        // accepted-then-Backspace rejection detection.
+        if terminal_accept {
+            self.last_prediction_accept = Some(Instant::now());
+            self.last_accepted_prediction = pre_accept_prediction;
         }
 
         // ── Phase 3: EVALUATE ────────────────────────────────────────
-        let signal =
-            self.frustration
-                .feed(&event.key, self.core.current_word(), self.last_tab_accept);
+        let signal = self.frustration.feed(
+            &event.key,
+            self.core.current_word(),
+            self.last_prediction_accept,
+        );
 
         if let Some(ref signal) = signal {
             self.phase = Phase::Correcting;
@@ -209,7 +217,7 @@ impl MasterLoop {
             if !matches!(signal, Some(FrustrationSignal::Reject { .. })) {
                 self.record_last_ghost_rejection();
             }
-            self.last_tab_accept = None;
+            self.last_prediction_accept = None;
         }
 
         // Word committed? → LEARNING phase.
@@ -222,9 +230,9 @@ impl MasterLoop {
             self.frustration.reset_word();
             // Boundary outcomes are recorded by the adapter after this call.
             // Clear the Rust-side cache to prevent a later ABANDON from
-            // double-counting the same rejection. Tab keeps its attribution
-            // for the immediate accepted-then-deleted path above.
-            if !is_tab {
+            // double-counting the same rejection. A terminal accept keeps its
+            // attribution for the immediate accepted-then-deleted path above.
+            if !terminal_accept {
                 self.last_shown_ghost = None;
             }
         }
@@ -902,6 +910,34 @@ mod tests {
         let profile = ml.light_profile();
         let sum: f64 = profile.lang_prior.iter().sum();
         assert!((sum - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn final_right_accept_updates_light_profile_like_tab() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("здравей", 1_000_000);
+        for code in [44, 32, 19, 30, 17] {
+            ml.handle_key(make_key(Key::RawCode(code)));
+        }
+        assert_eq!(ml.current_word(), "здрав");
+        assert_eq!(ml.ghost_text(), "ей");
+
+        ml.handle_key(make_key(Key::Right));
+        assert_eq!(ml.current_word(), "здраве");
+        assert_eq!(ml.ghost_text(), "й");
+
+        let before = ml.light_profile().ghost_accept_rate;
+        ml.handle_key(make_key(Key::Right));
+
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 1);
+        assert!(
+            ml.light_profile().ghost_accept_rate > before,
+            "final Right is a prediction acceptance, not an ordinary commit"
+        );
     }
 
     #[test]

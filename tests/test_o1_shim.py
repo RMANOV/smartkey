@@ -990,6 +990,40 @@ def test_adapter_tab_accept_commits_predicted_word():
     assert eng._o1.commits == ["hello"]
 
 
+def test_adapter_final_right_accept_commits_exact_predicted_word_once():
+    ske = _load_engine_module()
+    eng, core = _build_engine(ske)
+    eng._active_prediction = {
+        "prediction_id": 1,
+        "word": "здравей",
+        "ghost": "й",
+    }
+    core._current_word = "здраве"
+    core.queue([("hide", ""), ("commit", "здравей")], "")
+
+    eng.do_process_key_event(ske.IBus.KEY_Right, 0, 0)
+
+    assert eng._o1.commits == ["здравей"]
+    assert eng._active_prediction is None
+
+
+def test_adapter_partial_right_does_not_resolve_o1_word():
+    ske = _load_engine_module()
+    eng, core = _build_engine(ske)
+    eng._active_prediction = {
+        "prediction_id": 1,
+        "word": "hello",
+        "ghost": "lo",
+    }
+    core._current_word = "hel"
+    core.queue([("commit", "l"), ("ghost", "o")], "hell")
+    eng._show_ghost = lambda _text: None
+
+    eng.do_process_key_event(ske.IBus.KEY_Right, 0, 0)
+
+    assert eng._o1.commits == []
+
+
 def test_adapter_focus_out_abandons():
     ske = _load_engine_module()
     eng, _core = _build_engine(ske)

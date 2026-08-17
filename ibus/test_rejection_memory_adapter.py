@@ -161,6 +161,35 @@ def test_fully_typed_completion_at_boundary_is_not_rejected():
     assert core.recorded == []
 
 
+def test_final_right_accept_clears_prediction_without_later_rejection():
+    engine, core = build_engine()
+    events = capture_events(engine)
+    show_hello(engine, core)
+
+    # First Right accepts only "l" and keeps the remaining "o" visible.
+    core.queue([("composing", "hell\x00o")], "hell")
+    engine.do_process_key_event(ske.IBus.KEY_Right, 106, 0)
+    assert engine._active_prediction is not None
+    assert not [event for event, _payload in events if event == "accepted"]
+
+    # Final Right commits the complete composing word and must resolve the
+    # displayed prediction as an acceptance, not leave it pending.
+    core.queue([("hide", ""), ("commit", "hello")], "")
+    engine.do_process_key_event(ske.IBus.KEY_Right, 106, 0)
+    accepted = [payload for event, payload in events if event == "accepted"]
+    assert len(accepted) == 1
+    assert accepted[0]["reason"] == "right"
+    assert engine._active_prediction is None
+    assert core.recorded == []
+
+    # A later key belongs to a new interaction and must not reject/suppress the
+    # suggestion that the user just accepted.
+    core.queue([("forward", "")], "x")
+    engine.do_process_key_event(ord("x"), 45, 0)
+    assert core.recorded == []
+    assert not [event for event, _payload in events if event == "rejected"]
+
+
 def test_exclamation_boundary_records_and_still_forwards():
     engine, core = build_engine()
     show_hello(engine, core)

@@ -1209,6 +1209,60 @@ def test_current_native_core_reset_crosses_the_adapter_without_committing():
     assert native.debug_state()[0] is False, "native reset left the dual buffer alive"
 
 
+def test_current_native_right_accept_keeps_locked_bg_preedit_synchronized():
+    """Cross the real Rust → PyO3 → adapter seam for the M1 regression."""
+    if not ske._HAS_CORE:
+        if os.environ.get("SMARTKEY_REQUIRE_NATIVE_TESTS") == "1":
+            pytest.fail("current-checkout smartkey_py is required for the native seam test")
+        pytest.skip("smartkey_py is not built in this local Python environment")
+
+    native = ske.PyInputMethodCore(
+        json.dumps(
+            {
+                "dual_buffer": {
+                    "enabled": True,
+                    "lock_threshold": 0.85,
+                    "min_lock_chars": 4,
+                },
+                "ghost_text_separation_margin": 0.0,
+                "use_ppm": False,
+                "use_reranker": False,
+            }
+        )
+    )
+    native.load_word("здравей", 1_000_000)
+
+    eng, rec = build_engine()
+    eng._core = native
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+
+    def to_ibus(evdev):
+        return evdev if ske._IS_WAYLAND else evdev + 8
+
+    for keyval, evdev in zip("zdraw", (44, 32, 19, 30, 17), strict=True):
+        assert eng.do_process_key_event(ord(keyval), to_ibus(evdev), 0) is True
+
+    assert native.current_word() == "здрав"
+    assert native.debug_state() == (True, True, False)
+    assert eng._last_composing_typed == "здрав"
+
+    assert (
+        eng.do_process_key_event(ske.IBus.KEY_Right, to_ibus(106), 0) is True
+    )
+    assert rec.commits == [], "partial Right accept must stay in the BG preedit"
+    assert native.current_word() == "здраве"
+    assert eng._last_composing_typed == "здраве"
+
+    assert eng.do_process_key_event(ord("j"), to_ibus(36), 0) is True
+    assert native.current_word() == "здравей"
+    assert eng._last_composing_typed == "здравей"
+
+    consumed = eng.do_process_key_event(ske.IBus.KEY_space, to_ibus(57), 0)
+    assert consumed is False, "Space must still be forwarded as the delimiter"
+    assert rec.commits == ["здравей"], "the word must land once, without loss or duplication"
+    assert eng._preedit_active is False
+
+
 def test_a_bare_hide_mid_word_does_not_disarm_the_composition_fail_safe():
     """The core emits HideGhost mid-word; that must not read as "resolved".
 

@@ -34,6 +34,29 @@ pub fn scancode_to_both(code: u16, shift: bool) -> Option<(char, char)> {
     Some((en, bg))
 }
 
+/// Find the physical EN/BG pair whose character on `layout` is `ch`.
+///
+/// This reverse lookup deliberately reuses the hardware tables above.  The
+/// legacy text-transliteration map is not equivalent to xkeyboard-config's
+/// traditional phonetic layout for keys such as в/ш/щ/ч/ю.
+pub(crate) fn physical_pair_for_char(layout: Layout, ch: char) -> Option<(char, char)> {
+    for code in 2..=53 {
+        for shift in [false, true] {
+            let Some(pair) = scancode_to_both(code, shift) else {
+                continue;
+            };
+            let candidate = match layout {
+                Layout::En => pair.0,
+                Layout::Bg => pair.1,
+            };
+            if candidate == ch {
+                return Some(pair);
+            }
+        }
+    }
+    None
+}
+
 /// Returns `true` if the scancode maps to a letter key (A-Z), where EN and BG
 /// layouts produce different characters. Non-letter keys (numbers, punctuation)
 /// produce identical output on both layouts and don't need dual interpretation.
@@ -302,6 +325,22 @@ mod tests {
         let (en, bg) = scancode_to_both(2, false).unwrap(); // '1' key
         assert_eq!(en, '1');
         assert_eq!(bg, '1');
+    }
+
+    #[test]
+    fn test_physical_pair_reverse_lookup_uses_traditional_phonetic_layout() {
+        assert_eq!(physical_pair_for_char(Layout::Bg, 'в'), Some(('w', 'в')));
+        assert_eq!(physical_pair_for_char(Layout::Bg, 'ш'), Some(('[', 'ш')));
+        assert_eq!(physical_pair_for_char(Layout::Bg, 'щ'), Some((']', 'щ')));
+        assert_eq!(physical_pair_for_char(Layout::Bg, 'ч'), Some(('`', 'ч')));
+        assert_eq!(physical_pair_for_char(Layout::Bg, 'ю'), Some(('\\', 'ю')));
+        assert_eq!(physical_pair_for_char(Layout::Bg, 'В'), Some(('W', 'В')));
+        assert_eq!(physical_pair_for_char(Layout::En, 'v'), Some(('v', 'ж')));
+    }
+
+    #[test]
+    fn test_physical_pair_reverse_lookup_rejects_unmapped_character() {
+        assert_eq!(physical_pair_for_char(Layout::Bg, 'ѝ'), None);
     }
 
     #[test]

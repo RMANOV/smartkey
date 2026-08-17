@@ -828,6 +828,32 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         ):
             self._active_prediction = None
 
+    @staticmethod
+    def _prediction_accept_reason(
+        keyval: int,
+        key_release: bool,
+        actions: list[tuple[str, str]],
+    ) -> str | None:
+        """Classify a terminal prediction-accept batch.
+
+        A non-dual partial Right emits ``commit + ghost`` and is not terminal.
+        A final/fallback Right emits a full-word commit without any continuing
+        preedit or forwarded cursor movement; that has the same acceptance
+        meaning as Tab even though its action payload differs.
+        """
+        if key_release:
+            return None
+        action_types = {action_type for action_type, _ in actions}
+        if "commit" not in action_types:
+            return None
+        if keyval == IBus.KEY_Tab:
+            return "tab"
+        if keyval == IBus.KEY_Right and not action_types.intersection(
+            {"ghost", "composing", "forward"}
+        ):
+            return "right"
+        return None
+
     def _finalize_prediction_outcome(
         self,
         keyval: int,
@@ -840,22 +866,22 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         prediction_id = int(pending_prediction["prediction_id"])
         action_types = {action_type for action_type, _ in actions}
-        # Tab-only accept (2026-07-12): Space/Return commits are the TYPED
-        # word, never an acceptance — they fall through to the rejection
-        # bookkeeping below (reason="word_boundary").  The old
+        # Space/Return commits are the TYPED word, never an acceptance — they
+        # fall through to rejection bookkeeping (reason="word_boundary").
+        # Tab accepts the full completion; final Right does too after its prior
+        # one-character steps have exhausted the ghost.  The old
         # "space_autocommit" reason died with the aggressive path; a Space
-        # ``replace`` now only means a post-commit caps/translit correction
-        # of the typed word, which must not be logged as an acceptance.
-        accepted = keyval == IBus.KEY_Tab and "commit" in action_types
+        # ``replace`` now only means a post-commit caps/translit correction.
+        accept_reason = self._prediction_accept_reason(keyval, key_release, actions)
 
-        if accepted:
+        if accept_reason is not None:
             self._log_replay_event(
                 "accepted",
                 prediction_id=prediction_id,
                 word=pending_prediction.get("word"),
                 ghost=pending_prediction.get("ghost"),
                 confidence=pending_prediction.get("confidence"),
-                reason="tab",
+                reason=accept_reason,
             )
             self._clear_active_prediction_if(prediction_id)
             return
@@ -910,7 +936,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         committed = any(action_type == "commit" for action_type, _ in actions)
         if not committed:
             return
-        if keyval == IBus.KEY_Tab:
+        accept_reason = self._prediction_accept_reason(keyval, key_release, actions)
+        if accept_reason is not None:
             word = str((pending_prediction or {}).get("word") or "")
         else:
             word = pre_key_word
@@ -1300,7 +1327,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 composing_resolution_pending = False
                 if _PRED_LOG:
                     _PRED_LOG.write(
-                        str(time.time()) + " | TAB_ACCEPT | " + payload + "\n"
+                        str(time.time()) + " | COMMIT | " + payload + "\n"
                     )
             elif action_type == "replace":
                 decoded = ffi_decode_replace_payload(payload)

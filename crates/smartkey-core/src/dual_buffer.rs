@@ -96,6 +96,27 @@ impl DualBuffer {
         Some((en, bg))
     }
 
+    /// Append an explicitly accepted completion character to both physical
+    /// interpretations and pin the language currently shown to the user.
+    ///
+    /// Returns `false` without mutation when the character has no exact
+    /// physical-key counterpart.  Acceptance is an unambiguous language signal,
+    /// so an unlocked buffer becomes locked to its current winner.
+    pub(crate) fn push_winner_char(&mut self, ch: char) -> bool {
+        let layout = match self.winner {
+            LangId::Bg => keymap::Layout::Bg,
+            LangId::En | LangId::Tech => keymap::Layout::En,
+        };
+        let Some((en_ch, bg_ch)) = keymap::physical_pair_for_char(layout, ch) else {
+            return false;
+        };
+
+        self.push(en_ch, bg_ch);
+        self.locked = true;
+        self.locked_lang = Some(self.winner);
+        true
+    }
+
     /// Remove the last character from both buffers (backspace).
     pub fn pop(&mut self) {
         self.en_buf.pop();
@@ -295,6 +316,48 @@ mod tests {
         assert_eq!(pair, Some(('h', 'х')));
         assert_eq!(b.en_text(), "h");
         assert_eq!(b.bg_text(), "х");
+    }
+
+    #[test]
+    fn test_push_winner_char_pins_bg_and_updates_both_buffers() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('z', 'з');
+        b.push('d', 'д');
+        b.update_scores(1.0, 100.0);
+        assert_eq!(b.winner_lang(), LangId::Bg);
+        assert!(!b.is_locked());
+
+        assert!(b.push_winner_char('в'));
+
+        assert_eq!(b.en_text(), "zdw");
+        assert_eq!(b.bg_text(), "здв");
+        assert_eq!(b.winner_text(), "здв");
+        assert!(b.is_locked());
+    }
+
+    #[test]
+    fn test_push_winner_char_is_noop_when_character_is_unmapped() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('z', 'з');
+        b.update_scores(1.0, 100.0);
+        let before = (
+            b.en_text().to_string(),
+            b.bg_text().to_string(),
+            b.winner_lang(),
+            b.is_locked(),
+        );
+
+        assert!(!b.push_winner_char('ѝ'));
+
+        assert_eq!(
+            before,
+            (
+                b.en_text().to_string(),
+                b.bg_text().to_string(),
+                b.winner_lang(),
+                b.is_locked(),
+            )
+        );
     }
 
     #[test]

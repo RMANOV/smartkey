@@ -694,16 +694,46 @@ impl InputMethodCore {
 
             // Right arrow: accept one character of ghost text.
             Key::Right => {
-                if !self.ghost.is_empty() {
+                if !self.ghost.is_empty() && self.dual_buffer.is_some() {
+                    let mut ghost_chars = self.ghost.chars();
+                    let Some(ch) = ghost_chars.next() else {
+                        unreachable!("non-empty ghost must contain a character");
+                    };
+
+                    // The final accepted character completes the prediction;
+                    // use the shared full-preedit commit so learning, metrics,
+                    // and state reset happen exactly once.
+                    if ghost_chars.next().is_none() {
+                        return self.accept_ghost_completion();
+                    }
+
+                    let accepted = self
+                        .dual_buffer
+                        .as_mut()
+                        .is_some_and(|db| db.push_winner_char(ch));
+                    if !accepted {
+                        // No exact physical counterpart means the two buffers
+                        // cannot remain synchronized.  Fail safely by accepting
+                        // the already-visible word atomically, without a partial
+                        // mutation.
+                        return self.accept_ghost_completion();
+                    }
+
+                    self.ghost.remove(0);
+                    self.current_word = self
+                        .dual_buffer
+                        .as_ref()
+                        .expect("dual buffer accepted the character")
+                        .winner_text()
+                        .to_string();
+                    vec![Action::ShowComposing {
+                        typed: self.current_word.clone(),
+                        ghost: self.ghost.clone(),
+                    }]
+                } else if !self.ghost.is_empty() {
                     let ch = self.ghost.remove(0);
                     self.current_word.push(ch);
-                    if self.in_hypothesis_phase() {
-                        // Hypothesis phase: everything stays in preedit.
-                        vec![Action::ShowComposing {
-                            typed: self.current_word.clone(),
-                            ghost: self.ghost.clone(),
-                        }]
-                    } else if self.ghost.is_empty() {
+                    if self.ghost.is_empty() {
                         vec![Action::CommitText(ch.to_string()), Action::HideGhost]
                     } else {
                         vec![
@@ -2053,6 +2083,19 @@ mod tests {
         db
     }
 
+    /// Build the real physical-key interpretations for Bulgarian "здрав" and
+    /// lock the displayed winner to BG.
+    fn locked_bg_dual_buffer(core: &InputMethodCore) -> DualBuffer {
+        let mut db = DualBuffer::from_config(&core.config.dual_buffer);
+        for pair in [('z', 'з'), ('d', 'д'), ('r', 'р'), ('a', 'а'), ('w', 'в')] {
+            db.push(pair.0, pair.1);
+        }
+        db.update_scores(1.0, 100.0);
+        assert!(db.is_locked(), "precondition: BG buffer must be locked");
+        assert_eq!(db.winner_lang(), LangId::Bg);
+        db
+    }
+
     /// Regression (accept bug): full-word composing keeps the entire word in the
     /// preedit even after the dual buffer LOCKS.  Tab-accept must commit the full
     /// word (prefix + ghost), never just the ghost suffix — otherwise the typed
@@ -2075,6 +2118,120 @@ mod tests {
             "must not commit only the ghost suffix (drops the typed prefix)"
         );
         assert!(has_action(&actions, &Action::HideGhost));
+    }
+
+    /// Right-arrow still accepts one character under locked composing, but the
+    /// accepted character must join both physical interpretations and remain
+    /// in the preedit.  A one-character CommitText replaces and loses the
+    /// composing prefix in the adapter.
+    #[test]
+    fn test_right_accept_locked_composing_keeps_prefix_and_next_raw_key() {
+        let mut core = test_core();
+        core.dual_buffer = Some(locked_bg_dual_buffer(&core));
+        core.current_word = "здрав".to_string();
+        core.ghost = "ей".to_string();
+
+        let actions = core.handle_key(press(Key::Right));
+
+        assert_eq!(
+            actions,
+            vec![Action::ShowComposing {
+                typed: "здраве".to_string(),
+                ghost: "й".to_string(),
+            }]
+        );
+        assert_eq!(core.current_word(), "здраве");
+
+        // Physical j/й follows the accepted е. Rebuilding current_word from
+        // stale buffers used to drop the accepted character here.
+        core.handle_key(press(Key::RawCode(36)));
+        assert_eq!(core.current_word(), "здравей");
+
+        let boundary = core.handle_key(press(Key::Space));
+        let commits: Vec<&str> = boundary
+            .iter()
+            .filter_map(|action| match action {
+                Action::CommitText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commits, ["здравей"]);
+        assert!(has_action(&boundary, &Action::ForwardKey));
+    }
+
+    /// An unlocked dual buffer has the same preedit ownership as a locked one.
+    /// Accepting the displayed completion pins that winner before a later raw
+    /// key can re-score the word into a different script.
+    #[test]
+    fn test_right_accept_unlocked_composing_pins_winner_and_keeps_character() {
+        let mut core = test_core();
+        let mut db = DualBuffer::from_config(&core.config.dual_buffer);
+        db.push('m', 'м');
+        db.push('n', 'н');
+        db.update_scores(1.0, 100.0);
+        assert!(!db.is_locked(), "precondition: dual buffer is unlocked");
+        assert_eq!(db.winner_lang(), LangId::Bg);
+        core.dual_buffer = Some(db);
+        core.current_word = "мн".to_string();
+        core.ghost = "ого".to_string();
+
+        let actions = core.handle_key(press(Key::Right));
+
+        assert_eq!(
+            actions,
+            vec![Action::ShowComposing {
+                typed: "мно".to_string(),
+                ghost: "го".to_string(),
+            }]
+        );
+        assert_eq!(core.debug_state(), (true, true, false));
+
+        core.handle_key(press(Key::RawCode(34))); // g/г
+        assert_eq!(core.current_word(), "мног");
+    }
+
+    /// On the final ghost character there is no partial state left to retain:
+    /// commit the complete composing word once, record the acceptance, reset.
+    #[test]
+    fn test_right_accept_final_composing_character_commits_full_word() {
+        let mut core = test_core();
+        core.dual_buffer = Some(locked_bg_dual_buffer(&core));
+        core.current_word = "здраве".to_string();
+        core.ghost = "й".to_string();
+
+        let actions = core.handle_key(press(Key::Right));
+
+        assert!(has_action(
+            &actions,
+            &Action::CommitText("здравей".to_string())
+        ));
+        assert!(has_action(&actions, &Action::HideGhost));
+        assert!(core.dual_buffer.is_none());
+        assert_eq!(core.current_word(), "");
+        let summary = core.metrics().summary();
+        assert_eq!(summary.accepted_predictions, 1);
+        assert_eq!(summary.total_commits, 1);
+    }
+
+    /// A character absent from the physical layout must never half-update the
+    /// dual buffer.  The safe fallback accepts the already-visible word in one
+    /// batch and resets the composition.
+    #[test]
+    fn test_right_accept_unmapped_character_falls_back_atomically() {
+        let mut core = test_core();
+        core.dual_buffer = Some(locked_bg_dual_buffer(&core));
+        core.current_word = "здрав".to_string();
+        core.ghost = "ѝx".to_string();
+
+        let actions = core.handle_key(press(Key::Right));
+
+        assert!(has_action(
+            &actions,
+            &Action::CommitText("здравѝx".to_string())
+        ));
+        assert!(has_action(&actions, &Action::HideGhost));
+        assert!(core.dual_buffer.is_none());
+        assert_eq!(core.current_word(), "");
     }
 
     /// Same bug class as the Tab-accept fix above, on the correction-override
