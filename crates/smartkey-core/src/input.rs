@@ -3900,3 +3900,146 @@ mod tests {
         assert_eq!(config.min_prefix_length, 2);
     }
 }
+
+/// B9 / F1 (2026-08-23, ADVOCATE_CODEX ruling 487688994026): a contextual
+/// language prior (surrounding text / typing momentum) may bias the first
+/// character of a dual-buffer word but must never lock it — corpus evidence
+/// on char 2+ decides. Live defect: after an xkb→SmartKey switch inside a
+/// Latin-surrounded terminal, Bulgarian words were committed as the EN keymap
+/// text („имаш" → "ima[", „след" → "sled", „превключване" → "prewkl`wane").
+#[cfg(test)]
+mod lang_prior_tests {
+    use super::*;
+    use crate::lang_detect::LangId;
+
+    fn press_raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    /// Bilingual corpus shaped like the live one: the Bulgarian words of the
+    /// operator's report plus ordinary English words that share physical keys.
+    fn bilingual_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        assert!(core.config.dual_buffer.enabled);
+        for (w, f) in [
+            ("имаш", 120_000u32),
+            ("има", 900_000),
+            ("след", 400_000),
+            ("превключване", 30_000),
+            ("отговор", 250_000),
+            ("то", 700_000),
+        ] {
+            core.load_word(w, f);
+        }
+        for (w, f) in [
+            ("is", 4_000_000u32),
+            ("image", 600_000),
+            ("sled", 20_000),
+            ("the", 9_000_000),
+            ("hello", 4_800_000),
+            ("to", 5_000_000),
+        ] {
+            core.load_word(w, f);
+        }
+        core
+    }
+
+    fn with_prior(core: &mut InputMethodCore, prior: LangId) {
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(prior),
+            ..Default::default()
+        });
+    }
+
+    /// Physical keys (evdev) for the reported words.
+    const IMASH: [u16; 4] = [23, 50, 30, 26]; // i m a [  → имаш
+    const SLED: [u16; 4] = [31, 38, 18, 32]; // s l e d  → след
+    const OTGOWOR: [u16; 7] = [24, 20, 34, 24, 17, 24, 19]; // o t g o w o r → отговор
+    const PREWKL: [u16; 6] = [25, 19, 18, 17, 37, 38]; // p r e w k l → превкл(ючване)
+    const IS: [u16; 2] = [23, 31];
+    const HELLO: [u16; 5] = [35, 18, 38, 38, 24];
+    const TO: [u16; 2] = [20, 24];
+
+    fn type_word(core: &mut InputMethodCore, codes: &[u16]) -> String {
+        for &c in codes {
+            core.handle_key(press_raw(c));
+        }
+        core.current_word().to_string()
+    }
+
+    // ── RED: the reported alternating pattern must come out Cyrillic ───────
+
+    #[test]
+    fn bulgarian_words_after_english_context_are_cyrillic() {
+        let mut core = bilingual_core();
+        for (codes, expected) in [
+            (&IMASH[..], "имаш"),
+            (&SLED[..], "след"),
+            (&OTGOWOR[..], "отговор"),
+            (&PREWKL[..], "превкл"),
+        ] {
+            with_prior(&mut core, LangId::En); // Latin surrounding / EN momentum
+            let got = type_word(&mut core, codes);
+            assert_eq!(got, expected, "EN prior must not lock a Bulgarian word");
+            core.handle_key(press_raw(57)); // Space
+        }
+    }
+
+    #[test]
+    fn first_char_prior_is_a_bias_not_a_lock() {
+        let mut core = bilingual_core();
+        with_prior(&mut core, LangId::En);
+        core.handle_key(press_raw(23)); // i / и
+
+        let (dual, locked, hypothesis) = core.debug_state();
+        assert!(dual);
+        assert!(!locked, "char-1 prior must leave the buffer unlocked");
+        assert!(hypothesis);
+    }
+
+    // ── GUARDS: the prior still helps genuine English; invariants hold ─────
+
+    #[test]
+    fn genuine_english_after_english_context_stays_english() {
+        let mut core = bilingual_core();
+        with_prior(&mut core, LangId::En);
+        assert_eq!(type_word(&mut core, &IS), "is");
+        core.handle_key(press_raw(57));
+        with_prior(&mut core, LangId::En);
+        assert_eq!(type_word(&mut core, &HELLO), "hello");
+    }
+
+    /// Short, corpus-ambiguous word ("to" vs „то"): the English context must
+    /// still decide it — the bias is kept when the corpus cannot separate.
+    #[test]
+    fn short_ambiguous_english_word_keeps_the_english_context() {
+        let mut core = bilingual_core();
+        with_prior(&mut core, LangId::En);
+
+        assert_eq!(type_word(&mut core, &TO), "to");
+    }
+
+    /// Symmetry: a Bulgarian context must not trap a genuine English word.
+    #[test]
+    fn english_word_after_bulgarian_context_is_rescored_to_english() {
+        let mut core = bilingual_core();
+        with_prior(&mut core, LangId::Bg);
+
+        assert_eq!(type_word(&mut core, &HELLO), "hello");
+    }
+
+    /// Typing momentum is the other prior source: after a committed
+    /// Bulgarian word the momentum says BG, yet a clearly English word typed
+    /// next must still be re-scored to English (on the old code it locked to
+    /// „ис").
+    #[test]
+    fn momentum_prior_after_bulgarian_word_does_not_lock_english() {
+        let mut core = bilingual_core();
+        assert_eq!(type_word(&mut core, &IMASH), "имаш");
+        core.handle_key(press_raw(57));
+        assert_eq!(type_word(&mut core, &IS), "is");
+    }
+}
