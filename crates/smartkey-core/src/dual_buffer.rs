@@ -186,11 +186,18 @@ impl DualBuffer {
         // On the 1st character, context overrides corpus — single-char
         // frequencies are meaningless for language discrimination.
         // Momentum (≥60% of last 5 words) is the only reliable signal.
+        //
+        // B9 / F1 (2026-08-23): the override is a BIAS, never a lock.  Locking
+        // here made a contextual guess irreversible before any word-level
+        // evidence existed: after an xkb→SmartKey switch inside a Latin
+        // terminal every Bulgarian word was committed as EN keymap text
+        // (имаш → "ima[").  Leaving the buffer unlocked lets the caller's
+        // normal char-2+ rescoring (gated on `!is_locked()`) overturn the
+        // guess as soon as the corpus can tell the languages apart, while a
+        // matching prior can still early-lock through the branch below.
         if self.en_buf.len() == 1 && prior_lang != self.winner {
             self.winner = prior_lang;
             self.confidence = 0.65;
-            self.locked = true;
-            self.locked_lang = Some(prior_lang);
             return;
         }
 
@@ -616,18 +623,50 @@ mod tests {
         assert!(!b.is_locked());
 
         // Prior says BG (momentum from last 5 words).
-        // On char 1, prior should OVERRIDE corpus winner.
+        // On char 1, prior should OVERRIDE corpus winner — as a BIAS.
         b.apply_prior_lock_hint(Some(LangId::Bg));
         assert_eq!(
             b.winner_lang(),
             LangId::Bg,
             "prior should override on char 1"
         );
+        // B9 / F1 (2026-08-23, ruling 487688994026): the contextual prior
+        // must never become irreversible before word-level evidence exists.
+        // Live defect: Latin surrounding text locked Bulgarian words to the
+        // EN keymap on the first key (имаш → "ima[").
         assert!(
-            b.is_locked(),
-            "should lock immediately on char 1 with prior"
+            !b.is_locked(),
+            "a first-character prior biases the winner but must not lock"
+        );
+        assert!(
+            (b.confidence() - 0.65).abs() < 1e-9,
+            "prior confidence is recorded so a matching prior can still early-lock later"
         );
         assert_eq!(b.winner_text(), "х");
+    }
+
+    /// F1 end-to-end at the buffer level: after the char-1 prior bias the
+    /// caller's normal rescoring on char 2 (gated on `!is_locked()`) must be
+    /// able to flip the winner back to the corpus evidence.
+    #[test]
+    fn prior_bias_on_char_1_is_rescored_on_char_2() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('i', 'и');
+        b.update_scores(1.0, 100.0);
+        assert_eq!(b.winner_lang(), LangId::Bg);
+        b.apply_prior_lock_hint(Some(LangId::En));
+        assert_eq!(b.winner_lang(), LangId::En, "char-1 bias applied");
+        assert!(!b.is_locked());
+
+        b.push('m', 'м');
+        b.update_scores(1.0, 10_000.0); // corpus: "им" overwhelms "im"
+
+        assert_eq!(
+            b.winner_lang(),
+            LangId::Bg,
+            "corpus evidence re-scores the biased winner"
+        );
+        assert_eq!(b.winner_text(), "им");
     }
 
     #[test]
