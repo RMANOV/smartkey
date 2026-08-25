@@ -319,6 +319,13 @@ impl MasterLoop {
         self.core.current_word()
     }
 
+    /// Read-only view of the wrapped core (F4 Phase R plumbing so lane E
+    /// tests can inspect the dual buffer / injected prior through the loop).
+    #[cfg(test)]
+    pub(crate) fn core(&self) -> &InputMethodCore {
+        &self.core
+    }
+
     pub fn has_ghost(&self) -> bool {
         self.core.has_ghost()
     }
@@ -1554,5 +1561,29 @@ mod tests {
             .iter()
             .any(|action| matches!(action, Action::ForwardKey)));
         assert_eq!(ml.phase(), Phase::Tracking);
+    }
+}
+
+/// F4 Phase R plumbing smoke (ruling 221af6d0a1c8): the test-only `core()`
+/// view is wired.  Lane E RED tests live in `f4_lane_cde_tests.rs`, not here.
+#[cfg(test)]
+mod f4_plumbing_tests {
+    use super::*;
+    use crate::input::{InputConfig, Key, KeyEvent, Modifiers};
+    use crate::lang_detect::LangId;
+
+    #[test]
+    fn core_view_mirrors_the_decorator_state() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("статия", 12_000, LangId::Bg);
+        ml.set_surrounding_text(Some("smartkey ".to_string()), Some(9));
+        ml.handle_key(KeyEvent {
+            key: Key::RawCode(31),
+            modifiers: Modifiers::empty(),
+        });
+
+        assert_eq!(ml.core().current_word(), ml.current_word());
+        assert!(ml.core().dual_buffer().is_some());
+        assert_eq!(ml.core().active_lang_prior(), Some(LangId::En));
     }
 }

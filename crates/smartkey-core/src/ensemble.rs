@@ -743,6 +743,31 @@ impl SmartKeyEngine {
         (en, bg)
     }
 
+    /// Exact-word corpus evidence for the two physical interpretations of a
+    /// dual-buffer word: `en_word` against the EN model, `bg_word` against
+    /// the BG model.  Returns `(en_exact, bg_exact)`; `0.0` means the word is
+    /// not a complete corpus entry in that model.
+    ///
+    /// F4 Phase R read-only helper (ruling 221af6d0a1c8): `score_both()` is
+    /// the *prefix* evidence that drives display scoring while typing (top
+    /// completion frequency per corpus).  The delimiter-time resolver needs
+    /// the *exact* evidence instead — `stat` scores EN 602k / BG 55k as a
+    /// prefix, yet at the delimiter `statiq` is no English word while
+    /// `статия` is a Bulgarian one.  Case is folded exactly as in
+    /// `score_both()` so the two evidence sources are comparable.  Not yet
+    /// consulted by any commit path (GREEN pending ADVOCATE PASS).
+    pub fn score_exact_both(&self, en_word: &str, bg_word: &str) -> (f64, f64) {
+        let en_word = fold_case(en_word);
+        let bg_word = fold_case(bg_word);
+        let exact = |lang: LangId, word: &str| -> f64 {
+            self.lang_models
+                .get(lang)
+                .and_then(|m| m.trie.exact_frequency(word))
+                .map_or(0.0, f64::from)
+        };
+        (exact(LangId::En, &en_word), exact(LangId::Bg, &bg_word))
+    }
+
     /// Produce up to `limit` predictions for the given prefix and context.
     ///
     /// * `prefix` — the characters typed so far for the current word.
@@ -1865,5 +1890,24 @@ mod tests {
             "single garbage word confidence must be finite non-negative, got {}",
             preds[0].confidence
         );
+    }
+
+    /// F4 Phase R plumbing: exact evidence differs from prefix evidence and
+    /// is strictly per-language (no cross-contamination).
+    #[test]
+    fn score_exact_both_reports_exact_words_not_prefix_completions() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word_lang("state", 600_000, LangId::En);
+        engine.load_word_lang("stat", 100, LangId::En);
+        engine.load_word_lang("статия", 12_000, LangId::Bg);
+
+        // Prefix evidence (display scoring): the top completion wins.
+        assert_eq!(engine.score_both("stat", "стат"), (600_000.0, 12_000.0));
+        // Exact evidence (delimiter resolver): only complete words count.
+        assert_eq!(engine.score_exact_both("stat", "стат"), (100.0, 0.0));
+        assert_eq!(engine.score_exact_both("statiq", "статия"), (0.0, 12_000.0));
+        // Case folding matches score_both(); languages never cross.
+        assert_eq!(engine.score_exact_both("Stat", "Статия"), (100.0, 12_000.0));
+        assert_eq!(engine.score_exact_both("статия", "stat"), (0.0, 0.0));
     }
 }

@@ -30,6 +30,26 @@ impl Default for DualBufferConfig {
     }
 }
 
+/// Where the current winner/confidence of a [`DualBuffer`] came from.
+///
+/// F4 Phase R stub — baseline behaviour, GREEN pending ADVOCATE PASS
+/// (ruling 221af6d0a1c8, lane C).  Separates corpus-backed scores from a
+/// prior-only bias and from the zero-support case, so a resolver never
+/// mistakes an *inherited* winner for corpus confidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreProvenance {
+    /// `update_scores()` normalised real corpus counts (total ≥ 1).
+    Corpus,
+    /// Only a contextual prior has spoken (char-1 bias, no corpus support).
+    PriorOnly,
+    /// Both corpus counts were zero for the current buffers: the winner is
+    /// unsupported and must stay unlocked.
+    UnsupportedBoth,
+    /// The winner was carried over from an earlier state (initial EN default
+    /// or a previous prefix) without evidence for the current buffers.
+    Inherited,
+}
+
 /// Dual-interpretation buffer that tracks both EN and BG readings
 /// of the same physical keypress sequence.
 pub struct DualBuffer {
@@ -290,6 +310,56 @@ impl DualBuffer {
         self.locked = false;
         self.locked_lang = None;
         self.flip_detected = false;
+    }
+
+    // -- F4 Phase R stubs (ruling 221af6d0a1c8) -----------------------------
+
+    /// Provenance of the current winner/confidence.
+    ///
+    /// F4 Phase R stub — baseline behaviour, GREEN pending ADVOCATE PASS.
+    /// Derived from the existing fields only; no state is added and
+    /// `update_scores()` / `apply_prior_lock_hint()` are unchanged.  The
+    /// baseline keeps NO zero-support marker: `update_scores(0, 0)` resets the
+    /// scores to 0.5/0.5 and keeps the previous winner — the lane-C defect
+    /// itself.  Hence this stub can only report:
+    /// - `Corpus` when the scores were normalised from real counts;
+    /// - `PriorOnly` when the char-1 prior bias (confidence 0.65) is the only
+    ///   signal;
+    /// - `Inherited` otherwise — including the both-zero case, which the
+    ///   baseline cannot tell apart from the initial state (or from an exact
+    ///   50/50 corpus tie).  `UnsupportedBoth` is never produced here; lane C
+    ///   RED tests assert it and must fail until GREEN adds explicit
+    ///   provenance tracking.
+    pub fn provenance(&self) -> ScoreProvenance {
+        if (self.en_score - self.bg_score).abs() > f64::EPSILON {
+            ScoreProvenance::Corpus
+        } else if self.confidence > 0.5 {
+            ScoreProvenance::PriorOnly
+        } else {
+            ScoreProvenance::Inherited
+        }
+    }
+
+    /// Lane B crossover hook: let exact full-word evidence gathered at the
+    /// delimiter override a display lock before commit.
+    ///
+    /// F4 Phase R stub — baseline behaviour, GREEN pending ADVOCATE PASS.
+    /// Contract: `en_exact` / `bg_exact` are exact-word corpus counts
+    /// (`SmartKeyEngine::score_exact_both()`), `prior` the contextual language
+    /// prior.  GREEN returns `true` exactly when the winner changed (e.g.
+    /// `stat` locked EN at char 4, but `statiq` has no EN support while
+    /// `статия` has BG support), updating winner, confidence and locked
+    /// language atomically so the caller can commit `winner_text()` once.
+    /// The lock is display hysteresis, not final truth.  This stub never
+    /// mutates and always reports "no crossover".
+    pub fn apply_exact_word_evidence(
+        &mut self,
+        en_exact: f64,
+        bg_exact: f64,
+        prior: Option<LangId>,
+    ) -> bool {
+        let _ = (en_exact, bg_exact, prior);
+        false
     }
 }
 
