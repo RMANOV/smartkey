@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smartkey://diagnostics/anomalies/schema.json",
+  "title": "SmartKey anomaly registry",
+  "description": "Canonical, Git-tracked registry of typed-text anomalies. Every anomaly is an OPEN SmartKey defect until evidence closes it (ANOMALY GATE af4d6969b2ad). Each record carries at most one token per side and never full text, credentials, employer data or keystreams. Semantic rules (deterministic id, dedup uniqueness, closure gates, privacy walks) live in validate.py; this document is the structural contract and the single source of truth for enums.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "registry", "gate_ref", "records"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "registry": { "const": "smartkey-anomaly-registry" },
+    "gate_ref": { "type": "string", "pattern": "^[0-9a-f]{12}$" },
+    "records": { "type": "array", "items": { "$ref": "#/$defs/record" } }
+  },
+  "$defs": {
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha_or_unknown": { "type": "string", "pattern": "^([0-9a-f]{40}|unknown)$" },
+    "utc_or_null": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z)?$"
+    },
+    "short_text_or_null": { "type": ["string", "null"], "maxLength": 500 },
+    "token_or_null": { "type": ["string", "null"], "minLength": 1, "maxLength": 40 },
+    "script": { "enum": ["latin", "cyrillic", "mixed", "other", "unknown"] },
+    "side": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["token", "script", "descriptor"],
+      "properties": {
+        "token": { "$ref": "#/$defs/token_or_null" },
+        "script": { "$ref": "#/$defs/script" },
+        "descriptor": { "$ref": "#/$defs/short_text_or_null" }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "dedup_key", "category", "observed", "expected",
+        "needs_operator_confirmation", "minimal_context", "recorded_utc",
+        "first_seen_utc", "last_seen_utc", "repeat", "occurrence_count",
+        "environment", "source_refs", "status", "suspected_layer",
+        "reproducer", "red_test", "red_test_waiver", "fix_commit",
+        "verification", "closure_reason", "privacy_classification", "notes"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^anom-[0-9a-f]{12}$" },
+        "dedup_key": { "type": "string", "minLength": 3, "maxLength": 600 },
+        "category": {
+          "enum": ["script_flip_bg_to_en", "script_flip_en_to_bg", "inconsistent_acceptance", "unknown"]
+        },
+        "observed": { "$ref": "#/$defs/side" },
+        "expected": { "$ref": "#/$defs/side" },
+        "needs_operator_confirmation": { "type": "boolean" },
+        "minimal_context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["before", "after"],
+          "properties": {
+            "before": { "$ref": "#/$defs/token_or_null" },
+            "after": { "$ref": "#/$defs/token_or_null" }
+          }
+        },
+        "recorded_utc": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z$"
+        },
+        "first_seen_utc": { "$ref": "#/$defs/utc_or_null" },
+        "last_seen_utc": { "$ref": "#/$defs/utc_or_null" },
+        "repeat": { "type": "boolean" },
+        "occurrence_count": { "type": "integer", "minimum": 1 },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["app_surface", "os", "build_sha", "build_label", "flags"],
+          "properties": {
+            "app_surface": { "type": "string", "minLength": 1, "maxLength": 120 },
+            "os": { "type": "string", "minLength": 1, "maxLength": 40 },
+            "build_sha": { "$ref": "#/$defs/sha_or_unknown" },
+            "build_label": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "flags": {
+              "type": ["object", "null"],
+              "additionalProperties": { "enum": ["on", "off", "absent", "unknown"] }
+            }
+          }
+        },
+        "source_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "ref", "observed_utc", "build_sha", "surface", "note"],
+            "properties": {
+              "kind": { "enum": ["ledger", "ruling", "plan", "trace", "probe", "operator_report", "commit", "other"] },
+              "ref": { "type": "string", "minLength": 4, "maxLength": 120 },
+              "observed_utc": { "$ref": "#/$defs/utc_or_null" },
+              "build_sha": { "type": ["string", "null"], "pattern": "^([0-9a-f]{40}|unknown)$" },
+              "surface": { "type": ["string", "null"], "maxLength": 120 },
+              "note": { "$ref": "#/$defs/short_text_or_null" }
+            }
+          }
+        },
+        "status": {
+          "enum": ["open_suspected_smartkey", "reproduced", "red_tested", "fixed", "verified", "closed", "not_smartkey"]
+        },
+        "suspected_layer": {
+          "enum": [
+            "dual_buffer_short_word", "dual_buffer_prefix_lock",
+            "dual_buffer_unsupported_inheritance", "lang_prior_lock",
+            "accept_gesture", "unknown"
+          ]
+        },
+        "reproducer": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["kind", "ref", "build_sha", "summary"],
+          "properties": {
+            "kind": { "enum": ["offline_probe", "structural_trace", "full_trace", "unit_test", "operator_report"] },
+            "ref": { "type": "string", "minLength": 4, "maxLength": 200 },
+            "build_sha": { "$ref": "#/$defs/sha_or_unknown" },
+            "summary": { "type": "string", "minLength": 1, "maxLength": 500 }
+          }
+        },
+        "red_test": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["path", "name", "commit"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "commit": { "$ref": "#/$defs/sha" }
+          }
+        },
+        "red_test_waiver": { "$ref": "#/$defs/short_text_or_null" },
+        "fix_commit": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "verification": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["build_sha", "evidence_refs", "surface", "summary"],
+          "properties": {
+            "build_sha": { "$ref": "#/$defs/sha" },
+            "evidence_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 4, "maxLength": 120 }
+            },
+            "surface": { "type": "string", "minLength": 1, "maxLength": 120 },
+            "summary": { "type": "string", "minLength": 1, "maxLength": 500 }
+          }
+        },
+        "closure_reason": { "$ref": "#/$defs/short_text_or_null" },
+        "privacy_classification": { "enum": ["public_token", "redacted", "unknown"] },
+        "notes": { "$ref": "#/$defs/short_text_or_null" }
+      }
+    }
+  }
+}

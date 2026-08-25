@@ -1,0 +1,1234 @@
+{
+  "schema_version": 1,
+  "registry": "smartkey-anomaly-registry",
+  "gate_ref": "af4d6969b2ad",
+  "records": [
+    {
+      "id": "anom-8b967919509a",
+      "dedup_key": "li|ли",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "li",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "ли",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": "искаш",
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:07Z",
+      "last_seen_utc": "2026-08-23T18:14Z",
+      "repeat": true,
+      "occurrence_count": 2,
+      "environment": {
+        "app_surface": "unknown (operator live text)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "7670aa00c53a",
+          "observed_utc": "2026-08-23T18:07Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live, app unknown",
+          "note": "operator observed the pair искаш li"
+        },
+        {
+          "kind": "ledger",
+          "ref": "f09e9917b91f",
+          "observed_utc": "2026-08-23T18:14Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "offline probe",
+          "note": "audit: ли renders as li in every probed context on 7b9901a; fix candidates F4-a / F4-c named"
+        }
+      ],
+      "status": "reproduced",
+      "suspected_layer": "dual_buffer_short_word",
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "ledger f09e9917b91f",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "summary": "ли -> li in every probed context on 7b9901a"
+      },
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "F1 exposes context-free short-word scoring. F4 remains RED-only: no fix has landed; this record must not be used to widen F4."
+    },
+    {
+      "id": "anom-658c49a8621c",
+      "dedup_key": "wi|ви",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "wi",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "ви",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:14Z",
+      "last_seen_utc": "2026-08-23T18:14Z",
+      "repeat": true,
+      "occurrence_count": 2,
+      "environment": {
+        "app_surface": "offline probe",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "f09e9917b91f",
+          "observed_utc": "2026-08-23T18:14Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "offline probe",
+          "note": "ви -> wi on 7b9901a"
+        },
+        {
+          "kind": "ledger",
+          "ref": "f09e9917b91f",
+          "observed_utc": "2026-08-23T18:14Z",
+          "build_sha": "d8b01c076babc24881632739ebe4d4da763be86d",
+          "surface": "offline probe",
+          "note": "pre-existing: ви -> wi also on d8b01c0"
+        }
+      ],
+      "status": "reproduced",
+      "suspected_layer": "dual_buffer_short_word",
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "ledger f09e9917b91f",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "summary": "ви -> wi reproduces on both 7b9901a and d8b01c0 (not introduced by F1)"
+      },
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Expected form ви recorded per audit instruction; confidence is low only in the sense that a genuine Latin wi is conceivable in mixed text. Not seen live yet; probe-only."
+    },
+    {
+      "id": "anom-36d659523143",
+      "dedup_key": "desc:word containing one of ш/щ/ч/ю committed as en keymap text; token not captured (structural trace only)|null",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": null,
+        "script": "unknown",
+        "descriptor": "word containing one of ш/щ/ч/ю committed as EN keymap text; token not captured (structural trace only)"
+      },
+      "expected": {
+        "token": null,
+        "script": "unknown",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": true,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23",
+      "last_seen_utc": "2026-08-23",
+      "repeat": true,
+      "occurrence_count": 2,
+      "environment": {
+        "app_surface": "unknown (live structural trace)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "f09e9917b91f",
+          "observed_utc": "2026-08-23T18:14Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live structural trace",
+          "note": "two unidentified live commits: typed cyr, committed lat; words contain ш/щ/ч/ю"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "dual_buffer_unsupported_inheritance",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "unknown",
+      "notes": "Structural mode logs script classes only, so the words are unknown. ш/щ/ч/ю sit on non-letter keys of the BG phonetic map, which is the only basis for the suspected layer. Operator must supply the words or confirm they were intended Bulgarian."
+    },
+    {
+      "id": "anom-b529c0f08aad",
+      "dedup_key": "statiq|статия",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "statiq",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "статия",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:50Z",
+      "last_seen_utc": "2026-08-23T18:50Z",
+      "repeat": true,
+      "occurrence_count": 2,
+      "environment": {
+        "app_surface": "unknown (operator live sentence)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live, app unknown",
+          "note": "статия -> statiq in the operator sentence"
+        },
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "d8b01c076babc24881632739ebe4d4da763be86d",
+          "surface": "offline probe",
+          "note": "pre-F1 d8b01c0 with BG context still fails this word (41/45 pass without context)"
+        }
+      ],
+      "status": "reproduced",
+      "suspected_layer": "dual_buffer_prefix_lock",
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "ledger 9d211e447e57",
+        "build_sha": "d8b01c076babc24881632739ebe4d4da763be86d",
+        "summary": "статия still fails on pre-F1 d8b01c0 with Bulgarian context, so not introduced by F1"
+      },
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Hypothesis only: a Latin-plausible prefix (st-) locks the dual buffer to the EN keymap. Unaudited."
+    },
+    {
+      "id": "anom-c7b259355975",
+      "dedup_key": "no|но",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "no",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "но",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:50Z",
+      "last_seen_utc": "2026-08-23T18:50Z",
+      "repeat": true,
+      "occurrence_count": 3,
+      "environment": {
+        "app_surface": "unknown (operator live sentence)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live, app unknown",
+          "note": "но -> no twice in the operator sentence"
+        },
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "d8b01c076babc24881632739ebe4d4da763be86d",
+          "surface": "offline probe",
+          "note": "pre-F1 d8b01c0 with BG context still fails this word (41/45 pass without context)"
+        }
+      ],
+      "status": "reproduced",
+      "suspected_layer": "dual_buffer_short_word",
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "ledger 9d211e447e57",
+        "build_sha": "d8b01c076babc24881632739ebe4d4da763be86d",
+        "summary": "но still fails on pre-F1 d8b01c0 with Bulgarian context, so not introduced by F1"
+      },
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Two live occurrences in one sentence plus the pre-F1 offline reproduction. Two-letter word: same short-word class as li."
+    },
+    {
+      "id": "anom-51d9f85442d4",
+      "dedup_key": "statii|статии",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "statii",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "статии",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:50Z",
+      "last_seen_utc": "2026-08-23T18:50Z",
+      "repeat": true,
+      "occurrence_count": 2,
+      "environment": {
+        "app_surface": "unknown (operator live sentence)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live, app unknown",
+          "note": "статии -> statii in the operator sentence"
+        },
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "d8b01c076babc24881632739ebe4d4da763be86d",
+          "surface": "offline probe",
+          "note": "pre-F1 d8b01c0 with BG context still fails this word (41/45 pass without context)"
+        }
+      ],
+      "status": "reproduced",
+      "suspected_layer": "dual_buffer_prefix_lock",
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "ledger 9d211e447e57",
+        "build_sha": "d8b01c076babc24881632739ebe4d4da763be86d",
+        "summary": "статии still fails on pre-F1 d8b01c0 with Bulgarian context, so not introduced by F1"
+      },
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Same prefix as статия (st-). Hypothesis only; unaudited."
+    },
+    {
+      "id": "anom-511311e42402",
+      "dedup_key": "templejtyt|темплейтът",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "templejtyt",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "темплейтът",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:50Z",
+      "last_seen_utc": "2026-08-23T18:50Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown (operator live sentence)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live, app unknown",
+          "note": "темплейтът -> templejtyt in the operator sentence"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "dual_buffer_prefix_lock",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Live sighting only; no offline reproduction recorded yet. Hypothesis: Latin-plausible prefix (templ-)."
+    },
+    {
+      "id": "anom-b253e3d1599f",
+      "dedup_key": "sai-fai|сай-фай",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "sai-fai",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "сай-фай",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:50Z",
+      "last_seen_utc": "2026-08-23T18:50Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown (operator live sentence)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live, app unknown",
+          "note": "сай-фай -> sai-fai in the operator sentence"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "dual_buffer_short_word",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Hyphenated compound of two three-letter parts; the hyphen likely splits the word so each half scores as a short word. Hypothesis only; no offline reproduction recorded yet."
+    },
+    {
+      "id": "anom-b264208f35cb",
+      "dedup_key": "bekgraund|бекграунд",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "bekgraund",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "бекграунд",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:50Z",
+      "last_seen_utc": "2026-08-23T18:50Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown (operator live sentence)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live, app unknown",
+          "note": "бекграунд -> bekgraund in the operator sentence"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "dual_buffer_prefix_lock",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Live sighting only; no offline reproduction recorded yet. Loanword with a Latin-plausible prefix (bek-)."
+    },
+    {
+      "id": "anom-5e2b3f6d9e72",
+      "dedup_key": "fy`yri|фичъри",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "fy`yri",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "фичъри",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:50Z",
+      "last_seen_utc": "2026-08-23T18:50Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown (operator live sentence)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live, app unknown",
+          "note": "фичъри -> fy`yri on its first occurrence; the second occurrence in the same sentence was correct"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "dual_buffer_unsupported_inheritance",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Contains ч (backtick key on BG phonetic). First occurrence failed, second was correct, so the fault is state-dependent. No offline reproduction recorded yet."
+    },
+    {
+      "id": "anom-1c9c6180880c",
+      "dedup_key": "tn|тн",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "tn",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "тн",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:50Z",
+      "last_seen_utc": "2026-08-23T18:50Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown (operator live sentence)",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live combined v4+F1 (7b9901a), deployed 2026-08-23T17:53Z",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+          "surface": "live, app unknown",
+          "note": "тн -> tn in the operator sentence (abbreviation)"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "dual_buffer_short_word",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Two-letter abbreviation; same short-word class as li and но. No offline reproduction recorded yet."
+    },
+    {
+      "id": "anom-8f7f14473be3",
+      "dedup_key": "top|топ",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "top",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "топ",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23T18:50Z",
+      "last_seen_utc": "2026-08-23T18:50Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "offline probe",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "offline probe of the 9d211e447e57 sentence; build not recorded in the ledger summary",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "9d211e447e57",
+          "observed_utc": "2026-08-23T18:50Z",
+          "build_sha": "unknown",
+          "surface": "offline probe",
+          "note": "surfaced by the offline reproduction of the operator sentence; not seen live"
+        }
+      ],
+      "status": "reproduced",
+      "suspected_layer": "dual_buffer_short_word",
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "ledger 9d211e447e57",
+        "build_sha": "unknown",
+        "summary": "топ -> top in the offline reproduction of the operator sentence"
+      },
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Probe-only sighting; build of the probe is not stated in the ledger summary and is recorded as unknown."
+    },
+    {
+      "id": "anom-27ef05568e53",
+      "dedup_key": "ima[|имаш",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "ima[",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "имаш",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23",
+      "last_seen_utc": "2026-08-23",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "terminal (Latin shell line, after xkb to SmartKey switch)",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "GREEN v2 = d8b01c0 + space-accept patch, uncommitted at deploy (live 2026-08-22T20:41Z to 2026-08-23T17:53Z)",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ruling",
+          "ref": "487688994026",
+          "observed_utc": "2026-08-23",
+          "build_sha": "unknown",
+          "surface": "terminal (Latin shell line)",
+          "note": "ADVOCATE_CODEX ruling for B9: Bulgarian words committed as EN keymap text after the layout switch"
+        },
+        {
+          "kind": "ledger",
+          "ref": "cc42efc4adf2",
+          "observed_utc": "2026-08-23",
+          "build_sha": "unknown",
+          "surface": "terminal (Latin shell line)",
+          "note": "B9 evidence thread"
+        }
+      ],
+      "status": "fixed",
+      "suspected_layer": "lang_prior_lock",
+      "reproducer": {
+        "kind": "unit_test",
+        "ref": "ibus/test_native_lang_prior.py::test_native_bulgarian_words_with_latin_surrounding_are_cyrillic",
+        "build_sha": "89c0bd7dbc99eed677947c8b36433705d233793f",
+        "summary": "native regression encoding the exact live repro (Latin surrounding text, Bulgarian physical-key word)"
+      },
+      "red_test": {
+        "path": "crates/smartkey-core/src/input.rs",
+        "name": "lang_prior_tests::bulgarian_words_after_english_context_are_cyrillic",
+        "commit": "89c0bd7dbc99eed677947c8b36433705d233793f"
+      },
+      "red_test_waiver": null,
+      "fix_commit": "89c0bd7dbc99eed677947c8b36433705d233793f",
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Fixed by F1 (first-character language prior biases, never locks); the same change is 7b9901a on the combined live branch. Verified only at the structural-trace level on the reported surface. Contains ш ([ key). Structural trace 617716b98d81/f09e9917b91f = aggregate cyr/cyr only, cannot bind this token; 'verified' needs token-specific evidence (ruling 5394d2c2ad28)."
+    },
+    {
+      "id": "anom-53cae06a36b4",
+      "dedup_key": "sled|след",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "sled",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "след",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23",
+      "last_seen_utc": "2026-08-23",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "terminal (Latin shell line, after xkb to SmartKey switch)",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "GREEN v2 = d8b01c0 + space-accept patch, uncommitted at deploy (live 2026-08-22T20:41Z to 2026-08-23T17:53Z)",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ruling",
+          "ref": "487688994026",
+          "observed_utc": "2026-08-23",
+          "build_sha": "unknown",
+          "surface": "terminal (Latin shell line)",
+          "note": "ADVOCATE_CODEX ruling for B9: Bulgarian words committed as EN keymap text after the layout switch"
+        },
+        {
+          "kind": "ledger",
+          "ref": "cc42efc4adf2",
+          "observed_utc": "2026-08-23",
+          "build_sha": "unknown",
+          "surface": "terminal (Latin shell line)",
+          "note": "B9 evidence thread"
+        }
+      ],
+      "status": "fixed",
+      "suspected_layer": "lang_prior_lock",
+      "reproducer": {
+        "kind": "unit_test",
+        "ref": "ibus/test_native_lang_prior.py::test_native_bulgarian_words_with_latin_surrounding_are_cyrillic",
+        "build_sha": "89c0bd7dbc99eed677947c8b36433705d233793f",
+        "summary": "native regression encoding the exact live repro (Latin surrounding text, Bulgarian physical-key word)"
+      },
+      "red_test": {
+        "path": "crates/smartkey-core/src/input.rs",
+        "name": "lang_prior_tests::bulgarian_words_after_english_context_are_cyrillic",
+        "commit": "89c0bd7dbc99eed677947c8b36433705d233793f"
+      },
+      "red_test_waiver": null,
+      "fix_commit": "89c0bd7dbc99eed677947c8b36433705d233793f",
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Fixed by F1 (first-character language prior biases, never locks); the same change is 7b9901a on the combined live branch. Verified only at the structural-trace level on the reported surface. Structural trace 617716b98d81/f09e9917b91f = aggregate cyr/cyr only, cannot bind this token; 'verified' needs token-specific evidence (ruling 5394d2c2ad28)."
+    },
+    {
+      "id": "anom-ce7630c99f88",
+      "dedup_key": "otgowor|отговор",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "otgowor",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "отговор",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23",
+      "last_seen_utc": "2026-08-23",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "terminal (Latin shell line, after xkb to SmartKey switch)",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "GREEN v2 = d8b01c0 + space-accept patch, uncommitted at deploy (live 2026-08-22T20:41Z to 2026-08-23T17:53Z)",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ruling",
+          "ref": "487688994026",
+          "observed_utc": "2026-08-23",
+          "build_sha": "unknown",
+          "surface": "terminal (Latin shell line)",
+          "note": "ADVOCATE_CODEX ruling for B9: Bulgarian words committed as EN keymap text after the layout switch"
+        },
+        {
+          "kind": "ledger",
+          "ref": "cc42efc4adf2",
+          "observed_utc": "2026-08-23",
+          "build_sha": "unknown",
+          "surface": "terminal (Latin shell line)",
+          "note": "B9 evidence thread"
+        }
+      ],
+      "status": "fixed",
+      "suspected_layer": "lang_prior_lock",
+      "reproducer": {
+        "kind": "unit_test",
+        "ref": "ibus/test_native_lang_prior.py::test_native_bulgarian_words_with_latin_surrounding_are_cyrillic",
+        "build_sha": "89c0bd7dbc99eed677947c8b36433705d233793f",
+        "summary": "native regression encoding the exact live repro (Latin surrounding text, Bulgarian physical-key word)"
+      },
+      "red_test": {
+        "path": "crates/smartkey-core/src/input.rs",
+        "name": "lang_prior_tests::bulgarian_words_after_english_context_are_cyrillic",
+        "commit": "89c0bd7dbc99eed677947c8b36433705d233793f"
+      },
+      "red_test_waiver": null,
+      "fix_commit": "89c0bd7dbc99eed677947c8b36433705d233793f",
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Fixed by F1 (first-character language prior biases, never locks); the same change is 7b9901a on the combined live branch. Verified only at the structural-trace level on the reported surface. Structural trace 617716b98d81/f09e9917b91f = aggregate cyr/cyr only, cannot bind this token; 'verified' needs token-specific evidence (ruling 5394d2c2ad28)."
+    },
+    {
+      "id": "anom-41a9c9ac0049",
+      "dedup_key": "prewkl|превкл",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "prewkl",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "превкл",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-23",
+      "last_seen_utc": "2026-08-23",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "terminal (Latin shell line, after xkb to SmartKey switch)",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "GREEN v2 = d8b01c0 + space-accept patch, uncommitted at deploy (live 2026-08-22T20:41Z to 2026-08-23T17:53Z)",
+        "flags": {
+          "accept.space_accept": "off"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ruling",
+          "ref": "487688994026",
+          "observed_utc": "2026-08-23",
+          "build_sha": "unknown",
+          "surface": "terminal (Latin shell line)",
+          "note": "ADVOCATE_CODEX ruling for B9: Bulgarian words committed as EN keymap text after the layout switch"
+        },
+        {
+          "kind": "ledger",
+          "ref": "cc42efc4adf2",
+          "observed_utc": "2026-08-23",
+          "build_sha": "unknown",
+          "surface": "terminal (Latin shell line)",
+          "note": "B9 evidence thread"
+        }
+      ],
+      "status": "fixed",
+      "suspected_layer": "lang_prior_lock",
+      "reproducer": {
+        "kind": "unit_test",
+        "ref": "ibus/test_native_lang_prior.py::test_native_bulgarian_words_with_latin_surrounding_are_cyrillic",
+        "build_sha": "89c0bd7dbc99eed677947c8b36433705d233793f",
+        "summary": "native regression encoding the exact live repro (Latin surrounding text, Bulgarian physical-key word)"
+      },
+      "red_test": {
+        "path": "crates/smartkey-core/src/input.rs",
+        "name": "lang_prior_tests::bulgarian_words_after_english_context_are_cyrillic",
+        "commit": "89c0bd7dbc99eed677947c8b36433705d233793f"
+      },
+      "red_test_waiver": null,
+      "fix_commit": "89c0bd7dbc99eed677947c8b36433705d233793f",
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Fixed by F1 (first-character language prior biases, never locks); the same change is 7b9901a on the combined live branch. Verified only at the structural-trace level on the reported surface. Operator typed превключване; the ruling records the prefix превкл as the tracked token. Structural trace 617716b98d81/f09e9917b91f = aggregate cyr/cyr only, cannot bind this token; 'verified' needs token-specific evidence (ruling 5394d2c2ad28)."
+    },
+    {
+      "id": "anom-b003b2c54740",
+      "dedup_key": "draftyt|драфтът",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "draftyt",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "драфтът",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": null,
+      "last_seen_utc": null,
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "unknown (not observable from the gate message)",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "af4d6969b2ad",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator text seen by ADVOCATE; app, build and time not recorded"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Provenance unknown beyond the gate message; recorded as unknown rather than inferred."
+    },
+    {
+      "id": "anom-7fe22c88b977",
+      "dedup_key": "markdaun|маркдаун",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "markdaun",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "маркдаун",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": null,
+      "last_seen_utc": null,
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "unknown (not observable from the gate message)",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "af4d6969b2ad",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator text seen by ADVOCATE; app, build and time not recorded"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Provenance unknown beyond the gate message; recorded as unknown rather than inferred."
+    },
+    {
+      "id": "anom-6af125957474",
+      "dedup_key": "bygowe|бъгове",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "bygowe",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "бъгове",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": null,
+      "last_seen_utc": null,
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "unknown (not observable from the gate message)",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "af4d6969b2ad",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator text seen by ADVOCATE; app, build and time not recorded"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Provenance unknown beyond the gate message; recorded as unknown rather than inferred."
+    },
+    {
+      "id": "anom-332f94de57f9",
+      "dedup_key": "desc:visible 2-3 letter ghost is discarded on space (tab-only accept)|desc:space accepts the displayed ghost consistently with tab (opt-in accept.space_accept)",
+      "category": "inconsistent_acceptance",
+      "observed": {
+        "token": null,
+        "script": "unknown",
+        "descriptor": "visible 2-3 letter ghost is discarded on Space (Tab-only accept)"
+      },
+      "expected": {
+        "token": null,
+        "script": "unknown",
+        "descriptor": "Space accepts the displayed ghost consistently with Tab (opt-in accept.space_accept)"
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-25T16:11Z",
+      "first_seen_utc": "2026-08-22",
+      "last_seen_utc": "2026-08-22",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown (operator live typing)",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "live build of 2026-08-22 (master d8b01c0 era; exact SHA not recorded)",
+        "flags": {
+          "accept.space_accept": "absent"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "plan",
+          "ref": "smartkey_bughunt_plan",
+          "observed_utc": "2026-08-22",
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "B1 category: inconsistent acceptance"
+        },
+        {
+          "kind": "ruling",
+          "ref": "4f9970749edd",
+          "observed_utc": "2026-08-23",
+          "build_sha": null,
+          "surface": null,
+          "note": "GREEN v4 PASS for the opt-in Space-accept fix"
+        }
+      ],
+      "status": "fixed",
+      "suspected_layer": "accept_gesture",
+      "reproducer": {
+        "kind": "unit_test",
+        "ref": "ibus/test_space_accept.py::test_space_accept_default_off_path_is_unchanged",
+        "build_sha": "35c43618d5ce97ff96bdcbfcc76e9a527ed04bb3",
+        "summary": "flag-off path: visible ghost plus Space stays literal, i.e. the reported discard"
+      },
+      "red_test": {
+        "path": "crates/smartkey-core/src/input.rs",
+        "name": "space_accept_on_commits_typed_plus_ghost_plus_one_delimiter",
+        "commit": "35c43618d5ce97ff96bdcbfcc76e9a527ed04bb3"
+      },
+      "red_test_waiver": null,
+      "fix_commit": "35c43618d5ce97ff96bdcbfcc76e9a527ed04bb3",
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "unknown",
+      "notes": "Fix is opt-in and the flag is OFF on the live build (7b9901a), so the reported surface is NOT verified. Verification needs an operator-enabled flag-ON live run."
+    }
+  ]
+}
