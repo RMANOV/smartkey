@@ -84,6 +84,14 @@ One record per **(observed, expected)** pair. Fields, in file order:
   grants no right to quote the operator's text.
 - `notes` — short free text for legacy records (max 500 chars, single line);
   an enhanced record uses a typed opaque metadata ref or `null`.
+- `record_origin` / `baseline_record_sha256` — mandatory only on enhanced
+  records. `record_origin` is `new` or `preexisting_public_baseline`. A new
+  record carries a null baseline digest and may not carry a free public-token
+  literal. A baseline update carries the nonzero SHA-256 of its complete
+  derived legacy projection: remove only the enhanced origin/adjudication/fix
+  fields and enhanced evidence-coverage arrays, preserve every legacy identity
+  and content field, then serialize as compact ASCII JSON with sorted keys.
+  The nine retained unadjudicated records carry neither field.
 - `adjudications` — optional only for backwards-compatible migration of the
   pre-G0 records. Once present anywhere, every item maps exactly one canonical
   original-candidate or supplemental-hypothesis ref and the sealed top-level
@@ -106,8 +114,10 @@ import-HOLD input, not current registry data.
 The sealed accounting is exact: 106 original refs + 53 supplemental refs,
 classified as 125 bug candidates + 32 guards + 2 source exclusions. Dedup
 projects those mappings into 76 bug records + 26 guard records, retains 9
-legacy records, and therefore yields 111 records. The two source exclusions
-live in top-level `source_exclusions[]`, never as anomaly records. They still
+legacy records, and therefore yields 111 records. The action split is also
+exact: 20 enhanced updates of the reviewed public baseline + 82 new enhanced
+records + 9 unchanged legacy keeps. The two source exclusions live in
+top-level `source_exclusions[]`, never as anomaly records. They still
 participate in both 106/53 source-grain and 125/32/2 disposition accounting.
 
 Each `adjudications[]` item contains no prose and has these fields:
@@ -139,12 +149,11 @@ Each `adjudications[]` item contains no prose and has these fields:
   `null_non_unique`, `null_pending_operator_intent`,
   `unique_operator_confirmed`, `unique_authoritative_spelling`, or
   `not_applicable`; authority is `final|null|operator|authoritative|legacy_bridge|not_applicable`.
-  Unique expected forms carry
-  `hmac-sha256-v1:value:<64-lowercase-hex>` rather than requiring a literal
-  token. Null/not-applicable forms carry `null`. This represents a redacted
-  unique expected form and split-component fan-in without leaking or collapsing
-  distinct expected values. Deprecated `expected_form_status`, when present
-  during additive migration, must equal `expected.status`.
+  Unique expected forms carry a typed value-domain HMAC reference rather than
+  a literal token. Null/not-applicable forms carry `null`. This represents a
+  redacted unique expected form and split-component fan-in without leaking or
+  collapsing distinct expected values. Deprecated `expected_form_status`,
+  when present during additive migration, must equal `expected.status`.
 - `causal_confidence` — independent `anomaly_or_guard_presence`,
   `expected_form`, `runtime_mechanism`, and `smartkey_attribution` axes. Each is
   `none|low|medium|high|not_applicable`; one axis never stands in for another.
@@ -163,19 +172,53 @@ Each `adjudications[]` item contains no prose and has these fields:
   including a guard in a mixed bug/guard record — independently needs its own
   adjudication `ruling` or `receipt` ref.
 - `source_event_refs` — non-empty canonical
-  `hmac-sha256-v1:event:<64-lowercase-hex>` IDs. An event may support several
-  split mappings inside one dedup record, but it cannot be reconciled to two
-  records and cannot increment `occurrence_count` twice.
+  event-domain IDs. An event may support several split mappings inside one
+  dedup record, but it cannot be reconciled to two records and cannot increment
+  `occurrence_count` twice.
 
-All public opaque refs use
-`hmac-sha256-v1:<value|event|metadata|source_record>:<64-lowercase-hex>`.
-Plain `sha256(raw text)` is forbidden: an unsalted digest permits dictionary
-recovery of short typed forms. The future importer must generate refs with a
-random secret key held only in its private mode-`0600` corpus, never in this
-repository, debate messages or logs. The schema validates typed syntax and
-domain only; the importer and an independent external receipt must validate
-the actual HMAC derivation. Tests use deterministic synthetic shape fixtures,
-not a key, real HMAC, user text or authority evidence.
+### Opaque reference construction
+
+The only enhanced public opaque-reference scheme is
+`smartkey-g0-hmac-sha256-v1`. Its public representation is:
+
+```text
+smartkey-g0-hmac-sha256-v1:<domain>:<key_id>:<64-lowercase-hex-MAC>
+```
+
+`domain` is exactly one of `value`, `event`, `metadata`, or `source_record`.
+`key_id` is a public random 32-lowercase-hex rotation-epoch identifier; it is
+not the key. Every reference in one sealed contract must use that contract's
+pinned `key_id`. A MAC suffix cannot be reused across domains or key epochs;
+an identical same-domain reference may be shared where several mappings cite
+the same source.
+
+The future private importer uses one cryptographically random key of at least
+32 bytes, stored only in its mode-`0600` private corpus — never in this
+repository, debate messages or logs. It forms the payload as follows:
+
+- scalar: the exact UTF-8 bytes, with no Unicode normalization;
+- structured value: RFC 8259 JSON encoded as UTF-8 with sorted object keys,
+  compact separators and no Unicode normalization.
+
+The exact MAC input is the concatenation of:
+
+1. ASCII `smartkey-g0-hmac-sha256-v1`;
+2. one NUL byte;
+3. the ASCII domain (so domain separation is inside the MAC input, not only
+   in the printed prefix);
+4. one NUL byte;
+5. the payload length as one unsigned 8-byte big-endian integer;
+6. the payload bytes.
+
+Plain or unsalted `sha256(raw/user text)` and the legacy
+`hmac-sha256-v1:...` form are forbidden because short typed forms are
+dictionary-recoverable. Key rotation changes `key_id` and requires complete
+independent re-derivation and re-receipting of every reference. The public
+validator checks scheme/domain syntax, pinned-key consistency and
+cross-domain/key-epoch suffix reuse; it cannot prove secret derivation. The
+external private receipt must recompute every reference, domain, serialization
+choice and key ID. Tests use deterministic synthetic shape refs only — no key,
+real HMAC, user text or authority evidence.
 
 ## Exact semantic commitment
 
@@ -212,13 +255,30 @@ two nonzero, recomputed SHA-256 commitments:
   all 111 records, both top-level exclusions and contract metadata — after
   removing only the self-referential `registry_projection_sha256` field.
   It consequently also binds the semantic and legacy digests.
+- Every baseline-update record carries its own `baseline_record_sha256` over
+  the complete derived legacy projection described above.
+  `baseline_record_set_sha256` then hashes the sorted exact set of 20
+  `{record_id, baseline_record_sha256}` pairs. The sealed
+  `baseline_external_receipt` must approve that exact set and count. Therefore
+  changing a literal, adding another literal-bearing legacy field or
+  transplanting a record digest fails even after ordinary semantic/registry
+  digests are locally recomputed. Changing the approved baseline set is a new
+  external-authority event, not a local reseal.
 
 Stale digests reject identity, payload, note, evidence, exclusion and legacy
 substitutions even when counts stay unchanged. A digest that merely recomputes
 over attacker-supplied data is not authority, so the real import must publish
-an independently reviewed external receipt for both projection digests in the
-same integration commit. Synthetic fixture digests prove validator mechanics
-only and must never be reused as production pins.
+an independently reviewed external receipt for all projection and baseline
+digests in the same integration commit. The public validator checks the
+receipt envelope and exact committed set; independent tooling owns receipt
+authenticity. Synthetic fixture digests/receipt shapes prove validator
+mechanics only and must never be reused as production pins.
+
+This schema lane intentionally has no real baseline digest to pin. The real
+import integration must promote its independently reviewed 20-record-set
+digest and detached receipt SHA to validator/schema constants in that same
+commit. Until that happens, a locally rewritten receipt envelope is merely a
+claim and must not be treated as authority or an import PASS.
 
 ## Lifecycle gates (enforced by `validate.py`)
 
@@ -267,10 +327,21 @@ are accepted only by explicitly typed SHA/ID fields. Environment labels and
 dynamic flag keys; legacy source refs/surfaces; reproducer, test and
 verification refs/paths/names/surfaces; summaries, notes, descriptors and
 closure reasons must be controlled enums, correctly typed
-`hmac-sha256-v1:metadata:…` refs or null. A SHA-shaped or high-entropy token is
-not independently safe merely because it fits the public-token length limit.
-JSON Schema's `additionalProperties: false` closes structural dictionary
-keys; the validator separately checks the dynamic `flags` keys.
+`smartkey-g0-hmac-sha256-v1:metadata:…` refs or null. There is no global
+"known enum" fallback: a value allowed as a status, authority or confidence
+cannot be borrowed by notes, summaries or any other field. Literal
+`synthetic` is accepted only at the three documented environment-label paths
+in validator fixtures. JSON Schema's `additionalProperties: false` closes
+structural dictionary keys; the validator separately checks dynamic `flags`
+keys.
+
+Free `public_token` literals are forbidden on every `record_origin: new`
+record, regardless of whether they look alphabetic, base64-like, hex-like or
+otherwise harmless. Literal token sides survive only in an externally
+approved `preexisting_public_baseline` projection; its exact per-record and
+20-record-set commitments, rather than a shape heuristic, are the safety
+boundary. Redacted/metadata-only new records use null/placeholder sides plus
+typed metadata/value refs.
 
 The aggregate gate walks values and dynamic keys, assigns every
 reconstruction-bearing fragment from both values and dynamic keys to each
@@ -299,9 +370,11 @@ During the G0 data migration, add the sealed `adjudication_contract`, all 157
 record mappings and both top-level exclusions in the same canonical update.
 The validator requires exact 106+53 source-grain equality, 125/32/2
 disposition accounting, the pinned ref set, a recomputed semantic commitment
-and both complete 111-record/9-legacy projection commitments. Independently
-receipt the three real digests in that integration commit. No mapping draft,
-synthetic digest or count summary can substitute for this integration gate.
+and the complete 111-record/9-legacy projections, the 20-update baseline set,
+the exact 20/82/9 action split and the full private HMAC receipt. Independently
+receipt all real digests and derivations in that integration commit. No mapping
+draft, synthetic digest/receipt shape or count summary can substitute for this
+integration gate.
 
 The registry is bookkeeping for the RED-only F4 lane: recording a pair here
 neither widens nor bypasses F4, and no engine code reads this directory.

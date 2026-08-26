@@ -35,6 +35,7 @@ _DIR = _REPO / "diagnostics" / "anomalies"
 _REGISTRY = _DIR / "registry.json"
 _SCHEMA = _DIR / "schema.json"
 _VALIDATOR = _DIR / "validate.py"
+_R4_SYNTHETIC_KEY_ID = "0123456789abcdef0123456789abcdef"
 
 # The eight pairs the gate names as the minimum first baseline.
 _MANDATED_PAIRS = {
@@ -98,7 +99,7 @@ def _synthetic_hmac_ref(domain: str, label: str) -> str:
     digest = hashlib.sha256(
         f"synthetic-hmac-fixture:{domain}:{label}".encode("utf-8")
     ).hexdigest()
-    return f"hmac-sha256-v1:{domain}:{digest}"
+    return f"smartkey-g0-hmac-sha256-v1:{domain}:{_R4_SYNTHETIC_KEY_ID}:{digest}"
 
 
 def _synthetic_adjudicated_record(
@@ -467,6 +468,54 @@ def _r3_registry_projection_digest(doc: dict) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _r4_baseline_record_payload(rec: dict) -> dict:
+    payload = copy.deepcopy(rec)
+    for field in (
+        "adjudications",
+        "fix_evidence",
+        "record_origin",
+        "baseline_record_sha256",
+    ):
+        payload.pop(field, None)
+    for field in ("reproducer", "red_test", "verification"):
+        evidence = payload.get(field)
+        if isinstance(evidence, dict):
+            evidence.pop("covered_adjudication_refs", None)
+            evidence.pop("covered_source_event_refs", None)
+    return payload
+
+
+def _r4_baseline_record_digest(rec: dict) -> str:
+    encoded = json.dumps(
+        _r4_baseline_record_payload(rec),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _r4_baseline_set_digest(doc: dict) -> str:
+    payload = sorted(
+        (
+            {
+                "record_id": rec["id"],
+                "baseline_record_sha256": rec["baseline_record_sha256"],
+            }
+            for rec in doc["records"]
+            if rec.get("record_origin") == "preexisting_public_baseline"
+        ),
+        key=lambda item: item["record_id"],
+    )
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _refresh_r3_commitments(doc: dict) -> None:
     contract = doc["adjudication_contract"]
     contract["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
@@ -641,6 +690,37 @@ def _synthetic_r2_doc() -> dict:
     )
     records.extend(_r2_legacy_record(index) for index in range(9))
 
+    for index, rec in enumerate(records[:102]):
+        if index < 20:
+            rec["record_origin"] = "preexisting_public_baseline"
+            rec["baseline_record_sha256"] = None
+        else:
+            rec["record_origin"] = "new"
+            rec["baseline_record_sha256"] = None
+            if index < 76:
+                rec["observed"] = {
+                    "token": None,
+                    "script": "unknown",
+                    "descriptor": _synthetic_hmac_ref(
+                        "metadata", f"r4:redacted-observed:{index}"
+                    ),
+                }
+                rec["expected"] = {
+                    "token": None,
+                    "script": "unknown",
+                    "descriptor": _synthetic_hmac_ref(
+                        "metadata", f"r4:redacted-expected:{index}"
+                    ),
+                }
+                rec["privacy_classification"] = "redacted"
+                for adjudication in rec["adjudications"]:
+                    adjudication["privacy_class"] = "redacted"
+                _refresh_identity(rec)
+
+    for rec in records[:20]:
+        rec["baseline_record_sha256"] = _r4_baseline_record_digest(rec)
+    baseline_set_digest = _r4_baseline_set_digest({"records": records})
+
     doc = {
         "schema_version": 1,
         "registry": "smartkey-anomaly-registry",
@@ -660,11 +740,40 @@ def _synthetic_r2_doc() -> dict:
             "bug_record_count": 76,
             "guard_record_count": 26,
             "legacy_record_count": 9,
+            "baseline_update_record_count": 20,
+            "new_record_count": 82,
             "canonical_ref_set_sha256": "81168506c76776f060aaf9cd71bb4ed0e2fbde31b286ac30b69823bc8a54a5ee",
             "semantic_commitment_algorithm": "sha256-canonical-json-v1",
             "semantic_commitment_sha256": "f" * 64,
             "legacy_projection_sha256": "e" * 64,
             "registry_projection_sha256": "d" * 64,
+            "baseline_commitment_algorithm": "sha256-canonical-json-v1",
+            "baseline_record_set_sha256": baseline_set_digest,
+            "baseline_external_receipt": {
+                "state": "externally_verified",
+                "record_count": 20,
+                "approved_record_set_sha256": baseline_set_digest,
+                "receipt_sha256": _synthetic_opaque_ref("r4:baseline-receipt"),
+            },
+            "hmac_scheme": "smartkey-g0-hmac-sha256-v1",
+            "hmac_min_key_bytes": 32,
+            "hmac_domains": ["value", "event", "metadata", "source_record"],
+            "hmac_scalar_payload_encoding": ("exact-utf8-scalar-no-normalization-v1"),
+            "hmac_structured_payload_encoding": (
+                "rfc8259-canonical-json-utf8-sorted-keys-compact-"
+                "no-unicode-normalization-v1"
+            ),
+            "hmac_input_frame": ("ascii-scheme-nul-domain-nul-u64be-length-payload-v1"),
+            "hmac_key_id": _R4_SYNTHETIC_KEY_ID,
+            "hmac_external_receipt": {
+                "state": "externally_verified",
+                "scheme": "smartkey-g0-hmac-sha256-v1",
+                "key_id": _R4_SYNTHETIC_KEY_ID,
+                "coverage": (
+                    "all-refs-domain-serialization-key-id-private-recomputation-v1"
+                ),
+                "receipt_sha256": _synthetic_opaque_ref("r4:hmac-receipt"),
+            },
         },
         "source_exclusions": exclusions,
         "records": records,
@@ -1172,7 +1281,7 @@ def test_source_budget_allows_bounded_isolated_synthetic_tokens():
 
 def test_source_budget_does_not_count_opaque_metadata_as_payload():
     doc = _synthetic_r2_doc()
-    for ordinal, rec in enumerate(doc["records"][:4]):
+    for ordinal, rec in enumerate(doc["records"][20:24]):
         rec["notes"] = _synthetic_hmac_ref("metadata", f"note:{ordinal}")
         rec["adjudications"][0]["source_refs"] = [
             {
@@ -1328,7 +1437,7 @@ def test_g0_r2_expected_authority_status_matrix_is_strict():
 
 def test_g0_r2_redacted_unique_expected_needs_no_literal_token():
     doc = _synthetic_r2_doc()
-    rec = doc["records"][0]
+    rec = doc["records"][20]
     rec["observed"] = {
         "token": "[redacted]",
         "script": "latin",
@@ -1608,7 +1717,7 @@ def test_g0_r2_partial_multi_mapping_closure_is_rejected():
 
 def test_g0_r2_full_multi_mapping_closure_coverage_is_valid():
     doc = _synthetic_r2_doc()
-    rec = doc["records"][0]
+    rec = doc["records"][20]
     covered = [item["ref"] for item in rec["adjudications"]]
     _r2_add_bug_evidence(rec, covered)
     rec["status"] = "verified"
@@ -1746,18 +1855,21 @@ def test_g0_r3_sha_shaped_values_are_rejected_across_generic_field_types(
         "AbCdefghijKLMNopqrstUVWX12345678",
     ],
 )
-def test_g0_r3_sha_or_high_entropy_public_token_is_not_independently_safe(
+def test_g0_r3_new_public_token_requires_baseline_authority(
     token,
 ):
     doc = _synthetic_r2_doc()
-    rec = doc["records"][0]
+    rec = doc["records"][20]
     rec["observed"]["token"] = token
     rec["observed"]["script"] = "latin"
+    rec["privacy_classification"] = "public_token"
+    for adjudication in rec["adjudications"]:
+        adjudication["privacy_class"] = "public_token"
     _refresh_identity(rec)
     doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
         doc
     )
-    assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
+    assert "E_ADJ_ORIGIN" in _codes(V.validate_document(doc, _schema()))
 
 
 @pytest.mark.parametrize(
@@ -2042,3 +2154,281 @@ def test_g0_r3_whole_fixture_validates_under_external_draft_2020_12():
     jsonschema = pytest.importorskip("jsonschema")
     validator = jsonschema.Draft202012Validator(_schema())
     validator.validate(_synthetic_r2_doc())
+
+
+# ---------------------------------------- G0 adjudication contract revision 4
+
+
+def _r4_shaped_ref(
+    domain: str,
+    label: str,
+    *,
+    key_id: str = _R4_SYNTHETIC_KEY_ID,
+    suffix: str | None = None,
+) -> str:
+    mac = (
+        suffix
+        or hashlib.sha256(f"r4-shape-only:{domain}:{label}".encode("utf-8")).hexdigest()
+    )
+    return f"smartkey-g0-hmac-sha256-v1:{domain}:{key_id}:{mac}"
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "AlphabeticCredentialMaterialOnly",
+        "QWxhZGRpbjpPcGVuU2VzYW1lPQ==",
+        "a" * 32,
+    ],
+)
+def test_g0_r4_new_enhanced_records_forbid_every_public_literal_shape(
+    credential,
+):
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][20]
+    rec["record_origin"] = "new"
+    rec["baseline_record_sha256"] = None
+    rec["observed"] = {
+        "token": credential,
+        "script": "latin",
+        "descriptor": None,
+    }
+    rec["expected"] = {
+        "token": "SyntheticExpectedLiteral",
+        "script": "latin",
+        "descriptor": None,
+    }
+    rec["privacy_classification"] = "public_token"
+    for adjudication in rec["adjudications"]:
+        adjudication["privacy_class"] = "public_token"
+    _refresh_identity(rec)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
+    assert "E_ADJ_ORIGIN" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_baseline_literal_mutation_fails_after_local_reseal():
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    rec["observed"]["token"] = "SyntheticMutatedBaselineLiteral"
+    rec["observed"]["script"] = "latin"
+    _refresh_identity(rec)
+    _refresh_r3_commitments(doc)
+    assert "E_BASELINE_AUTHORITY" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_baseline_extra_literal_field_fails_after_local_reseal():
+    doc = _synthetic_r2_doc()
+    doc["records"][0]["notes"] = "SyntheticExtraBaselineLiteral"
+    _refresh_r3_commitments(doc)
+    codes = _codes(V.validate_document(doc, _schema()))
+    assert {"E_BASELINE_AUTHORITY", "E_ADJ_PRIVACY"} <= codes
+
+
+def test_g0_r4_baseline_receipt_stays_external_to_local_digest_reseal():
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    rec["observed"]["token"] = "SyntheticLocallyResealedLiteral"
+    rec["observed"]["script"] = "latin"
+    _refresh_identity(rec)
+    rec["baseline_record_sha256"] = _r4_baseline_record_digest(rec)
+    doc["adjudication_contract"]["baseline_record_set_sha256"] = (
+        _r4_baseline_set_digest(doc)
+    )
+    _refresh_r3_commitments(doc)
+    assert "E_BASELINE_AUTHORITY" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_baseline_commitments_are_independently_recomputed():
+    doc = _synthetic_r2_doc()
+    baseline = [
+        rec
+        for rec in doc["records"]
+        if rec.get("record_origin") == "preexisting_public_baseline"
+    ]
+    assert len(baseline) == 20
+    for rec in baseline:
+        assert rec["baseline_record_sha256"] == _r4_baseline_record_digest(rec)
+        assert rec["baseline_record_sha256"] == V.baseline_record_sha256(rec)
+    digest = _r4_baseline_set_digest(doc)
+    assert digest == V.baseline_record_set_sha256(doc)
+    assert doc["adjudication_contract"]["baseline_record_set_sha256"] == digest
+    assert (
+        doc["adjudication_contract"]["baseline_external_receipt"][
+            "approved_record_set_sha256"
+        ]
+        == digest
+    )
+
+
+def test_g0_r4_baseline_receipt_cannot_be_transplanted_to_new_record():
+    doc = _synthetic_r2_doc()
+    source = doc["records"][0]
+    target = doc["records"][20]
+    target["record_origin"] = "preexisting_public_baseline"
+    target["baseline_record_sha256"] = source.get("baseline_record_sha256")
+    assert "E_BASELINE_AUTHORITY" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_fixture_has_exact_20_update_82_new_9_keep_actions():
+    doc = _synthetic_r2_doc()
+    origins = [
+        rec.get("record_origin") for rec in doc["records"] if rec.get("adjudications")
+    ]
+    assert origins.count("preexisting_public_baseline") == 20
+    assert origins.count("new") == 82
+    assert sum(not rec.get("adjudications") for rec in doc["records"]) == 9
+
+
+@pytest.mark.parametrize(
+    ("field", "borrowed_enum"),
+    [
+        ("notes", "fixed"),
+        ("reproducer_summary", "public_token"),
+        ("source_surface", "not_applicable"),
+        ("closure_reason", "high"),
+    ],
+)
+def test_g0_r4_cross_field_enum_substitutions_are_rejected(field, borrowed_enum):
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][20]
+    rec["reproducer"] = {
+        "kind": "offline_probe",
+        "ref": _synthetic_hmac_ref("metadata", "r4:probe"),
+        "build_sha": "unknown",
+        "summary": _synthetic_hmac_ref("metadata", "r4:summary"),
+    }
+    targets = {
+        "notes": (rec, "notes"),
+        "reproducer_summary": (rec["reproducer"], "summary"),
+        "source_surface": (rec["source_refs"][0], "surface"),
+        "closure_reason": (rec, "closure_reason"),
+    }
+    parent, key = targets[field]
+    parent[key] = borrowed_enum
+    assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_synthetic_literal_is_fixture_only_not_generic_metadata():
+    doc = _synthetic_r2_doc()
+    doc["records"][20]["notes"] = "synthetic"
+    assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_cross_record_enum_covert_channel_is_rejected_and_budgeted():
+    doc = _synthetic_r2_doc()
+    shared = _synthetic_hmac_ref("source_record", "r4:shared-source")
+    symbols = (
+        "fixed",
+        "verified",
+        "closed",
+        "operator",
+        "authoritative",
+        "legacy_bridge",
+        "medium",
+        "source_record",
+        "punctuation_boundary",
+    )
+    for rec, symbol in zip(doc["records"][20:29], symbols):
+        rec["notes"] = symbol
+        rec["adjudications"][0]["source_refs"] = [
+            {"kind": "source_record", "ref": shared}
+        ]
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
+    codes = _codes(V.validate_document(doc, _schema()))
+    assert {"E_ADJ_PRIVACY", "E_PRIV_AGGREGATE"} <= codes
+
+
+def test_g0_r4_contract_declares_domain_inside_mac_input():
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"]["hmac_input_frame"] = (
+        "ascii-scheme-nul-u64be-length-payload-v1"
+    )
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_contract_cannot_omit_domain_bound_input_frame():
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"].pop("hmac_input_frame")
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_contract_requires_exact_domain_set():
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"]["hmac_domains"] = [
+        "value",
+        "event",
+        "metadata",
+    ]
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_contract_requires_exact_scalar_encoding():
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"]["hmac_scalar_payload_encoding"] = "normalized-utf8"
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_contract_rejects_wrong_structured_serialization_declaration():
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"]["hmac_structured_payload_encoding"] = "json-defaults"
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_contract_requires_external_private_receipt_declaration():
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"].pop("hmac_external_receipt", None)
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_ref_with_wrong_key_id_is_rejected():
+    doc = _synthetic_r2_doc()
+    source = doc["records"][0]["adjudications"][0]["source_refs"][0]
+    source["ref"] = _r4_shaped_ref("source_record", "wrong-key", key_id="f" * 32)
+    assert "E_HMAC_KEY_ID" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_dynamic_metadata_key_uses_the_sealed_key_epoch():
+    doc = _synthetic_r2_doc()
+    doc["records"][20]["environment"]["flags"] = {
+        _r4_shaped_ref("metadata", "flag-key", key_id="f" * 32): "on"
+    }
+    assert "E_HMAC_KEY_ID" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_external_receipt_must_match_the_key_epoch():
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"]["hmac_external_receipt"]["key_id"] = "f" * 32
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_schema_cannot_relax_hmac_receipt_coverage_pin():
+    doc = _synthetic_r2_doc()
+    schema = _schema()
+    schema["$defs"]["hmac_external_receipt"]["properties"]["coverage"] = {
+        "type": "string"
+    }
+    assert "E_SCHEMA_DRIFT" in _codes(V.validate_document(doc, schema))
+
+
+def test_g0_r4_legacy_opaque_prefix_is_rejected():
+    doc = _synthetic_r2_doc()
+    source = doc["records"][0]["adjudications"][0]["source_refs"][0]
+    source["ref"] = "hmac-sha256-v1:source_record:" + "a" * 64
+    assert "E_HMAC_LEGACY" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r4_same_mac_suffix_cannot_be_reused_across_domains():
+    doc = _synthetic_r2_doc()
+    adjudication = doc["records"][0]["adjudications"][0]
+    suffix = "a" * 64
+    adjudication["expected"]["value_ref"] = _r4_shaped_ref(
+        "value", "shared", suffix=suffix
+    )
+    adjudication["source_event_refs"][0] = _r4_shaped_ref(
+        "event", "shared", suffix=suffix
+    )
+    assert "E_HMAC_SUFFIX" in _codes(V.validate_document(doc, _schema()))
