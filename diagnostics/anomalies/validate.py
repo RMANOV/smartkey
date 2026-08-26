@@ -69,6 +69,14 @@ EXPECTED_FORM_STATUSES = (
     "unique_authoritative_spelling",
     "not_applicable",
 )
+EXPECTED_AUTHORITIES = (
+    "final",
+    "null",
+    "operator",
+    "authoritative",
+    "legacy_bridge",
+    "not_applicable",
+)
 CAUSAL_CONFIDENCES = ("none", "low", "medium", "high", "not_applicable")
 OWNER_LANES = (
     "adapter_event_integrity",
@@ -84,6 +92,31 @@ OWNER_LANES = (
     "outside_product_source_authorship",
     "punctuation_boundary",
     "same_script_loss",
+)
+NORMALIZED_CLASSES = (
+    "not_applicable",
+    "boundary_extra_hyphen",
+    "boundary_extra_space",
+    "boundary_space_before_terminal_punctuation",
+    "brand_or_intentional_transliteration_ambiguity",
+    "brand_or_native_word_layout_ambiguity",
+    "duplicated_character",
+    "f4_early_lock_full_word_crossover",
+    "grammar_adjective_or_ellipsis",
+    "grammar_definite_article",
+    "grammar_missing_comma",
+    "grammar_verb_or_mood",
+    "intentional_transliteration_guard",
+    "loanword_vowel_orthography",
+    "orthographic_missing_hyphen",
+    "orthographic_word_boundary_space",
+    "phrase_level_omission",
+    "same_script_character_omission",
+    "same_script_character_substitution",
+    "semantic_word_form_ambiguity",
+    "source_harness_framing",
+    "style_punctuation_guard",
+    "style_sensitive_extra_comma",
 )
 ADJUDICATION_PRIVACY_CLASSES = ("public_token", "redacted", "metadata_only")
 ADJUDICATION_GRAINS = ("original_candidate", "supplemental_hypothesis")
@@ -109,22 +142,156 @@ CLASSIFICATION_DISPOSITION = {
     "mechanical_red_candidate": "bug_candidate",
     "source_authorship_exclusion": "source_exclusion",
 }
+CLASSIFICATION_OWNER_LANES = {
+    "guard_not_bug_unless_intent_changes": frozenset(
+        {"future_language_quality_layer", "intended_english_quoted_guard"}
+    ),
+    "instrumentation_first_candidate": frozenset(
+        {
+            "adapter_event_integrity",
+            "composite_boundary_and_provenance",
+            "output_neutral_provenance",
+            "punctuation_boundary",
+            "same_script_loss",
+        }
+    ),
+    "intent_confirmation_needed": frozenset(
+        {"future_language_quality_layer", "future_language_quality_or_intent"}
+    ),
+    "language_quality_feature_candidate": frozenset(
+        {"future_language_quality_layer"}
+    ),
+    "mechanical_red_candidate": frozenset(
+        {
+            "f4_core",
+            "f4_core_both_supported_contextual",
+            "f4_core_early_lock_full_word",
+            "f4_core_one_sided_exact",
+            "punctuation_boundary",
+        }
+    ),
+    "source_authorship_exclusion": frozenset(
+        {"outside_product_source_authorship"}
+    ),
+}
+EXPECTED_AUTHORITY_BY_STATUS = {
+    "null_non_unique": frozenset({"final", "null"}),
+    "null_pending_operator_intent": frozenset({"final", "null"}),
+    "unique_operator_confirmed": frozenset(
+        {"operator", "final", "legacy_bridge"}
+    ),
+    "unique_authoritative_spelling": frozenset(
+        {"authoritative", "final", "legacy_bridge"}
+    ),
+    "not_applicable": frozenset({"not_applicable"}),
+}
 MAX_RECONSTRUCTION_FRAGMENTS_PER_SOURCE = 8
+PROJECTED_RECORD_COUNT = 111
+RECORD_SHAPE_CONTRACT = {
+    "bug_record_count": 76,
+    "guard_record_count": 26,
+    "legacy_record_count": 9,
+}
+CANONICAL_REF_SET_SHA256 = (
+    "81168506c76776f060aaf9cd71bb4ed0e2fbde31b286ac30b69823bc8a54a5ee"
+)
+SEMANTIC_COMMITMENT_ALGORITHM = "sha256-canonical-json-v1"
+SEALED_CONTRACT_CONSTS = {
+    "state": "sealed",
+    "ruling_ref": "6e0704632fef",
+    "artifact_sha256": "92c6dd612be8095d54dc385044c60e9d33e91d0ed9e9f62f6701c87722edbb72",
+    "mapping_crosswalk_sha256": "7838b51bf55fbe7f7ac2ec7e1f5fbb0285df425242b1cbcfeaccaa3a0a6902a4",
+    "audit_contract": "g0-r2-security-crosswalk",
+    "original_count": 106,
+    "supplemental_count": 53,
+    "bug_candidate_count": 125,
+    "guard_count": 32,
+    "source_exclusion_count": 2,
+    "projected_record_count": PROJECTED_RECORD_COUNT,
+    **RECORD_SHAPE_CONTRACT,
+    "canonical_ref_set_sha256": CANONICAL_REF_SET_SHA256,
+    "semantic_commitment_algorithm": SEMANTIC_COMMITMENT_ALGORITHM,
+}
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+DIGEST_NONZERO_RE = re.compile(r"^(?!0{64}$)[0-9a-f]{64}$")
 DIGIT_RUN_RE = re.compile(r"[0-9]{7,}")
 LETTER_RUN_RE = re.compile(r"[A-Za-zЀ-ӿ]{41,}")
 WORD_FRAGMENT_RE = re.compile(r"[A-Za-zЀ-ӿ]{2,40}")
 OPAQUE_ID_PATTERN = r"(?:[0-9a-f]{12}|[0-9a-f]{16}|[0-9a-f]{64}|H[0-9]{3})"
 OPAQUE_ID_RE = re.compile(rf"^{OPAQUE_ID_PATTERN}$")
-METADATA_TEXT_RE = re.compile(rf"^metadata:{OPAQUE_ID_PATTERN}$")
+METADATA_TEXT_RE = re.compile(r"^metadata:[0-9a-f]{64}$")
+CANONICAL_ORIGINAL_REF_RE = re.compile(r"^orig:[0-9a-f]{16}$")
+CANONICAL_SUPPLEMENTAL_REF_RE = re.compile(r"^supp:G[0-9]{3}:H[0-9]{3}$")
+SOURCE_EVENT_REF_RE = re.compile(r"^event:[0-9a-f]{64}$")
+EXPECTED_VALUE_REF_RE = re.compile(r"^value:[0-9a-f]{64}$")
+SYNTHETIC_TEXT_RE = re.compile(r"^synthetic(?::[0-9a-f]{64})?$")
+UTC_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z)?$"
+)
 CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
 LATIN_RE = re.compile(r"[A-Za-z]")
 # Fields whose values are commit SHAs (40 hex or "unknown") by contract.
 SHA_KEYS = frozenset({"build_sha", "commit", "fix_commit"})
 # Fields whose values are ledger/ruling/test identifiers or derived identity;
 # their source fields are independently privacy-checked.
-IDENTIFIER_KEYS = frozenset({"id", "dedup_key", "ref", "evidence_refs"})
+IDENTIFIER_KEYS = frozenset(
+    {
+        "id",
+        "dedup_key",
+        "ref",
+        "evidence_refs",
+        "value_ref",
+        "source_event_refs",
+        "covered_adjudication_refs",
+        "covered_source_event_refs",
+    }
+)
+SAFE_ENUM_VALUES = frozenset(
+    {
+        *STATUSES,
+        *PRIVACY_CLASSES,
+        *ADJUDICATION_CLASSIFICATIONS,
+        *ADJUDICATION_DISPOSITIONS,
+        *EXPECTED_FORM_STATUSES,
+        *EXPECTED_AUTHORITIES,
+        *CAUSAL_CONFIDENCES,
+        *OWNER_LANES,
+        *NORMALIZED_CLASSES,
+        *ADJUDICATION_PRIVACY_CLASSES,
+        *ADJUDICATION_GRAINS,
+        *ADJUDICATION_SOURCE_KINDS,
+        "script_flip_bg_to_en",
+        "script_flip_en_to_bg",
+        "inconsistent_acceptance",
+        "unknown",
+        "latin",
+        "cyrillic",
+        "mixed",
+        "other",
+        "dual_buffer_short_word",
+        "dual_buffer_prefix_lock",
+        "dual_buffer_unsupported_inheritance",
+        "lang_prior_lock",
+        "accept_gesture",
+        "ledger",
+        "plan",
+        "trace",
+        "probe",
+        "operator_report",
+        "commit",
+        "offline_probe",
+        "structural_trace",
+        "full_trace",
+        "unit_test",
+        "on",
+        "off",
+        "absent",
+        "sealed",
+        SEMANTIC_COMMITMENT_ALGORITHM,
+    }
+)
 
 
 # --------------------------------------------------------------------------
@@ -172,6 +339,15 @@ def script_class(token: str | None) -> str:
     if has_lat:
         return "latin"
     return "other"
+
+
+def canonical_ref_matches_grain(grain: str, ref: str) -> bool:
+    """Return whether an adjudication ref is canonical for its source grain."""
+    if grain == "original_candidate":
+        return CANONICAL_ORIGINAL_REF_RE.fullmatch(ref) is not None
+    if grain == "supplemental_hypothesis":
+        return CANONICAL_SUPPLEMENTAL_REF_RE.fullmatch(ref) is not None
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -297,7 +473,11 @@ def _check_sides(rec: dict, path: str, errors: list[str]) -> None:
         errors.append(f"E_OBSERVED: {path}.privacy_classification: 'unknown' but observed.token is present")
     adjudications = rec.get("adjudications") or []
     expected_not_applicable = bool(adjudications) and all(
-        adj["expected_form_status"] == "not_applicable" for adj in adjudications
+        (adj.get("expected") or {}).get(
+            "status", adj.get("expected_form_status")
+        )
+        == "not_applicable"
+        for adj in adjudications
     )
     if (
         expected["token"] is None
@@ -324,13 +504,33 @@ def _check_gates(rec: dict, path: str, errors: list[str]) -> None:
     status = rec["status"]
     has = {k: rec.get(k) is not None for k in ("reproducer", "red_test", "red_test_waiver", "fix_commit", "verification")}
     has_closure = isinstance(rec.get("closure_reason"), str) and bool(rec["closure_reason"].strip())
+    adjudications = rec.get("adjudications") or []
+    all_guard = bool(adjudications) and all(
+        adjudication.get("disposition") == "guard"
+        for adjudication in adjudications
+    )
+    guard_receipts_complete = all_guard and all(
+        any(
+            source.get("kind") in {"ruling", "receipt"}
+            for source in adjudication.get("source_refs", ())
+        )
+        for adjudication in adjudications
+    )
 
     def need(cond: bool, what: str) -> None:
         if not cond:
             errors.append(f"E_GATE: {path}: status {status!r} requires {what}")
 
-    if status in ("reproduced", "red_tested", "fixed", "verified", "closed", "not_smartkey"):
+    if status in ("reproduced", "red_tested", "fixed", "verified", "closed"):
         need(has["reproducer"], "a reproducer (probe/trace/test evidence)")
+    if status == "not_smartkey":
+        if all_guard:
+            need(
+                guard_receipts_complete,
+                "an adjudication ruling/receipt for every guard mapping",
+            )
+        else:
+            need(has["reproducer"], "a reproducer (probe/trace/test evidence)")
     if status == "red_tested":
         need(has["red_test"], "a linked RED test")
     if status in ("fixed", "verified", "closed"):
@@ -347,6 +547,11 @@ def _check_gates(rec: dict, path: str, errors: list[str]) -> None:
         errors.append(f"E_STATE: {path}: verification without fix_commit")
     if has["red_test"] and has["red_test_waiver"]:
         errors.append(f"E_STATE: {path}: red_test and red_test_waiver are mutually exclusive")
+    if all_guard and (rec.get("reproducer") or {}).get("kind") == "unit_test":
+        errors.append(
+            f"E_ADJ_GUARD_EVIDENCE: {path}.reproducer: guard adjudication "
+            "requires ruling/receipt evidence, not a fabricated unit-test reproducer"
+        )
 
 
 def _walk_strings(value, path: tuple, out: list[tuple[tuple, str]]) -> None:
@@ -371,6 +576,10 @@ def _check_privacy(rec: dict, path: str, errors: list[str]) -> None:
         is_opaque = (
             OPAQUE_ID_RE.fullmatch(text) is not None
             or METADATA_TEXT_RE.fullmatch(text) is not None
+            or CANONICAL_ORIGINAL_REF_RE.fullmatch(text) is not None
+            or CANONICAL_SUPPLEMENTAL_REF_RE.fullmatch(text) is not None
+            or SOURCE_EVENT_REF_RE.fullmatch(text) is not None
+            or EXPECTED_VALUE_REF_RE.fullmatch(text) is not None
         )
         is_identifier = is_sha_field or last_key in IDENTIFIER_KEYS or is_opaque
         if "@" in text:
@@ -391,69 +600,402 @@ def _check_privacy(rec: dict, path: str, errors: list[str]) -> None:
             errors.append(f"E_PRIV_CONTEXT: {path}.minimal_context.{side}: at most one whitespace-free token per side")
 
 
+def _is_enhanced_atom(text: str) -> bool:
+    """Closed allowlist for non-payload strings in enhanced records."""
+    return (
+        text in SAFE_ENUM_VALUES
+        or text in {"[redacted]", "redacted"}
+        or SHA_RE.fullmatch(text) is not None
+        or SHA256_RE.fullmatch(text) is not None
+        or OPAQUE_ID_RE.fullmatch(text) is not None
+        or METADATA_TEXT_RE.fullmatch(text) is not None
+        or CANONICAL_ORIGINAL_REF_RE.fullmatch(text) is not None
+        or CANONICAL_SUPPLEMENTAL_REF_RE.fullmatch(text) is not None
+        or SOURCE_EVENT_REF_RE.fullmatch(text) is not None
+        or EXPECTED_VALUE_REF_RE.fullmatch(text) is not None
+        or SYNTHETIC_TEXT_RE.fullmatch(text) is not None
+        or re.fullmatch(r"anom-[0-9a-f]{12}", text) is not None
+        or UTC_RE.fullmatch(text) is not None
+    )
+
+
 def _payload_fragments(rec: dict) -> set[str]:
-    """Return reconstruction-bearing atoms, never their source order."""
+    """Return unordered reconstruction atoms, including dynamic keys."""
     fragments: set[str] = set()
     for side in ("observed", "expected"):
-        for field in ("token", "descriptor"):
-            value = rec[side][field]
-            if isinstance(value, str) and METADATA_TEXT_RE.fullmatch(value) is None:
-                fragments.add(normalize(value))
-    for side in ("before", "after"):
-        value = rec["minimal_context"][side]
-        if isinstance(value, str):
-            fragments.add(normalize(value))
+        token = rec[side].get("token")
+        if isinstance(token, str) and token not in {"redacted", "[redacted]"}:
+            fragments.add(normalize(token))
 
-    free_text = [rec.get("notes"), rec.get("closure_reason")]
-    reproducer = rec.get("reproducer")
-    verification = rec.get("verification")
-    if reproducer:
-        free_text.append(reproducer.get("summary"))
-    if verification:
-        free_text.append(verification.get("summary"))
-    free_text.extend(source.get("note") for source in rec.get("source_refs", ()))
-    for value in free_text:
-        if isinstance(value, str) and METADATA_TEXT_RE.fullmatch(value) is None:
+    strings: list[tuple[tuple, str]] = []
+    _walk_strings(rec, (), strings)
+    for keys, text in strings:
+        last_key = next((key for key in reversed(keys) if isinstance(key, str)), None)
+        if last_key in {
+            "token",
+            "id",
+            "dedup_key",
+            "recorded_utc",
+            "first_seen_utc",
+            "last_seen_utc",
+        }:
+            continue
+        if text.startswith("synthetic:") and SYNTHETIC_TEXT_RE.fullmatch(text):
+            fragments.add(normalize(text))
+        elif not _is_enhanced_atom(text):
             fragments.update(
-                normalize(word) for word in WORD_FRAGMENT_RE.findall(value)
+                normalize(word) for word in WORD_FRAGMENT_RE.findall(text)
+            )
+
+    flags = rec.get("environment", {}).get("flags") or {}
+    for key in flags:
+        if key.startswith("synthetic:") and SYNTHETIC_TEXT_RE.fullmatch(key):
+            fragments.add(normalize(key))
+        elif not _is_enhanced_atom(key):
+            fragments.update(
+                normalize(word) for word in WORD_FRAGMENT_RE.findall(key)
             )
     return {fragment for fragment in fragments if fragment}
 
 
 def _check_adjudication_privacy(rec: dict, path: str, errors: list[str]) -> None:
-    """Enhanced records carry only isolated values plus opaque metadata."""
+    """Apply the recursive closed allowlist and side-complete privacy rules."""
     if any(rec["minimal_context"].values()):
         errors.append(
             f"E_ADJ_PRIVACY: {path}.minimal_context: enhanced records require null context"
         )
 
-    templated = [
-        ("notes", rec.get("notes")),
-        ("closure_reason", rec.get("closure_reason")),
-        ("observed.descriptor", rec["observed"].get("descriptor")),
-        ("expected.descriptor", rec["expected"].get("descriptor")),
-    ]
-    if rec.get("reproducer"):
-        templated.append(("reproducer.summary", rec["reproducer"].get("summary")))
-    if rec.get("verification"):
-        templated.append(("verification.summary", rec["verification"].get("summary")))
-    for index, source in enumerate(rec.get("source_refs", ())):
-        templated.append((f"source_refs[{index}].note", source.get("note")))
-    for field, value in templated:
-        if isinstance(value, str) and not METADATA_TEXT_RE.fullmatch(value):
+    strings: list[tuple[tuple, str]] = []
+    _walk_strings(rec, (), strings)
+    skipped_fields = {
+        "token",
+        "id",
+        "dedup_key",
+        "recorded_utc",
+        "first_seen_utc",
+        "last_seen_utc",
+    }
+    for keys, text in strings:
+        last_key = next((key for key in reversed(keys) if isinstance(key, str)), None)
+        if last_key in skipped_fields:
+            continue
+        if not _is_enhanced_atom(text):
+            where = path + "." + ".".join(str(key) for key in keys)
             errors.append(
-                f"E_ADJ_PRIVACY: {path}.{field}: enhanced free text must be metadata:<opaque-id>"
+                f"E_ADJ_PRIVACY: {where}: enhanced string is outside the closed allowlist"
             )
+
+    flags = rec.get("environment", {}).get("flags") or {}
+    for key in flags:
+        if not _is_enhanced_atom(key):
+            errors.append(
+                f"E_ADJ_PRIVACY: {path}.environment.flags: dynamic key is outside "
+                "the closed allowlist"
+            )
+
+    privacy_classes = {
+        adjudication["privacy_class"] for adjudication in rec["adjudications"]
+    }
+    if len(privacy_classes) != 1:
+        errors.append(
+            f"E_ADJ_PRIVACY: {path}: one dedup record cannot mix privacy classes"
+        )
+        return
+    privacy_class = next(iter(privacy_classes))
+    tokens = [rec[side]["token"] for side in ("observed", "expected")]
+    descriptors = [rec[side]["descriptor"] for side in ("observed", "expected")]
+    if privacy_class == "public_token":
+        if (
+            rec["privacy_classification"] != "public_token"
+            or rec["observed"]["token"] is None
+        ):
+            errors.append(
+                f"E_ADJ_PRIVACY: {path}: public_token requires an independently "
+                "classified isolated observed token"
+            )
+        for side, token, descriptor in zip(
+            ("observed", "expected"), tokens, descriptors
+        ):
+            if isinstance(token, str) and ("/" in token or "\\" in token):
+                errors.append(
+                    f"E_ADJ_PRIVACY: {path}.{side}.token: public token cannot "
+                    "encode a filesystem path"
+                )
+            if isinstance(descriptor, str) and not METADATA_TEXT_RE.fullmatch(descriptor):
+                errors.append(
+                    f"E_ADJ_PRIVACY: {path}.{side}.descriptor: public representation "
+                    "descriptor must be metadata:<sha256>"
+                )
+    elif privacy_class == "redacted":
+        if rec["privacy_classification"] != "redacted" or any(
+            token not in {None, "redacted", "[redacted]"} for token in tokens
+        ):
+            errors.append(
+                f"E_ADJ_PRIVACY: {path}: redacted requires placeholder/null on both sides"
+            )
+        for side, descriptor in zip(("observed", "expected"), descriptors):
+            if isinstance(descriptor, str) and not METADATA_TEXT_RE.fullmatch(descriptor):
+                errors.append(
+                    f"E_ADJ_PRIVACY: {path}.{side}.descriptor: redacted descriptor "
+                    "must be metadata:<sha256>"
+                )
+    else:
+        if rec["privacy_classification"] != "unknown" or any(
+            token is not None for token in tokens
+        ):
+            errors.append(
+                f"E_ADJ_PRIVACY: {path}: metadata_only cannot carry token payload"
+            )
+        for side, descriptor in zip(("observed", "expected"), descriptors):
+            if isinstance(descriptor, str) and not METADATA_TEXT_RE.fullmatch(descriptor):
+                errors.append(
+                    f"E_ADJ_PRIVACY: {path}.{side}.descriptor: metadata-only "
+                    "descriptor must be metadata:<sha256>"
+                )
+
+
+def _check_expected_envelope(
+    adjudication: dict, path: str, errors: list[str]
+) -> None:
+    expected = adjudication["expected"]
+    status = expected["status"]
+    authority = expected["authority"]
+    value_ref = expected["value_ref"]
+    classification = adjudication["classification"]
+    disposition = adjudication["disposition"]
+    confidence = adjudication["causal_confidence"]
+
+    bridge_status = adjudication.get("expected_form_status")
+    if bridge_status is not None and bridge_status != status:
+        errors.append(
+            f"E_ADJ_EXPECTED: {path}: deprecated expected_form_status disagrees "
+            "with expected.status"
+        )
+    if authority not in EXPECTED_AUTHORITY_BY_STATUS[status]:
+        errors.append(
+            f"E_ADJ_EXPECTED: {path}.expected.authority: {authority!r} is not "
+            f"valid for {status!r}"
+        )
+
+    unique_statuses = {
+        "unique_operator_confirmed",
+        "unique_authoritative_spelling",
+    }
+    null_statuses = {"null_non_unique", "null_pending_operator_intent"}
+    if status in unique_statuses:
+        if not isinstance(value_ref, str) or not EXPECTED_VALUE_REF_RE.fullmatch(value_ref):
+            errors.append(
+                f"E_ADJ_EXPECTED: {path}.expected.value_ref: unique expected form "
+                "requires an opaque value commitment"
+            )
+        if confidence["expected_form"] != "high":
+            errors.append(
+                f"E_ADJ_CONFIDENCE: {path}.causal_confidence.expected_form: "
+                "unique expected form requires high confidence"
+            )
+    elif status in null_statuses:
+        if value_ref is not None:
+            errors.append(
+                f"E_ADJ_EXPECTED: {path}.expected.value_ref: null status cannot "
+                "carry a value commitment"
+            )
+        if confidence["expected_form"] not in {"none", "low", "medium"}:
+            errors.append(
+                f"E_ADJ_CONFIDENCE: {path}.causal_confidence.expected_form: "
+                "null expected form cannot be high/not_applicable"
+            )
+        if (
+            status == "null_pending_operator_intent"
+            and classification != "intent_confirmation_needed"
+        ):
+            errors.append(
+                f"E_ADJ_STATE: {path}: pending operator intent requires "
+                "intent_confirmation_needed"
+            )
+    else:
+        if value_ref is not None:
+            errors.append(
+                f"E_ADJ_EXPECTED: {path}.expected.value_ref: not_applicable "
+                "cannot carry a value commitment"
+            )
+        if confidence["expected_form"] != "not_applicable":
+            errors.append(
+                f"E_ADJ_CONFIDENCE: {path}.causal_confidence.expected_form: "
+                "not_applicable status requires not_applicable confidence"
+            )
+        if disposition == "bug_candidate":
+            errors.append(
+                f"E_ADJ_STATE: {path}: bug candidate needs expected-form adjudication"
+            )
+
+
+def _check_adjudication_item(
+    adjudication: dict,
+    path: str,
+    owner_path: str,
+    errors: list[str],
+    seen_adjudications: dict[str, str],
+    grain_refs: dict[str, set[str]],
+    disposition_refs: dict[str, set[str]],
+    event_owners: dict[str, str],
+) -> tuple[set[str], set[str]]:
+    grain = adjudication["grain"]
+    ref = adjudication["ref"]
+    if not canonical_ref_matches_grain(grain, ref):
+        errors.append(
+            f"E_ADJ_REF: {path}.ref: canonical ref does not match {grain!r}"
+        )
+    prior = seen_adjudications.get(ref)
+    if prior is not None:
+        errors.append(f"E_ADJ_DUP: {path}.ref: mapping already present at {prior}")
+    else:
+        seen_adjudications[ref] = path
+    grain_refs[grain].add(ref)
+
+    classification = adjudication["classification"]
+    disposition = adjudication["disposition"]
+    disposition_refs[disposition].add(ref)
+    if CLASSIFICATION_DISPOSITION[classification] != disposition:
+        errors.append(
+            f"E_ADJ_STATE: {path}: classification {classification!r} requires "
+            f"disposition {CLASSIFICATION_DISPOSITION[classification]!r}"
+        )
+    owner_lane = adjudication["owner_lane"]
+    if owner_lane not in CLASSIFICATION_OWNER_LANES[classification]:
+        errors.append(
+            f"E_ADJ_OWNER: {path}.owner_lane: {owner_lane!r} is outside the "
+            f"exclusive lane matrix for {classification!r}"
+        )
+
+    normalized_class = adjudication["normalized_class"]
+    if grain == "original_candidate" and normalized_class != "not_applicable":
+        errors.append(
+            f"E_ADJ_NORMALIZED: {path}.normalized_class: original mappings "
+            "require the explicit not_applicable sentinel"
+        )
+    if grain == "supplemental_hypothesis" and normalized_class == "not_applicable":
+        errors.append(
+            f"E_ADJ_NORMALIZED: {path}.normalized_class: supplemental mappings "
+            "require their ratified normalized class"
+        )
+
+    confidence = adjudication["causal_confidence"]
+    if confidence["anomaly_or_guard_presence"] not in {"medium", "high"}:
+        errors.append(
+            f"E_ADJ_CONFIDENCE: {path}.causal_confidence.anomaly_or_guard_presence: "
+            "retained mapping requires medium/high confidence"
+        )
+    if disposition == "bug_candidate":
+        for axis in ("runtime_mechanism", "smartkey_attribution"):
+            if confidence[axis] == "not_applicable":
+                errors.append(
+                    f"E_ADJ_CONFIDENCE: {path}.causal_confidence.{axis}: "
+                    "bug candidate requires an explicit confidence level"
+                )
+    else:
+        for axis in ("runtime_mechanism", "smartkey_attribution"):
+            if confidence[axis] != "not_applicable":
+                errors.append(
+                    f"E_ADJ_CONFIDENCE: {path}.causal_confidence.{axis}: "
+                    "guard/exclusion requires not_applicable"
+                )
+    _check_expected_envelope(adjudication, path, errors)
+
+    source_keys: set[tuple[str, str]] = set()
+    source_records: set[str] = set()
+    for source in adjudication["source_refs"]:
+        source_key = (source["kind"], source["ref"])
+        if source_key in source_keys:
+            errors.append(f"E_ADJ_DUP: {path}.source_refs: duplicate source ref")
+        source_keys.add(source_key)
+        if source["kind"] == "source_record":
+            source_records.add(source["ref"])
+    if not source_records:
+        errors.append(
+            f"E_ADJ_STATE: {path}.source_refs: source_record ref is required"
+        )
+
+    source_events = adjudication["source_event_refs"]
+    event_set = set(source_events)
+    if len(event_set) != len(source_events):
+        errors.append(
+            f"E_ADJ_EVENT: {path}.source_event_refs: duplicate event cannot "
+            "increase occurrence count"
+        )
+    for event in event_set:
+        if not SOURCE_EVENT_REF_RE.fullmatch(event):
+            errors.append(
+                f"E_ADJ_EVENT: {path}.source_event_refs: non-canonical event ID"
+            )
+        prior_owner = event_owners.setdefault(event, owner_path)
+        if prior_owner != owner_path:
+            errors.append(
+                f"E_ADJ_EVENT: {path}.source_event_refs: event already reconciled "
+                f"to {prior_owner}"
+            )
+    return source_records, event_set
+
+
+def _check_evidence_coverage(
+    rec: dict,
+    path: str,
+    adjudications: list[dict],
+    errors: list[str],
+) -> None:
+    bug_adjudications = [
+        item for item in adjudications if item["disposition"] == "bug_candidate"
+    ]
+    bug_refs = {item["ref"] for item in bug_adjudications}
+    event_by_ref = {
+        item["ref"]: set(item["source_event_refs"]) for item in bug_adjudications
+    }
+
+    def check(evidence: dict | None, field: str) -> None:
+        if not isinstance(evidence, dict):
+            errors.append(
+                f"E_ADJ_COVERAGE: {path}.{field}: evidence coverage is required"
+            )
+            return
+        covered_refs = evidence.get("covered_adjudication_refs")
+        covered_events = evidence.get("covered_source_event_refs")
+        if not isinstance(covered_refs, list) or not isinstance(covered_events, list):
+            errors.append(
+                f"E_ADJ_COVERAGE: {path}.{field}: covered adjudication and "
+                "source-event refs are required"
+            )
+            return
+        ref_set = set(covered_refs)
+        event_set = set(covered_events)
+        if len(ref_set) != len(covered_refs) or ref_set != bug_refs:
+            errors.append(
+                f"E_ADJ_COVERAGE: {path}.{field}: coverage must equal every bug ref"
+            )
+        required_events = {
+            event for ref in ref_set & bug_refs for event in event_by_ref[ref]
+        }
+        if len(event_set) != len(covered_events) or event_set != required_events:
+            errors.append(
+                f"E_ADJ_COVERAGE: {path}.{field}: source-event coverage is partial"
+            )
+
+    status = rec["status"]
+    if status in {"red_tested", "fixed", "verified", "closed"}:
+        check(rec.get("red_test"), "red_test")
+    if status in {"fixed", "verified", "closed"}:
+        check(rec.get("fix_evidence"), "fix_evidence")
+    if status in {"verified", "closed"}:
+        check(rec.get("verification"), "verification")
 
 
 def _check_adjudication_record(
     rec: dict,
     path: str,
     errors: list[str],
-    seen_adjudications: dict[tuple[str, str], str],
-    grain_refs: dict[str, set[tuple[str, str]]],
-    disposition_refs: dict[str, set[tuple[str, str]]],
+    seen_adjudications: dict[str, str],
+    grain_refs: dict[str, set[str]],
+    disposition_refs: dict[str, set[str]],
     source_fragments: dict[str, set[str]],
+    event_owners: dict[str, str],
 ) -> None:
     adjudications = rec.get("adjudications")
     if not adjudications:
@@ -461,213 +1003,170 @@ def _check_adjudication_record(
 
     _check_adjudication_privacy(rec, path, errors)
     dispositions: set[str] = set()
-    privacy_classes: set[str] = set()
-    null_statuses = {"null_non_unique", "null_pending_operator_intent"}
-    unique_statuses = {"unique_operator_confirmed", "unique_authoritative_spelling"}
-
+    record_events: set[str] = set()
+    fragments = _payload_fragments(rec)
     for index, adjudication in enumerate(adjudications):
         adj_path = f"{path}.adjudications[{index}]"
-        grain = adjudication["grain"]
-        ref = adjudication["ref"]
-        mapping_key = (grain, ref)
-        prior = seen_adjudications.get(mapping_key)
-        if prior is not None:
-            errors.append(
-                f"E_ADJ_DUP: {adj_path}.ref: mapping already present at {prior}"
-            )
-        else:
-            seen_adjudications[mapping_key] = adj_path
-        grain_refs[grain].add(mapping_key)
+        source_records, events = _check_adjudication_item(
+            adjudication,
+            adj_path,
+            path,
+            errors,
+            seen_adjudications,
+            grain_refs,
+            disposition_refs,
+            event_owners,
+        )
+        dispositions.add(adjudication["disposition"])
+        record_events.update(events)
+        for source_ref in source_records:
+            source_fragments.setdefault(source_ref, set()).update(fragments)
 
-        classification = adjudication["classification"]
-        disposition = adjudication["disposition"]
-        dispositions.add(disposition)
-        disposition_refs[disposition].add(mapping_key)
-        if CLASSIFICATION_DISPOSITION[classification] != disposition:
-            errors.append(
-                f"E_ADJ_STATE: {adj_path}: classification {classification!r} "
-                f"requires disposition {CLASSIFICATION_DISPOSITION[classification]!r}"
-            )
-
-        expected_status = adjudication["expected_form_status"]
-        confidence = adjudication["causal_confidence"]
-        if confidence["anomaly_or_guard_presence"] not in ("medium", "high"):
-            errors.append(
-                f"E_ADJ_CONFIDENCE: {adj_path}.causal_confidence.anomaly_or_guard_presence: "
-                "a retained mapping requires medium or high confidence"
-            )
-        if expected_status in unique_statuses:
-            if (
-                not isinstance(rec["expected"]["token"], str)
-                or rec["needs_operator_confirmation"]
-            ):
-                errors.append(
-                    f"E_ADJ_EXPECTED: {adj_path}: unique expected status requires a stored, confirmed token"
-                )
-            if confidence["expected_form"] != "high":
-                errors.append(
-                    f"E_ADJ_CONFIDENCE: {adj_path}.causal_confidence.expected_form: "
-                    "a unique expected form requires high confidence"
-                )
-        elif expected_status in null_statuses:
-            if (
-                rec["expected"]["token"] is not None
-                or rec["expected"]["descriptor"] is not None
-            ):
-                errors.append(
-                    f"E_ADJ_EXPECTED: {adj_path}: null expected status cannot carry an expected value"
-                )
-            if not rec["needs_operator_confirmation"]:
-                errors.append(
-                    f"E_ADJ_EXPECTED: {adj_path}: null expected status requires operator confirmation"
-                )
-            if confidence["expected_form"] not in ("none", "low", "medium"):
-                errors.append(
-                    f"E_ADJ_CONFIDENCE: {adj_path}.causal_confidence.expected_form: "
-                    "a non-unique expected form cannot be high or not_applicable"
-                )
-            if (
-                expected_status == "null_pending_operator_intent"
-                and classification != "intent_confirmation_needed"
-            ):
-                errors.append(
-                    f"E_ADJ_STATE: {adj_path}: pending operator intent requires intent_confirmation_needed"
-                )
-        else:
-            if (
-                rec["expected"]["token"] is not None
-                or rec["expected"]["descriptor"] is not None
-            ):
-                errors.append(
-                    f"E_ADJ_EXPECTED: {adj_path}: not_applicable cannot carry an expected value"
-                )
-            if confidence["expected_form"] != "not_applicable":
-                errors.append(
-                    f"E_ADJ_CONFIDENCE: {adj_path}.causal_confidence.expected_form: "
-                    "not_applicable status requires not_applicable confidence"
-                )
-            if disposition == "bug_candidate":
-                errors.append(
-                    f"E_ADJ_STATE: {adj_path}: a bug candidate needs an expected-form adjudication"
-                )
-
-        if disposition == "bug_candidate":
-            for axis in ("runtime_mechanism", "smartkey_attribution"):
-                if confidence[axis] == "not_applicable":
-                    errors.append(
-                        f"E_ADJ_CONFIDENCE: {adj_path}.causal_confidence.{axis}: "
-                        "bug candidates require an explicit confidence level"
-                    )
-        else:
-            for axis in ("runtime_mechanism", "smartkey_attribution"):
-                if confidence[axis] != "not_applicable":
-                    errors.append(
-                        f"E_ADJ_CONFIDENCE: {adj_path}.causal_confidence.{axis}: "
-                        "guards and exclusions require not_applicable"
-                    )
-
-        if (
-            classification == "source_authorship_exclusion"
-            and adjudication["owner_lane"] != "outside_product_source_authorship"
-        ):
-            errors.append(
-                f"E_ADJ_STATE: {adj_path}.owner_lane: source exclusion has a fixed owner lane"
-            )
-        if (
-            classification == "language_quality_feature_candidate"
-            and adjudication["owner_lane"] != "future_language_quality_layer"
-        ):
-            errors.append(
-                f"E_ADJ_STATE: {adj_path}.owner_lane: language quality has a fixed owner lane"
-            )
-
-        privacy_class = adjudication["privacy_class"]
-        privacy_classes.add(privacy_class)
-        if privacy_class == "public_token":
-            if (
-                rec["privacy_classification"] != "public_token"
-                or rec["observed"]["token"] is None
-            ):
-                errors.append(
-                    f"E_ADJ_PRIVACY: {adj_path}.privacy_class: public_token requires an isolated public token"
-                )
-        elif privacy_class == "metadata_only":
-            has_payload = any(
-                rec[side]["token"] is not None for side in ("observed", "expected")
-            )
-            if has_payload or rec["privacy_classification"] != "unknown":
-                errors.append(
-                    f"E_ADJ_PRIVACY: {adj_path}.privacy_class: metadata_only cannot carry token payload"
-                )
-        else:
-            if rec["privacy_classification"] != "redacted" or rec["observed"][
-                "token"
-            ] not in {
-                "redacted",
-                "[redacted]",
-            }:
-                errors.append(
-                    f"E_ADJ_PRIVACY: {adj_path}.privacy_class: redacted requires the canonical placeholder"
-                )
-
-        source_keys: set[tuple[str, str]] = set()
-        source_records: set[str] = set()
-        for source in adjudication["source_refs"]:
-            source_key = (source["kind"], source["ref"])
-            if source_key in source_keys:
-                errors.append(
-                    f"E_ADJ_DUP: {adj_path}.source_refs: duplicate opaque source ref"
-                )
-            source_keys.add(source_key)
-            if source["kind"] == "source_record":
-                source_records.add(source["ref"])
-        if not source_records:
-            errors.append(
-                f"E_ADJ_STATE: {adj_path}.source_refs: source_record ref is required"
-            )
-        if privacy_class != "metadata_only":
-            fragments = _payload_fragments(rec)
-            for source_ref in source_records:
-                source_fragments.setdefault(source_ref, set()).update(fragments)
-
-    if len(privacy_classes) > 1:
+    if rec["occurrence_count"] != len(record_events):
         errors.append(
-            f"E_ADJ_PRIVACY: {path}: one dedup record cannot mix privacy classes"
+            f"E_ADJ_EVENT: {path}.occurrence_count: {rec['occurrence_count']} does "
+            f"not equal {len(record_events)} distinct source event(s)"
+        )
+    if "source_exclusion" in dispositions:
+        errors.append(
+            f"E_ADJ_STATE: {path}: source exclusions belong only in top-level "
+            "source_exclusions"
         )
     has_bug = "bug_candidate" in dispositions
     if has_bug and rec["status"] == "not_smartkey":
         errors.append(
-            f"E_ADJ_STATE: {path}: a bug-candidate record cannot be not_smartkey"
+            f"E_ADJ_STATE: {path}: bug-candidate record cannot be not_smartkey"
         )
     if not has_bug and rec["status"] != "not_smartkey":
         errors.append(
-            f"E_ADJ_STATE: {path}: an all-guard/exclusion record must be not_smartkey"
+            f"E_ADJ_STATE: {path}: all-guard record must be not_smartkey"
         )
     if not has_bug and any(
         rec.get(field) is not None
-        for field in ("red_test", "red_test_waiver", "fix_commit", "verification")
+        for field in (
+            "red_test",
+            "red_test_waiver",
+            "fix_commit",
+            "fix_evidence",
+            "verification",
+        )
     ):
         errors.append(
-            f"E_ADJ_STATE: {path}: guards/exclusions cannot carry fix lifecycle evidence"
+            f"E_ADJ_STATE: {path}: guards cannot carry fix lifecycle evidence"
         )
+    if has_bug:
+        _check_evidence_coverage(rec, path, adjudications, errors)
+
+
+def semantic_commitment_payload(doc: dict) -> list[dict]:
+    """Canonical, non-sensitive tuple set committed by the sealed contract."""
+    adjudications = [
+        (adjudication, rec["id"])
+        for rec in doc.get("records", ())
+        for adjudication in rec.get("adjudications", ())
+    ]
+    adjudications.extend(
+        (adjudication, "top_level_source_exclusion")
+        for adjudication in doc.get("source_exclusions", ())
+    )
+    return [
+        {
+            "ref": item["ref"],
+            "grain": item["grain"],
+            "classification": item["classification"],
+            "disposition": item["disposition"],
+            "normalized_class": item["normalized_class"],
+            "expected": {
+                "status": item["expected"]["status"],
+                "authority": item["expected"]["authority"],
+                "value_commitment": item["expected"]["value_ref"],
+            },
+            "causal_confidence": item["causal_confidence"],
+            "owner_lane": item["owner_lane"],
+            "privacy_class": item["privacy_class"],
+            "source_binding": {
+                "target_record_id": target_record_id,
+                "source_refs": sorted(
+                    f"{source['kind']}:{source['ref']}"
+                    for source in item["source_refs"]
+                ),
+                "source_event_refs": sorted(item["source_event_refs"]),
+            },
+        }
+        for item, target_record_id in sorted(
+            adjudications, key=lambda value: value[0]["ref"]
+        )
+    ]
+
+
+def semantic_commitment_sha256(doc: dict) -> str:
+    payload = json.dumps(
+        semantic_commitment_payload(doc),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def canonical_ref_set_sha256(refs: set[str]) -> str:
+    payload = json.dumps(
+        sorted(refs), ensure_ascii=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _check_adjudication_contract(
     doc: dict,
     errors: list[str],
-    seen_adjudications: dict[tuple[str, str], str],
-    grain_refs: dict[str, set[tuple[str, str]]],
-    disposition_refs: dict[str, set[tuple[str, str]]],
+    seen_adjudications: dict[str, str],
+    grain_refs: dict[str, set[str]],
+    disposition_refs: dict[str, set[str]],
     source_fragments: dict[str, set[str]],
 ) -> None:
     contract = doc.get("adjudication_contract")
     if seen_adjudications and contract is None:
-        errors.append("E_ADJ_COUNT: $: adjudications require adjudication_contract")
+        errors.append(
+            "E_ADJ_CONTRACT: $: enhanced mappings require a sealed contract"
+        )
     if contract is not None and not seen_adjudications:
         errors.append(
-            "E_ADJ_COUNT: $: adjudication_contract has no mapped adjudication IDs"
+            "E_ADJ_CONTRACT: $: sealed contract has no enhanced mappings"
         )
     if contract is not None:
+        for name, expected in SEALED_CONTRACT_CONSTS.items():
+            if contract.get(name) != expected:
+                errors.append(
+                    f"E_ADJ_CONTRACT: $.adjudication_contract.{name}: value is "
+                    "not the validator-pinned audit contract"
+                )
+        if len(doc["records"]) != PROJECTED_RECORD_COUNT:
+            errors.append(
+                f"E_ADJ_COUNT: $.records: projected registry has {len(doc['records'])} "
+                f"record(s), expected {PROJECTED_RECORD_COUNT}"
+            )
+        record_shape = {
+            "bug_record_count": 0,
+            "guard_record_count": 0,
+            "legacy_record_count": 0,
+        }
+        for rec in doc["records"]:
+            adjudications = rec.get("adjudications") or []
+            if not adjudications:
+                record_shape["legacy_record_count"] += 1
+            elif any(
+                item["disposition"] == "bug_candidate"
+                for item in adjudications
+            ):
+                record_shape["bug_record_count"] += 1
+            else:
+                record_shape["guard_record_count"] += 1
+        for name, expected in RECORD_SHAPE_CONTRACT.items():
+            if record_shape[name] != expected:
+                errors.append(
+                    f"E_ADJ_COUNT: $.records: {name} is {record_shape[name]}, "
+                    f"expected {expected}"
+                )
         for name, expected in ADJUDICATION_COUNT_CONTRACT.items():
             actual = (
                 len(grain_refs[name])
@@ -676,7 +1175,35 @@ def _check_adjudication_contract(
             )
             if actual != expected:
                 errors.append(
-                    f"E_ADJ_COUNT: $: {name} has {actual} unique ID(s), expected {expected}"
+                    f"E_ADJ_COUNT: $: {name} has {actual} unique ref(s), "
+                    f"expected {expected}"
+                )
+        refs = set(seen_adjudications)
+        actual_ref_digest = canonical_ref_set_sha256(refs)
+        if actual_ref_digest != CANONICAL_REF_SET_SHA256:
+            errors.append(
+                "E_ADJ_REF_SET: $: canonical adjudication namespace differs "
+                "from the ratified 159-ref set"
+            )
+        if contract.get("canonical_ref_set_sha256") != actual_ref_digest:
+            errors.append(
+                "E_ADJ_REF_SET: $.adjudication_contract: stored ref-set digest "
+                "does not match mapped refs"
+            )
+        stored_semantic = contract.get("semantic_commitment_sha256")
+        if not isinstance(stored_semantic, str) or not DIGEST_NONZERO_RE.fullmatch(
+            stored_semantic
+        ):
+            errors.append(
+                "E_ADJ_COMMITMENT: $.adjudication_contract: semantic digest must "
+                "be a nonzero lowercase sha256"
+            )
+        else:
+            actual_semantic = semantic_commitment_sha256(doc)
+            if stored_semantic != actual_semantic:
+                errors.append(
+                    "E_ADJ_COMMITMENT: $.adjudication_contract: semantic tuple "
+                    "commitment does not match mapped adjudications"
                 )
     for fragments in source_fragments.values():
         if len(fragments) > MAX_RECONSTRUCTION_FRAGMENTS_PER_SOURCE:
@@ -685,6 +1212,102 @@ def _check_adjudication_contract(
                 f"{len(fragments)} distinct payload fragments; maximum is "
                 f"{MAX_RECONSTRUCTION_FRAGMENTS_PER_SOURCE}"
             )
+
+
+def _adjudication_locations(doc: dict) -> list[tuple[str, dict]]:
+    locations: list[tuple[str, dict]] = []
+    records = doc.get("records")
+    if not isinstance(records, list):
+        records = []
+    for index, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            continue
+        adjudications = rec.get("adjudications")
+        if not isinstance(adjudications, list):
+            continue
+        for adj_index, adjudication in enumerate(adjudications):
+            if isinstance(adjudication, dict):
+                locations.append(
+                    (f"$.records[{index}].adjudications[{adj_index}]", adjudication)
+                )
+    source_exclusions = doc.get("source_exclusions")
+    if not isinstance(source_exclusions, list):
+        source_exclusions = []
+    for index, adjudication in enumerate(source_exclusions):
+        if isinstance(adjudication, dict):
+            locations.append((f"$.source_exclusions[{index}]", adjudication))
+    return locations
+
+
+def _check_enhanced_preflight(doc, errors: list[str]) -> None:
+    """Emit fail-closed domain codes even when structural validation fails."""
+    if not isinstance(doc, dict):
+        return
+    locations = _adjudication_locations(doc)
+    contract = doc.get("adjudication_contract")
+    if locations and (
+        not isinstance(contract, dict) or contract.get("state") != "sealed"
+    ):
+        errors.append(
+            "E_ADJ_CONTRACT: $: enhanced mappings require state='sealed' contract"
+        )
+    if doc.get("source_exclusions") and not locations:
+        errors.append(
+            "E_ADJ_CONTRACT: $.source_exclusions: exclusions require enhanced mappings"
+        )
+    if isinstance(contract, dict):
+        digest = contract.get("semantic_commitment_sha256")
+        if not isinstance(digest, str) or not DIGEST_NONZERO_RE.fullmatch(digest):
+            errors.append(
+                "E_ADJ_COMMITMENT: $.adjudication_contract: semantic digest must "
+                "be a nonzero lowercase sha256"
+            )
+        exclusions = doc.get("source_exclusions")
+        if not isinstance(exclusions, list) or len(exclusions) != 2:
+            errors.append(
+                "E_ADJ_COUNT: $.source_exclusions: sealed contract requires "
+                "exactly two top-level exclusions"
+            )
+    for path, adjudication in locations:
+        grain = adjudication.get("grain")
+        ref = adjudication.get("ref")
+        if not isinstance(grain, str) or not isinstance(ref, str) or not canonical_ref_matches_grain(
+            grain, ref
+        ):
+            errors.append(
+                f"E_ADJ_REF: {path}.ref: ref must use the canonical grain namespace"
+            )
+        normalized_class = adjudication.get("normalized_class")
+        if normalized_class is None:
+            errors.append(
+                f"E_ADJ_NORMALIZED: {path}: normalized_class is mandatory"
+            )
+        elif grain == "original_candidate" and normalized_class != "not_applicable":
+            errors.append(
+                f"E_ADJ_NORMALIZED: {path}: original mapping requires not_applicable"
+            )
+        elif (
+            grain == "supplemental_hypothesis"
+            and normalized_class == "not_applicable"
+        ):
+            errors.append(
+                f"E_ADJ_NORMALIZED: {path}: supplemental mapping cannot use not_applicable"
+            )
+        source_events = adjudication.get("source_event_refs")
+        if isinstance(source_events, list):
+            strings_only = all(isinstance(event, str) for event in source_events)
+            if (
+                not strings_only
+                or len(source_events) != len(set(source_events))
+                or any(
+                    SOURCE_EVENT_REF_RE.fullmatch(event) is None
+                    for event in source_events
+                )
+            ):
+                errors.append(
+                    f"E_ADJ_EVENT: {path}.source_event_refs: event IDs must be "
+                    "unique canonical event:<sha256> values"
+                )
 
 
 def _check_schema_drift(schema: dict, errors: list[str]) -> None:
@@ -698,8 +1321,10 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
         ("adjudication_classification", ADJUDICATION_CLASSIFICATIONS),
         ("adjudication_disposition", ADJUDICATION_DISPOSITIONS),
         ("expected_form_status", EXPECTED_FORM_STATUSES),
+        ("expected_authority", EXPECTED_AUTHORITIES),
         ("causal_confidence", CAUSAL_CONFIDENCES),
         ("owner_lane", OWNER_LANES),
+        ("normalized_class", NORMALIZED_CLASSES),
         ("adjudication_privacy_class", ADJUDICATION_PRIVACY_CLASSES),
     )
     for definition, expected in enum_contracts:
@@ -717,21 +1342,32 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
         errors.append(
             "E_SCHEMA_DRIFT: schema adjudication source kind differs from validator contract"
         )
+    contract_props = definitions.get("adjudication_contract", {}).get(
+        "properties", {}
+    )
+    for name, expected in SEALED_CONTRACT_CONSTS.items():
+        if contract_props.get(name, {}).get("const") != expected:
+            errors.append(
+                f"E_SCHEMA_DRIFT: schema adjudication contract pin {name!r} "
+                "differs from validator contract"
+            )
 
 
 def validate_document(doc, schema: dict) -> list[str]:
     """Return every violation for an in-memory registry document."""
     errors: list[str] = []
     _check_schema_drift(schema, errors)
+    _check_enhanced_preflight(doc, errors)
     SchemaChecker(schema).check(schema, doc, "$", errors)
-    if errors:
+    if any(error.startswith(("E_SCHEMA", "E_ENUM")) for error in errors):
         return errors  # semantic checks assume the structural contract holds
     seen_keys: dict[str, str] = {}
     seen_ids: dict[str, str] = {}
-    seen_adjudications: dict[tuple[str, str], str] = {}
+    seen_adjudications: dict[str, str] = {}
     grain_refs = {grain: set() for grain in ADJUDICATION_GRAINS}
     disposition_refs = {disposition: set() for disposition in ADJUDICATION_DISPOSITIONS}
     source_fragments: dict[str, set[str]] = {}
+    event_owners: dict[str, str] = {}
     for i, rec in enumerate(doc["records"]):
         path = f"$.records[{i}]"
         _check_identity(rec, path, errors)
@@ -753,7 +1389,40 @@ def validate_document(doc, schema: dict) -> list[str]:
             grain_refs,
             disposition_refs,
             source_fragments,
+            event_owners,
         )
+    for index, adjudication in enumerate(doc.get("source_exclusions", ())):
+        path = f"$.source_exclusions[{index}]"
+        _source_records, _events = _check_adjudication_item(
+            adjudication,
+            path,
+            path,
+            errors,
+            seen_adjudications,
+            grain_refs,
+            disposition_refs,
+            event_owners,
+        )
+        if (
+            adjudication["grain"] != "supplemental_hypothesis"
+            or adjudication["classification"] != "source_authorship_exclusion"
+            or adjudication["disposition"] != "source_exclusion"
+            or adjudication["normalized_class"] != "source_harness_framing"
+            or adjudication["owner_lane"] != "outside_product_source_authorship"
+            or adjudication["privacy_class"] != "metadata_only"
+        ):
+            errors.append(
+                f"E_ADJ_STATE: {path}: top-level exclusion must use the exact "
+                "source-harness exclusion envelope"
+            )
+        if not any(
+            source["kind"] in {"ruling", "receipt"}
+            for source in adjudication["source_refs"]
+        ):
+            errors.append(
+                f"E_ADJ_GUARD_EVIDENCE: {path}.source_refs: exclusion requires "
+                "a ruling/receipt"
+            )
     _check_adjudication_contract(
         doc,
         errors,

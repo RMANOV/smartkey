@@ -45,7 +45,9 @@ One record per **(observed, expected)** pair. Fields, in file order:
   guessed.
 - `repeat` / `occurrence_count` — count of distinct observation events (a live
   sighting, or one probe session; several sightings inside one text count
-  each). `repeat` must equal `occurrence_count > 1`.
+  each). `repeat` must equal `occurrence_count > 1`. For an enhanced G0 record,
+  this count is recomputed from the union of its adjudications'
+  `source_event_refs`; repeating an event ID cannot inflate the count.
 - `environment` — `app_surface`, `os`, `build_sha` (40 hex or `unknown`),
   `build_label`, `flags` (map of flag name to `on|off|absent|unknown`, or
   `null` when nothing was observable). Environment of the first sighting;
@@ -64,6 +66,9 @@ One record per **(observed, expected)** pair. Fields, in file order:
 - `red_test` — `{path, name, commit}` (40-hex commit that contains the test),
   or `null`; `red_test_waiver` explains a not-applicable test (mutually exclusive).
 - `fix_commit` — exact 40-hex commit or `null`.
+- `fix_evidence` — enhanced-record coverage envelope for `fix_commit`, or
+  `null`: exact `covered_adjudication_refs` plus the corresponding
+  `covered_source_event_refs`. Legacy records may omit it.
 - `verification` — `{build_sha, evidence_refs, surface, summary}`: post-fix
   evidence **on the reported surface**, or `null`.
 - `closure_reason` — required for `closed` and `not_smartkey`.
@@ -74,25 +79,40 @@ One record per **(observed, expected)** pair. Fields, in file order:
   grants no right to quote the operator's text.
 - `notes` — short free text (max 500 chars, single line).
 - `adjudications` — optional only for backwards-compatible migration of the
-  pre-G0 records. Once present anywhere, every item maps exactly one opaque
-  original-candidate or supplemental-hypothesis ID and the top-level
+  pre-G0 records. Once present anywhere, every item maps exactly one canonical
+  original-candidate or supplemental-hypothesis ref and the sealed top-level
   `adjudication_contract` becomes mandatory. Multiple adjudications may map to
-  one deterministic dedup record; this preserves source-grain accounting when
-  the registry record count is smaller than the adjudication count.
+  one deterministic dedup record; expected authority, expected commitment,
+  evidence, privacy and source events stay per-adjudication across that fan-in.
 
 ## G0 adjudication envelope
 
-`adjudication_contract` pins the ruling ref, private-artifact SHA-256 and the
-ratified units: 106 original IDs + 53 supplemental IDs, classified as 125 bug
-candidates + 32 guards + 2 source exclusions. The validator derives every
-count from unique `(grain, ref)` pairs; stored summary numbers never substitute
-for ID accounting.
+The unchanged 20-record legacy registry may omit the G0 layer. As soon as one
+enhanced adjudication or source exclusion exists, `adjudication_contract` is
+mandatory and `state` must be `sealed`. It pins ruling `6e0704632fef`, the
+metadata-only resealed adjudication receipt SHA-256
+`92c6dd612be8095d54dc385044c60e9d33e91d0ed9e9f62f6701c87722edbb72`,
+the stale-but-structurally-audited mapping-draft receipt
+`7838b51bf55fbe7f7ac2ec7e1f5fbb0285df425242b1cbcfeaccaa3a0a6902a4`,
+and the merged security/crosswalk contract version. The mapping draft is an
+import-HOLD input, not current registry data.
+
+The sealed accounting is exact: 106 original refs + 53 supplemental refs,
+classified as 125 bug candidates + 32 guards + 2 source exclusions. Dedup
+projects those mappings into 76 bug records + 26 guard records, retains 9
+legacy records, and therefore yields 111 records. The two source exclusions
+live in top-level `source_exclusions[]`, never as anomaly records. They still
+participate in both 106/53 source-grain and 125/32/2 disposition accounting.
 
 Each `adjudications[]` item contains no prose and has these fields:
 
-- `grain` + `ref` — `original_candidate` or `supplemental_hypothesis`, plus a
-  hash/ID-shaped opaque reference. A mapping ID may appear exactly once across
-  the whole registry.
+- `grain` + `ref` — exact namespace grammar: `orig:<16-lowercase-hex>` for an
+  `original_candidate`; `supp:G###:H###` for a
+  `supplemental_hypothesis`. Grammar and grain are cross-checked, and a ref may
+  appear exactly once across records plus top-level exclusions. All-letter hex
+  is valid. The authoritative sorted-ref-set commitment is
+  `81168506c76776f060aaf9cd71bb4ed0e2fbde31b286ac30b69823bc8a54a5ee`:
+  SHA-256 of the sorted ref array serialized as compact ASCII JSON.
 - `classification` — one of `mechanical_red_candidate`,
   `instrumentation_first_candidate`, `language_quality_feature_candidate`,
   `intent_confirmation_needed`, `guard_not_bug_unless_intent_changes`, or
@@ -100,21 +120,60 @@ Each `adjudications[]` item contains no prose and has these fields:
 - `disposition` — the derived coarse register: `bug_candidate`, `guard`, or
   `source_exclusion`. The validator rejects a classification/disposition
   mismatch.
-- `expected_form_status` — `null_non_unique`,
-  `null_pending_operator_intent`, `unique_operator_confirmed`,
-  `unique_authoritative_spelling`, or `not_applicable`. A unique status requires
-  a stored confirmed token; a null status cannot carry an expected value.
+- `normalized_class` — strict enum of every ratified supplemental mapping class,
+  including `source_harness_framing`. Because the final source has no such axis
+  for the 106 originals, they must use the explicit `not_applicable` sentinel;
+  supplemental mappings and exclusions may never use that sentinel.
+- `expected` — per-adjudication `{status, authority, value_ref}`. Status is
+  `null_non_unique`, `null_pending_operator_intent`,
+  `unique_operator_confirmed`, `unique_authoritative_spelling`, or
+  `not_applicable`; authority is `final|null|operator|authoritative|legacy_bridge|not_applicable`.
+  Unique expected forms carry `value:<sha256>` rather than requiring a literal
+  token. Null/not-applicable forms carry `null`. This represents a redacted
+  unique expected form and split-component fan-in without leaking or collapsing
+  distinct expected values. Deprecated `expected_form_status`, when present
+  during additive migration, must equal `expected.status`.
 - `causal_confidence` — independent `anomaly_or_guard_presence`,
   `expected_form`, `runtime_mechanism`, and `smartkey_attribution` axes. Each is
   `none|low|medium|high|not_applicable`; one axis never stands in for another.
 - `owner_lane` — one of the ratified G0-G6/deferred lane identifiers from
-  `schema.json`. Source exclusions and language-quality candidates have fixed
-  owner lanes.
+  `schema.json`, constrained by an exact classification-to-lane allow matrix.
+  Outside-product, guard and language-quality lanes cannot be borrowed by an
+  unrelated classification.
 - `privacy_class` — `public_token`, `redacted`, or `metadata_only`, coupled to
-  the record payload and legacy `privacy_classification`.
+  both record sides and legacy `privacy_classification`. Redacted means
+  placeholder/null on observed and expected; metadata-only means no token on
+  either side; a public literal is treated independently on each side.
 - `source_refs` — non-empty opaque `{kind, ref}` pairs. At least one
-  `source_record` is mandatory; refs contain only a 12/16/64-hex identifier or
-  a short hypothesis ID, never a path, label, sentence, or user text.
+  `source_record` is mandatory; refs contain only opaque identifiers, never a
+  path, label, sentence, or user text. Guards and exclusions additionally need
+  an adjudication `ruling` or `receipt` ref.
+- `source_event_refs` — non-empty canonical `event:<sha256>` IDs. An event may
+  support several split mappings inside one dedup record, but it cannot be
+  reconciled to two records and cannot increment `occurrence_count` twice.
+
+## Exact semantic commitment
+
+Counts cannot detect count-preserving substitutions. The sealed contract also
+stores a nonzero `semantic_commitment_sha256`, recomputed over all 159 mappings
+(record adjudications plus top-level exclusions). The serialization algorithm
+is `sha256-canonical-json-v1`:
+
+1. Build one object per mapping containing `ref`, `grain`, `classification`,
+   `disposition`, `normalized_class`, expected `status`/`authority`/
+   `value_commitment`, all four confidence axes, `owner_lane`, `privacy_class`,
+   the target record ID (or top-level-exclusion sentinel), sorted `(kind, ref)`
+   source bindings and sorted source-event refs.
+2. Sort mapping objects by `ref`.
+3. Serialize as UTF-8 JSON with ASCII escaping, sorted object keys and compact
+   separators (`,` and `:`), then SHA-256 the exact bytes.
+
+There is deliberately no zero or placeholder digest. A synthetic validator
+fixture uses the real opaque 159-ref namespace, synthetic-only payloads and
+its own honestly recomputed nonzero semantic digest. The real import must
+compute and externally receipt its reviewed semantic digest in the same
+integration commit; this schema task does not import data or invent expected
+authority, value commitments or source events.
 
 ## Lifecycle gates (enforced by `validate.py`)
 
@@ -126,18 +185,24 @@ Each `adjudications[]` item contains no prose and has these fields:
 | `fixed` | `reproducer` + `fix_commit` + (`red_test` or `red_test_waiver`) |
 | `verified` | all of `fixed` + `verification` on the reported surface |
 | `closed` | all of `verified` + `closure_reason` |
-| `not_smartkey` | `reproducer` (diagnostic evidence) + `closure_reason` |
+| `not_smartkey` | legacy/non-guard: `reproducer` + `closure_reason`; enhanced all-guard: per-mapping ruling/receipt + `closure_reason` |
 
 Open/reproduced/red_tested records may not carry `fix_commit` or
 `verification`; `verification` always implies `fix_commit`. A record whose
 expected form is unconfirmed cannot advance past `reproduced`.
 
 For adjudicated records, lifecycle is also coupled to disposition: a record
-with any bug-candidate mapping cannot be `not_smartkey`; a record containing
-only guards/source exclusions must be `not_smartkey` and cannot carry fix
-evidence. This record-level rule permits dedup to retain several source-grain
-mappings without turning a guard into a defect or hiding a real defect behind
-a guard.
+with any bug-candidate mapping cannot be `not_smartkey`; an all-guard record
+must be `not_smartkey` and cannot carry fix evidence. A guard is justified by
+its adjudication/ruling receipt, not by manufacturing a `unit_test` reproducer.
+Source exclusions never enter the record lifecycle because they live outside
+`records`.
+
+For a bug record, advancing to `red_tested` requires `red_test` coverage equal
+to every bug adjudication ref and the corresponding source-event union.
+`fixed` adds the same exact coverage in `fix_evidence`; `verified`/`closed` add
+it in `verification`. Duplicate refs/events and partial coverage fail. Thus one
+fixed component cannot close an uncovered sibling mapping in a fan-in record.
 
 ## Privacy rules (enforced)
 
@@ -149,14 +214,21 @@ identifier fields (`build_sha`, `commit`, `fix_commit`, `ref`,
 newlines; more than one token per context side; whitespace inside a token.
 Unknown provenance is written as `unknown` / `null`, never inferred.
 
-G0 adds a second, aggregate privacy gate for adjudicated records. Context is
-always null; free text is null or `metadata:<opaque-id>`; `metadata_only`
-cannot carry token payload. The validator groups every payload-bearing string
-by opaque `source_record` and rejects more than eight distinct fragments across
-all linked records (`E_PRIV_AGGREGATE`). This closes the split-record attack in
-which individually short values can be assembled into private text. Synthetic
-validator fixtures remain valid when they use isolated synthetic tokens and
-distinct hash-shaped source IDs; no production-data exception exists.
+G0 adds a closed, recursive allowlist for every string-bearing enhanced field.
+Environment labels and dynamic flag keys; legacy source refs/surfaces;
+reproducer, test and verification refs/paths/names/surfaces; summaries, notes,
+descriptors and closure reasons must be enums, SHAs, canonical opaque IDs,
+`metadata:<64-lowercase-hex>` or null. JSON Schema's
+`additionalProperties: false` closes structural dictionary keys; the validator
+separately checks the dynamic `flags` keys. Clearly synthetic validator values
+use the reserved `synthetic` / `synthetic:<sha256>` forms.
+
+The aggregate gate walks values and dynamic keys, assigns every
+reconstruction-bearing fragment to each linked opaque `source_record`, and
+rejects more than eight distinct fragments across linked records
+(`E_PRIV_AGGREGATE`). `metadata:<sha256>` descriptors do not consume the
+budget. This closes split-record and split-field reconstruction attacks; there
+is no production-data exception.
 
 ## Adding or updating a record
 
@@ -171,11 +243,12 @@ distinct hash-shaped source IDs; no production-data exception exists.
 4. Advance `status` only with the evidence the table above requires; the
    validator refuses shortcuts.
 
-During the G0 data migration, add `adjudication_contract` and all 159 opaque
-mapping IDs in the same canonical update. The validator requires exact 106+53
-source-grain equality and exact 125/32/2 disposition accounting. Do not infer
-that the resulting `records` length must be 159: deterministic dedup/upsert is
-still authoritative.
+During the G0 data migration, add the sealed `adjudication_contract`, all 157
+record mappings and both top-level exclusions in the same canonical update.
+The validator requires exact 106+53 source-grain equality, 125/32/2
+disposition accounting, the pinned ref set, a recomputed semantic commitment
+and the 111-record dedup projection. No mapping draft or count summary can
+substitute for this integration gate.
 
 The registry is bookkeeping for the RED-only F4 lane: recording a pair here
 neither widens nor bypasses F4, and no engine code reads this directory.
