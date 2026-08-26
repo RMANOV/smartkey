@@ -37,13 +37,59 @@ FILE_URI_AUTHORITY = r"(?:[A-Za-z0-9._~!$&'()*+,;=:%@\[\]-]+)?"
 FILE_URI_PREFIX = r"(?<![A-Za-z0-9_./\\-])file://" + FILE_URI_AUTHORITY + r"/"
 HEX_IDENTIFIER = r"(?<![0-9a-f])[0-9a-f]{12,64}(?![0-9a-f])"
 FULL_HEX_IDENTIFIER = r"(?<![0-9a-f])[0-9a-f]{40}(?:[0-9a-f]{24})?(?![0-9a-f])"
+COMPONENT_LEFT_BOUNDARY = r"(?<![A-Za-z0-9_.-])"
 SHARD_TEXT_LABEL = r"(?:claude|codex)[ _.-]shard(?:[ _.-]manifest)?"
 SHARD_FILENAME = r"(?:claude|codex)[_.-]shard(?:[_.-]manifest)?\.jsonl?"
 SHARD_REFERENCE = r"(?:" + SHARD_FILENAME + r"|" + SHARD_TEXT_LABEL + r")"
-SHARD_LEFT_BOUNDARY = r"(?<![A-Za-z0-9_.-])"
 SHARD_RIGHT_BOUNDARY = r"(?![A-Za-z0-9_.-])"
-BOUNDED_SHARD_REFERENCE = SHARD_LEFT_BOUNDARY + SHARD_REFERENCE + SHARD_RIGHT_BOUNDARY
-BOUNDED_SHARD_FILENAME = SHARD_LEFT_BOUNDARY + SHARD_FILENAME + SHARD_RIGHT_BOUNDARY
+BOUNDED_SHARD_REFERENCE = (
+    COMPONENT_LEFT_BOUNDARY + SHARD_REFERENCE + SHARD_RIGHT_BOUNDARY
+)
+BOUNDED_SHARD_FILENAME = COMPONENT_LEFT_BOUNDARY + SHARD_FILENAME + SHARD_RIGHT_BOUNDARY
+FILESYSTEM_SEPARATOR = r"[\\/]"
+FILESYSTEM_COMPONENT = r"(?:\.\.?|[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})"
+RELATIVE_CHECKSUM_PREFIX = (
+    r"(?:" + FILESYSTEM_COMPONENT + FILESYSTEM_SEPARATOR + r"){1,8}"
+)
+ROOTED_CHECKSUM_PREFIX = (
+    FILESYSTEM_SEPARATOR
+    + r"(?:"
+    + FILESYSTEM_COMPONENT
+    + FILESYSTEM_SEPARATOR
+    + r"){0,8}"
+)
+DRIVE_CHECKSUM_PREFIX = (
+    r"[A-Za-z]:"
+    + FILESYSTEM_SEPARATOR
+    + r"(?:"
+    + FILESYSTEM_COMPONENT
+    + FILESYSTEM_SEPARATOR
+    + r"){0,8}"
+)
+UNC_CHECKSUM_PREFIX = (
+    r"(?:"
+    + FILESYSTEM_SEPARATOR
+    + r"){2}"
+    + FILESYSTEM_COMPONENT
+    + FILESYSTEM_SEPARATOR
+    + FILESYSTEM_COMPONENT
+    + FILESYSTEM_SEPARATOR
+    + r"(?:"
+    + FILESYSTEM_COMPONENT
+    + FILESYSTEM_SEPARATOR
+    + r"){0,6}"
+)
+BOUNDED_CHECKSUM_PATH_PREFIX = (
+    r"(?:(?:"
+    + RELATIVE_CHECKSUM_PREFIX
+    + r"|"
+    + ROOTED_CHECKSUM_PREFIX
+    + r"|"
+    + DRIVE_CHECKSUM_PREFIX
+    + r"|"
+    + UNC_CHECKSUM_PREFIX
+    + r"))?"
+)
 SOURCE_LABEL = r"source[-_](?:session|record|path)(?:[-_](?:hash|digest))?"
 DIGEST_LABEL = r"(?:sha(?:-?256)?|digest|hash|receipt)"
 LABEL_SEPARATOR = r"(?:[^\S\r\n]|[_:=()/.`-])"
@@ -72,7 +118,8 @@ PRIVATE_HOME_PATTERNS = (
 )
 PRIVATE_SESSION_PATTERNS = (
     re.compile(
-        r"(?:^|[\\/])\.(?:claude|codex)[\\/](?:projects|sessions)(?:[\\/]|$)",
+        COMPONENT_LEFT_BOUNDARY
+        + r"\.(?:claude|codex)[\\/](?:projects|sessions)(?:[\\/]|$)",
         re.IGNORECASE,
     ),
     re.compile(
@@ -84,7 +131,10 @@ PRIVATE_SESSION_PATTERNS = (
     ),
 )
 PRIVATE_CORPUS_PATTERNS = (
-    re.compile(r"(?:^|[\\/])anomaly-corpus(?:[\\/]|$)", re.IGNORECASE),
+    re.compile(
+        COMPONENT_LEFT_BOUNDARY + r"anomaly-corpus(?:[\\/]|$)",
+        re.IGNORECASE,
+    ),
     re.compile(r"\banchor-[0-9]{8}T[0-9]{6}(?:[+-][0-9]{4}|Z)\b", re.IGNORECASE),
 )
 PRIVATE_CORRELATION_PATTERNS = (
@@ -108,7 +158,7 @@ PRIVATE_CORRELATION_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        SHARD_LEFT_BOUNDARY
+        COMPONENT_LEFT_BOUNDARY
         + SHARD_REFERENCE
         + LABEL_SEPARATOR
         + DIGEST_LABEL
@@ -120,7 +170,7 @@ PRIVATE_CORRELATION_PATTERNS = (
         r"\b(?:sha(?:-?256)?|digest)\s*\(\s*(?:"
         + SOURCE_LABEL
         + r"|"
-        + SHARD_LEFT_BOUNDARY
+        + COMPONENT_LEFT_BOUNDARY
         + SHARD_REFERENCE
         + r")\s*\)\s*[:=]\s*"
         + HEX_IDENTIFIER,
@@ -138,7 +188,10 @@ PRIVATE_CORRELATION_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        FULL_HEX_IDENTIFIER + r"[^\S\r\n]+\*?" + BOUNDED_SHARD_FILENAME,
+        FULL_HEX_IDENTIFIER
+        + r"[^\S\r\n]+\*?"
+        + BOUNDED_CHECKSUM_PATH_PREFIX
+        + BOUNDED_SHARD_FILENAME,
         re.IGNORECASE,
     ),
 )

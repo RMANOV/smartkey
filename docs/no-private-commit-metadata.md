@@ -14,6 +14,12 @@ The gate rejects:
 - bounded first-party session/correlation URLs;
 - known source, shard-manifest, digest, and corpus-receipt label combinations.
 
+Literal protected components use the same left boundary: start, punctuation,
+or a path separator is accepted, while alphanumeric, underscore, dot, and
+hyphen attachment is not. This applies to `anomaly-corpus`,
+`.claude/projects`, and `.codex/sessions`; their existing right path boundary
+is unchanged.
+
 It deliberately permits ordinary commit/checksum SHAs, unrelated URLs and
 paths, body prose that merely mentions the trailer name, and standard trailers
 such as `Co-Authored-By`. Diagnostics are one deterministic ASCII JSON object.
@@ -141,7 +147,7 @@ patterns include:
 
 ```text
 (?im)^[\t ]*claude-session[\t ]*[:=]
-(?i)(^|[/\\])anomaly-corpus([/\\]|$)
+(?i)(^|[^A-Za-z0-9_.-])anomaly-corpus([/\\]|$)
 (?i)(^|[[:space:]"'(<`=,;\[\]])(/(home|Users)/[^/[:space:]`]+|/root)([/\\]|$)
 (?i)(^|[[:space:]"'(<`=,;\[\]])[A-Z]:[/\\]Users[/\\][^/\\[:space:]`]+([/\\]|$)
 (?i)(^|[[:space:]"'(<`=,;\[\]])(\$HOME|\$\{HOME\}|%USERPROFILE%|~)[/\\]
@@ -162,6 +168,14 @@ richer policy. Audit existing controlled-branch history first, account for
 legacy matches, activate rules externally, exercise both rejection and
 acceptance on a bootstrap branch, and read back the exact rule
 mode/pattern/scope. Repository code cannot activate or verify that state.
+
+The bare-checksum RE2 starter above intentionally covers an adjacent basename
+only. The repository scanner additionally accepts bounded filesystem-shaped
+relative, rooted, drive, and UNC prefixes. That grammar allows at most eight
+path components of at most 32 characters each; a UNC server and share count as
+two of the eight components. The server-side starter is not equivalent path
+coverage and must not be represented as such without a separate RE2 rule and
+bootstrap matrix.
 
 The push-triggered run is explicitly **post-publication detection**, never
 prevention. A clean push result does not prove that an active ruleset blocked

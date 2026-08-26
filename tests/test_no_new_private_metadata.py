@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from contextlib import redirect_stdout
@@ -84,6 +85,13 @@ class CommitMetadataGateTests(unittest.TestCase):
         self,
         cases: list[tuple[str, str, bool]],
     ) -> None:
+        self.assert_rule_table(cases, "private_corpus_correlation")
+
+    def assert_rule_table(
+        self,
+        cases: list[tuple[str, str, bool]],
+        rule: str,
+    ) -> None:
         process = self.run_gate(
             "--stdin",
             message=(
@@ -93,7 +101,7 @@ class CommitMetadataGateTests(unittest.TestCase):
             ),
         )
         expected = {
-            (line_number, "private_corpus_correlation")
+            (line_number, rule)
             for line_number, (_name, _value, reject) in enumerate(cases, start=3)
             if reject
         }
@@ -396,6 +404,143 @@ class CommitMetadataGateTests(unittest.TestCase):
                 process = self.run_gate("--stdin", message=message)
                 self.assertEqual(process.returncode, 0, process.stderr)
 
+    def test_bare_checksum_supports_bounded_filesystem_prefixes(self) -> None:
+        path_prefixes = (
+            ("adjacent", ""),
+            ("relative", "docs/"),
+            ("dot-relative", "./"),
+            ("parent-relative", "../"),
+            ("multi-relative", "one/two/three/"),
+            ("posix-root", "/var/tmp/"),
+            ("windows-drive", "C:\\work\\tmp\\"),
+            ("unc", "\\\\server\\share\\dir\\"),
+        )
+        separators = (("whitespace", "  "), ("star", " *"))
+        cases = []
+        for path_name, path_prefix in path_prefixes:
+            for size in (40, 64):
+                for separator_name, separator in separators:
+                    cases.append(
+                        (
+                            f"{path_name}-{size}-{separator_name}",
+                            (
+                                ("a" * size)
+                                + separator
+                                + path_prefix
+                                + "claude_shard_manifest.json"
+                            ),
+                            True,
+                        )
+                    )
+        self.assert_correlation_table(cases)
+
+    def test_bare_checksum_path_bounds_and_near_misses(self) -> None:
+        max_component = "a" * 32
+        max_prefix = "/".join([max_component] * 8) + "/"
+        too_many_components = "/".join(["a"] * 9) + "/"
+        windows_max_prefix = "Q:\\" + "\\".join([max_component] * 8) + "\\"
+        windows_too_many = "Q:\\" + "\\".join(["a"] * 9) + "\\"
+        unc_max_prefix = "\\\\server\\share\\" + "\\".join([max_component] * 6) + "\\"
+        unc_too_many = "\\\\server\\share\\" + "\\".join(["a"] * 7) + "\\"
+        too_long_component = ("b" * 33) + "/"
+        filename = "claude_shard_manifest.json"
+        cases = [
+            ("relative-maximum", ("a" * 40) + "  " + max_prefix + filename, True),
+            (
+                "relative-too-many",
+                ("b" * 40) + "  " + too_many_components + filename,
+                False,
+            ),
+            (
+                "rooted-maximum",
+                ("c" * 40) + "  /" + max_prefix + filename,
+                True,
+            ),
+            (
+                "rooted-too-many",
+                ("d" * 40) + "  /" + too_many_components + filename,
+                False,
+            ),
+            (
+                "drive-maximum",
+                ("e" * 64) + " *" + windows_max_prefix + filename,
+                True,
+            ),
+            (
+                "drive-too-many",
+                ("f" * 64) + " *" + windows_too_many + filename,
+                False,
+            ),
+            (
+                "unc-maximum",
+                ("1" * 40) + "  " + unc_max_prefix + filename,
+                True,
+            ),
+            (
+                "unc-too-many",
+                ("2" * 40) + "  " + unc_too_many + filename,
+                False,
+            ),
+            (
+                "too-long-component",
+                ("3" * 64) + " *" + too_long_component + filename,
+                False,
+            ),
+        ]
+        for size in (39, 41, 63, 65):
+            cases.append(
+                (
+                    f"invalid-digest-{size}",
+                    ("d" * size) + "  docs/" + filename,
+                    False,
+                )
+            )
+        for suffix in (".bak", ".jsonx", "-extra", "_extra", ".old"):
+            cases.append(
+                (
+                    f"near-suffix-{suffix}",
+                    ("e" * 40) + "  docs/" + filename + suffix,
+                    False,
+                )
+            )
+        cases.extend(
+            (
+                (
+                    "unrelated-basename",
+                    ("f" * 64) + "  docs/ordinary_manifest.json",
+                    False,
+                ),
+                (
+                    "near-prefix-basename",
+                    ("1" * 40) + "  docs/not-" + filename,
+                    False,
+                ),
+                ("path-without-basename", ("2" * 40) + "  docs/", False),
+            )
+        )
+        self.assert_correlation_table(cases)
+
+    def test_repeated_bare_checksum_paths_are_bounded(self) -> None:
+        filename = "claude_shard_manifest.json "
+        tokens = (
+            ("3" * 40) + "  a/b/c/d/e/f/g/h/i/" + filename,
+            ("4" * 40) + "  /a/b/c/d/e/f/g/h/i/" + filename,
+            ("5" * 40) + "  Q:\\a\\b\\c\\d\\e\\f\\g\\h\\i\\" + filename,
+            ("6" * 40) + "  \\\\server\\share\\a\\b\\c\\d\\e\\f\\g\\" + filename,
+        )
+        token = "".join(tokens)
+        target_bytes = 240 * 1024
+        body = (token * ((target_bytes // len(token)) + 1))[:target_bytes]
+        started = time.monotonic()
+        process = self.run_gate(
+            "--stdin",
+            message="Synthetic subject\n\n" + body + "\n",
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(self.assert_payload(process)["status"], "pass")
+        self.assertLess(elapsed, 5.0)
+
     def test_shard_label_near_misses_do_not_correlate(self) -> None:
         digest = "a" * 64
         near_misses = (
@@ -505,7 +650,7 @@ class CommitMetadataGateTests(unittest.TestCase):
                     (
                         f"bare-filename-{prefix_name}",
                         f"{'e' * 40}  {filename}",
-                        reject and prefix_name != "path",
+                        reject,
                     ),
                 )
             )
@@ -659,6 +804,74 @@ class CommitMetadataGateTests(unittest.TestCase):
                 "--stdin", message=f"Synthetic subject\n\nReference: {reference}\n"
             )
             self.assertEqual(process.returncode, 0, process.stderr)
+
+    def test_protected_components_share_the_same_left_boundary(self) -> None:
+        allowed_prefixes = (
+            ("start", ""),
+            ("space", " "),
+            ("tab", "\t"),
+            ("colon", ":"),
+            ("equals", "="),
+            ("quote", '"'),
+            ("slash", "/"),
+            ("backslash", "\\"),
+            ("relative-path", "docs/"),
+            ("windows-path", "C:\\work\\"),
+        )
+        blocked_prefixes = (
+            ("word", "not"),
+            ("underscore", "not_"),
+            ("hyphen", "not-"),
+            ("dot", "not."),
+            ("alphanumeric", "x9"),
+        )
+        targets = (
+            ("anomaly-corpus", "anomaly-corpus/entry", "private_corpus_path"),
+            ("claude-projects", ".claude/projects/entry", "private_session_path"),
+            ("codex-sessions", ".codex/sessions/entry", "private_session_path"),
+        )
+        for target_name, target, rule in targets:
+            cases = [
+                (f"{target_name}-{prefix_name}", prefix + target, True)
+                for prefix_name, prefix in allowed_prefixes
+            ]
+            cases.extend(
+                (f"{target_name}-{prefix_name}", prefix + target, False)
+                for prefix_name, prefix in blocked_prefixes
+            )
+            self.assert_rule_table(cases, rule)
+
+    def test_anomaly_corpus_re2_example_matches_component_boundary(self) -> None:
+        candidates = [
+            line
+            for line in POLICY_DOC.read_text(encoding="utf-8").splitlines()
+            if line.startswith("(?i)") and "anomaly-corpus" in line
+        ]
+        self.assertEqual(len(candidates), 1)
+        pattern = re.compile(candidates[0])
+        self.assertTrue(pattern.pattern.startswith("(?i)(^|"))
+        self.assertNotIn("(?<", pattern.pattern)
+
+        prefixes = (
+            ("start", "", True),
+            ("space", " ", True),
+            ("tab", "\t", True),
+            ("colon", ":", True),
+            ("equals", "=", True),
+            ("quote", '"', True),
+            ("slash", "/", True),
+            ("backslash", "\\", True),
+            ("relative-path", "docs/", True),
+            ("word", "not", False),
+            ("underscore", "not_", False),
+            ("hyphen", "not-", False),
+            ("dot", "not.", False),
+            ("alphanumeric", "x9", False),
+        )
+        for prefix_name, prefix, should_match in prefixes:
+            with self.subTest(prefix=prefix_name):
+                value = prefix + "anomaly-corpus/entry"
+                self.assertEqual(pattern.search(value) is not None, should_match)
 
     def test_diagnostics_are_deterministic_and_never_echo_raw_matches(self) -> None:
         sentinel = "SYNTHETIC_PRIVATE_SENTINEL_DO_NOT_ECHO"
