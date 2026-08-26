@@ -186,6 +186,45 @@ class CommitMetadataGateTests(unittest.TestCase):
                 )
                 self.assertEqual(process.returncode, 0, process.stderr)
 
+    def test_file_uri_authority_private_homes_fail_without_url_broadening(
+        self,
+    ) -> None:
+        private_file_uris = (
+            "file://host.example/home/sample-account/private-note.md",
+            "file://host.example/Users/sample-account/private-note.md",
+            "file://host.example/C:/Users/sample-account/private-note.md",
+        )
+        for private_file_uri in private_file_uris:
+            with self.subTest(private_file_uri=private_file_uri):
+                process = self.run_gate(
+                    "--stdin",
+                    message=(f"Synthetic subject\n\nReference: {private_file_uri}\n"),
+                )
+                self.assertEqual(process.returncode, 1, process.stderr)
+                self.assertIn(
+                    "private_home_path",
+                    {
+                        item["rule"]
+                        for item in self.assert_payload(process)["violations"]
+                    },
+                )
+
+        benign_locations = (
+            "file://host.example/opt/public",
+            "file://host.example/tmp/Users-guide.txt",
+            "docs/file://host.example/home/sample-account/relative",
+            "https://host.example/home/sample-account/public",
+            "https://host.example/Users/sample-account/public",
+            "https://host.example/C:/Users/sample-account/public",
+        )
+        for benign in benign_locations:
+            with self.subTest(benign=benign):
+                process = self.run_gate(
+                    "--stdin",
+                    message=f"Synthetic subject\n\nReference: {benign}\n",
+                )
+                self.assertEqual(process.returncode, 0, process.stderr)
+
     def test_private_correlation_labels_fail_but_ordinary_shas_pass(self) -> None:
         synthetic_correlation_messages = (
             "Synthetic subject\n\nsource_session_hash: " + "a" * 64 + "\n",
@@ -246,6 +285,54 @@ class CommitMetadataGateTests(unittest.TestCase):
         )
         for message in benign_correlations:
             with self.subTest(message=message[:32]):
+                process = self.run_gate("--stdin", message=message)
+                self.assertEqual(process.returncode, 0, process.stderr)
+
+    def test_dotted_shard_manifest_correlations_fail(self) -> None:
+        messages = (
+            "Synthetic subject\n\nclaude.shard.manifest.json=" + "a" * 40 + "\n",
+            (
+                "Synthetic subject\n\nsha256: "
+                + "b" * 64
+                + " claude.shard.manifest.json\n"
+            ),
+        )
+        for message in messages:
+            with self.subTest(message_number=messages.index(message)):
+                process = self.run_gate("--stdin", message=message)
+                self.assertEqual(process.returncode, 1, process.stderr)
+                self.assertIn(
+                    "private_corpus_correlation",
+                    {
+                        item["rule"]
+                        for item in self.assert_payload(process)["violations"]
+                    },
+                )
+
+    def test_bare_checksum_first_known_shard_manifest_fails(self) -> None:
+        messages = (
+            "Synthetic subject\n\n" + "c" * 40 + "  codex-shard.jsonl\n",
+            ("Synthetic subject\n\n" + "d" * 64 + " *claude_shard_manifest.json\n"),
+        )
+        for message in messages:
+            with self.subTest(message_number=messages.index(message)):
+                process = self.run_gate("--stdin", message=message)
+                self.assertEqual(process.returncode, 1, process.stderr)
+                self.assertIn(
+                    "private_corpus_correlation",
+                    {
+                        item["rule"]
+                        for item in self.assert_payload(process)["violations"]
+                    },
+                )
+
+        benign = (
+            "Synthetic subject\n\n" + "e" * 64 + "\n",
+            "Synthetic subject\n\nchecksum: " + "f" * 64 + "\n",
+            "Synthetic subject\n\n" + "1" * 64 + " ordinary_manifest.json\n",
+        )
+        for message in benign:
+            with self.subTest(benign_number=benign.index(message)):
                 process = self.run_gate("--stdin", message=message)
                 self.assertEqual(process.returncode, 0, process.stderr)
 

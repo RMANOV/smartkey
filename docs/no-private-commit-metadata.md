@@ -58,8 +58,8 @@ closed in a shallow repository; fetch the required history before retrying.
 
 `.github/workflows/trusted-commit-metadata.yml` uses
 `pull_request_target` only for commit metadata enforcement. GitHub loads the
-workflow code from the trusted base/default branch. Inside the job, the
-workflow and checked-out policy remain base-owned: the job:
+workflow definition from the trusted default-branch context. Inside the job,
+the scanner policy is checked out from the exact pull-request base SHA: the job:
 
 1. checks out the exact pull-request base SHA, with credentials not persisted;
 2. fetches the base repository's `refs/pull/<number>/head` as Git objects only;
@@ -74,8 +74,9 @@ secrets are not referenced, and the metadata jobs have explicit timeouts.
 
 These two SHA concepts must not be conflated:
 
-- the workflow code, in-job `GITHUB_SHA`, and policy checkout are from the
-  trusted base SHA;
+- the workflow definition and in-job `GITHUB_SHA` come from the trusted
+  default-branch context;
+- the scanner checkout is the exact pull-request base SHA;
 - GitHub's native workflow run and check suite can still be associated with the
   pull-request **head** SHA. Public REST observations of
   `pull_request_target` runs (for example, dotnet/skills run `32952853192` and
@@ -85,7 +86,8 @@ These two SHA concepts must not be conflated:
 That public evidence supports the architecture, but it does not prove this
 repository's ruleset, context, or merge-blocking behavior. The target
 repository must pass the live bootstrap gate below before this job is treated
-as active enforcement.
+as active enforcement. No final status-context or merge-blocking claim is made
+until that live bootstrap passes.
 
 `CODEOWNERS` assigns every workflow file, the policy scanner, and its tests to
 `@RMANOV`. Owning the whole workflow directory also prevents an unreviewed new
@@ -141,11 +143,12 @@ patterns include:
 (?i)(^|[[:space:]"'(<`=,;\[\]])(/(home|Users)/[^/[:space:]`]+|/root)([/\\]|$)
 (?i)(^|[[:space:]"'(<`=,;\[\]])[A-Z]:[/\\]Users[/\\][^/\\[:space:]`]+([/\\]|$)
 (?i)(^|[[:space:]"'(<`=,;\[\]])(\$HOME|\$\{HOME\}|%USERPROFILE%|~)[/\\]
-(?i)(^|[[:space:]"'(<`=:,;\[\]])file:///((home|Users)/[^/[:space:]`]+|root)(/|$)
-(?i)(^|[[:space:]"'(<`=:,;\[\]])file:///[A-Z]:/Users/[^/[:space:]`]+(/|$)
+(?i)(^|[[:space:]"'(<`=:,;\[\]])file://([A-Za-z0-9._~:@!$&'()*+,;=%\[\]-]+)?/((home|Users)/[^/[:space:]`]+|root)(/|$)
+(?i)(^|[[:space:]"'(<`=:,;\[\]])file://([A-Za-z0-9._~:@!$&'()*+,;=%\[\]-]+)?/[A-Z]:/Users/[^/[:space:]`]+(/|$)
 (?i)(^|[^A-Za-z0-9.-])(https?://)?(www\.)?claude\.ai/code/[A-Za-z0-9][A-Za-z0-9_-]{11,127}([^A-Za-z0-9_-]|$)
 (?i)(private|anomaly)[ _-]?corpus[ _-]+receipt[\t ]*[:=]?[\t ]*[0-9a-f]{12,64}
-(?i)(claude|codex)[_-]shard([_-]manifest)?\.jsonl?[\t ]*[:=][\t ]*[0-9a-f]{40}([0-9a-f]{24})?
+(?i)(claude|codex)[_.-]shard([_.-]manifest)?\.jsonl?[\t ]*[:=][\t ]*[0-9a-f]{40}([0-9a-f]{24})?
+(?i)(^|[^0-9a-f])[0-9a-f]{40}([0-9a-f]{24})?[\t ]+\*?(claude|codex)[_.-]shard([_.-]manifest)?\.jsonl?([^A-Za-z0-9_.-]|$)
 ```
 
 RE2 has no look-around, and a regex rule cannot reproduce Git's canonical
