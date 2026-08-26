@@ -36,6 +36,7 @@ jobs:
           python -m pip install --disable-pip-version-check \
             --require-hashes --only-binary=:all: \
             -r requirements/schema-contract-py312-linux-x86_64.lock
+          python -m pip check
       - name: Verify pinned Draft 2020-12 test contract
         run: |
           . "$RUNNER_TEMP/smartkey-ci-venv/bin/activate"

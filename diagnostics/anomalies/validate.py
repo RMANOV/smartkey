@@ -1272,7 +1272,11 @@ def _private_source_record_payload(envelope: dict) -> bytes | None:
 
 
 def source_record_identity_envelope(source_record) -> dict:
-    """Project one whole merged source into its fixed public HMAC envelope."""
+    """Public contract producing a PRIVATE pre-HMAC source-record envelope.
+
+    The returned envelope and any derived payload or frame must not be persisted,
+    logged, or published; only the typed HMAC reference is public.
+    """
     valid, envelope = _private_source_record_identity_envelope(
         source_record,
         require_closed_root=False,
