@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+from itertools import islice
 import json
 import re
 import sys
@@ -538,6 +539,8 @@ def _scan_raw_string(text: str, start: int) -> tuple[str | None, int, int]:
         char = text[index]
         code_point = ord(char)
         if char == '"':
+            if decoded_bytes > HMAC_RESOURCE_LIMITS["max_string_utf8_bytes"]:
+                return CANONICAL_ERROR_RESOURCE, index, 0
             return None, index + 1, decoded_bytes
         if char != "\\":
             if code_point <= 0x1F or 0xD800 <= code_point <= 0xDFFF:
@@ -552,6 +555,8 @@ def _scan_raw_string(text: str, start: int) -> tuple[str | None, int, int]:
         escape = text[index + 1]
         if escape in _JSON_SIMPLE_ESCAPE_CODE_POINTS:
             decoded_bytes += _utf8_width(_JSON_SIMPLE_ESCAPE_CODE_POINTS[escape])
+            if decoded_bytes > HMAC_RESOURCE_LIMITS["max_string_utf8_bytes"]:
+                return CANONICAL_ERROR_RESOURCE, index, 0
             index += 2
             continue
         if escape != "u" or index + 6 > length:
@@ -724,6 +729,28 @@ def _append_output(output: bytearray, fragment: bytes) -> str | None:
 def _encode_string_into(
     value: str, output: bytearray, *, key: bool = False
 ) -> str | None:
+
+    code = _validate_typed_string(value, key=key)
+    if code is not None:
+        return code
+    code = _append_output(output, b'"')
+    if code is not None:
+        return code
+    for char in value:
+        code_point = ord(char)
+        fragment = _CANONICAL_JSON_ESCAPE_BYTES.get(char)
+        if fragment is None:
+            if code_point <= 0x1F:
+                fragment = f"\\u{code_point:04x}".encode("ascii")
+            else:
+                fragment = char.encode("utf-8")
+        code = _append_output(output, fragment)
+        if code is not None:
+            return code
+    return _append_output(output, b'"')
+
+
+def _validate_typed_string(value: str, *, key: bool = False) -> str | None:
     maximum = HMAC_RESOURCE_LIMITS[
         "max_key_utf8_bytes" if key else "max_string_utf8_bytes"
     ]
@@ -737,23 +764,7 @@ def _encode_string_into(
         utf8_bytes += _utf8_width(code_point)
         if utf8_bytes > maximum:
             return CANONICAL_ERROR_RESOURCE
-    code = _append_output(output, b'"')
-    if code is not None:
-        return code
-    for char in value:
-        code_point = ord(char)
-        if 0xD800 <= code_point <= 0xDFFF:
-            return CANONICAL_ERROR_TYPE
-        fragment = _CANONICAL_JSON_ESCAPE_BYTES.get(char)
-        if fragment is None:
-            if code_point <= 0x1F:
-                fragment = f"\\u{code_point:04x}".encode("ascii")
-            else:
-                fragment = char.encode("utf-8")
-        code = _append_output(output, fragment)
-        if code is not None:
-            return code
-    return _append_output(output, b'"')
+    return None
 
 
 def _consume_typed_node(state: dict[str, object]) -> str | None:
@@ -763,15 +774,99 @@ def _consume_typed_node(state: dict[str, object]) -> str | None:
     return None
 
 
+_SNAPSHOT_LIST = object()
+_SNAPSHOT_DICT = object()
+
+
+def _snapshot_typed_value(
+    value, state: dict[str, object], depth: int
+) -> tuple[str | None, object | None]:
+    """Capture one bounded immutable view before canonical traversal."""
+    code = _consume_typed_node(state)
+    if code is not None:
+        return code, None
+    value_type = type(value)
+    if value is None or value_type in (bool, int, str):
+        if value_type is int and abs(value) > CANONICAL_JSON_SAFE_INTEGER_MAX:
+            return CANONICAL_ERROR_BOUNDS, None
+        if value_type is str:
+            code = _validate_typed_string(value)
+            if code is not None:
+                return code, None
+        return None, value
+    if value_type not in (list, dict):
+        return CANONICAL_ERROR_TYPE, None
+
+    next_depth = depth + 1
+    if next_depth > HMAC_RESOURCE_LIMITS["max_typed_nesting_depth"]:
+        return CANONICAL_ERROR_DEPTH, None
+    identity = id(value)
+    active = state["active"]
+    if identity in active:
+        return CANONICAL_ERROR_CYCLE, None
+    memo = state["memo"]
+    completed = memo.get(identity)
+    if completed is not None:
+        return None, completed
+
+    active.add(identity)
+    captured = None
+    snapshot = None
+    try:
+        if value_type is list:
+            maximum = HMAC_RESOURCE_LIMITS["max_array_members"]
+            captured = tuple(list.__getitem__(value, slice(0, maximum + 1)))
+            if len(captured) > maximum:
+                return CANONICAL_ERROR_RESOURCE, None
+            children = []
+            for item in captured:
+                code, child = _snapshot_typed_value(item, state, next_depth)
+                if code is not None:
+                    children = None
+                    return code, None
+                children.append(child)
+            snapshot = (_SNAPSHOT_LIST, tuple(children))
+            children = None
+        else:
+            maximum = HMAC_RESOURCE_LIMITS["max_object_members"]
+            captured = tuple(islice(dict.items(value), maximum + 1))
+            if len(captured) > maximum:
+                return CANONICAL_ERROR_RESOURCE, None
+            for key, _item in captured:
+                code = _consume_typed_node(state)
+                if code is not None:
+                    return code, None
+                if type(key) is not str:
+                    return CANONICAL_ERROR_TYPE, None
+                code = _validate_typed_string(key, key=True)
+                if code is not None:
+                    return code, None
+            pairs = []
+            for key, item in captured:
+                code, child = _snapshot_typed_value(item, state, next_depth)
+                if code is not None:
+                    pairs = None
+                    return code, None
+                pairs.append((key, child))
+            pairs = sorted(pairs, key=lambda pair: pair[0])
+            snapshot = (_SNAPSHOT_DICT, tuple(pairs))
+            pairs = None
+        memo[identity] = snapshot
+        return None, snapshot
+    finally:
+        captured = None
+        active.remove(identity)
+
+
 def _encode_typed_value(
     value, output: bytearray, state: dict[str, object], depth: int
 ) -> str | None:
     code = _consume_typed_node(state)
     if code is not None:
         return code
-    value_type = type(value)
     if value is None:
         return _append_output(output, b"null")
+    value_type = type(value)
     if value_type is bool:
         return _append_output(output, b"true" if value else b"false")
     if value_type is int:
@@ -780,73 +875,77 @@ def _encode_typed_value(
         return _append_output(output, str(value).encode("ascii"))
     if value_type is str:
         return _encode_string_into(value, output)
-    if value_type not in (list, dict):
+    if value_type is not tuple or len(value) != 2:
         return CANONICAL_ERROR_TYPE
 
     next_depth = depth + 1
     if next_depth > HMAC_RESOURCE_LIMITS["max_typed_nesting_depth"]:
         return CANONICAL_ERROR_DEPTH
-    identity = id(value)
-    active = state["active"]
-    if identity in active:
-        return CANONICAL_ERROR_CYCLE
-    active.add(identity)
-    try:
-        if value_type is list:
-            if len(value) > HMAC_RESOURCE_LIMITS["max_array_members"]:
-                return CANONICAL_ERROR_RESOURCE
-            code = _append_output(output, b"[")
-            if code is not None:
-                return code
-            for index, item in enumerate(value):
-                if index:
-                    code = _append_output(output, b",")
-                    if code is not None:
-                        return code
-                code = _encode_typed_value(item, output, state, next_depth)
-                if code is not None:
-                    return code
-            return _append_output(output, b"]")
-
-        if len(value) > HMAC_RESOURCE_LIMITS["max_object_members"]:
+    kind, contents = value
+    if kind is _SNAPSHOT_LIST:
+        if type(contents) is not tuple:
+            return CANONICAL_ERROR_INTERNAL
+        if len(contents) > HMAC_RESOURCE_LIMITS["max_array_members"]:
             return CANONICAL_ERROR_RESOURCE
-        for key in value:
-            if type(key) is not str:
-                return CANONICAL_ERROR_TYPE
-        sorted_keys = sorted(value)
-        try:
-            code = _append_output(output, b"{")
+        code = _append_output(output, b"[")
+        if code is not None:
+            return code
+        for index, item in enumerate(contents):
+            if index:
+                code = _append_output(output, b",")
+                if code is not None:
+                    return code
+            code = _encode_typed_value(item, output, state, next_depth)
             if code is not None:
                 return code
-            for index, key in enumerate(sorted_keys):
-                if index:
-                    code = _append_output(output, b",")
-                    if code is not None:
-                        return code
-                code = _consume_typed_node(state)
-                if code is not None:
-                    return code
-                code = _encode_string_into(key, output, key=True)
-                if code is not None:
-                    return code
-                code = _append_output(output, b":")
-                if code is not None:
-                    return code
-                code = _encode_typed_value(value[key], output, state, next_depth)
-                if code is not None:
-                    return code
-            return _append_output(output, b"}")
-        finally:
-            sorted_keys = None
-    finally:
-        active.remove(identity)
+        return _append_output(output, b"]")
+
+    if kind is not _SNAPSHOT_DICT or type(contents) is not tuple:
+        return CANONICAL_ERROR_INTERNAL
+    if len(contents) > HMAC_RESOURCE_LIMITS["max_object_members"]:
+        return CANONICAL_ERROR_RESOURCE
+    code = _append_output(output, b"{")
+    if code is not None:
+        return code
+    for index, pair in enumerate(contents):
+        if type(pair) is not tuple or len(pair) != 2:
+            return CANONICAL_ERROR_INTERNAL
+        key, item = pair
+        if index:
+            code = _append_output(output, b",")
+            if code is not None:
+                return code
+        code = _consume_typed_node(state)
+        if code is not None:
+            return code
+        code = _encode_string_into(key, output, key=True)
+        if code is not None:
+            return code
+        code = _append_output(output, b":")
+        if code is not None:
+            return code
+        code = _encode_typed_value(item, output, state, next_depth)
+        if code is not None:
+            return code
+    return _append_output(output, b"}")
 
 
 def _private_encode(value) -> tuple[str | None, bytes | None]:
     output = bytearray()
-    state: dict[str, object] = {"nodes": 0, "active": set()}
+    snapshot = None
+    snapshot_state: dict[str, object] = {
+        "nodes": 0,
+        "active": set(),
+        "memo": {},
+    }
     try:
-        code = _encode_typed_value(value, output, state, 0)
+        code, snapshot = _snapshot_typed_value(value, snapshot_state, 0)
+        value = None
+        snapshot_state = None
+        if code is None:
+            encode_state: dict[str, object] = {"nodes": 0}
+            code = _encode_typed_value(snapshot, output, encode_state, 0)
+            encode_state = None
     except RecursionError as internal:
         _discard_internal_exception(internal)
         internal = None
@@ -856,7 +955,8 @@ def _private_encode(value) -> tuple[str | None, bytes | None]:
         internal = None
         code = CANONICAL_ERROR_INTERNAL
     value = None
-    state = None
+    snapshot = None
+    snapshot_state = None
     if code is not None:
         output = None
         return code, None

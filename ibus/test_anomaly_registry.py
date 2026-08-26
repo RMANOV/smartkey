@@ -24,6 +24,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -3420,3 +3421,247 @@ def test_g0_r6_external_receipt_cannot_tamper_resource_or_vector_contract(
     doc["adjudication_contract"]["hmac_external_receipt"][field] = replacement
     _refresh_r3_commitments(doc)
     assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+# ---------------------------------------- G0 adjudication contract revision 7
+def _r7_spy_json_loads(monkeypatch):
+    real_loads = V.json.loads
+    calls = []
+
+    def spy(text, *args, **kwargs):
+        calls.append(len(text))
+        return real_loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(V.json, "loads", spy)
+    return calls
+
+
+def _r7_mixed_escaped_content(decoded_utf8_bytes: int) -> str:
+    fixed = "a" + r"\/" + r"\u0062" + r"\ud83d\ude00"
+    fixed_decoded_utf8_bytes = 7
+    assert decoded_utf8_bytes >= fixed_decoded_utf8_bytes
+    return fixed + "c" * (decoded_utf8_bytes - fixed_decoded_utf8_bytes)
+
+
+def _r7_mutate_on_first_append(monkeypatch, fragment: bytes, mutation):
+    real_append = V._append_output
+    state = {"calls": 0}
+
+    def mutate_after_append(output, current):
+        code = real_append(output, current)
+        if current == fragment and state["calls"] == 0:
+            state["calls"] += 1
+            mutation()
+        return code
+
+    monkeypatch.setattr(V, "_append_output", mutate_after_append)
+    return state
+
+
+def _r7_mutate_on_first_sort(monkeypatch, mutation):
+    real_sorted = sorted
+    state = {"calls": 0}
+
+    def mutate_before_sort(iterable, *args, **kwargs):
+        if state["calls"] == 0:
+            state["calls"] += 1
+            mutation()
+        return real_sorted(iterable, *args, **kwargs)
+
+    monkeypatch.setattr(V, "sorted", mutate_before_sort, raising=False)
+    return state
+
+
+def test_g0_r7_simple_escape_decoded_limit_is_enforced_before_json_loads(
+    monkeypatch,
+):
+    maximum = _R6_RESOURCE_LIMITS["max_string_utf8_bytes"]
+    exact = '"' + r"\/" * maximum + '"'
+    calls = _r7_spy_json_loads(monkeypatch)
+
+    assert V.parse_project_canonical_json(exact) == "/" * maximum
+    assert len(calls) == 1
+
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json('"' + r"\/" * (maximum + 1) + '"'),
+        _R6_ERROR_RESOURCE,
+    )
+    assert len(calls) == 1
+
+
+def test_g0_r7_simple_escape_overflow_has_clean_error_without_calling_json_loads(
+    monkeypatch,
+):
+    maximum = _R6_RESOURCE_LIMITS["max_string_utf8_bytes"]
+    marker = "private_escape_marker"
+    raw = '"' + marker + r"\/" * (maximum + 1 - len(marker)) + '"'
+    calls = _r7_spy_json_loads(monkeypatch)
+
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json(raw),
+        _R6_ERROR_RESOURCE,
+        marker,
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("as_key", "maximum"),
+    [
+        (False, _R6_RESOURCE_LIMITS["max_string_utf8_bytes"]),
+        (True, _R6_RESOURCE_LIMITS["max_key_utf8_bytes"]),
+    ],
+)
+def test_g0_r7_mixed_escape_boundary_is_preflight_bounded(monkeypatch, as_key, maximum):
+    content = _r7_mixed_escaped_content(maximum)
+    exact = '{"' + content + '":null}' if as_key else '"' + content + '"'
+    overflow = (
+        '{"' + content + r"\/" + '":null}' if as_key else '"' + content + r"\/" + '"'
+    )
+    calls = _r7_spy_json_loads(monkeypatch)
+
+    parsed = V.parse_project_canonical_json(exact)
+    parsed_text = next(iter(parsed)) if as_key else parsed
+    assert len(parsed_text.encode("utf-8")) == maximum
+    assert len(calls) == 1
+
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json(overflow),
+        _R6_ERROR_RESOURCE,
+    )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("final_size", [1_025, 4_095])
+def test_g0_r7_list_snapshot_is_stable_when_live_list_grows(monkeypatch, final_size):
+    source = [0] * 1_024
+    expected = b"[" + b",".join([b"0"] * 1_024) + b"]"
+    state = _r7_mutate_on_first_append(
+        monkeypatch,
+        b"[",
+        lambda: source.extend([1] * (final_size - len(source))),
+    )
+
+    started = time.monotonic()
+    actual = V.canonical_structured_payload_bytes(source)
+    elapsed = time.monotonic() - started
+
+    assert actual == expected
+    assert elapsed < 5.0
+    assert state["calls"] == 1
+    assert len(source) == final_size
+
+
+def test_g0_r7_dict_snapshot_is_stable_when_live_size_changes(monkeypatch):
+    source = {f"k{index:03d}": 0 for index in range(512)}
+    expected = json.dumps(source, separators=(",", ":"), sort_keys=True).encode()
+    state = _r7_mutate_on_first_sort(
+        monkeypatch,
+        lambda: source.__setitem__("overflow", 1),
+    )
+
+    assert V.canonical_structured_payload_bytes(source) == expected
+    assert state["calls"] == 1
+    assert len(source) == 513
+
+
+def test_g0_r7_dict_snapshot_never_rereads_live_values(monkeypatch):
+    source = {"key": "before"}
+    state = _r7_mutate_on_first_append(
+        monkeypatch,
+        b"{",
+        lambda: source.__setitem__("key", "after"),
+    )
+
+    assert V.canonical_structured_payload_bytes(source) == b'{"key":"before"}'
+    assert state["calls"] == 1
+    assert source == {"key": "after"}
+
+
+def test_g0_r7_nested_container_is_deeply_snapshotted_before_sort(monkeypatch):
+    nested = [0]
+    source = {"nested": nested}
+    state = _r7_mutate_on_first_sort(monkeypatch, lambda: nested.append(1))
+
+    assert V.canonical_structured_payload_bytes(source) == b'{"nested":[0]}'
+    assert state["calls"] == 1
+    assert nested == [0, 1]
+
+
+def test_g0_r7_repeated_alias_reuses_first_completed_snapshot(monkeypatch):
+    shared = {"value": 0}
+    source = [shared, shared]
+    state = _r7_mutate_on_first_sort(
+        monkeypatch,
+        lambda: shared.__setitem__("value", 1),
+    )
+
+    assert V.canonical_structured_payload_bytes(source) == (
+        b'[{"value":0},{"value":0}]'
+    )
+    assert state["calls"] == 1
+    assert shared == {"value": 1}
+
+
+def test_g0_r7_overlimit_key_is_rejected_before_sort(monkeypatch):
+    marker = "private_snapshot_marker"
+    source = {marker + "k" * (1_025 - len(marker)): None}
+    state = {"calls": 0}
+
+    def forbidden_sort(*_args, **_kwargs):
+        state["calls"] += 1
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(V, "sorted", forbidden_sort, raising=False)
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(source),
+        _R6_ERROR_RESOURCE,
+        marker,
+    )
+    assert state["calls"] == 0
+
+
+def test_g0_r7_sort_failure_is_normalized_without_source_retention(monkeypatch):
+    marker = "private_snapshot_marker"
+    source = {marker: None}
+
+    def fail_sort(*_args, **_kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(V, "sorted", fail_sort, raising=False)
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(source),
+        _R6_ERROR_INTERNAL,
+        marker,
+    )
+
+
+def test_g0_r7_dict_capture_failure_is_normalized_without_source_retention(
+    monkeypatch,
+):
+    marker = "private_snapshot_marker"
+    source = {marker: None}
+
+    def fail_capture(*_args, **_kwargs):
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(V, "islice", fail_capture)
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(source),
+        _R6_ERROR_INTERNAL,
+        marker,
+    )
+
+
+def test_g0_r7_snapshot_preserves_cycle_rejection_and_static_bytes():
+    static = {"b": [None, True, 1, "x"], "a": {"z": False}}
+    assert V.canonical_structured_payload_bytes(static) == (
+        b'{"a":{"z":false},"b":[null,true,1,"x"]}'
+    )
+
+    cyclic = []
+    cyclic.append(cyclic)
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(cyclic),
+        _R6_ERROR_CYCLE,
+    )

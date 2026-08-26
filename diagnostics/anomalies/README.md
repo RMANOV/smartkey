@@ -273,10 +273,17 @@ contract rather than silently widening it.
 | digits in one raw integer token | 16 |
 
 The raw boundary counts UTF-8 bytes, lexical depth, nodes, members, decoded
-string/key bytes and integer digits before `json.loads` can materialize a
-container or integer. The typed encoder walks with explicit node/depth/member
-budgets and appends to a byte buffer only while the canonical-payload budget
-remains. Boundary values are contractual; every `+1` case fails closed.
+string/key bytes (including every escape) and integer digits before
+`json.loads` can materialize a container or integer. Before canonical
+traversal, the typed boundary captures each exact built-in list or dictionary
+into a bounded immutable deep snapshot: lists and dictionary item pairs are
+captured at no more than their limit plus one, keys are validated before
+sorting, and the live source is never read again. Active identities reject
+cycles; a repeated alias reuses its first completed snapshot. A separate
+encoder walk still charges every logical serialized occurrence against the
+node and depth budgets, and appends to a byte buffer only while the
+canonical-payload budget remains. Boundary values are contractual; every
+`+1` case fails closed.
 Malformed input, duplicate keys, unsupported types/numbers, resource excess,
 depth excess, cycles, bad roots and unexpected internals become one of the
 fixed non-reflective codes `canonical_syntax`, `canonical_type`,
