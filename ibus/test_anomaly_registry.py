@@ -15,6 +15,7 @@ belt-and-suspenders, matching the other adapter tests).
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -81,6 +82,160 @@ def _find(doc: dict, observed: str, expected: str) -> dict:
 def _refresh_identity(rec: dict) -> None:
     rec["dedup_key"] = V.compute_dedup_key(rec)
     rec["id"] = V.compute_id(rec)
+
+
+def _synthetic_opaque_ref(label: str) -> str:
+    return hashlib.sha256(f"synthetic:{label}".encode("utf-8")).hexdigest()
+
+
+def _synthetic_adjudicated_record(
+    ordinal: int,
+    *,
+    grain: str,
+    disposition: str,
+) -> dict:
+    """Build one privacy-clean synthetic record without copying registry data."""
+    is_bug = disposition == "bug_candidate"
+    if is_bug:
+        observed = f"syntheticobserved{ordinal}"
+        expected = f"syntheticexpected{ordinal}"
+        observed_side = {"token": observed, "script": "latin", "descriptor": None}
+        expected_side = {"token": expected, "script": "latin", "descriptor": None}
+        dedup_key = f"{observed}|{expected}"
+        category = "unknown"
+        status = "open_suspected_smartkey"
+        privacy = "public_token"
+        classification = "mechanical_red_candidate"
+        expected_form_status = "unique_authoritative_spelling"
+        owner_lane = "f4_core"
+        expected_confidence = "high"
+        mechanism_confidence = "low"
+        attribution_confidence = "low"
+        reproducer = None
+        closure_reason = None
+    else:
+        descriptor = "metadata:" + _synthetic_opaque_ref(
+            f"descriptor:{disposition}:{ordinal}"
+        )
+        observed_side = {"token": None, "script": "unknown", "descriptor": descriptor}
+        expected_side = {"token": None, "script": "unknown", "descriptor": None}
+        dedup_key = f"desc:{descriptor}|null"
+        category = "unknown"
+        status = "not_smartkey"
+        privacy = "unknown"
+        expected_form_status = "not_applicable"
+        expected_confidence = "not_applicable"
+        mechanism_confidence = "not_applicable"
+        attribution_confidence = "not_applicable"
+        reproducer = {
+            "kind": "unit_test",
+            "ref": f"synthetic:evidence:{ordinal}",
+            "build_sha": "unknown",
+            "summary": "metadata:" + _synthetic_opaque_ref("evidence:summary"),
+        }
+        closure_reason = "metadata:" + _synthetic_opaque_ref("closure:reason")
+        if disposition == "guard":
+            classification = "guard_not_bug_unless_intent_changes"
+            owner_lane = "intended_english_quoted_guard"
+        else:
+            classification = "source_authorship_exclusion"
+            owner_lane = "outside_product_source_authorship"
+
+    adjudication_ref = _synthetic_opaque_ref(f"{grain}:{ordinal}")
+    return {
+        "id": "anom-" + hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()[:12],
+        "dedup_key": dedup_key,
+        "category": category,
+        "observed": observed_side,
+        "expected": expected_side,
+        "needs_operator_confirmation": False,
+        "minimal_context": {"before": None, "after": None},
+        "recorded_utc": "2026-08-26T00:00Z",
+        "first_seen_utc": None,
+        "last_seen_utc": None,
+        "repeat": False,
+        "occurrence_count": 1,
+        "environment": {
+            "app_surface": "synthetic validator fixture",
+            "os": "synthetic",
+            "build_sha": "unknown",
+            "build_label": "synthetic validator fixture",
+            "flags": None,
+        },
+        "source_refs": [
+            {
+                "kind": "other",
+                "ref": f"synthetic:legacy:{ordinal}",
+                "observed_utc": None,
+                "build_sha": None,
+                "surface": "synthetic fixture",
+                "note": None,
+            }
+        ],
+        "status": status,
+        "suspected_layer": "unknown",
+        "reproducer": reproducer,
+        "red_test": None,
+        "red_test_waiver": None,
+        "fix_commit": None,
+        "verification": None,
+        "closure_reason": closure_reason,
+        "privacy_classification": privacy,
+        "notes": None,
+        "adjudications": [
+            {
+                "grain": grain,
+                "ref": adjudication_ref,
+                "classification": classification,
+                "disposition": disposition,
+                "expected_form_status": expected_form_status,
+                "causal_confidence": {
+                    "anomaly_or_guard_presence": "high",
+                    "expected_form": expected_confidence,
+                    "runtime_mechanism": mechanism_confidence,
+                    "smartkey_attribution": attribution_confidence,
+                },
+                "owner_lane": owner_lane,
+                "privacy_class": "public_token" if is_bug else "metadata_only",
+                "source_refs": [
+                    {
+                        "kind": "source_record",
+                        "ref": _synthetic_opaque_ref(f"source:{ordinal}"),
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _synthetic_adjudicated_doc() -> dict:
+    """Exact ratified 159-ID count contract, using synthetic values only."""
+    records = []
+    dispositions = ["bug_candidate"] * 125 + ["guard"] * 32 + ["source_exclusion"] * 2
+    for ordinal, disposition in enumerate(dispositions):
+        grain = "original_candidate" if ordinal < 106 else "supplemental_hypothesis"
+        records.append(
+            _synthetic_adjudicated_record(
+                ordinal,
+                grain=grain,
+                disposition=disposition,
+            )
+        )
+    return {
+        "schema_version": 1,
+        "registry": "smartkey-anomaly-registry",
+        "gate_ref": "af4d6969b2ad",
+        "adjudication_contract": {
+            "ruling_ref": "6e0704632fef",
+            "artifact_sha256": "8291bc669da60feffbd4b51e9f1956f4d4a5c08299b3e71036be2da2a9231e21",
+            "original_count": 106,
+            "supplemental_count": 53,
+            "bug_candidate_count": 125,
+            "guard_count": 32,
+            "source_exclusion_count": 2,
+        },
+        "records": records,
+    }
 
 
 # ---------------------------------------------------------------- real file
@@ -399,3 +554,151 @@ def test_schema_enum_drift_is_detected():
     schema = _schema()
     schema["$defs"]["record"]["properties"]["status"]["enum"].append("maybe")
     assert "E_SCHEMA_DRIFT" in _codes(V.validate_document(_doc(), schema))
+
+
+# -------------------------------------------- G0 adjudication contract (RED)
+def test_exact_synthetic_adjudication_contract_validates_cleanly():
+    assert V.validate_document(_synthetic_adjudicated_doc(), _schema()) == []
+
+
+def test_adjudication_enum_is_strict():
+    doc = _synthetic_adjudicated_doc()
+    doc["records"][0]["adjudications"][0]["classification"] = "plausible_guess"
+    assert "E_ENUM" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_classification_must_match_coarse_disposition():
+    doc = _synthetic_adjudicated_doc()
+    doc["records"][0]["adjudications"][0]["disposition"] = "guard"
+    assert "E_ADJ_STATE" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_unique_expected_status_requires_a_stored_expected_form():
+    doc = _synthetic_adjudicated_doc()
+    rec = doc["records"][0]
+    rec["expected"] = {"token": None, "script": "unknown", "descriptor": None}
+    rec["needs_operator_confirmation"] = True
+    _refresh_identity(rec)
+    assert "E_ADJ_EXPECTED" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_not_applicable_expected_status_rejects_expected_form_confidence():
+    doc = _synthetic_adjudicated_doc()
+    guard = doc["records"][125]["adjudications"][0]
+    guard["causal_confidence"]["expected_form"] = "low"
+    assert "E_ADJ_CONFIDENCE" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_all_guard_record_uses_not_smartkey_lifecycle():
+    doc = _synthetic_adjudicated_doc()
+    rec = doc["records"][125]
+    rec["status"] = "open_suspected_smartkey"
+    assert "E_ADJ_STATE" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_bug_candidate_record_cannot_use_not_smartkey_lifecycle():
+    doc = _synthetic_adjudicated_doc()
+    rec = doc["records"][0]
+    rec["status"] = "not_smartkey"
+    rec["reproducer"] = {
+        "kind": "unit_test",
+        "ref": "synthetic:evidence:bug",
+        "build_sha": "unknown",
+        "summary": "metadata:" + _synthetic_opaque_ref("bug:evidence"),
+    }
+    rec["closure_reason"] = "metadata:" + _synthetic_opaque_ref("bug:closure")
+    assert "E_ADJ_STATE" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_metadata_only_privacy_rejects_token_payload():
+    doc = _synthetic_adjudicated_doc()
+    doc["records"][0]["adjudications"][0]["privacy_class"] = "metadata_only"
+    assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_metadata_only_privacy_rejects_semantic_text_encoded_as_a_code():
+    doc = _synthetic_adjudicated_doc()
+    rec = doc["records"][125]
+    rec["closure_reason"] = "metadata:synthetic_private_sentence_fragment"
+    assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_hash_shaped_metadata_is_not_mistaken_for_a_long_word():
+    doc = _synthetic_adjudicated_doc()
+    doc["records"][125]["closure_reason"] = "metadata:" + "a" * 64
+    assert "E_PRIV_LONGRUN" not in _codes(V.validate_document(doc, _schema()))
+
+
+def test_opaque_source_ref_rejects_paths_and_whitespace():
+    doc = _synthetic_adjudicated_doc()
+    ref = doc["records"][0]["adjudications"][0]["source_refs"][0]
+    ref["ref"] = "source/private transcript"
+    errors = V.validate_document(doc, _schema())
+    assert any(
+        error.startswith("E_SCHEMA") and "adjudications[0].source_refs[0].ref" in error
+        for error in errors
+    )
+
+
+def test_opaque_source_ref_rejects_semantic_text_encoded_with_underscores():
+    doc = _synthetic_adjudicated_doc()
+    ref = doc["records"][0]["adjudications"][0]["source_refs"][0]
+    ref["ref"] = "synthetic_private_sentence_fragment"
+    errors = V.validate_document(doc, _schema())
+    assert any(
+        error.startswith("E_SCHEMA") and "adjudications[0].source_refs[0].ref" in error
+        for error in errors
+    )
+
+
+def test_adjudication_id_is_mapped_exactly_once_across_records():
+    doc = _synthetic_adjudicated_doc()
+    first = doc["records"][0]["adjudications"][0]
+    duplicate = doc["records"][1]["adjudications"][0]
+    duplicate["grain"] = first["grain"]
+    duplicate["ref"] = first["ref"]
+    assert "E_ADJ_DUP" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_ratified_mapping_counts_are_derived_from_unique_ids():
+    doc = _synthetic_adjudicated_doc()
+    doc["records"].pop()
+    assert "E_ADJ_COUNT" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_contract_rejects_an_unratified_artifact_receipt():
+    doc = _synthetic_adjudicated_doc()
+    doc["adjudication_contract"]["artifact_sha256"] = "b" * 64
+    errors = V.validate_document(doc, _schema())
+    assert any(
+        error.startswith("E_SCHEMA") and "adjudication_contract.artifact_sha256" in error
+        for error in errors
+    )
+
+
+def test_cross_record_source_budget_blocks_reconstructable_payload():
+    doc = _synthetic_adjudicated_doc()
+    for rec in doc["records"][:5]:
+        rec["adjudications"][0]["source_refs"] = [
+            {"kind": "source_record", "ref": _synthetic_opaque_ref("source:shared")}
+        ]
+    assert "E_PRIV_AGGREGATE" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_source_budget_allows_bounded_isolated_synthetic_tokens():
+    doc = _synthetic_adjudicated_doc()
+    for rec in doc["records"][:4]:
+        rec["adjudications"][0]["source_refs"] = [
+            {"kind": "source_record", "ref": _synthetic_opaque_ref("source:bounded")}
+        ]
+    assert V.validate_document(doc, _schema()) == []
+
+
+def test_source_budget_does_not_count_opaque_metadata_as_payload():
+    doc = _synthetic_adjudicated_doc()
+    for ordinal, rec in enumerate(doc["records"][:4]):
+        rec["notes"] = "metadata:" + _synthetic_opaque_ref(f"note:{ordinal}")
+        rec["adjudications"][0]["source_refs"] = [
+            {"kind": "source_record", "ref": _synthetic_opaque_ref("source:bounded")}
+        ]
+    assert "E_PRIV_AGGREGATE" not in _codes(V.validate_document(doc, _schema()))
