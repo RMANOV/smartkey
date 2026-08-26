@@ -15,14 +15,16 @@ Checks, in order:
 3. side consistency: script class of each token, token/descriptor/privacy
    coupling, ``needs_operator_confirmation`` coupling, ``repeat`` vs
    ``occurrence_count``, timestamp ordering;
-4. optional G0 adjudication mapping: exact ID/count accounting, enum coupling,
-   expected-form provenance, causal confidence and lifecycle rules;
+4. optional sealed G0 adjudication mapping: exact ID/count accounting, typed
+   HMAC-ref domains, enum/normalized-class coupling, expected-form provenance,
+   causal confidence and complete semantic/registry/legacy commitments;
 5. lifecycle gates: what evidence each ``status`` must carry;
 6. privacy walk over every string in every record: no ``@``, no ``http``
    outside ``source_refs``, no digit run longer than six characters outside
    SHA/reference fields, no letter run longer than 40 characters, no
    newlines, one whitespace-free token per side of the context; enhanced
-   records also have an aggregate source-linked reconstruction budget;
+   records also have a path/type-aware closed allowlist, non-reflective
+   diagnostics and an aggregate source-linked reconstruction budget;
 7. canonical on-disk format (indent 2, non-ASCII preserved, trailing newline).
 
 The registry never changes SmartKey behaviour: this file only reads JSON.
@@ -31,6 +33,7 @@ The registry never changes SmartKey behaviour: this file only reads JSON.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import re
@@ -158,9 +161,7 @@ CLASSIFICATION_OWNER_LANES = {
     "intent_confirmation_needed": frozenset(
         {"future_language_quality_layer", "future_language_quality_or_intent"}
     ),
-    "language_quality_feature_candidate": frozenset(
-        {"future_language_quality_layer"}
-    ),
+    "language_quality_feature_candidate": frozenset({"future_language_quality_layer"}),
     "mechanical_red_candidate": frozenset(
         {
             "f4_core",
@@ -170,16 +171,148 @@ CLASSIFICATION_OWNER_LANES = {
             "punctuation_boundary",
         }
     ),
-    "source_authorship_exclusion": frozenset(
-        {"outside_product_source_authorship"}
+    "source_authorship_exclusion": frozenset({"outside_product_source_authorship"}),
+}
+
+
+def _tuples(
+    classification: str, lanes: frozenset[str]
+) -> frozenset[tuple[str, str, str]]:
+    disposition = CLASSIFICATION_DISPOSITION[classification]
+    return frozenset((classification, disposition, lane) for lane in lanes)
+
+
+_ORIGINAL_NOT_APPLICABLE_TUPLES = frozenset(
+    item
+    for classification, lanes in CLASSIFICATION_OWNER_LANES.items()
+    for item in _tuples(classification, lanes)
+)
+_BOUNDARY_TUPLES = frozenset(
+    {
+        (
+            "instrumentation_first_candidate",
+            "bug_candidate",
+            "punctuation_boundary",
+        ),
+        (
+            "mechanical_red_candidate",
+            "bug_candidate",
+            "punctuation_boundary",
+        ),
+    }
+)
+_LANGUAGE_QUALITY_TUPLES = frozenset(
+    {
+        (
+            "language_quality_feature_candidate",
+            "bug_candidate",
+            "future_language_quality_layer",
+        )
+    }
+)
+_INTENT_OR_LANGUAGE_TUPLES = frozenset(
+    {
+        (
+            "intent_confirmation_needed",
+            "bug_candidate",
+            "future_language_quality_layer",
+        ),
+        (
+            "intent_confirmation_needed",
+            "bug_candidate",
+            "future_language_quality_or_intent",
+        ),
+        *_LANGUAGE_QUALITY_TUPLES,
+    }
+)
+_INTENT_GUARD_TUPLES = frozenset(
+    {
+        (
+            "guard_not_bug_unless_intent_changes",
+            "guard",
+            "intended_english_quoted_guard",
+        )
+    }
+)
+NORMALIZED_CLASS_ALLOWED_TUPLES = {
+    "not_applicable": _ORIGINAL_NOT_APPLICABLE_TUPLES,
+    "boundary_extra_hyphen": _BOUNDARY_TUPLES,
+    "boundary_extra_space": _BOUNDARY_TUPLES,
+    "boundary_space_before_terminal_punctuation": _BOUNDARY_TUPLES,
+    "brand_or_intentional_transliteration_ambiguity": _INTENT_GUARD_TUPLES,
+    "brand_or_native_word_layout_ambiguity": _INTENT_GUARD_TUPLES,
+    "duplicated_character": frozenset(
+        {
+            (
+                "instrumentation_first_candidate",
+                "bug_candidate",
+                "same_script_loss",
+            )
+        }
     ),
+    "f4_early_lock_full_word_crossover": _tuples(
+        "mechanical_red_candidate",
+        frozenset(
+            {
+                "f4_core",
+                "f4_core_both_supported_contextual",
+                "f4_core_early_lock_full_word",
+                "f4_core_one_sided_exact",
+            }
+        ),
+    ),
+    "grammar_adjective_or_ellipsis": _LANGUAGE_QUALITY_TUPLES,
+    "grammar_definite_article": _LANGUAGE_QUALITY_TUPLES,
+    "grammar_missing_comma": _LANGUAGE_QUALITY_TUPLES,
+    "grammar_verb_or_mood": _LANGUAGE_QUALITY_TUPLES,
+    "intentional_transliteration_guard": _INTENT_GUARD_TUPLES,
+    "loanword_vowel_orthography": _LANGUAGE_QUALITY_TUPLES,
+    "orthographic_missing_hyphen": _LANGUAGE_QUALITY_TUPLES,
+    "orthographic_word_boundary_space": _LANGUAGE_QUALITY_TUPLES,
+    "phrase_level_omission": _LANGUAGE_QUALITY_TUPLES,
+    "same_script_character_omission": frozenset(
+        {
+            (
+                "instrumentation_first_candidate",
+                "bug_candidate",
+                "same_script_loss",
+            )
+        }
+    ),
+    "same_script_character_substitution": frozenset(
+        {
+            (
+                "instrumentation_first_candidate",
+                "bug_candidate",
+                "same_script_loss",
+            )
+        }
+    ),
+    "semantic_word_form_ambiguity": _INTENT_OR_LANGUAGE_TUPLES,
+    "source_harness_framing": frozenset(
+        {
+            (
+                "source_authorship_exclusion",
+                "source_exclusion",
+                "outside_product_source_authorship",
+            )
+        }
+    ),
+    "style_punctuation_guard": frozenset(
+        {
+            (
+                "guard_not_bug_unless_intent_changes",
+                "guard",
+                "future_language_quality_layer",
+            )
+        }
+    ),
+    "style_sensitive_extra_comma": _LANGUAGE_QUALITY_TUPLES,
 }
 EXPECTED_AUTHORITY_BY_STATUS = {
     "null_non_unique": frozenset({"final", "null"}),
     "null_pending_operator_intent": frozenset({"final", "null"}),
-    "unique_operator_confirmed": frozenset(
-        {"operator", "final", "legacy_bridge"}
-    ),
+    "unique_operator_confirmed": frozenset({"operator", "final", "legacy_bridge"}),
     "unique_authoritative_spelling": frozenset(
         {"authoritative", "final", "legacy_bridge"}
     ),
@@ -221,15 +354,16 @@ LETTER_RUN_RE = re.compile(r"[A-Za-zЀ-ӿ]{41,}")
 WORD_FRAGMENT_RE = re.compile(r"[A-Za-zЀ-ӿ]{2,40}")
 OPAQUE_ID_PATTERN = r"(?:[0-9a-f]{12}|[0-9a-f]{16}|[0-9a-f]{64}|H[0-9]{3})"
 OPAQUE_ID_RE = re.compile(rf"^{OPAQUE_ID_PATTERN}$")
-METADATA_TEXT_RE = re.compile(r"^metadata:[0-9a-f]{64}$")
+HMAC_REF_PATTERN = r"hmac-sha256-v1:(?:value|event|metadata|source_record):[0-9a-f]{64}"
+HMAC_REF_RE = re.compile(rf"^{HMAC_REF_PATTERN}$")
+METADATA_TEXT_RE = re.compile(r"^hmac-sha256-v1:metadata:[0-9a-f]{64}$")
 CANONICAL_ORIGINAL_REF_RE = re.compile(r"^orig:[0-9a-f]{16}$")
 CANONICAL_SUPPLEMENTAL_REF_RE = re.compile(r"^supp:G[0-9]{3}:H[0-9]{3}$")
-SOURCE_EVENT_REF_RE = re.compile(r"^event:[0-9a-f]{64}$")
-EXPECTED_VALUE_REF_RE = re.compile(r"^value:[0-9a-f]{64}$")
-SYNTHETIC_TEXT_RE = re.compile(r"^synthetic(?::[0-9a-f]{64})?$")
-UTC_RE = re.compile(
-    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z)?$"
-)
+SOURCE_EVENT_REF_RE = re.compile(r"^hmac-sha256-v1:event:[0-9a-f]{64}$")
+EXPECTED_VALUE_REF_RE = re.compile(r"^hmac-sha256-v1:value:[0-9a-f]{64}$")
+HEX_TOKEN_RE = re.compile(r"^(?:[0-9a-f]{12}|[0-9a-f]{16}|[0-9a-f]{40})$")
+HIGH_ENTROPY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{24,40}$")
+UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z)?$")
 CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
 LATIN_RE = re.compile(r"[A-Za-z]")
 # Fields whose values are commit SHAs (40 hex or "unknown") by contract.
@@ -289,6 +423,7 @@ SAFE_ENUM_VALUES = frozenset(
         "off",
         "absent",
         "sealed",
+        "synthetic",
         SEMANTIC_COMMITMENT_ALGORITHM,
     }
 )
@@ -314,7 +449,11 @@ def _side_key(side: dict) -> str:
 
 def compute_dedup_key(record: dict) -> str:
     """``<normalized observed>|<normalized expected or null>``."""
-    return _side_key(record.get("observed") or {}) + "|" + _side_key(record.get("expected") or {})
+    return (
+        _side_key(record.get("observed") or {})
+        + "|"
+        + _side_key(record.get("expected") or {})
+    )
 
 
 def compute_id(record: dict) -> str:
@@ -348,6 +487,33 @@ def canonical_ref_matches_grain(grain: str, ref: str) -> bool:
     if grain == "supplemental_hypothesis":
         return CANONICAL_SUPPLEMENTAL_REF_RE.fullmatch(ref) is not None
     return False
+
+
+def typed_hmac_ref_matches(value: str, domain: str | None = None) -> bool:
+    """Validate only the public typed-ref shape, never its private derivation."""
+    if HMAC_REF_RE.fullmatch(value) is None:
+        return False
+    return domain is None or value.startswith(f"hmac-sha256-v1:{domain}:")
+
+
+def normalized_tuple_is_allowed(
+    normalized_class: str,
+    grain: str,
+    classification: str,
+    disposition: str,
+    owner_lane: str,
+) -> bool:
+    """Return whether the independent normalized axis fits its routing tuple."""
+    if normalized_class == "not_applicable":
+        if grain != "original_candidate":
+            return False
+    elif grain != "supplemental_hypothesis":
+        return False
+    return (
+        classification,
+        disposition,
+        owner_lane,
+    ) in NORMALIZED_CLASS_ALLOWED_TUPLES.get(normalized_class, ())
 
 
 # --------------------------------------------------------------------------
@@ -389,12 +555,14 @@ class SchemaChecker:
             errors.append(f"E_SCHEMA: {path}: expected constant {node['const']!r}")
             return
         if "enum" in node and value not in node["enum"]:
-            errors.append(f"E_ENUM: {path}: {value!r} not in {node['enum']}")
+            errors.append(f"E_ENUM: {path}: expected a declared enum member")
             return
         if "type" in node:
             types = node["type"] if isinstance(node["type"], list) else [node["type"]]
             if not any(_TYPE_CHECKS[t](value) for t in types):
-                errors.append(f"E_SCHEMA: {path}: expected type {types}, got {type(value).__name__}")
+                errors.append(
+                    f"E_SCHEMA: {path}: expected type {types}, got {type(value).__name__}"
+                )
                 return
         if value is None:
             return
@@ -404,7 +572,7 @@ class SchemaChecker:
             if "maxLength" in node and len(value) > node["maxLength"]:
                 errors.append(f"E_SCHEMA: {path}: longer than {node['maxLength']}")
             if "pattern" in node and not re.search(node["pattern"], value):
-                errors.append(f"E_SCHEMA: {path}: {value!r} does not match {node['pattern']}")
+                errors.append(f"E_SCHEMA: {path}: expected the declared string shape")
         elif isinstance(value, bool):
             pass
         elif isinstance(value, (int, float)):
@@ -428,9 +596,9 @@ class SchemaChecker:
                 if key in props:
                     self.check(props[key], item, f"{path}.{key}", errors)
                 elif extra is False:
-                    errors.append(f"E_SCHEMA: {path}: unknown key {key!r}")
+                    errors.append(f"E_SCHEMA: {path}: unknown key is not allowed")
                 elif isinstance(extra, dict):
-                    self.check(extra, item, f"{path}.{key}", errors)
+                    self.check(extra, item, f"{path}.*", errors)
 
 
 # --------------------------------------------------------------------------
@@ -448,10 +616,12 @@ def _pad_utc(stamp: str) -> str:
 def _check_identity(rec: dict, path: str, errors: list[str]) -> None:
     expected_key = compute_dedup_key(rec)
     if rec.get("dedup_key") != expected_key:
-        errors.append(f"E_DEDUP_KEY: {path}: stored {rec.get('dedup_key')!r} != computed {expected_key!r}")
+        errors.append(
+            f"E_DEDUP_KEY: {path}.dedup_key: value differs from canonical recomputation"
+        )
     expected_id = compute_id(rec)
     if rec.get("id") != expected_id:
-        errors.append(f"E_ID: {path}: stored {rec.get('id')!r} != computed {expected_id!r}")
+        errors.append(f"E_ID: {path}.id: value differs from canonical recomputation")
 
 
 def _check_sides(rec: dict, path: str, errors: list[str]) -> None:
@@ -460,22 +630,32 @@ def _check_sides(rec: dict, path: str, errors: list[str]) -> None:
     for name, side in (("observed", observed), ("expected", expected)):
         token = side["token"]
         if isinstance(token, str) and token.split() != [token]:
-            errors.append(f"E_TOKEN_WS: {path}.{name}.token: must be one whitespace-free token")
+            errors.append(
+                f"E_TOKEN_WS: {path}.{name}.token: must be one whitespace-free token"
+            )
         actual = script_class(token)
         if side["script"] != actual:
-            errors.append(f"E_SCRIPT: {path}.{name}.script: declared {side['script']!r}, token is {actual!r}")
+            errors.append(
+                f"E_SCRIPT: {path}.{name}.script: value differs from token script class"
+            )
     if observed["token"] is None:
-        if not (isinstance(observed["descriptor"], str) and observed["descriptor"].strip()):
-            errors.append(f"E_OBSERVED: {path}.observed: descriptor required when token is null")
+        if not (
+            isinstance(observed["descriptor"], str) and observed["descriptor"].strip()
+        ):
+            errors.append(
+                f"E_OBSERVED: {path}.observed: descriptor required when token is null"
+            )
         if rec["privacy_classification"] != "unknown":
-            errors.append(f"E_OBSERVED: {path}.privacy_classification: must be 'unknown' when no token was captured")
+            errors.append(
+                f"E_OBSERVED: {path}.privacy_classification: must be 'unknown' when no token was captured"
+            )
     elif rec["privacy_classification"] == "unknown":
-        errors.append(f"E_OBSERVED: {path}.privacy_classification: 'unknown' but observed.token is present")
+        errors.append(
+            f"E_OBSERVED: {path}.privacy_classification: 'unknown' but observed.token is present"
+        )
     adjudications = rec.get("adjudications") or []
     expected_not_applicable = bool(adjudications) and all(
-        (adj.get("expected") or {}).get(
-            "status", adj.get("expected_form_status")
-        )
+        (adj.get("expected") or {}).get("status", adj.get("expected_form_status"))
         == "not_applicable"
         for adj in adjudications
     )
@@ -489,10 +669,16 @@ def _check_sides(rec: dict, path: str, errors: list[str]) -> None:
             f"E_EXPECTED: {path}: expected form is null, needs_operator_confirmation must be true"
         )
     if rec["needs_operator_confirmation"] and rec["status"] not in UNCONFIRMED_STATUSES:
-        errors.append(f"E_EXPECTED: {path}: status {rec['status']!r} needs a confirmed expected form")
+        errors.append(
+            f"E_EXPECTED: {path}.needs_operator_confirmation: state requires a confirmed expected form"
+        )
     if rec["repeat"] != (rec["occurrence_count"] > 1):
         errors.append(f"E_REPEAT: {path}: repeat must equal occurrence_count > 1")
-    first, last, recorded = rec["first_seen_utc"], rec["last_seen_utc"], rec["recorded_utc"]
+    first, last, recorded = (
+        rec["first_seen_utc"],
+        rec["last_seen_utc"],
+        rec["recorded_utc"],
+    )
     if first and last and _pad_utc(first) > _pad_utc(last):
         errors.append(f"E_TIME: {path}: first_seen_utc after last_seen_utc")
     for name, stamp in (("first_seen_utc", first), ("last_seen_utc", last)):
@@ -502,12 +688,22 @@ def _check_sides(rec: dict, path: str, errors: list[str]) -> None:
 
 def _check_gates(rec: dict, path: str, errors: list[str]) -> None:
     status = rec["status"]
-    has = {k: rec.get(k) is not None for k in ("reproducer", "red_test", "red_test_waiver", "fix_commit", "verification")}
-    has_closure = isinstance(rec.get("closure_reason"), str) and bool(rec["closure_reason"].strip())
+    has = {
+        k: rec.get(k) is not None
+        for k in (
+            "reproducer",
+            "red_test",
+            "red_test_waiver",
+            "fix_commit",
+            "verification",
+        )
+    }
+    has_closure = isinstance(rec.get("closure_reason"), str) and bool(
+        rec["closure_reason"].strip()
+    )
     adjudications = rec.get("adjudications") or []
     all_guard = bool(adjudications) and all(
-        adjudication.get("disposition") == "guard"
-        for adjudication in adjudications
+        adjudication.get("disposition") == "guard" for adjudication in adjudications
     )
     guard_receipts_complete = all_guard and all(
         any(
@@ -535,18 +731,25 @@ def _check_gates(rec: dict, path: str, errors: list[str]) -> None:
         need(has["red_test"], "a linked RED test")
     if status in ("fixed", "verified", "closed"):
         need(has["fix_commit"], "an exact fix_commit")
-        need(has["red_test"] or has["red_test_waiver"], "a linked regression test or an explicit red_test_waiver")
+        need(
+            has["red_test"] or has["red_test_waiver"],
+            "a linked regression test or an explicit red_test_waiver",
+        )
     if status in ("verified", "closed"):
         need(has["verification"], "post-fix verification on the reported surface")
     if status in ("closed", "not_smartkey"):
         need(has_closure, "a closure_reason")
     if status in ("open_suspected_smartkey", "reproduced", "red_tested"):
         if has["fix_commit"] or has["verification"]:
-            errors.append(f"E_STATE: {path}: status {status!r} cannot carry fix_commit/verification")
+            errors.append(
+                f"E_STATE: {path}: status {status!r} cannot carry fix_commit/verification"
+            )
     if has["verification"] and not has["fix_commit"]:
         errors.append(f"E_STATE: {path}: verification without fix_commit")
     if has["red_test"] and has["red_test_waiver"]:
-        errors.append(f"E_STATE: {path}: red_test and red_test_waiver are mutually exclusive")
+        errors.append(
+            f"E_STATE: {path}: red_test and red_test_waiver are mutually exclusive"
+        )
     if all_guard and (rec.get("reproducer") or {}).get("kind") == "unit_test":
         errors.append(
             f"E_ADJ_GUARD_EVIDENCE: {path}.reproducer: guard adjudication "
@@ -565,16 +768,35 @@ def _walk_strings(value, path: tuple, out: list[tuple[tuple, str]]) -> None:
             _walk_strings(v, path + (i,), out)
 
 
+def _display_path(base: str, keys: tuple) -> str:
+    """Render a JSON path without reflecting dynamic dictionary keys."""
+    parts = [base]
+    dynamic = False
+    for key in keys:
+        if isinstance(key, int):
+            parts[-1] += f"[{key}]"
+            continue
+        if dynamic:
+            parts.append("*")
+            dynamic = False
+            continue
+        parts.append(key)
+        if key == "flags":
+            dynamic = True
+    return ".".join(parts)
+
+
 def _check_privacy(rec: dict, path: str, errors: list[str]) -> None:
     strings: list[tuple[tuple, str]] = []
     _walk_strings(rec, (), strings)
     for keys, text in strings:
-        where = path + "." + ".".join(str(k) for k in keys)
+        where = _display_path(path, keys)
         in_source_refs = bool(keys) and keys[0] == "source_refs"
         last_key = next((k for k in reversed(keys) if isinstance(k, str)), None)
         is_sha_field = last_key in SHA_KEYS
         is_opaque = (
             OPAQUE_ID_RE.fullmatch(text) is not None
+            or HMAC_REF_RE.fullmatch(text) is not None
             or METADATA_TEXT_RE.fullmatch(text) is not None
             or CANONICAL_ORIGINAL_REF_RE.fullmatch(text) is not None
             or CANONICAL_SUPPLEMENTAL_REF_RE.fullmatch(text) is not None
@@ -583,39 +805,76 @@ def _check_privacy(rec: dict, path: str, errors: list[str]) -> None:
         )
         is_identifier = is_sha_field or last_key in IDENTIFIER_KEYS or is_opaque
         if "@" in text:
-            errors.append(f"E_PRIV_AT: {where}: '@' is never allowed (addresses/handles)")
+            errors.append(
+                f"E_PRIV_AT: {where}: '@' is never allowed (addresses/handles)"
+            )
         if "http" in text.lower() and not in_source_refs:
             errors.append(f"E_PRIV_URL: {where}: URLs only inside source_refs")
         if "\n" in text or "\r" in text:
-            errors.append(f"E_PRIV_MULTILINE: {where}: multi-line text looks like a transcript")
+            errors.append(
+                f"E_PRIV_MULTILINE: {where}: multi-line text looks like a transcript"
+            )
         if LETTER_RUN_RE.search(text) and not is_opaque and last_key != "dedup_key":
-            errors.append(f"E_PRIV_LONGRUN: {where}: letter run longer than 40 characters")
+            errors.append(
+                f"E_PRIV_LONGRUN: {where}: letter run longer than 40 characters"
+            )
         if not is_identifier and DIGIT_RUN_RE.search(text):
-            errors.append(f"E_PRIV_DIGITS: {where}: digit run longer than 6 outside SHA/reference fields")
+            errors.append(
+                f"E_PRIV_DIGITS: {where}: digit run longer than 6 outside SHA/reference fields"
+            )
         if is_sha_field and text != "unknown" and not SHA_RE.match(text):
             errors.append(f"E_SHA: {where}: SHA field must be 40 hex or 'unknown'")
     for side in ("before", "after"):
         token = rec["minimal_context"][side]
         if isinstance(token, str) and token.split() != [token]:
-            errors.append(f"E_PRIV_CONTEXT: {path}.minimal_context.{side}: at most one whitespace-free token per side")
+            errors.append(
+                f"E_PRIV_CONTEXT: {path}.minimal_context.{side}: at most one whitespace-free token per side"
+            )
 
 
-def _is_enhanced_atom(text: str) -> bool:
-    """Closed allowlist for non-payload strings in enhanced records."""
-    return (
-        text in SAFE_ENUM_VALUES
-        or text in {"[redacted]", "redacted"}
-        or SHA_RE.fullmatch(text) is not None
-        or SHA256_RE.fullmatch(text) is not None
-        or OPAQUE_ID_RE.fullmatch(text) is not None
-        or METADATA_TEXT_RE.fullmatch(text) is not None
-        or CANONICAL_ORIGINAL_REF_RE.fullmatch(text) is not None
-        or CANONICAL_SUPPLEMENTAL_REF_RE.fullmatch(text) is not None
-        or SOURCE_EVENT_REF_RE.fullmatch(text) is not None
-        or EXPECTED_VALUE_REF_RE.fullmatch(text) is not None
-        or SYNTHETIC_TEXT_RE.fullmatch(text) is not None
-        or re.fullmatch(r"anom-[0-9a-f]{12}", text) is not None
-        or UTC_RE.fullmatch(text) is not None
+def _is_enhanced_string_allowed(keys: tuple, text: str) -> bool:
+    """Path/type-aware allowlist for one enhanced-record string value."""
+    last_key = next((key for key in reversed(keys) if isinstance(key, str)), None)
+    if last_key in {"token", "dedup_key"}:
+        return True  # side/privacy and canonical-identity checks own payload
+    if last_key == "id":
+        return re.fullmatch(r"anom-[0-9a-f]{12}", text) is not None
+    if last_key in {"recorded_utc", "first_seen_utc", "last_seen_utc", "observed_utc"}:
+        return UTC_RE.fullmatch(text) is not None
+    if last_key in SHA_KEYS:
+        return text == "unknown" or SHA_RE.fullmatch(text) is not None
+    if last_key == "value_ref":
+        return EXPECTED_VALUE_REF_RE.fullmatch(text) is not None
+    if "source_event_refs" in keys or "covered_source_event_refs" in keys:
+        return SOURCE_EVENT_REF_RE.fullmatch(text) is not None
+    if "covered_adjudication_refs" in keys:
+        return (
+            CANONICAL_ORIGINAL_REF_RE.fullmatch(text) is not None
+            or CANONICAL_SUPPLEMENTAL_REF_RE.fullmatch(text) is not None
+        )
+    if last_key == "ref":
+        if "adjudications" in keys:
+            if "source_refs" in keys:
+                return HMAC_REF_RE.fullmatch(text) is not None
+            return (
+                CANONICAL_ORIGINAL_REF_RE.fullmatch(text) is not None
+                or CANONICAL_SUPPLEMENTAL_REF_RE.fullmatch(text) is not None
+            )
+        return METADATA_TEXT_RE.fullmatch(text) is not None
+    if "evidence_refs" in keys:
+        return METADATA_TEXT_RE.fullmatch(text) is not None
+    if len(keys) >= 2 and keys[:2] == ("environment", "flags"):
+        return text in {"on", "off", "absent", "unknown"}
+    return text in SAFE_ENUM_VALUES or METADATA_TEXT_RE.fullmatch(text) is not None
+
+
+def _public_token_looks_secret(token: str) -> bool:
+    if HEX_TOKEN_RE.fullmatch(token) or HMAC_REF_RE.fullmatch(token):
+        return True
+    return bool(
+        HIGH_ENTROPY_TOKEN_RE.fullmatch(token)
+        and any(character.isdigit() for character in token)
+        and len(set(token)) >= 12
     )
 
 
@@ -640,21 +899,13 @@ def _payload_fragments(rec: dict) -> set[str]:
             "last_seen_utc",
         }:
             continue
-        if text.startswith("synthetic:") and SYNTHETIC_TEXT_RE.fullmatch(text):
-            fragments.add(normalize(text))
-        elif not _is_enhanced_atom(text):
-            fragments.update(
-                normalize(word) for word in WORD_FRAGMENT_RE.findall(text)
-            )
+        if not _is_enhanced_string_allowed(keys, text):
+            fragments.update(normalize(word) for word in WORD_FRAGMENT_RE.findall(text))
 
     flags = rec.get("environment", {}).get("flags") or {}
     for key in flags:
-        if key.startswith("synthetic:") and SYNTHETIC_TEXT_RE.fullmatch(key):
-            fragments.add(normalize(key))
-        elif not _is_enhanced_atom(key):
-            fragments.update(
-                normalize(word) for word in WORD_FRAGMENT_RE.findall(key)
-            )
+        if METADATA_TEXT_RE.fullmatch(key) is None:
+            fragments.update(normalize(word) for word in WORD_FRAGMENT_RE.findall(key))
     return {fragment for fragment in fragments if fragment}
 
 
@@ -679,15 +930,15 @@ def _check_adjudication_privacy(rec: dict, path: str, errors: list[str]) -> None
         last_key = next((key for key in reversed(keys) if isinstance(key, str)), None)
         if last_key in skipped_fields:
             continue
-        if not _is_enhanced_atom(text):
-            where = path + "." + ".".join(str(key) for key in keys)
+        if not _is_enhanced_string_allowed(keys, text):
+            where = _display_path(path, keys)
             errors.append(
                 f"E_ADJ_PRIVACY: {where}: enhanced string is outside the closed allowlist"
             )
 
     flags = rec.get("environment", {}).get("flags") or {}
     for key in flags:
-        if not _is_enhanced_atom(key):
+        if METADATA_TEXT_RE.fullmatch(key) is None:
             errors.append(
                 f"E_ADJ_PRIVACY: {path}.environment.flags: dynamic key is outside "
                 "the closed allowlist"
@@ -716,15 +967,23 @@ def _check_adjudication_privacy(rec: dict, path: str, errors: list[str]) -> None
         for side, token, descriptor in zip(
             ("observed", "expected"), tokens, descriptors
         ):
-            if isinstance(token, str) and ("/" in token or "\\" in token):
-                errors.append(
-                    f"E_ADJ_PRIVACY: {path}.{side}.token: public token cannot "
-                    "encode a filesystem path"
-                )
-            if isinstance(descriptor, str) and not METADATA_TEXT_RE.fullmatch(descriptor):
+            if isinstance(token, str):
+                if "/" in token or "\\" in token:
+                    errors.append(
+                        f"E_ADJ_PRIVACY: {path}.{side}.token: public token cannot "
+                        "encode a filesystem path"
+                    )
+                if _public_token_looks_secret(token):
+                    errors.append(
+                        f"E_ADJ_PRIVACY: {path}.{side}.token: public token has a "
+                        "secret/hash-shaped representation"
+                    )
+            if isinstance(descriptor, str) and not METADATA_TEXT_RE.fullmatch(
+                descriptor
+            ):
                 errors.append(
                     f"E_ADJ_PRIVACY: {path}.{side}.descriptor: public representation "
-                    "descriptor must be metadata:<sha256>"
+                    "descriptor must be a typed metadata HMAC ref"
                 )
     elif privacy_class == "redacted":
         if rec["privacy_classification"] != "redacted" or any(
@@ -734,10 +993,12 @@ def _check_adjudication_privacy(rec: dict, path: str, errors: list[str]) -> None
                 f"E_ADJ_PRIVACY: {path}: redacted requires placeholder/null on both sides"
             )
         for side, descriptor in zip(("observed", "expected"), descriptors):
-            if isinstance(descriptor, str) and not METADATA_TEXT_RE.fullmatch(descriptor):
+            if isinstance(descriptor, str) and not METADATA_TEXT_RE.fullmatch(
+                descriptor
+            ):
                 errors.append(
                     f"E_ADJ_PRIVACY: {path}.{side}.descriptor: redacted descriptor "
-                    "must be metadata:<sha256>"
+                    "must be a typed metadata HMAC ref"
                 )
     else:
         if rec["privacy_classification"] != "unknown" or any(
@@ -747,16 +1008,16 @@ def _check_adjudication_privacy(rec: dict, path: str, errors: list[str]) -> None
                 f"E_ADJ_PRIVACY: {path}: metadata_only cannot carry token payload"
             )
         for side, descriptor in zip(("observed", "expected"), descriptors):
-            if isinstance(descriptor, str) and not METADATA_TEXT_RE.fullmatch(descriptor):
+            if isinstance(descriptor, str) and not METADATA_TEXT_RE.fullmatch(
+                descriptor
+            ):
                 errors.append(
                     f"E_ADJ_PRIVACY: {path}.{side}.descriptor: metadata-only "
-                    "descriptor must be metadata:<sha256>"
+                    "descriptor must be a typed metadata HMAC ref"
                 )
 
 
-def _check_expected_envelope(
-    adjudication: dict, path: str, errors: list[str]
-) -> None:
+def _check_expected_envelope(adjudication: dict, path: str, errors: list[str]) -> None:
     expected = adjudication["expected"]
     status = expected["status"]
     authority = expected["authority"]
@@ -773,8 +1034,8 @@ def _check_expected_envelope(
         )
     if authority not in EXPECTED_AUTHORITY_BY_STATUS[status]:
         errors.append(
-            f"E_ADJ_EXPECTED: {path}.expected.authority: {authority!r} is not "
-            f"valid for {status!r}"
+            f"E_ADJ_EXPECTED: {path}.expected.authority: value is outside the "
+            "status-specific authority set"
         )
 
     unique_statuses = {
@@ -783,7 +1044,9 @@ def _check_expected_envelope(
     }
     null_statuses = {"null_non_unique", "null_pending_operator_intent"}
     if status in unique_statuses:
-        if not isinstance(value_ref, str) or not EXPECTED_VALUE_REF_RE.fullmatch(value_ref):
+        if not isinstance(value_ref, str) or not EXPECTED_VALUE_REF_RE.fullmatch(
+            value_ref
+        ):
             errors.append(
                 f"E_ADJ_EXPECTED: {path}.expected.value_ref: unique expected form "
                 "requires an opaque value commitment"
@@ -842,9 +1105,7 @@ def _check_adjudication_item(
     grain = adjudication["grain"]
     ref = adjudication["ref"]
     if not canonical_ref_matches_grain(grain, ref):
-        errors.append(
-            f"E_ADJ_REF: {path}.ref: canonical ref does not match {grain!r}"
-        )
+        errors.append(f"E_ADJ_REF: {path}.ref: canonical ref does not match its grain")
     prior = seen_adjudications.get(ref)
     if prior is not None:
         errors.append(f"E_ADJ_DUP: {path}.ref: mapping already present at {prior}")
@@ -857,14 +1118,13 @@ def _check_adjudication_item(
     disposition_refs[disposition].add(ref)
     if CLASSIFICATION_DISPOSITION[classification] != disposition:
         errors.append(
-            f"E_ADJ_STATE: {path}: classification {classification!r} requires "
-            f"disposition {CLASSIFICATION_DISPOSITION[classification]!r}"
+            f"E_ADJ_STATE: {path}: classification and disposition are inconsistent"
         )
     owner_lane = adjudication["owner_lane"]
     if owner_lane not in CLASSIFICATION_OWNER_LANES[classification]:
         errors.append(
-            f"E_ADJ_OWNER: {path}.owner_lane: {owner_lane!r} is outside the "
-            f"exclusive lane matrix for {classification!r}"
+            f"E_ADJ_OWNER: {path}.owner_lane: value is outside the exclusive "
+            "classification lane matrix"
         )
 
     normalized_class = adjudication["normalized_class"]
@@ -877,6 +1137,17 @@ def _check_adjudication_item(
         errors.append(
             f"E_ADJ_NORMALIZED: {path}.normalized_class: supplemental mappings "
             "require their ratified normalized class"
+        )
+    if not normalized_tuple_is_allowed(
+        normalized_class,
+        grain,
+        classification,
+        disposition,
+        owner_lane,
+    ):
+        errors.append(
+            f"E_ADJ_NORMALIZED: {path}.normalized_class: value is inconsistent "
+            "with grain/classification/disposition/owner lane"
         )
 
     confidence = adjudication["causal_confidence"]
@@ -908,11 +1179,25 @@ def _check_adjudication_item(
         if source_key in source_keys:
             errors.append(f"E_ADJ_DUP: {path}.source_refs: duplicate source ref")
         source_keys.add(source_key)
+        expected_domain = (
+            "source_record" if source["kind"] == "source_record" else "metadata"
+        )
+        if not typed_hmac_ref_matches(source["ref"], expected_domain):
+            errors.append(
+                f"E_ADJ_REF_PRIVACY: {path}.source_refs: ref must use the "
+                "kind-specific typed HMAC domain"
+            )
         if source["kind"] == "source_record":
             source_records.add(source["ref"])
     if not source_records:
+        errors.append(f"E_ADJ_STATE: {path}.source_refs: source_record ref is required")
+    if disposition == "guard" and not any(
+        source["kind"] in {"ruling", "receipt"}
+        for source in adjudication["source_refs"]
+    ):
         errors.append(
-            f"E_ADJ_STATE: {path}.source_refs: source_record ref is required"
+            f"E_ADJ_GUARD_EVIDENCE: {path}.source_refs: guard mapping requires "
+            "its own ruling/receipt evidence"
         )
 
     source_events = adjudication["source_event_refs"]
@@ -931,7 +1216,7 @@ def _check_adjudication_item(
         if prior_owner != owner_path:
             errors.append(
                 f"E_ADJ_EVENT: {path}.source_event_refs: event already reconciled "
-                f"to {prior_owner}"
+                "to another record"
             )
     return source_records, event_set
 
@@ -979,6 +1264,8 @@ def _check_evidence_coverage(
             )
 
     status = rec["status"]
+    if status in {"reproduced", "red_tested", "fixed", "verified", "closed"}:
+        check(rec.get("reproducer"), "reproducer")
     if status in {"red_tested", "fixed", "verified", "closed"}:
         check(rec.get("red_test"), "red_test")
     if status in {"fixed", "verified", "closed"}:
@@ -1002,6 +1289,11 @@ def _check_adjudication_record(
         return
 
     _check_adjudication_privacy(rec, path, errors)
+    if rec.get("red_test_waiver") is not None:
+        errors.append(
+            f"E_ADJ_WAIVER: {path}.red_test_waiver: enhanced records require "
+            "actual covered RED evidence; waivers are forbidden"
+        )
     dispositions: set[str] = set()
     record_events: set[str] = set()
     fragments = _payload_fragments(rec)
@@ -1038,9 +1330,7 @@ def _check_adjudication_record(
             f"E_ADJ_STATE: {path}: bug-candidate record cannot be not_smartkey"
         )
     if not has_bug and rec["status"] != "not_smartkey":
-        errors.append(
-            f"E_ADJ_STATE: {path}: all-guard record must be not_smartkey"
-        )
+        errors.append(f"E_ADJ_STATE: {path}: all-guard record must be not_smartkey")
     if not has_bug and any(
         rec.get(field) is not None
         for field in (
@@ -1109,10 +1399,45 @@ def semantic_commitment_sha256(doc: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def canonical_ref_set_sha256(refs: set[str]) -> str:
+def _canonical_sha256(value) -> str:
     payload = json.dumps(
-        sorted(refs), ensure_ascii=True, separators=(",", ":")
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
     )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def legacy_projection_payload(doc: dict) -> list[dict]:
+    """Canonical complete identity/content of unadjudicated retained records."""
+    records = [
+        copy.deepcopy(record)
+        for record in doc.get("records", ())
+        if not record.get("adjudications")
+    ]
+    return sorted(records, key=lambda record: record.get("id", ""))
+
+
+def legacy_projection_sha256(doc: dict) -> str:
+    return _canonical_sha256(legacy_projection_payload(doc))
+
+
+def registry_projection_payload(doc: dict) -> dict:
+    """Complete sealed document excluding only its self-referential digest."""
+    payload = copy.deepcopy(doc)
+    contract = payload.get("adjudication_contract")
+    if isinstance(contract, dict):
+        contract.pop("registry_projection_sha256", None)
+    return payload
+
+
+def registry_projection_sha256(doc: dict) -> str:
+    return _canonical_sha256(registry_projection_payload(doc))
+
+
+def canonical_ref_set_sha256(refs: set[str]) -> str:
+    payload = json.dumps(sorted(refs), ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -1126,13 +1451,9 @@ def _check_adjudication_contract(
 ) -> None:
     contract = doc.get("adjudication_contract")
     if seen_adjudications and contract is None:
-        errors.append(
-            "E_ADJ_CONTRACT: $: enhanced mappings require a sealed contract"
-        )
+        errors.append("E_ADJ_CONTRACT: $: enhanced mappings require a sealed contract")
     if contract is not None and not seen_adjudications:
-        errors.append(
-            "E_ADJ_CONTRACT: $: sealed contract has no enhanced mappings"
-        )
+        errors.append("E_ADJ_CONTRACT: $: sealed contract has no enhanced mappings")
     if contract is not None:
         for name, expected in SEALED_CONTRACT_CONSTS.items():
             if contract.get(name) != expected:
@@ -1154,10 +1475,7 @@ def _check_adjudication_contract(
             adjudications = rec.get("adjudications") or []
             if not adjudications:
                 record_shape["legacy_record_count"] += 1
-            elif any(
-                item["disposition"] == "bug_candidate"
-                for item in adjudications
-            ):
+            elif any(item["disposition"] == "bug_candidate" for item in adjudications):
                 record_shape["bug_record_count"] += 1
             else:
                 record_shape["guard_record_count"] += 1
@@ -1205,6 +1523,32 @@ def _check_adjudication_contract(
                     "E_ADJ_COMMITMENT: $.adjudication_contract: semantic tuple "
                     "commitment does not match mapped adjudications"
                 )
+        stored_legacy = contract.get("legacy_projection_sha256")
+        if not isinstance(stored_legacy, str) or not DIGEST_NONZERO_RE.fullmatch(
+            stored_legacy
+        ):
+            errors.append(
+                "E_ADJ_PROJECTION: $.adjudication_contract.legacy_projection_sha256: "
+                "expected a nonzero lowercase sha256"
+            )
+        elif stored_legacy != legacy_projection_sha256(doc):
+            errors.append(
+                "E_ADJ_PROJECTION: $.adjudication_contract.legacy_projection_sha256: "
+                "digest does not match the complete legacy-record projection"
+            )
+        stored_projection = contract.get("registry_projection_sha256")
+        if not isinstance(stored_projection, str) or not DIGEST_NONZERO_RE.fullmatch(
+            stored_projection
+        ):
+            errors.append(
+                "E_ADJ_PROJECTION: $.adjudication_contract.registry_projection_sha256: "
+                "expected a nonzero lowercase sha256"
+            )
+        elif stored_projection != registry_projection_sha256(doc):
+            errors.append(
+                "E_ADJ_PROJECTION: $.adjudication_contract.registry_projection_sha256: "
+                "digest does not match the complete sealed projection"
+            )
     for fragments in source_fragments.values():
         if len(fragments) > MAX_RECONSTRUCTION_FRAGMENTS_PER_SOURCE:
             errors.append(
@@ -1262,6 +1606,18 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
                 "E_ADJ_COMMITMENT: $.adjudication_contract: semantic digest must "
                 "be a nonzero lowercase sha256"
             )
+        for field in (
+            "legacy_projection_sha256",
+            "registry_projection_sha256",
+        ):
+            projection_digest = contract.get(field)
+            if not isinstance(
+                projection_digest, str
+            ) or not DIGEST_NONZERO_RE.fullmatch(projection_digest):
+                errors.append(
+                    f"E_ADJ_PROJECTION: $.adjudication_contract.{field}: "
+                    "expected a nonzero lowercase sha256"
+                )
         exclusions = doc.get("source_exclusions")
         if not isinstance(exclusions, list) or len(exclusions) != 2:
             errors.append(
@@ -1271,24 +1627,23 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
     for path, adjudication in locations:
         grain = adjudication.get("grain")
         ref = adjudication.get("ref")
-        if not isinstance(grain, str) or not isinstance(ref, str) or not canonical_ref_matches_grain(
-            grain, ref
+        if (
+            not isinstance(grain, str)
+            or not isinstance(ref, str)
+            or not canonical_ref_matches_grain(grain, ref)
         ):
             errors.append(
                 f"E_ADJ_REF: {path}.ref: ref must use the canonical grain namespace"
             )
         normalized_class = adjudication.get("normalized_class")
         if normalized_class is None:
-            errors.append(
-                f"E_ADJ_NORMALIZED: {path}: normalized_class is mandatory"
-            )
+            errors.append(f"E_ADJ_NORMALIZED: {path}: normalized_class is mandatory")
         elif grain == "original_candidate" and normalized_class != "not_applicable":
             errors.append(
                 f"E_ADJ_NORMALIZED: {path}: original mapping requires not_applicable"
             )
         elif (
-            grain == "supplemental_hypothesis"
-            and normalized_class == "not_applicable"
+            grain == "supplemental_hypothesis" and normalized_class == "not_applicable"
         ):
             errors.append(
                 f"E_ADJ_NORMALIZED: {path}: supplemental mapping cannot use not_applicable"
@@ -1306,16 +1661,23 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
             ):
                 errors.append(
                     f"E_ADJ_EVENT: {path}.source_event_refs: event IDs must be "
-                    "unique canonical event:<sha256> values"
+                    "unique canonical typed event-HMAC refs"
                 )
 
 
 def _check_schema_drift(schema: dict, errors: list[str]) -> None:
     props = schema.get("$defs", {}).get("record", {}).get("properties", {})
     if tuple(props.get("status", {}).get("enum", ())) != STATUSES:
-        errors.append("E_SCHEMA_DRIFT: schema status enum differs from validate.STATUSES")
-    if tuple(props.get("privacy_classification", {}).get("enum", ())) != PRIVACY_CLASSES:
-        errors.append("E_SCHEMA_DRIFT: schema privacy enum differs from validate.PRIVACY_CLASSES")
+        errors.append(
+            "E_SCHEMA_DRIFT: schema status enum differs from validate.STATUSES"
+        )
+    if (
+        tuple(props.get("privacy_classification", {}).get("enum", ()))
+        != PRIVACY_CLASSES
+    ):
+        errors.append(
+            "E_SCHEMA_DRIFT: schema privacy enum differs from validate.PRIVACY_CLASSES"
+        )
     definitions = schema.get("$defs", {})
     enum_contracts = (
         ("adjudication_classification", ADJUDICATION_CLASSIFICATIONS),
@@ -1342,14 +1704,39 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
         errors.append(
             "E_SCHEMA_DRIFT: schema adjudication source kind differs from validator contract"
         )
-    contract_props = definitions.get("adjudication_contract", {}).get(
-        "properties", {}
+    pattern_contracts = (
+        ("typed_hmac_ref", rf"^{HMAC_REF_PATTERN}$"),
+        ("source_event_ref", r"^hmac-sha256-v1:event:[0-9a-f]{64}$"),
+        (
+            "expected_value_ref_or_null",
+            r"^hmac-sha256-v1:value:[0-9a-f]{64}$",
+        ),
     )
+    for definition, expected_pattern in pattern_contracts:
+        if definitions.get(definition, {}).get("pattern") != expected_pattern:
+            errors.append(
+                f"E_SCHEMA_DRIFT: schema {definition} pattern differs from "
+                "the typed-HMAC validator contract"
+            )
+    contract_props = definitions.get("adjudication_contract", {}).get("properties", {})
     for name, expected in SEALED_CONTRACT_CONSTS.items():
         if contract_props.get(name, {}).get("const") != expected:
             errors.append(
                 f"E_SCHEMA_DRIFT: schema adjudication contract pin {name!r} "
                 "differs from validator contract"
+            )
+    contract_required = set(
+        definitions.get("adjudication_contract", {}).get("required", ())
+    )
+    for field in (
+        "semantic_commitment_sha256",
+        "legacy_projection_sha256",
+        "registry_projection_sha256",
+    ):
+        if field not in contract_required or field not in contract_props:
+            errors.append(
+                f"E_SCHEMA_DRIFT: schema adjudication contract omits required "
+                f"digest field {field}"
             )
 
 
@@ -1373,10 +1760,12 @@ def validate_document(doc, schema: dict) -> list[str]:
         _check_identity(rec, path, errors)
         key, rid = rec["dedup_key"], rec["id"]
         if key in seen_keys:
-            errors.append(f"E_DUP: {path}: dedup_key {key!r} already used by {seen_keys[key]}")
+            errors.append(
+                f"E_DUP: {path}.dedup_key: value is already used by another record"
+            )
         seen_keys.setdefault(key, path)
         if rid in seen_ids:
-            errors.append(f"E_DUP: {path}: id {rid!r} already used by {seen_ids[rid]}")
+            errors.append(f"E_DUP: {path}.id: value is already used by another record")
         seen_ids.setdefault(rid, path)
         _check_sides(rec, path, errors)
         _check_gates(rec, path, errors)
@@ -1444,7 +1833,9 @@ def validate_file(registry: Path, schema_path: Path = DEFAULT_SCHEMA) -> list[st
     schema = json.loads(Path(schema_path).read_text(encoding="utf-8"))
     errors = validate_document(doc, schema)
     if text != canonical_text(doc):
-        errors.append("E_FORMAT: registry is not in canonical form (indent 2, ensure_ascii=False, trailing newline)")
+        errors.append(
+            "E_FORMAT: registry is not in canonical form (indent 2, ensure_ascii=False, trailing newline)"
+        )
     return errors
 
 
@@ -1463,8 +1854,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         errors = validate_file(Path(args.registry), Path(args.schema))
         doc = json.loads(Path(args.registry).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        print(f"E_READ: {exc}", file=sys.stderr)
+    except (OSError, ValueError):
+        print("E_READ: input could not be read or parsed", file=sys.stderr)
         return 2
     for err in errors:
         print(err)
@@ -1472,7 +1863,9 @@ def main(argv: list[str] | None = None) -> int:
     if errors:
         print(f"FAIL: {len(errors)} violation(s) in {count} record(s)")
         return 1
-    print(f"OK: {count} record(s); by status: {json.dumps(status_counts(doc), sort_keys=True)}")
+    print(
+        f"OK: {count} record(s); by status: {json.dumps(status_counts(doc), sort_keys=True)}"
+    )
     return 0
 
 

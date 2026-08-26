@@ -26,11 +26,10 @@
       "pattern": "^(?!0000000000000000000000000000000000000000000000000000000000000000$)[0-9a-f]{64}$"
     },
     "sha_or_unknown": { "type": "string", "pattern": "^([0-9a-f]{40}|unknown)$" },
-    "opaque_ref": {
+    "typed_hmac_ref": {
       "type": "string",
-      "minLength": 4,
-      "maxLength": 64,
-      "pattern": "^([0-9a-f]{12}|[0-9a-f]{16}|[0-9a-f]{64}|H[0-9]{3})$"
+      "description": "Domain-separated hmac-sha256-v1 opaque reference. Syntax validation here does not prove private-key derivation.",
+      "pattern": "^hmac-sha256-v1:(?:value|event|metadata|source_record):[0-9a-f]{64}$"
     },
     "canonical_adjudication_ref": {
       "type": "string",
@@ -38,11 +37,11 @@
     },
     "source_event_ref": {
       "type": "string",
-      "pattern": "^event:[0-9a-f]{64}$"
+      "pattern": "^hmac-sha256-v1:event:[0-9a-f]{64}$"
     },
     "expected_value_ref_or_null": {
       "type": ["string", "null"],
-      "pattern": "^value:[0-9a-f]{64}$"
+      "pattern": "^hmac-sha256-v1:value:[0-9a-f]{64}$"
     },
     "utc_or_null": {
       "type": ["string", "null"],
@@ -145,7 +144,7 @@
       "required": ["kind", "ref"],
       "properties": {
         "kind": { "enum": ["source_record", "source_span", "ruling", "receipt", "other"] },
-        "ref": { "$ref": "#/$defs/opaque_ref" }
+        "ref": { "$ref": "#/$defs/typed_hmac_ref" }
       }
     },
     "adjudication": {
@@ -203,7 +202,8 @@
         "source_exclusion_count", "projected_record_count",
         "bug_record_count", "guard_record_count", "legacy_record_count",
         "canonical_ref_set_sha256", "semantic_commitment_algorithm",
-        "semantic_commitment_sha256"
+        "semantic_commitment_sha256", "legacy_projection_sha256",
+        "registry_projection_sha256"
       ],
       "properties": {
         "state": { "const": "sealed" },
@@ -222,7 +222,15 @@
         "legacy_record_count": { "const": 9 },
         "canonical_ref_set_sha256": { "const": "81168506c76776f060aaf9cd71bb4ed0e2fbde31b286ac30b69823bc8a54a5ee" },
         "semantic_commitment_algorithm": { "const": "sha256-canonical-json-v1" },
-        "semantic_commitment_sha256": { "$ref": "#/$defs/sha256_nonzero" }
+        "semantic_commitment_sha256": { "$ref": "#/$defs/sha256_nonzero" },
+        "legacy_projection_sha256": {
+          "description": "Canonical complete projection of the nine retained unadjudicated records; authority requires an external import receipt.",
+          "$ref": "#/$defs/sha256_nonzero"
+        },
+        "registry_projection_sha256": {
+          "description": "Canonical complete sealed document projection excluding only this self-referential field; authority requires an external import receipt.",
+          "$ref": "#/$defs/sha256_nonzero"
+        }
       }
     },
     "side": {
@@ -322,7 +330,17 @@
             "kind": { "enum": ["offline_probe", "structural_trace", "full_trace", "unit_test", "operator_report"] },
             "ref": { "type": "string", "minLength": 4, "maxLength": 200 },
             "build_sha": { "$ref": "#/$defs/sha_or_unknown" },
-            "summary": { "type": "string", "minLength": 1, "maxLength": 500 }
+            "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "covered_adjudication_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/canonical_adjudication_ref" }
+            },
+            "covered_source_event_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/source_event_ref" }
+            }
           }
         },
         "red_test": {
@@ -345,7 +363,10 @@
             }
           }
         },
-        "red_test_waiver": { "$ref": "#/$defs/short_text_or_null" },
+        "red_test_waiver": {
+          "description": "Legacy-only compatibility field. Enhanced adjudicated records forbid waivers and require covered RED evidence.",
+          "$ref": "#/$defs/short_text_or_null"
+        },
         "fix_commit": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
         "fix_evidence": {
           "type": ["object", "null"],

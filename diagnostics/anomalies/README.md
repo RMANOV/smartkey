@@ -62,9 +62,14 @@ One record per **(observed, expected)** pair. Fields, in file order:
   `dual_buffer_prefix_lock`, `dual_buffer_unsupported_inheritance`,
   `lang_prior_lock`, `accept_gesture`, `unknown`.
 - `reproducer` — `{kind, ref, build_sha, summary}` with `kind` in
-  `offline_probe|structural_trace|full_trace|unit_test|operator_report`, or `null`.
+  `offline_probe|structural_trace|full_trace|unit_test|operator_report`, or
+  `null`. Enhanced reproduced-or-later bug records also carry exact
+  `covered_adjudication_refs` and `covered_source_event_refs`; those two
+  fields remain optional for legacy records.
 - `red_test` — `{path, name, commit}` (40-hex commit that contains the test),
-  or `null`; `red_test_waiver` explains a not-applicable test (mutually exclusive).
+  or `null`. `red_test_waiver` remains a legacy compatibility field only:
+  it is forbidden on every enhanced record, whose fixed-or-later lifecycle
+  requires actual covered RED evidence.
 - `fix_commit` — exact 40-hex commit or `null`.
 - `fix_evidence` — enhanced-record coverage envelope for `fix_commit`, or
   `null`: exact `covered_adjudication_refs` plus the corresponding
@@ -77,7 +82,8 @@ One record per **(observed, expected)** pair. Fields, in file order:
   This is a **data-safety classification only** — it says the isolated token
   is safe to store in a public repository; it is not publication consent and
   grants no right to quote the operator's text.
-- `notes` — short free text (max 500 chars, single line).
+- `notes` — short free text for legacy records (max 500 chars, single line);
+  an enhanced record uses a typed opaque metadata ref or `null`.
 - `adjudications` — optional only for backwards-compatible migration of the
   pre-G0 records. Once present anywhere, every item maps exactly one canonical
   original-candidate or supplemental-hypothesis ref and the sealed top-level
@@ -123,12 +129,18 @@ Each `adjudications[]` item contains no prose and has these fields:
 - `normalized_class` — strict enum of every ratified supplemental mapping class,
   including `source_harness_framing`. Because the final source has no such axis
   for the 106 originals, they must use the explicit `not_applicable` sentinel;
-  supplemental mappings and exclusions may never use that sentinel.
+  supplemental mappings and exclusions may never use that sentinel. The
+  validator additionally checks an explicit
+  `normalized_class × classification × disposition × owner_lane` allow
+  matrix: grammar/language-quality classes cannot enter mechanical/F4 lanes,
+  and mechanical/input-loss classes cannot enter language-quality or guard
+  lanes.
 - `expected` — per-adjudication `{status, authority, value_ref}`. Status is
   `null_non_unique`, `null_pending_operator_intent`,
   `unique_operator_confirmed`, `unique_authoritative_spelling`, or
   `not_applicable`; authority is `final|null|operator|authoritative|legacy_bridge|not_applicable`.
-  Unique expected forms carry `value:<sha256>` rather than requiring a literal
+  Unique expected forms carry
+  `hmac-sha256-v1:value:<64-lowercase-hex>` rather than requiring a literal
   token. Null/not-applicable forms carry `null`. This represents a redacted
   unique expected form and split-component fan-in without leaking or collapsing
   distinct expected values. Deprecated `expected_form_status`, when present
@@ -145,12 +157,25 @@ Each `adjudications[]` item contains no prose and has these fields:
   placeholder/null on observed and expected; metadata-only means no token on
   either side; a public literal is treated independently on each side.
 - `source_refs` — non-empty opaque `{kind, ref}` pairs. At least one
-  `source_record` is mandatory; refs contain only opaque identifiers, never a
-  path, label, sentence, or user text. Guards and exclusions additionally need
-  an adjudication `ruling` or `receipt` ref.
-- `source_event_refs` — non-empty canonical `event:<sha256>` IDs. An event may
-  support several split mappings inside one dedup record, but it cannot be
-  reconciled to two records and cannot increment `occurrence_count` twice.
+  `source_record` is mandatory; its ref uses the `source_record` HMAC
+  domain, while ruling/receipt/span/other refs use the `metadata` domain.
+  Refs contain no path, label, sentence or user text. Every guard mapping —
+  including a guard in a mixed bug/guard record — independently needs its own
+  adjudication `ruling` or `receipt` ref.
+- `source_event_refs` — non-empty canonical
+  `hmac-sha256-v1:event:<64-lowercase-hex>` IDs. An event may support several
+  split mappings inside one dedup record, but it cannot be reconciled to two
+  records and cannot increment `occurrence_count` twice.
+
+All public opaque refs use
+`hmac-sha256-v1:<value|event|metadata|source_record>:<64-lowercase-hex>`.
+Plain `sha256(raw text)` is forbidden: an unsalted digest permits dictionary
+recovery of short typed forms. The future importer must generate refs with a
+random secret key held only in its private mode-`0600` corpus, never in this
+repository, debate messages or logs. The schema validates typed syntax and
+domain only; the importer and an independent external receipt must validate
+the actual HMAC derivation. Tests use deterministic synthetic shape fixtures,
+not a key, real HMAC, user text or authority evidence.
 
 ## Exact semantic commitment
 
@@ -175,6 +200,26 @@ compute and externally receipt its reviewed semantic digest in the same
 integration commit; this schema task does not import data or invent expected
 authority, value commitments or source events.
 
+## Complete projection commitments
+
+The semantic tuple digest does not by itself bind record-only fields or the
+nine retained unadjudicated records. A sealed contract therefore also requires
+two nonzero, recomputed SHA-256 commitments:
+
+- `legacy_projection_sha256` hashes the nine complete legacy record objects,
+  sorted by record ID and serialized as compact ASCII JSON with sorted keys.
+- `registry_projection_sha256` hashes the complete sealed document —
+  all 111 records, both top-level exclusions and contract metadata — after
+  removing only the self-referential `registry_projection_sha256` field.
+  It consequently also binds the semantic and legacy digests.
+
+Stale digests reject identity, payload, note, evidence, exclusion and legacy
+substitutions even when counts stay unchanged. A digest that merely recomputes
+over attacker-supplied data is not authority, so the real import must publish
+an independently reviewed external receipt for both projection digests in the
+same integration commit. Synthetic fixture digests prove validator mechanics
+only and must never be reused as production pins.
+
 ## Lifecycle gates (enforced by `validate.py`)
 
 | status | must carry |
@@ -182,7 +227,7 @@ authority, value commitments or source events.
 | `open_suspected_smartkey` | nothing beyond the envelope; **the default** |
 | `reproduced` | `reproducer` |
 | `red_tested` | `reproducer` + `red_test` |
-| `fixed` | `reproducer` + `fix_commit` + (`red_test` or `red_test_waiver`) |
+| `fixed` | `reproducer` + `fix_commit` + `red_test` (legacy may use a waiver; enhanced may not) |
 | `verified` | all of `fixed` + `verification` on the reported surface |
 | `closed` | all of `verified` + `closure_reason` |
 | `not_smartkey` | legacy/non-guard: `reproducer` + `closure_reason`; enhanced all-guard: per-mapping ruling/receipt + `closure_reason` |
@@ -198,11 +243,13 @@ its adjudication/ruling receipt, not by manufacturing a `unit_test` reproducer.
 Source exclusions never enter the record lifecycle because they live outside
 `records`.
 
-For a bug record, advancing to `red_tested` requires `red_test` coverage equal
-to every bug adjudication ref and the corresponding source-event union.
-`fixed` adds the same exact coverage in `fix_evidence`; `verified`/`closed` add
-it in `verification`. Duplicate refs/events and partial coverage fail. Thus one
-fixed component cannot close an uncovered sibling mapping in a fan-in record.
+For an enhanced bug record, advancing to `reproduced` requires `reproducer`
+coverage equal to every relevant bug adjudication ref and the corresponding
+source-event union. `red_tested` adds the same coverage in `red_test`;
+`fixed` adds it in `fix_evidence`; `verified`/`closed` add it in
+`verification`. Duplicate refs/events and partial coverage fail. Thus one
+reproduced or fixed component cannot advance an uncovered sibling mapping in a
+fan-in record.
 
 ## Privacy rules (enforced)
 
@@ -214,21 +261,26 @@ identifier fields (`build_sha`, `commit`, `fix_commit`, `ref`,
 newlines; more than one token per context side; whitespace inside a token.
 Unknown provenance is written as `unknown` / `null`, never inferred.
 
-G0 adds a closed, recursive allowlist for every string-bearing enhanced field.
-Environment labels and dynamic flag keys; legacy source refs/surfaces;
-reproducer, test and verification refs/paths/names/surfaces; summaries, notes,
-descriptors and closure reasons must be enums, SHAs, canonical opaque IDs,
-`metadata:<64-lowercase-hex>` or null. JSON Schema's
-`additionalProperties: false` closes structural dictionary keys; the validator
-separately checks the dynamic `flags` keys. Clearly synthetic validator values
-use the reserved `synthetic` / `synthetic:<sha256>` forms.
+G0 adds a closed, recursive, path/type-aware allowlist for every string-bearing
+enhanced field and every dynamic dictionary key. Bare 12/16/40/64-hex strings
+are accepted only by explicitly typed SHA/ID fields. Environment labels and
+dynamic flag keys; legacy source refs/surfaces; reproducer, test and
+verification refs/paths/names/surfaces; summaries, notes, descriptors and
+closure reasons must be controlled enums, correctly typed
+`hmac-sha256-v1:metadata:…` refs or null. A SHA-shaped or high-entropy token is
+not independently safe merely because it fits the public-token length limit.
+JSON Schema's `additionalProperties: false` closes structural dictionary
+keys; the validator separately checks the dynamic `flags` keys.
 
 The aggregate gate walks values and dynamic keys, assigns every
-reconstruction-bearing fragment to each linked opaque `source_record`, and
+reconstruction-bearing fragment from both values and dynamic keys to each
+linked opaque `source_record`, and
 rejects more than eight distinct fragments across linked records
-(`E_PRIV_AGGREGATE`). `metadata:<sha256>` descriptors do not consume the
+(`E_PRIV_AGGREGATE`). Typed metadata HMAC refs do not consume the
 budget. This closes split-record and split-field reconstruction attacks; there
-is no production-data exception.
+is no production-data exception. Validation errors are non-reflective: they
+report a code, a safe JSON path and an expected shape/type (optionally a safe
+length/count), never a rejected token, key, dedup value or corpus fragment.
 
 ## Adding or updating a record
 
@@ -247,8 +299,9 @@ During the G0 data migration, add the sealed `adjudication_contract`, all 157
 record mappings and both top-level exclusions in the same canonical update.
 The validator requires exact 106+53 source-grain equality, 125/32/2
 disposition accounting, the pinned ref set, a recomputed semantic commitment
-and the 111-record dedup projection. No mapping draft or count summary can
-substitute for this integration gate.
+and both complete 111-record/9-legacy projection commitments. Independently
+receipt the three real digests in that integration commit. No mapping draft,
+synthetic digest or count summary can substitute for this integration gate.
 
 The registry is bookkeeping for the RED-only F4 lane: recording a pair here
 neither widens nor bypasses F4, and no engine code reads this directory.

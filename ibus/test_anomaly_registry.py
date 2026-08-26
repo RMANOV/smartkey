@@ -50,7 +50,9 @@ _MANDATED_PAIRS = {
 
 
 def _load_validator():
-    spec = importlib.util.spec_from_file_location("smartkey_anomaly_validate", _VALIDATOR)
+    spec = importlib.util.spec_from_file_location(
+        "smartkey_anomaly_validate", _VALIDATOR
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -74,7 +76,10 @@ def _codes(errors: list[str]) -> set[str]:
 
 def _find(doc: dict, observed: str, expected: str) -> dict:
     for rec in doc["records"]:
-        if rec["observed"]["token"] == observed and rec["expected"]["token"] == expected:
+        if (
+            rec["observed"]["token"] == observed
+            and rec["expected"]["token"] == expected
+        ):
             return rec
     raise AssertionError(f"pair {observed!r} -> {expected!r} missing from registry")
 
@@ -86,6 +91,14 @@ def _refresh_identity(rec: dict) -> None:
 
 def _synthetic_opaque_ref(label: str) -> str:
     return hashlib.sha256(f"synthetic:{label}".encode("utf-8")).hexdigest()
+
+
+def _synthetic_hmac_ref(domain: str, label: str) -> str:
+    """Shape-only fixture ref; never derived from user data or a real HMAC key."""
+    digest = hashlib.sha256(
+        f"synthetic-hmac-fixture:{domain}:{label}".encode("utf-8")
+    ).hexdigest()
+    return f"hmac-sha256-v1:{domain}:{digest}"
 
 
 def _synthetic_adjudicated_record(
@@ -114,8 +127,8 @@ def _synthetic_adjudicated_record(
         reproducer = None
         closure_reason = None
     else:
-        descriptor = "metadata:" + _synthetic_opaque_ref(
-            f"descriptor:{disposition}:{ordinal}"
+        descriptor = _synthetic_hmac_ref(
+            "metadata", f"descriptor:{disposition}:{ordinal}"
         )
         observed_side = {"token": None, "script": "unknown", "descriptor": descriptor}
         expected_side = {"token": None, "script": "unknown", "descriptor": None}
@@ -129,11 +142,11 @@ def _synthetic_adjudicated_record(
         attribution_confidence = "not_applicable"
         reproducer = {
             "kind": "unit_test",
-            "ref": f"synthetic:evidence:{ordinal}",
+            "ref": _synthetic_hmac_ref("metadata", f"evidence:{ordinal}"),
             "build_sha": "unknown",
-            "summary": "metadata:" + _synthetic_opaque_ref("evidence:summary"),
+            "summary": _synthetic_hmac_ref("metadata", "evidence:summary"),
         }
-        closure_reason = "metadata:" + _synthetic_opaque_ref("closure:reason")
+        closure_reason = _synthetic_hmac_ref("metadata", "closure:reason")
         if disposition == "guard":
             classification = "guard_not_bug_unless_intent_changes"
             owner_lane = "intended_english_quoted_guard"
@@ -165,10 +178,10 @@ def _synthetic_adjudicated_record(
         "source_refs": [
             {
                 "kind": "other",
-                "ref": f"synthetic:legacy:{ordinal}",
+                "ref": _synthetic_hmac_ref("metadata", f"legacy:{ordinal}"),
                 "observed_utc": None,
                 "build_sha": None,
-                "surface": "synthetic fixture",
+                "surface": _synthetic_hmac_ref("metadata", f"legacy-surface:{ordinal}"),
                 "note": None,
             }
         ],
@@ -243,59 +256,112 @@ def _synthetic_adjudicated_doc() -> dict:
 # synthetic fixture exercise the exact production namespace without importing
 # the private corpus.
 _CANONICAL_ORIGINAL_REFS = (
-    "orig:01dddf93a4946369", "orig:03078aa3f0211682",
-    "orig:077e507ca5b404c3", "orig:0a1f4eea084f295d",
-    "orig:0b54da36ae8fdd6a", "orig:1825fef17b7d6958",
-    "orig:19cb8c152dd465d5", "orig:1bf4e08e6c94bbaf",
-    "orig:1ce28219e06b7de2", "orig:1fe9e0c8a0b903fa",
-    "orig:2072a8f696034a65", "orig:21ca2a4de3d3549a",
-    "orig:260d1f3b9c057661", "orig:286349b461143bc3",
-    "orig:29b59535f67faf39", "orig:2db970d7241fb6ba",
-    "orig:31ace7712b72546c", "orig:32a1249096ca0101",
-    "orig:32cd3ab535039553", "orig:347798fcd3dc3674",
-    "orig:349b676e76d10fb3", "orig:35853c01ba074901",
-    "orig:3cc100e857d1c0eb", "orig:3dda31f67a7e0504",
-    "orig:4119a99c3bdbd501", "orig:41ad2b57e9c7fac6",
-    "orig:445b1bcb07b1fb2f", "orig:468e0ba3d0ea4a62",
-    "orig:471c7a33f9a969ac", "orig:4aeb912add6cdfb5",
-    "orig:4cf19f9ecc7feb1b", "orig:4dd4fadeafbfb404",
-    "orig:4fcea9ac064464fe", "orig:51c0fa6d3356962d",
-    "orig:5ce5d7a27704b57c", "orig:5ea197799c601113",
-    "orig:6330045760ba0612", "orig:63482ea1d7333296",
-    "orig:6399efd2fbf9f937", "orig:6511e29c9434b123",
-    "orig:65c3f0433762c985", "orig:6826ae16029f7972",
-    "orig:6831cf6ed6d41185", "orig:6a44807c71050404",
-    "orig:6e72417255fd294b", "orig:6edca44b9be0c444",
-    "orig:7370ec2b227900fd", "orig:74e5d7e1d7a7aacf",
-    "orig:7abc6ead3e07f378", "orig:7c82590873671bec",
-    "orig:7d68d95b8291fb41", "orig:7de6b869119c55d5",
-    "orig:806d02defb5c17a2", "orig:833b7279e47c1756",
-    "orig:8c87cf5a5f68fc6f", "orig:8f262cdc8a46e802",
-    "orig:8f7dc21c7efaaead", "orig:8fef3450f841fbc4",
-    "orig:90105acdd01e53da", "orig:9666d71f20e59585",
-    "orig:97cb5f1c8f386e04", "orig:99515bbe9876abdd",
-    "orig:9986c7195ca98755", "orig:9a0f2c0e6352d59b",
-    "orig:9c5e6344772055ef", "orig:aa80db451a033ec3",
-    "orig:ac9a25456ce09f35", "orig:ad250eb3b3b95d23",
-    "orig:ad96597876fccede", "orig:b1d0e80e0941b903",
-    "orig:b2c01597a6e2e12d", "orig:b435d3b647a685b0",
-    "orig:b4ca378f49780878", "orig:b6167ac3189d8ac5",
-    "orig:b9a4ae5205ce3289", "orig:b9b3d5bf3a023f72",
-    "orig:ba91d56421d76122", "orig:bdd53ee2538899df",
-    "orig:bf50ed6e6a9fb714", "orig:c13bdd0b07a5e87e",
-    "orig:c163e3c0880979b2", "orig:c25e29700ec68ab0",
-    "orig:c3f31858ed64a47b", "orig:c551228040d71cec",
-    "orig:c55a6a1fea77bd58", "orig:c92e246078fc0bcb",
-    "orig:cbb5fa8f2c6228c3", "orig:cbc0c1a0517e0255",
-    "orig:cc02dd4936f81442", "orig:cc6c5cbf0c6bbc46",
-    "orig:cc6e3f51ebdb366d", "orig:d6b1dece032d0060",
-    "orig:d6b9e24e1bb841af", "orig:dacc32c611276450",
-    "orig:e67ace843f5274b2", "orig:e8cbad930acdae29",
-    "orig:edf3c58b92cda9c4", "orig:ee8450ab997022b5",
-    "orig:f3dd016012c9d986", "orig:f4a5fd9a8cc730d4",
-    "orig:f8c5fabbe999b0dd", "orig:f9b98070d1b72035",
-    "orig:fbd3f544727e8d56", "orig:fce8d6c98d84dc4d",
-    "orig:fe152ae9873db112", "orig:fecf5af6bd40a120",
+    "orig:01dddf93a4946369",
+    "orig:03078aa3f0211682",
+    "orig:077e507ca5b404c3",
+    "orig:0a1f4eea084f295d",
+    "orig:0b54da36ae8fdd6a",
+    "orig:1825fef17b7d6958",
+    "orig:19cb8c152dd465d5",
+    "orig:1bf4e08e6c94bbaf",
+    "orig:1ce28219e06b7de2",
+    "orig:1fe9e0c8a0b903fa",
+    "orig:2072a8f696034a65",
+    "orig:21ca2a4de3d3549a",
+    "orig:260d1f3b9c057661",
+    "orig:286349b461143bc3",
+    "orig:29b59535f67faf39",
+    "orig:2db970d7241fb6ba",
+    "orig:31ace7712b72546c",
+    "orig:32a1249096ca0101",
+    "orig:32cd3ab535039553",
+    "orig:347798fcd3dc3674",
+    "orig:349b676e76d10fb3",
+    "orig:35853c01ba074901",
+    "orig:3cc100e857d1c0eb",
+    "orig:3dda31f67a7e0504",
+    "orig:4119a99c3bdbd501",
+    "orig:41ad2b57e9c7fac6",
+    "orig:445b1bcb07b1fb2f",
+    "orig:468e0ba3d0ea4a62",
+    "orig:471c7a33f9a969ac",
+    "orig:4aeb912add6cdfb5",
+    "orig:4cf19f9ecc7feb1b",
+    "orig:4dd4fadeafbfb404",
+    "orig:4fcea9ac064464fe",
+    "orig:51c0fa6d3356962d",
+    "orig:5ce5d7a27704b57c",
+    "orig:5ea197799c601113",
+    "orig:6330045760ba0612",
+    "orig:63482ea1d7333296",
+    "orig:6399efd2fbf9f937",
+    "orig:6511e29c9434b123",
+    "orig:65c3f0433762c985",
+    "orig:6826ae16029f7972",
+    "orig:6831cf6ed6d41185",
+    "orig:6a44807c71050404",
+    "orig:6e72417255fd294b",
+    "orig:6edca44b9be0c444",
+    "orig:7370ec2b227900fd",
+    "orig:74e5d7e1d7a7aacf",
+    "orig:7abc6ead3e07f378",
+    "orig:7c82590873671bec",
+    "orig:7d68d95b8291fb41",
+    "orig:7de6b869119c55d5",
+    "orig:806d02defb5c17a2",
+    "orig:833b7279e47c1756",
+    "orig:8c87cf5a5f68fc6f",
+    "orig:8f262cdc8a46e802",
+    "orig:8f7dc21c7efaaead",
+    "orig:8fef3450f841fbc4",
+    "orig:90105acdd01e53da",
+    "orig:9666d71f20e59585",
+    "orig:97cb5f1c8f386e04",
+    "orig:99515bbe9876abdd",
+    "orig:9986c7195ca98755",
+    "orig:9a0f2c0e6352d59b",
+    "orig:9c5e6344772055ef",
+    "orig:aa80db451a033ec3",
+    "orig:ac9a25456ce09f35",
+    "orig:ad250eb3b3b95d23",
+    "orig:ad96597876fccede",
+    "orig:b1d0e80e0941b903",
+    "orig:b2c01597a6e2e12d",
+    "orig:b435d3b647a685b0",
+    "orig:b4ca378f49780878",
+    "orig:b6167ac3189d8ac5",
+    "orig:b9a4ae5205ce3289",
+    "orig:b9b3d5bf3a023f72",
+    "orig:ba91d56421d76122",
+    "orig:bdd53ee2538899df",
+    "orig:bf50ed6e6a9fb714",
+    "orig:c13bdd0b07a5e87e",
+    "orig:c163e3c0880979b2",
+    "orig:c25e29700ec68ab0",
+    "orig:c3f31858ed64a47b",
+    "orig:c551228040d71cec",
+    "orig:c55a6a1fea77bd58",
+    "orig:c92e246078fc0bcb",
+    "orig:cbb5fa8f2c6228c3",
+    "orig:cbc0c1a0517e0255",
+    "orig:cc02dd4936f81442",
+    "orig:cc6c5cbf0c6bbc46",
+    "orig:cc6e3f51ebdb366d",
+    "orig:d6b1dece032d0060",
+    "orig:d6b9e24e1bb841af",
+    "orig:dacc32c611276450",
+    "orig:e67ace843f5274b2",
+    "orig:e8cbad930acdae29",
+    "orig:edf3c58b92cda9c4",
+    "orig:ee8450ab997022b5",
+    "orig:f3dd016012c9d986",
+    "orig:f4a5fd9a8cc730d4",
+    "orig:f8c5fabbe999b0dd",
+    "orig:f9b98070d1b72035",
+    "orig:fbd3f544727e8d56",
+    "orig:fce8d6c98d84dc4d",
+    "orig:fe152ae9873db112",
+    "orig:fecf5af6bd40a120",
 )
 
 
@@ -344,8 +410,7 @@ def _r2_semantic_payload(doc: dict) -> list[dict]:
             "source_binding": {
                 "target_record_id": target_record_id,
                 "source_refs": sorted(
-                    f"{source['kind']}:{source['ref']}"
-                    for source in adj["source_refs"]
+                    f"{source['kind']}:{source['ref']}" for source in adj["source_refs"]
                 ),
                 "source_event_refs": sorted(adj["source_event_refs"]),
             },
@@ -376,9 +441,44 @@ def _r2_ref_set_digest(doc: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _r3_legacy_projection_digest(doc: dict) -> str:
+    records = sorted(
+        (copy.deepcopy(rec) for rec in doc["records"] if not rec.get("adjudications")),
+        key=lambda rec: rec["id"],
+    )
+    payload = json.dumps(
+        records,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _r3_registry_projection_digest(doc: dict) -> str:
+    payload = copy.deepcopy(doc)
+    payload["adjudication_contract"].pop("registry_projection_sha256", None)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _refresh_r3_commitments(doc: dict) -> None:
+    contract = doc["adjudication_contract"]
+    contract["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    contract["legacy_projection_sha256"] = _r3_legacy_projection_digest(doc)
+    contract["registry_projection_sha256"] = _r3_registry_projection_digest(doc)
+
+
 def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
-    grain = "original_candidate" if ref.startswith("orig:") else "supplemental_hypothesis"
-    opaque = _synthetic_opaque_ref(f"r2:{ordinal}")
+    grain = (
+        "original_candidate" if ref.startswith("orig:") else "supplemental_hypothesis"
+    )
+    source_ref = _synthetic_hmac_ref("source_record", f"r2:{ordinal}")
     if disposition == "bug_candidate":
         classification = "mechanical_red_candidate"
         normalized_class = (
@@ -389,7 +489,7 @@ def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
         expected = {
             "status": "unique_authoritative_spelling",
             "authority": "authoritative",
-            "value_ref": f"value:{opaque}",
+            "value_ref": _synthetic_hmac_ref("value", f"r2:{ordinal}"),
         }
         confidence = {
             "anomaly_or_guard_presence": "high",
@@ -399,7 +499,7 @@ def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
         }
         lane = "f4_core"
         privacy = "public_token"
-        sources = [{"kind": "source_record", "ref": opaque}]
+        sources = [{"kind": "source_record", "ref": source_ref}]
     elif disposition == "guard":
         classification = "guard_not_bug_unless_intent_changes"
         normalized_class = "intentional_transliteration_guard"
@@ -417,8 +517,11 @@ def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
         lane = "intended_english_quoted_guard"
         privacy = "metadata_only"
         sources = [
-            {"kind": "source_record", "ref": opaque},
-            {"kind": "ruling", "ref": _synthetic_opaque_ref(f"r2:ruling:{ordinal}")},
+            {"kind": "source_record", "ref": source_ref},
+            {
+                "kind": "ruling",
+                "ref": _synthetic_hmac_ref("metadata", f"r2:ruling:{ordinal}"),
+            },
         ]
     else:
         classification = "source_authorship_exclusion"
@@ -437,8 +540,11 @@ def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
         lane = "outside_product_source_authorship"
         privacy = "metadata_only"
         sources = [
-            {"kind": "source_record", "ref": opaque},
-            {"kind": "receipt", "ref": _synthetic_opaque_ref(f"r2:receipt:{ordinal}")},
+            {"kind": "source_record", "ref": source_ref},
+            {
+                "kind": "receipt",
+                "ref": _synthetic_hmac_ref("metadata", f"r2:receipt:{ordinal}"),
+            },
         ]
     return {
         "grain": grain,
@@ -454,7 +560,7 @@ def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
         "owner_lane": lane,
         "privacy_class": privacy,
         "source_refs": sources,
-        "source_event_refs": [f"event:{_synthetic_opaque_ref(f'r2:event:{ordinal}')}"] ,
+        "source_event_refs": [_synthetic_hmac_ref("event", f"r2:event:{ordinal}")],
     }
 
 
@@ -476,10 +582,10 @@ def _r2_enhanced_record(seed: int, adjudications: list[dict]) -> dict:
     base["source_refs"] = [
         {
             "kind": "other",
-            "ref": _synthetic_opaque_ref(f"r2:legacy-source:{seed}"),
+            "ref": _synthetic_hmac_ref("metadata", f"r2:legacy-source:{seed}"),
             "observed_utc": None,
             "build_sha": None,
-            "surface": f"metadata:{_synthetic_opaque_ref(f'r2:surface:{seed}')}",
+            "surface": _synthetic_hmac_ref("metadata", f"r2:surface:{seed}"),
             "note": None,
         }
     ]
@@ -508,10 +614,11 @@ def _r2_legacy_record(ordinal: int) -> dict:
 
 def _synthetic_r2_doc() -> dict:
     refs = list(_CANONICAL_ADJUDICATION_REFS)
-    bug = [_r2_adjudication(ref, i, "bug_candidate") for i, ref in enumerate(refs[:125])]
+    bug = [
+        _r2_adjudication(ref, i, "bug_candidate") for i, ref in enumerate(refs[:125])
+    ]
     guard = [
-        _r2_adjudication(ref, i + 125, "guard")
-        for i, ref in enumerate(refs[125:157])
+        _r2_adjudication(ref, i + 125, "guard") for i, ref in enumerate(refs[125:157])
     ]
     exclusions = [
         _r2_adjudication(ref, i + 157, "source_exclusion")
@@ -523,8 +630,7 @@ def _synthetic_r2_doc() -> dict:
     for index, item in enumerate(bug[76:]):
         bug_groups[index].append(item)
     records.extend(
-        _r2_enhanced_record(index, items)
-        for index, items in enumerate(bug_groups)
+        _r2_enhanced_record(index, items) for index, items in enumerate(bug_groups)
     )
     guard_groups = [[item] for item in guard[:26]]
     for index, item in enumerate(guard[26:]):
@@ -557,11 +663,13 @@ def _synthetic_r2_doc() -> dict:
             "canonical_ref_set_sha256": "81168506c76776f060aaf9cd71bb4ed0e2fbde31b286ac30b69823bc8a54a5ee",
             "semantic_commitment_algorithm": "sha256-canonical-json-v1",
             "semantic_commitment_sha256": "f" * 64,
+            "legacy_projection_sha256": "e" * 64,
+            "registry_projection_sha256": "d" * 64,
         },
         "source_exclusions": exclusions,
         "records": records,
     }
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    _refresh_r3_commitments(doc)
     return doc
 
 
@@ -692,9 +800,12 @@ def test_id_is_deterministic_and_independent_of_layer():
     before = V.compute_id(rec)
     rec["suspected_layer"] = "unknown"
     rec["status"] = "open_suspected_smartkey"
-    assert V.compute_id(rec) == before == "anom-" + __import__("hashlib").sha256(
-        b"li|\xd0\xbb\xd0\xb8"
-    ).hexdigest()[:12]
+    assert (
+        V.compute_id(rec)
+        == before
+        == "anom-"
+        + __import__("hashlib").sha256(b"li|\xd0\xbb\xd0\xb8").hexdigest()[:12]
+    )
 
 
 @pytest.mark.parametrize(
@@ -819,7 +930,11 @@ def test_red_tested_requires_red_test():
     doc = _doc()
     rec = _find(doc, "li", "ли")  # reproduced, no red test
     rec["status"] = "red_tested"
-    assert any("RED test" in e for e in V.validate_document(doc, _schema()) if e.startswith("E_GATE"))
+    assert any(
+        "RED test" in e
+        for e in V.validate_document(doc, _schema())
+        if e.startswith("E_GATE")
+    )
 
 
 def test_fixed_requires_fix_commit_and_test_or_waiver():
@@ -859,8 +974,10 @@ def test_fixed_b9_records_carry_fix_chain_but_no_verification():
     # Ruling 5394d2c2ad28: aggregate structural evidence cannot verify a
     # single token — the four B9 records are 'fixed', never 'verified'.
     doc = _doc()
+    # fmt: off
     for observed, expected in (("ima[", "имаш"), ("sled", "след"),
                                ("otgowor", "отговор"), ("prewkl", "превкл")):
+    # fmt: on
         rec = _find(doc, observed, expected)
         assert rec["status"] == "fixed"
         assert rec["reproducer"] and rec["red_test"] and rec["fix_commit"]
@@ -897,14 +1014,18 @@ def test_adjudication_enum_is_strict():
 def test_classification_must_match_coarse_disposition():
     doc = _synthetic_r2_doc()
     doc["records"][0]["adjudications"][0]["disposition"] = "guard"
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_STATE" in _codes(V.validate_document(doc, _schema()))
 
 
 def test_unique_expected_status_requires_an_opaque_value_commitment():
     doc = _synthetic_r2_doc()
     doc["records"][0]["adjudications"][0]["expected"]["value_ref"] = None
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_EXPECTED" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -912,7 +1033,9 @@ def test_not_applicable_expected_status_rejects_expected_form_confidence():
     doc = _synthetic_r2_doc()
     guard = doc["records"][76]["adjudications"][0]
     guard["causal_confidence"]["expected_form"] = "low"
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_CONFIDENCE" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -940,7 +1063,9 @@ def test_bug_candidate_record_cannot_use_not_smartkey_lifecycle():
 def test_metadata_only_privacy_rejects_token_payload():
     doc = _synthetic_r2_doc()
     doc["records"][0]["adjudications"][0]["privacy_class"] = "metadata_only"
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -953,7 +1078,10 @@ def test_metadata_only_privacy_rejects_semantic_text_encoded_as_a_code():
 
 def test_hash_shaped_metadata_is_not_mistaken_for_a_long_word():
     doc = _synthetic_r2_doc()
-    doc["records"][76]["closure_reason"] = "metadata:" + "a" * 64
+    doc["records"][76]["closure_reason"] = _synthetic_hmac_ref(
+        "metadata", "hash-shaped-metadata"
+    )
+    _refresh_r3_commitments(doc)
     assert "E_PRIV_LONGRUN" not in _codes(V.validate_document(doc, _schema()))
 
 
@@ -999,7 +1127,8 @@ def test_contract_rejects_an_unratified_artifact_receipt():
     doc["adjudication_contract"]["artifact_sha256"] = "b" * 64
     errors = V.validate_document(doc, _schema())
     assert any(
-        error.startswith("E_SCHEMA") and "adjudication_contract.artifact_sha256" in error
+        error.startswith("E_SCHEMA")
+        and "adjudication_contract.artifact_sha256" in error
         for error in errors
     )
 
@@ -1019,9 +1148,12 @@ def test_cross_record_source_budget_blocks_reconstructable_payload():
     doc = _synthetic_r2_doc()
     for rec in doc["records"][:5]:
         rec["adjudications"][0]["source_refs"] = [
-            {"kind": "source_record", "ref": _synthetic_opaque_ref("source:shared")}
+            {
+                "kind": "source_record",
+                "ref": _synthetic_hmac_ref("source_record", "source:shared"),
+            }
         ]
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    _refresh_r3_commitments(doc)
     assert "E_PRIV_AGGREGATE" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1029,20 +1161,26 @@ def test_source_budget_allows_bounded_isolated_synthetic_tokens():
     doc = _synthetic_r2_doc()
     for rec in doc["records"][:4]:
         rec["adjudications"][0]["source_refs"] = [
-            {"kind": "source_record", "ref": _synthetic_opaque_ref("source:bounded")}
+            {
+                "kind": "source_record",
+                "ref": _synthetic_hmac_ref("source_record", "source:bounded"),
+            }
         ]
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    _refresh_r3_commitments(doc)
     assert V.validate_document(doc, _schema()) == []
 
 
 def test_source_budget_does_not_count_opaque_metadata_as_payload():
     doc = _synthetic_r2_doc()
     for ordinal, rec in enumerate(doc["records"][:4]):
-        rec["notes"] = "metadata:" + _synthetic_opaque_ref(f"note:{ordinal}")
+        rec["notes"] = _synthetic_hmac_ref("metadata", f"note:{ordinal}")
         rec["adjudications"][0]["source_refs"] = [
-            {"kind": "source_record", "ref": _synthetic_opaque_ref("source:bounded")}
+            {
+                "kind": "source_record",
+                "ref": _synthetic_hmac_ref("source_record", "source:bounded"),
+            }
         ]
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    _refresh_r3_commitments(doc)
     assert "E_PRIV_AGGREGATE" not in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1051,9 +1189,7 @@ def test_g0_r2_exact_159_to_111_shape_validates_without_raw_data():
     doc = _synthetic_r2_doc()
     assert len(doc["records"]) == 111
     assert sum("adjudications" in rec for rec in doc["records"]) == 102
-    assert sum(
-        len(rec.get("adjudications", ())) for rec in doc["records"]
-    ) == 157
+    assert sum(len(rec.get("adjudications", ())) for rec in doc["records"]) == 157
     assert len(doc["source_exclusions"]) == 2
     assert V.validate_document(doc, _schema()) == []
 
@@ -1114,7 +1250,9 @@ def test_g0_r2_ref_set_is_pinned_not_merely_counted():
     doc = _synthetic_r2_doc()
     adjudication = doc["records"][0]["adjudications"][0]
     adjudication["ref"] = "orig:aaaaaaaaaaaaaaaa"
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_REF_SET" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1124,14 +1262,14 @@ def test_g0_r2_bare_and_cross_grain_refs_are_rejected():
 
     doc = _synthetic_r2_doc()
     doc["records"][0]["adjudications"][0]["grain"] = "supplemental_hypothesis"
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_REF" in _codes(V.validate_document(doc, _schema()))
 
 
 def test_g0_r2_all_letter_hex_ref_is_grammatically_valid():
-    assert V.canonical_ref_matches_grain(
-        "original_candidate", "orig:aaaaaaaaaaaaaaaa"
-    )
+    assert V.canonical_ref_matches_grain("original_candidate", "orig:aaaaaaaaaaaaaaaa")
 
 
 def test_g0_r2_normalized_class_sentinel_is_grain_specific():
@@ -1142,9 +1280,7 @@ def test_g0_r2_normalized_class_sentinel_is_grain_specific():
     original["adjudication_contract"]["semantic_commitment_sha256"] = (
         _r2_semantic_digest(original)
     )
-    assert "E_ADJ_NORMALIZED" in _codes(
-        V.validate_document(original, _schema())
-    )
+    assert "E_ADJ_NORMALIZED" in _codes(V.validate_document(original, _schema()))
 
     supplemental = _synthetic_r2_doc()
     supplemental["records"][30]["adjudications"][1]["normalized_class"] = (
@@ -1153,9 +1289,7 @@ def test_g0_r2_normalized_class_sentinel_is_grain_specific():
     supplemental["adjudication_contract"]["semantic_commitment_sha256"] = (
         _r2_semantic_digest(supplemental)
     )
-    assert "E_ADJ_NORMALIZED" in _codes(
-        V.validate_document(supplemental, _schema())
-    )
+    assert "E_ADJ_NORMALIZED" in _codes(V.validate_document(supplemental, _schema()))
 
     exclusion = _synthetic_r2_doc()
     exclusion["source_exclusions"][0]["normalized_class"] = "not_applicable"
@@ -1175,7 +1309,10 @@ def test_g0_r2_expected_envelope_is_per_adjudication_for_fan_in():
     doc = _synthetic_r2_doc()
     adjudications = doc["records"][0]["adjudications"]
     assert len(adjudications) == 2
-    assert adjudications[0]["expected"]["value_ref"] != adjudications[1]["expected"]["value_ref"]
+    assert (
+        adjudications[0]["expected"]["value_ref"]
+        != adjudications[1]["expected"]["value_ref"]
+    )
     assert V.validate_document(doc, _schema()) == []
 
 
@@ -1183,7 +1320,9 @@ def test_g0_r2_expected_authority_status_matrix_is_strict():
     doc = _synthetic_r2_doc()
     expected = doc["records"][0]["adjudications"][0]["expected"]
     expected["authority"] = "null"
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_EXPECTED" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1198,13 +1337,13 @@ def test_g0_r2_redacted_unique_expected_needs_no_literal_token():
     rec["expected"] = {
         "token": None,
         "script": "unknown",
-        "descriptor": f"metadata:{_synthetic_opaque_ref('r2:redacted:expected')}",
+        "descriptor": _synthetic_hmac_ref("metadata", "r2:redacted:expected"),
     }
     rec["privacy_classification"] = "redacted"
     for adjudication in rec["adjudications"]:
         adjudication["privacy_class"] = "redacted"
     _refresh_identity(rec)
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    _refresh_r3_commitments(doc)
     assert V.validate_document(doc, _schema()) == []
 
 
@@ -1220,7 +1359,9 @@ def test_g0_r2_redaction_applies_to_expected_side_too():
     for adjudication in rec["adjudications"]:
         adjudication["privacy_class"] = "redacted"
     _refresh_identity(rec)
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1230,7 +1371,9 @@ def test_g0_r2_public_token_cannot_encode_a_private_path():
     rec["observed"]["token"] = "private/path"
     rec["observed"]["script"] = "latin"
     _refresh_identity(rec)
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1296,15 +1439,21 @@ def test_g0_r2_metadata_descriptors_require_full_sha256():
 
 def test_g0_r2_aggregate_budget_includes_dynamic_keys_and_values():
     doc = _synthetic_r2_doc()
-    shared = _synthetic_opaque_ref("r2:shared-source")
+    shared = _synthetic_hmac_ref("source_record", "r2:shared-source")
+    dynamic_keys = (
+        "alphafragment",
+        "betafragment",
+        "gammafragment",
+        "deltafragment",
+    )
     for index, rec in enumerate(doc["records"][:4]):
         rec["adjudications"][0]["source_refs"] = [
             {"kind": "source_record", "ref": shared}
         ]
-        rec["environment"]["flags"] = {
-            f"synthetic:{_synthetic_opaque_ref(f'r2:flag:{index}')}": "off"
-        }
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+        rec["environment"]["flags"] = {dynamic_keys[index]: "off"}
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_PRIV_AGGREGATE" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1313,7 +1462,9 @@ def test_g0_r2_owner_lane_matrix_rejects_guard_lane_for_mechanical_bug():
     doc["records"][0]["adjudications"][0]["owner_lane"] = (
         "intended_english_quoted_guard"
     )
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_OWNER" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1331,7 +1482,9 @@ def test_g0_r2_language_quality_and_guard_lanes_are_exclusive(
     adjudication = doc["records"][record_index]["adjudications"][0]
     adjudication["classification"] = classification
     adjudication["owner_lane"] = owner_lane
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_OWNER" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1339,7 +1492,9 @@ def test_g0_r2_outside_product_lane_is_exclusive_to_source_exclusions():
     doc = _synthetic_r2_doc()
     adjudication = doc["records"][0]["adjudications"][0]
     adjudication["owner_lane"] = "outside_product_source_authorship"
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_OWNER" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1355,7 +1510,9 @@ def test_g0_r2_source_event_cannot_reconcile_to_two_records():
     doc = _synthetic_r2_doc()
     first = doc["records"][0]["adjudications"][0]["source_event_refs"][0]
     doc["records"][1]["adjudications"][0]["source_event_refs"] = [first]
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_EVENT" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1379,7 +1536,9 @@ def test_g0_r2_duplicate_source_event_does_not_increment_occurrence():
     rec["adjudications"][0]["source_event_refs"].append(event)
     rec["occurrence_count"] += 1
     rec["repeat"] = True
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_EVENT" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1398,13 +1557,14 @@ def _r2_add_bug_evidence(rec: dict, covered_refs: list[str]) -> None:
     }
     rec["reproducer"] = {
         "kind": "offline_probe",
-        "ref": f"metadata:{_synthetic_opaque_ref('r2:reproducer')}",
+        "ref": _synthetic_hmac_ref("metadata", "r2:reproducer"),
         "build_sha": "unknown",
-        "summary": f"metadata:{_synthetic_opaque_ref('r2:reproducer-summary')}",
+        "summary": _synthetic_hmac_ref("metadata", "r2:reproducer-summary"),
+        **coverage,
     }
     rec["red_test"] = {
-        "path": f"metadata:{_synthetic_opaque_ref('r2:red-path')}",
-        "name": f"metadata:{_synthetic_opaque_ref('r2:red-name')}",
+        "path": _synthetic_hmac_ref("metadata", "r2:red-path"),
+        "name": _synthetic_hmac_ref("metadata", "r2:red-name"),
         "commit": "a" * 40,
         **coverage,
     }
@@ -1412,9 +1572,9 @@ def _r2_add_bug_evidence(rec: dict, covered_refs: list[str]) -> None:
     rec["fix_evidence"] = copy.deepcopy(coverage)
     rec["verification"] = {
         "build_sha": "b" * 40,
-        "evidence_refs": [f"metadata:{_synthetic_opaque_ref('r2:verify-ref')}"] ,
-        "surface": f"metadata:{_synthetic_opaque_ref('r2:verify-surface')}",
-        "summary": f"metadata:{_synthetic_opaque_ref('r2:verify-summary')}",
+        "evidence_refs": [_synthetic_hmac_ref("metadata", "r2:verify-ref")],
+        "surface": _synthetic_hmac_ref("metadata", "r2:verify-surface"),
+        "summary": _synthetic_hmac_ref("metadata", "r2:verify-summary"),
         **coverage,
     }
 
@@ -1452,6 +1612,7 @@ def test_g0_r2_full_multi_mapping_closure_coverage_is_valid():
     covered = [item["ref"] for item in rec["adjudications"]]
     _r2_add_bug_evidence(rec, covered)
     rec["status"] = "verified"
+    _refresh_r3_commitments(doc)
     assert V.validate_document(doc, _schema()) == []
 
 
@@ -1470,7 +1631,9 @@ def test_g0_r2_guard_uses_ruling_receipt_not_fabricated_unit_test():
 def test_g0_r2_partial_or_missing_top_level_source_exclusions_fail_counts():
     doc = _synthetic_r2_doc()
     doc["source_exclusions"].pop()
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_COUNT" in _codes(V.validate_document(doc, _schema()))
 
 
@@ -1485,5 +1648,397 @@ def test_g0_r2_record_projection_breakdown_is_derived_not_trusted():
     }
     doc["records"][77]["occurrence_count"] = len(events)
     doc["records"][77]["repeat"] = len(events) > 1
-    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
     assert "E_ADJ_COUNT" in _codes(V.validate_document(doc, _schema()))
+
+
+# ---------------------------------------- G0 adjudication contract revision 3
+@pytest.mark.parametrize(
+    "secret",
+    ["a" * 12, "b" * 16, "c" * 40, "d" * 64],
+)
+def test_g0_r3_bare_hex_is_rejected_in_generic_string_fields(secret):
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    for field, parent in (
+        ("notes", rec),
+        ("app_surface", rec["environment"]),
+        ("surface", rec["source_refs"][0]),
+    ):
+        candidate = copy.deepcopy(doc)
+        candidate_rec = candidate["records"][0]
+        if parent is rec:
+            candidate_rec[field] = secret
+        elif parent is rec["environment"]:
+            candidate_rec["environment"][field] = secret
+        else:
+            candidate_rec["source_refs"][0][field] = secret
+        assert "E_ADJ_PRIVACY" in _codes(V.validate_document(candidate, _schema()))
+
+
+def test_g0_r3_bare_hex_is_rejected_as_a_dynamic_dictionary_key():
+    doc = _synthetic_r2_doc()
+    doc["records"][0]["environment"]["flags"] = {"a" * 64: "off"}
+    assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "descriptor",
+        "record_source_ref",
+        "reproducer_ref",
+        "reproducer_summary",
+        "red_path",
+        "red_name",
+        "verification_ref",
+        "verification_surface",
+        "verification_summary",
+    ],
+)
+def test_g0_r3_sha_shaped_values_are_rejected_across_generic_field_types(
+    field,
+):
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    secret = "e" * 64
+    rec["reproducer"] = {
+        "kind": "offline_probe",
+        "ref": _synthetic_hmac_ref("metadata", "r3:typed-reproducer"),
+        "build_sha": "unknown",
+        "summary": _synthetic_hmac_ref("metadata", "r3:typed-summary"),
+    }
+    rec["red_test"] = {
+        "path": _synthetic_hmac_ref("metadata", "r3:typed-path"),
+        "name": _synthetic_hmac_ref("metadata", "r3:typed-name"),
+        "commit": "a" * 40,
+    }
+    rec["verification"] = {
+        "build_sha": "b" * 40,
+        "evidence_refs": [_synthetic_hmac_ref("metadata", "r3:typed-evidence")],
+        "surface": _synthetic_hmac_ref("metadata", "r3:typed-surface"),
+        "summary": _synthetic_hmac_ref("metadata", "r3:typed-verification"),
+    }
+    targets = {
+        "descriptor": (rec["observed"], "descriptor"),
+        "record_source_ref": (rec["source_refs"][0], "ref"),
+        "reproducer_ref": (rec["reproducer"], "ref"),
+        "reproducer_summary": (rec["reproducer"], "summary"),
+        "red_path": (rec["red_test"], "path"),
+        "red_name": (rec["red_test"], "name"),
+        "verification_surface": (rec["verification"], "surface"),
+        "verification_summary": (rec["verification"], "summary"),
+    }
+    if field == "verification_ref":
+        rec["verification"]["evidence_refs"][0] = secret
+    else:
+        parent, key = targets[field]
+        parent[key] = secret
+    assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "a" * 40,
+        "AbCdefghijKLMNopqrstUVWX12345678",
+    ],
+)
+def test_g0_r3_sha_or_high_entropy_public_token_is_not_independently_safe(
+    token,
+):
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    rec["observed"]["token"] = token
+    rec["observed"]["script"] = "latin"
+    _refresh_identity(rec)
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
+    assert "E_ADJ_PRIVACY" in _codes(V.validate_document(doc, _schema()))
+
+
+@pytest.mark.parametrize(
+    ("target", "unsalted"),
+    [
+        ("source_record", "a" * 64),
+        ("event", "event:" + "b" * 64),
+        ("value", "value:" + "c" * 64),
+        ("metadata", "metadata:" + "d" * 64),
+    ],
+)
+def test_g0_r3_plain_unsalted_sha256_refs_are_rejected(target, unsalted):
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    adjudication = rec["adjudications"][0]
+    if target == "source_record":
+        adjudication["source_refs"][0]["ref"] = unsalted
+    elif target == "event":
+        adjudication["source_event_refs"][0] = unsalted
+    elif target == "value":
+        adjudication["expected"]["value_ref"] = unsalted
+    else:
+        rec["notes"] = unsalted
+    assert {
+        "E_SCHEMA",
+        "E_ADJ_PRIVACY",
+        "E_ADJ_REF_PRIVACY",
+    } & _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r3_typed_hmac_schema_pattern_drift_is_rejected():
+    schema = _schema()
+    schema["$defs"]["typed_hmac_ref"]["pattern"] = "^.*$"
+    assert "E_SCHEMA_DRIFT" in _codes(V.validate_document(_synthetic_r2_doc(), schema))
+
+
+@pytest.mark.parametrize(
+    ("source_index", "wrong_domain"),
+    [
+        (0, "metadata"),
+        (1, "source_record"),
+    ],
+)
+def test_g0_r3_adjudication_source_kind_requires_its_hmac_domain(
+    source_index, wrong_domain
+):
+    doc = _synthetic_r2_doc()
+    guard = doc["records"][76]["adjudications"][0]
+    guard["source_refs"][source_index]["ref"] = _synthetic_hmac_ref(
+        wrong_domain, f"r3:wrong-domain:{source_index}"
+    )
+    assert "E_ADJ_REF_PRIVACY" in _codes(V.validate_document(doc, _schema()))
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_domain"),
+    [
+        ("expected", "event"),
+        ("event", "value"),
+    ],
+)
+def test_g0_r3_expected_and_event_refs_reject_cross_domain_hmacs(field, wrong_domain):
+    doc = _synthetic_r2_doc()
+    adjudication = doc["records"][0]["adjudications"][0]
+    wrong_ref = _synthetic_hmac_ref(wrong_domain, f"r3:wrong-{field}")
+    if field == "expected":
+        adjudication["expected"]["value_ref"] = wrong_ref
+    else:
+        adjudication["source_event_refs"][0] = wrong_ref
+    assert "E_SCHEMA" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r3_projection_digest_schema_omission_is_rejected():
+    schema = _schema()
+    contract = schema["$defs"]["adjudication_contract"]
+    contract["required"].remove("legacy_projection_sha256")
+    assert "E_SCHEMA_DRIFT" in _codes(V.validate_document(_synthetic_r2_doc(), schema))
+
+
+def test_g0_r3_registry_projection_binds_enhanced_record_content():
+    doc = _synthetic_r2_doc()
+    doc["records"][0]["notes"] = _synthetic_hmac_ref(
+        "metadata", "r3:enhanced-note-substitution"
+    )
+    codes = _codes(V.validate_document(doc, _schema()))
+    assert "E_ADJ_PROJECTION" in codes
+    assert "E_ADJ_PRIVACY" not in codes
+
+
+def test_g0_r3_synthetic_projection_digests_are_independently_recomputed():
+    doc = _synthetic_r2_doc()
+    contract = doc["adjudication_contract"]
+    assert contract["legacy_projection_sha256"] == _r3_legacy_projection_digest(doc)
+    assert contract["legacy_projection_sha256"] == (V.legacy_projection_sha256(doc))
+    assert contract["registry_projection_sha256"] == (
+        _r3_registry_projection_digest(doc)
+    )
+    assert contract["registry_projection_sha256"] == (V.registry_projection_sha256(doc))
+    assert contract["legacy_projection_sha256"] != "0" * 64
+    assert contract["registry_projection_sha256"] != "0" * 64
+
+
+def test_g0_r3_legacy_projection_binds_identity_and_content():
+    for mutation in ("identity", "content"):
+        doc = _synthetic_r2_doc()
+        legacy = doc["records"][-1]
+        if mutation == "identity":
+            legacy["observed"]["token"] = "syntheticlegacysubstitution"
+            legacy["observed"]["script"] = "latin"
+            _refresh_identity(legacy)
+        else:
+            legacy["notes"] = _synthetic_hmac_ref(
+                "metadata", "r3:legacy-note-substitution"
+            )
+        codes = _codes(V.validate_document(doc, _schema()))
+        assert "E_ADJ_PROJECTION" in codes
+        assert "E_ADJ_PRIVACY" not in codes
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["registry_projection_sha256", "legacy_projection_sha256"],
+)
+def test_g0_r3_projection_commitments_reject_zero_digest(field):
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"][field] = "0" * 64
+    assert "E_ADJ_PROJECTION" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r3_mixed_bug_guard_record_needs_ruling_per_guard_mapping():
+    doc = _synthetic_r2_doc()
+    adjudication = doc["records"][0]["adjudications"][1]
+    adjudication["classification"] = "guard_not_bug_unless_intent_changes"
+    adjudication["disposition"] = "guard"
+    adjudication["owner_lane"] = "intended_english_quoted_guard"
+    adjudication["expected"] = {
+        "status": "not_applicable",
+        "authority": "not_applicable",
+        "value_ref": None,
+    }
+    adjudication["expected_form_status"] = "not_applicable"
+    adjudication["causal_confidence"] = {
+        "anomaly_or_guard_presence": "high",
+        "expected_form": "not_applicable",
+        "runtime_mechanism": "not_applicable",
+        "smartkey_attribution": "not_applicable",
+    }
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
+    assert "E_ADJ_GUARD_EVIDENCE" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r3_reproduced_multi_mapping_requires_exact_reproducer_coverage():
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    rec["status"] = "reproduced"
+    rec["reproducer"] = {
+        "kind": "offline_probe",
+        "ref": _synthetic_hmac_ref("metadata", "r3:probe"),
+        "build_sha": "unknown",
+        "summary": _synthetic_hmac_ref("metadata", "r3:probe-summary"),
+    }
+    codes = _codes(V.validate_document(doc, _schema()))
+    assert "E_ADJ_COVERAGE" in codes
+    assert "E_ADJ_PRIVACY" not in codes
+
+
+def test_g0_r3_normalized_class_must_match_classification_register_and_lane():
+    doc = _synthetic_r2_doc()
+    adjudication = doc["records"][30]["adjudications"][1]
+    adjudication["normalized_class"] = "grammar_definite_article"
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
+    assert "E_ADJ_NORMALIZED" in _codes(V.validate_document(doc, _schema()))
+
+
+@pytest.mark.parametrize(
+    ("normalized_class", "classification", "disposition", "owner_lane"),
+    [
+        (
+            "same_script_character_omission",
+            "language_quality_feature_candidate",
+            "bug_candidate",
+            "future_language_quality_layer",
+        ),
+        (
+            "intentional_transliteration_guard",
+            "mechanical_red_candidate",
+            "bug_candidate",
+            "f4_core",
+        ),
+    ],
+)
+def test_g0_r3_mechanical_language_and_guard_normalized_lanes_do_not_mix(
+    normalized_class, classification, disposition, owner_lane
+):
+    doc = _synthetic_r2_doc()
+    adjudication = doc["records"][30]["adjudications"][1]
+    adjudication["normalized_class"] = normalized_class
+    adjudication["classification"] = classification
+    adjudication["disposition"] = disposition
+    adjudication["owner_lane"] = owner_lane
+    doc["adjudication_contract"]["semantic_commitment_sha256"] = _r2_semantic_digest(
+        doc
+    )
+    assert "E_ADJ_NORMALIZED" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r3_normalized_tuple_contract_covers_every_enum_member():
+    matrix = getattr(V, "NORMALIZED_CLASS_ALLOWED_TUPLES", {})
+    assert set(matrix) == set(V.NORMALIZED_CLASSES)
+    assert all(matrix[normalized_class] for normalized_class in V.NORMALIZED_CLASSES)
+    for normalized_class, allowed_tuples in matrix.items():
+        grain = (
+            "original_candidate"
+            if normalized_class == "not_applicable"
+            else "supplemental_hypothesis"
+        )
+        assert all(
+            V.normalized_tuple_is_allowed(
+                normalized_class,
+                grain,
+                classification,
+                disposition,
+                owner_lane,
+            )
+            for classification, disposition, owner_lane in allowed_tuples
+        )
+
+
+def test_g0_r3_user_derived_values_are_never_reflected_in_diagnostics():
+    sentinel = "DO_NOT_ECHO_SENTINEL"
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    rec["observed"]["token"] = sentinel
+    rec["observed"]["script"] = "latin"
+    rec["notes"] = sentinel
+    rec["environment"]["flags"] = {sentinel: "off"}
+    errors = V.validate_document(doc, _schema())
+    assert errors
+    assert all(sentinel.casefold() not in error.casefold() for error in errors)
+
+
+def test_g0_r3_structural_diagnostics_do_not_echo_values_or_dynamic_keys():
+    sentinel = "DO_NOT_ECHO_STRUCTURAL_SENTINEL"
+    candidates = []
+
+    unknown_key = _synthetic_r2_doc()
+    unknown_key["records"][0][sentinel] = None
+    candidates.append(unknown_key)
+
+    enum_value = _synthetic_r2_doc()
+    enum_value["records"][0]["adjudications"][0]["classification"] = sentinel
+    candidates.append(enum_value)
+
+    shaped_ref = _synthetic_r2_doc()
+    shaped_ref["records"][0]["adjudications"][0]["source_refs"][0]["ref"] = sentinel
+    candidates.append(shaped_ref)
+
+    for candidate in candidates:
+        errors = V.validate_document(candidate, _schema())
+        assert errors
+        assert all(sentinel.casefold() not in error.casefold() for error in errors)
+
+
+def test_g0_r3_enhanced_red_test_waiver_is_forbidden():
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    covered = [item["ref"] for item in rec["adjudications"]]
+    _r2_add_bug_evidence(rec, covered)
+    rec["status"] = "fixed"
+    rec["red_test"] = None
+    rec["red_test_waiver"] = _synthetic_hmac_ref("metadata", "r3:waiver")
+    codes = _codes(V.validate_document(doc, _schema()))
+    assert "E_ADJ_WAIVER" in codes
+    assert "E_ADJ_PRIVACY" not in codes
+
+
+def test_g0_r3_whole_fixture_validates_under_external_draft_2020_12():
+    jsonschema = pytest.importorskip("jsonschema")
+    validator = jsonschema.Draft202012Validator(_schema())
+    validator.validate(_synthetic_r2_doc())
