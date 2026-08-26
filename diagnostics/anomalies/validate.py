@@ -235,22 +235,48 @@ _INTENT_GUARD_TUPLES = frozenset(
         )
     }
 )
+_BRAND_AMBIGUITY_TUPLES = frozenset(
+    {
+        *_INTENT_GUARD_TUPLES,
+        (
+            "intent_confirmation_needed",
+            "bug_candidate",
+            "future_language_quality_layer",
+        ),
+    }
+)
+_TRANSLITERATION_GUARD_TUPLES = frozenset(
+    {
+        *_INTENT_GUARD_TUPLES,
+        (
+            "guard_not_bug_unless_intent_changes",
+            "guard",
+            "future_language_quality_layer",
+        ),
+    }
+)
+_SAME_SCRIPT_LOSS_TUPLES = frozenset(
+    {
+        (
+            "instrumentation_first_candidate",
+            "bug_candidate",
+            "same_script_loss",
+        ),
+        (
+            "instrumentation_first_candidate",
+            "bug_candidate",
+            "adapter_event_integrity",
+        ),
+    }
+)
 NORMALIZED_CLASS_ALLOWED_TUPLES = {
     "not_applicable": _ORIGINAL_NOT_APPLICABLE_TUPLES,
     "boundary_extra_hyphen": _BOUNDARY_TUPLES,
     "boundary_extra_space": _BOUNDARY_TUPLES,
     "boundary_space_before_terminal_punctuation": _BOUNDARY_TUPLES,
-    "brand_or_intentional_transliteration_ambiguity": _INTENT_GUARD_TUPLES,
-    "brand_or_native_word_layout_ambiguity": _INTENT_GUARD_TUPLES,
-    "duplicated_character": frozenset(
-        {
-            (
-                "instrumentation_first_candidate",
-                "bug_candidate",
-                "same_script_loss",
-            )
-        }
-    ),
+    "brand_or_intentional_transliteration_ambiguity": _BRAND_AMBIGUITY_TUPLES,
+    "brand_or_native_word_layout_ambiguity": _BRAND_AMBIGUITY_TUPLES,
+    "duplicated_character": _SAME_SCRIPT_LOSS_TUPLES,
     "f4_early_lock_full_word_crossover": _tuples(
         "mechanical_red_candidate",
         frozenset(
@@ -266,7 +292,7 @@ NORMALIZED_CLASS_ALLOWED_TUPLES = {
     "grammar_definite_article": _LANGUAGE_QUALITY_TUPLES,
     "grammar_missing_comma": _LANGUAGE_QUALITY_TUPLES,
     "grammar_verb_or_mood": _LANGUAGE_QUALITY_TUPLES,
-    "intentional_transliteration_guard": _INTENT_GUARD_TUPLES,
+    "intentional_transliteration_guard": _TRANSLITERATION_GUARD_TUPLES,
     "loanword_vowel_orthography": _LANGUAGE_QUALITY_TUPLES,
     "orthographic_missing_hyphen": _LANGUAGE_QUALITY_TUPLES,
     "orthographic_word_boundary_space": _LANGUAGE_QUALITY_TUPLES,
@@ -280,15 +306,7 @@ NORMALIZED_CLASS_ALLOWED_TUPLES = {
             )
         }
     ),
-    "same_script_character_substitution": frozenset(
-        {
-            (
-                "instrumentation_first_candidate",
-                "bug_candidate",
-                "same_script_loss",
-            )
-        }
-    ),
+    "same_script_character_substitution": _SAME_SCRIPT_LOSS_TUPLES,
     "semantic_word_form_ambiguity": _INTENT_OR_LANGUAGE_TUPLES,
     "source_harness_framing": frozenset(
         {
@@ -310,6 +328,9 @@ NORMALIZED_CLASS_ALLOWED_TUPLES = {
     ),
     "style_sensitive_extra_comma": _LANGUAGE_QUALITY_TUPLES,
 }
+NORMALIZED_TUPLE_MATRIX_SHA256 = (
+    "4c32653fa93b8dbe2ca48b5ee42cb4d733aec6ebc374c2ca712f558203237a04"
+)
 EXPECTED_AUTHORITY_BY_STATUS = {
     "null_non_unique": frozenset({"final", "null"}),
     "null_pending_operator_intent": frozenset({"final", "null"}),
@@ -336,10 +357,10 @@ SEMANTIC_AUTHORITY_PROJECTION_VERSION = "smartkey-g0-semantic-authority-projecti
 HMAC_SCHEME = "smartkey-g0-hmac-sha256-v1"
 HMAC_DOMAINS = ("value", "event", "metadata", "source_record")
 HMAC_MIN_KEY_BYTES = 32
-HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v3"
+HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v4"
 HMAC_SCALAR_PAYLOAD_ENCODING = "exact-utf8-scalar-no-normalization-v1"
 HMAC_STRUCTURED_PAYLOAD_ENCODING = "smartkey-g0-canonical-json-v1"
-SOURCE_RECORD_HMAC_PROFILE = "smartkey-g0-source-record-semantic-v1"
+SOURCE_RECORD_HMAC_PROFILE = "smartkey-g0-source-record-adjudication-scoped-semantic-v2"
 HMAC_DOMAIN_PAYLOAD_PROFILES = {
     "value": "scalar_utf8",
     "event": "project_canonical_json_v1",
@@ -370,11 +391,33 @@ HMAC_RESOURCE_CONTRACT_SHA256 = (
 )
 HMAC_INPUT_FRAME = "ascii-scheme-nul-domain-nul-u64be-length-payload-v1"
 HMAC_RECEIPT_COVERAGE = (
-    "all-refs-domain-serialization-resource-key-id-private-recomputation-v2"
+    "all-refs-domain-serialization-resource-key-id-adjudication-scope-"
+    "uniqueness-whole-source-private-recomputation-v3"
 )
 HMAC_RECEIPT_STATE = "externally_verified"
 HMAC_VECTOR_SET_SHA256 = (
-    "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192"
+    "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c"
+)
+RECONSTRUCTION_FRAGMENT_POLICY_VERSION = "smartkey-g0-source-ref-scoped-cap-v1"
+CROSSWALK_PROJECTION_PROFILE = "smartkey-g0-crosswalk-target-binding-v2"
+SOURCE_SCOPE_PLACEMENT_PROFILE = "smartkey-g0-source-scope-placement-v1"
+HMAC_SOURCE_SCOPE_BINDING_COUNT = 159
+MAPPING_CROSSWALK_SHA256 = (
+    "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6"
+)
+SOURCE_SCOPE_PLACEMENT_SHA256 = (
+    "c4f2a3a642a15c0a62ce9bb5904adfdec43721e88af65be1577f68d7e122f119"
+)
+R11A_PRESEAL_AUDIT_CONTRACT = "g0-r11a-preseal-crosswalk"
+ORIGINAL_PRESENCE_DERIVATION_VERSION = (
+    "smartkey-g0-original-retained-exactly-once-presence-v1"
+)
+ORIGINAL_PRESENCE_DERIVATION_RULING_REF = "4e0198426714"
+ORIGINAL_REF_SET_SHA256 = (
+    "6a2d167b00ece704a369772c76b231821513b0da5602ab960c16ac9bed78a3f2"
+)
+ORIGINAL_PRESENCE_RECEIPT_SHA256 = (
+    "6e9d2931631a284fb25e0f60e354eb42e42f026a5032d5f58db3a1a7e07b96ee"
 )
 CANONICAL_JSON_SAFE_INTEGER_MAX = 9_007_199_254_740_991
 BASELINE_RECEIPT_STATE = "externally_verified"
@@ -384,8 +427,8 @@ SEALED_CONTRACT_CONSTS = {
     "state": "sealed",
     "ruling_ref": "6e0704632fef",
     "artifact_sha256": "92c6dd612be8095d54dc385044c60e9d33e91d0ed9e9f62f6701c87722edbb72",
-    "mapping_crosswalk_sha256": "7838b51bf55fbe7f7ac2ec7e1f5fbb0285df425242b1cbcfeaccaa3a0a6902a4",
-    "audit_contract": "g0-r2-security-crosswalk",
+    "mapping_crosswalk_sha256": MAPPING_CROSSWALK_SHA256,
+    "audit_contract": R11A_PRESEAL_AUDIT_CONTRACT,
     "original_count": 106,
     "supplemental_count": 53,
     "bug_candidate_count": 125,
@@ -394,6 +437,16 @@ SEALED_CONTRACT_CONSTS = {
     "projected_record_count": PROJECTED_RECORD_COUNT,
     **RECORD_SHAPE_CONTRACT,
     "canonical_ref_set_sha256": CANONICAL_REF_SET_SHA256,
+    "normalized_tuple_matrix_sha256": NORMALIZED_TUPLE_MATRIX_SHA256,
+    "reconstruction_fragment_policy_version": (RECONSTRUCTION_FRAGMENT_POLICY_VERSION),
+    "crosswalk_projection_profile": CROSSWALK_PROJECTION_PROFILE,
+    "source_scope_placement_profile": SOURCE_SCOPE_PLACEMENT_PROFILE,
+    "source_scope_placement_sha256": SOURCE_SCOPE_PLACEMENT_SHA256,
+    "original_presence_derivation_version": (ORIGINAL_PRESENCE_DERIVATION_VERSION),
+    "original_presence_derivation_ruling_ref": (
+        ORIGINAL_PRESENCE_DERIVATION_RULING_REF
+    ),
+    "original_ref_set_sha256": ORIGINAL_REF_SET_SHA256,
     "semantic_commitment_algorithm": SEMANTIC_COMMITMENT_ALGORITHM,
     "baseline_commitment_algorithm": BASELINE_COMMITMENT_ALGORITHM,
     "hmac_scheme": HMAC_SCHEME,
@@ -437,6 +490,57 @@ METADATA_TEXT_RE = re.compile(
 )
 CANONICAL_ORIGINAL_REF_RE = re.compile(r"^orig:[0-9a-f]{16}$")
 CANONICAL_SUPPLEMENTAL_REF_RE = re.compile(r"^supp:G[0-9]{3}:H[0-9]{3}$")
+# Public, deidentified namespace ratified by the 159-ref contract.  The source
+# builder needs exact membership rather than accepting any grammatically valid
+# caller-selected scope.
+CANONICAL_ORIGINAL_REFS = frozenset(
+    f"orig:{suffix}"
+    for suffix in """
+01dddf93a4946369 03078aa3f0211682 077e507ca5b404c3 0a1f4eea084f295d
+0b54da36ae8fdd6a 1825fef17b7d6958 19cb8c152dd465d5 1bf4e08e6c94bbaf
+1ce28219e06b7de2 1fe9e0c8a0b903fa 2072a8f696034a65 21ca2a4de3d3549a
+260d1f3b9c057661 286349b461143bc3 29b59535f67faf39 2db970d7241fb6ba
+31ace7712b72546c 32a1249096ca0101 32cd3ab535039553 347798fcd3dc3674
+349b676e76d10fb3 35853c01ba074901 3cc100e857d1c0eb 3dda31f67a7e0504
+4119a99c3bdbd501 41ad2b57e9c7fac6 445b1bcb07b1fb2f 468e0ba3d0ea4a62
+471c7a33f9a969ac 4aeb912add6cdfb5 4cf19f9ecc7feb1b 4dd4fadeafbfb404
+4fcea9ac064464fe 51c0fa6d3356962d 5ce5d7a27704b57c 5ea197799c601113
+6330045760ba0612 63482ea1d7333296 6399efd2fbf9f937 6511e29c9434b123
+65c3f0433762c985 6826ae16029f7972 6831cf6ed6d41185 6a44807c71050404
+6e72417255fd294b 6edca44b9be0c444 7370ec2b227900fd 74e5d7e1d7a7aacf
+7abc6ead3e07f378 7c82590873671bec 7d68d95b8291fb41 7de6b869119c55d5
+806d02defb5c17a2 833b7279e47c1756 8c87cf5a5f68fc6f 8f262cdc8a46e802
+8f7dc21c7efaaead 8fef3450f841fbc4 90105acdd01e53da 9666d71f20e59585
+97cb5f1c8f386e04 99515bbe9876abdd 9986c7195ca98755 9a0f2c0e6352d59b
+9c5e6344772055ef aa80db451a033ec3 ac9a25456ce09f35 ad250eb3b3b95d23
+ad96597876fccede b1d0e80e0941b903 b2c01597a6e2e12d b435d3b647a685b0
+b4ca378f49780878 b6167ac3189d8ac5 b9a4ae5205ce3289 b9b3d5bf3a023f72
+ba91d56421d76122 bdd53ee2538899df bf50ed6e6a9fb714 c13bdd0b07a5e87e
+c163e3c0880979b2 c25e29700ec68ab0 c3f31858ed64a47b c551228040d71cec
+c55a6a1fea77bd58 c92e246078fc0bcb cbb5fa8f2c6228c3 cbc0c1a0517e0255
+cc02dd4936f81442 cc6c5cbf0c6bbc46 cc6e3f51ebdb366d d6b1dece032d0060
+d6b9e24e1bb841af dacc32c611276450 e67ace843f5274b2 e8cbad930acdae29
+edf3c58b92cda9c4 ee8450ab997022b5 f3dd016012c9d986 f4a5fd9a8cc730d4
+f8c5fabbe999b0dd f9b98070d1b72035 fbd3f544727e8d56 fce8d6c98d84dc4d
+fe152ae9873db112 fecf5af6bd40a120
+""".split()
+)
+CANONICAL_SUPPLEMENTAL_REFS = frozenset(
+    f"supp:{value}"
+    for value in """
+G001:H001 G002:H002 G003:H003 G004:H004 G005:H005 G006:H006 G007:H007
+G008:H008 G009:H009 G010:H010 G011:H011 G012:H012 G013:H013 G014:H014
+G015:H015 G016:H016 G017:H017 G018:H018 G019:H019 G020:H020 G021:H021
+G022:H022 G023:H023 G024:H024 G025:H025 G026:H026 G027:H027 G028:H028
+G029:H029 G030:H030 G031:H031 G032:H032 G033:H033 G034:H034 G035:H035
+G036:H036 G037:H037 G038:H038 G039:H039 G040:H040 G041:H041 G042:H042
+G043:H043 G044:H044 G045:H045 G046:H046 G046:H047 G047:H048 G048:H049
+G049:H050 G050:H051 G051:H052 G052:H053
+""".split()
+)
+CANONICAL_ADJUDICATION_REFS = frozenset(
+    (*CANONICAL_ORIGINAL_REFS, *CANONICAL_SUPPLEMENTAL_REFS)
+)
 SOURCE_EVENT_REF_RE = re.compile(
     rf"^{HMAC_SCHEME}:event:{HMAC_KEY_ID_PATTERN}:[0-9a-f]{{64}}$"
 )
@@ -1090,7 +1194,11 @@ _SOURCE_RECORD_INPUT_FIELDS = (
     "excluded_segments",
     "raw_sha256",
 )
-_SOURCE_RECORD_ENVELOPE_FIELDS = ("profile", *_SOURCE_RECORD_INPUT_FIELDS)
+_SOURCE_RECORD_ENVELOPE_FIELDS = (
+    "profile",
+    "scope_ref",
+    *_SOURCE_RECORD_INPUT_FIELDS,
+)
 _SOURCE_RECORD_SEGMENT_FIELDS = (
     "authorship_confidence",
     "start_char",
@@ -1100,6 +1208,27 @@ _SOURCE_RECORD_SEGMENT_FIELDS = (
 _SOURCE_RECORD_INPUT_FIELD_SET = frozenset(_SOURCE_RECORD_INPUT_FIELDS)
 _SOURCE_RECORD_ENVELOPE_FIELD_SET = frozenset(_SOURCE_RECORD_ENVELOPE_FIELDS)
 _SOURCE_RECORD_SEGMENT_FIELD_SET = frozenset(_SOURCE_RECORD_SEGMENT_FIELDS)
+_ADJUDICATION_SCOPE_REQUIRED_FIELDS = frozenset(
+    {
+        "grain",
+        "ref",
+        "classification",
+        "disposition",
+        "normalized_class",
+        "expected",
+        "causal_confidence",
+        "owner_lane",
+        "privacy_class",
+        "source_refs",
+        "source_event_refs",
+    }
+)
+_ADJUDICATION_SCOPE_ALLOWED_FIELD_SETS = frozenset(
+    {
+        _ADJUDICATION_SCOPE_REQUIRED_FIELDS,
+        _ADJUDICATION_SCOPE_REQUIRED_FIELDS | {"expected_form_status"},
+    }
+)
 
 
 def _raise_hmac_contract_error() -> None:
@@ -1140,6 +1269,38 @@ def _source_record_exact_keys(value: dict, expected: frozenset[str]) -> bool:
 def _source_record_has_input_fields(value: dict) -> bool:
     """Check only the six public input keys; never consult ignored metadata."""
     return all(dict.__contains__(value, field) for field in _SOURCE_RECORD_INPUT_FIELDS)
+
+
+def _private_authoritative_scope(adjudication) -> tuple[bool, str | None]:
+    """Resolve one ratified scope without consulting non-authority fields."""
+    try:
+        if type(adjudication) is not dict:
+            return False, None
+        keys = frozenset(dict.__iter__(adjudication))
+        if keys not in _ADJUDICATION_SCOPE_ALLOWED_FIELD_SETS:
+            return False, None
+        grain = dict.__getitem__(adjudication, "grain")
+        ref = dict.__getitem__(adjudication, "ref")
+        if (
+            type(grain) is not str
+            or type(ref) is not str
+            or len(ref) > 32
+            or grain not in ADJUDICATION_GRAINS
+        ):
+            return False, None
+        allowed = (
+            CANONICAL_ORIGINAL_REFS
+            if grain == "original_candidate"
+            else CANONICAL_SUPPLEMENTAL_REFS
+        )
+        if ref not in allowed:
+            return False, None
+        return True, ref
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        adjudication = None
+        return False, None
 
 
 def _private_source_record_segments(
@@ -1198,7 +1359,11 @@ def _private_source_record_segments(
 
 
 def _private_source_record_identity_envelope(
-    source_record, *, require_closed_root: bool, require_canonical_order: bool
+    source_record,
+    *,
+    require_closed_root: bool,
+    require_canonical_order: bool,
+    derived_scope_ref: str | None = None,
 ) -> tuple[bool, dict | None]:
     """Build a bounded fresh snapshot, returning no input-derived diagnostics."""
     try:
@@ -1212,8 +1377,20 @@ def _private_source_record_identity_envelope(
             profile = dict.__getitem__(source_record, "profile")
             if type(profile) is not str or profile != SOURCE_RECORD_HMAC_PROFILE:
                 return False, None
+            scope_ref = dict.__getitem__(source_record, "scope_ref")
+            if type(scope_ref) is not str or not canonical_ref_matches_grain(
+                "original_candidate"
+                if CANONICAL_ORIGINAL_REF_RE.fullmatch(scope_ref)
+                else "supplemental_hypothesis",
+                scope_ref,
+            ):
+                return False, None
         elif not _source_record_has_input_fields(source_record):
             return False, None
+        else:
+            scope_ref = derived_scope_ref
+            if type(scope_ref) is not str:
+                return False, None
 
         merged_id = dict.__getitem__(source_record, "merged_id")
         source_schema_version = dict.__getitem__(source_record, "source_schema_version")
@@ -1237,6 +1414,7 @@ def _private_source_record_identity_envelope(
             return False, None
         envelope = {
             "profile": SOURCE_RECORD_HMAC_PROFILE,
+            "scope_ref": scope_ref,
             "merged_id": merged_id,
             "source_schema_version": source_schema_version,
             "platform": platform,
@@ -1271,18 +1449,25 @@ def _private_source_record_payload(envelope: dict) -> bytes | None:
     return payload
 
 
-def source_record_identity_envelope(source_record) -> dict:
+def source_record_identity_envelope(source_record, adjudication) -> dict:
     """Public contract producing a PRIVATE pre-HMAC source-record envelope.
 
     The returned envelope and any derived payload or frame must not be persisted,
     logged, or published; only the typed HMAC reference is public.
     """
-    valid, envelope = _private_source_record_identity_envelope(
-        source_record,
-        require_closed_root=False,
-        require_canonical_order=False,
-    )
+    valid_scope, scope_ref = _private_authoritative_scope(adjudication)
+    adjudication = None
+    if valid_scope:
+        valid, envelope = _private_source_record_identity_envelope(
+            source_record,
+            require_closed_root=False,
+            require_canonical_order=False,
+            derived_scope_ref=scope_ref,
+        )
+    else:
+        valid, envelope = False, None
     source_record = None
+    scope_ref = None
     if valid:
         payload = _private_source_record_payload(envelope)
         if payload is None:
@@ -2272,6 +2457,7 @@ def _check_adjudication_item(
     grain_refs: dict[str, set[str]],
     disposition_refs: dict[str, set[str]],
     event_owners: dict[str, str],
+    source_record_owners: dict[str, str],
 ) -> tuple[set[str], set[str]]:
     grain = adjudication["grain"]
     ref = adjudication["ref"]
@@ -2322,7 +2508,21 @@ def _check_adjudication_item(
         )
 
     confidence = adjudication["causal_confidence"]
-    if confidence["anomaly_or_guard_presence"] not in {"medium", "high"}:
+    presence = confidence.get("anomaly_or_guard_presence")
+    if grain == "original_candidate" and "anomaly_or_guard_presence" in confidence:
+        errors.append(
+            f"E_ADJ_PRESENCE: {path}.causal_confidence: original mapping "
+            "forbids caller-supplied presence"
+        )
+        presence = "high"
+    elif grain == "original_candidate":
+        presence = "high"
+    elif "anomaly_or_guard_presence" not in confidence:
+        errors.append(
+            f"E_ADJ_PRESENCE: {path}.causal_confidence: supplemental mapping "
+            "requires explicit presence"
+        )
+    if presence not in {"medium", "high"}:
         errors.append(
             f"E_ADJ_CONFIDENCE: {path}.causal_confidence.anomaly_or_guard_presence: "
             "retained mapping requires medium/high confidence"
@@ -2360,6 +2560,12 @@ def _check_adjudication_item(
             )
         if source["kind"] == "source_record":
             source_records.add(source["ref"])
+            prior_source_owner = source_record_owners.setdefault(source["ref"], path)
+            if prior_source_owner != path:
+                errors.append(
+                    f"E_ADJ_SOURCE_SCOPE: {path}.source_refs: source_record ref "
+                    "is already bound to another adjudication"
+                )
     if not source_records:
         errors.append(f"E_ADJ_STATE: {path}.source_refs: source_record ref is required")
     if disposition == "guard" and not any(
@@ -2454,6 +2660,7 @@ def _check_adjudication_record(
     disposition_refs: dict[str, set[str]],
     source_fragments: dict[str, set[str]],
     event_owners: dict[str, str],
+    source_record_owners: dict[str, str],
 ) -> None:
     adjudications = rec.get("adjudications")
     if not adjudications:
@@ -2511,6 +2718,7 @@ def _check_adjudication_record(
             grain_refs,
             disposition_refs,
             event_owners,
+            source_record_owners,
         )
         dispositions.add(adjudication["disposition"])
         record_events.update(events)
@@ -2551,45 +2759,195 @@ def _check_adjudication_record(
         _check_evidence_coverage(rec, path, adjudications, errors)
 
 
+def _presence_authority_is_valid(
+    doc: dict, adjudications: list[tuple[dict, str]]
+) -> bool:
+    """Verify the external original-presence proof without trusting caller values."""
+    try:
+        contract = dict.get(doc, "adjudication_contract")
+        if type(contract) is not dict:
+            return False
+        if (
+            dict.get(contract, "original_presence_derivation_version")
+            != ORIGINAL_PRESENCE_DERIVATION_VERSION
+            or dict.get(contract, "original_presence_derivation_ruling_ref")
+            != ORIGINAL_PRESENCE_DERIVATION_RULING_REF
+            or dict.get(contract, "original_ref_set_sha256") != ORIGINAL_REF_SET_SHA256
+            or dict.get(contract, "crosswalk_projection_profile")
+            != CROSSWALK_PROJECTION_PROFILE
+            or dict.get(contract, "audit_contract") != R11A_PRESEAL_AUDIT_CONTRACT
+        ):
+            return False
+
+        original_refs: list[str] = []
+        for item, _target_id in adjudications:
+            if type(item) is not dict:
+                return False
+            grain = dict.get(item, "grain")
+            ref = dict.get(item, "ref")
+            confidence = dict.get(item, "causal_confidence")
+            if (
+                type(grain) is not str
+                or type(ref) is not str
+                or type(confidence) is not dict
+            ):
+                return False
+            has_presence = dict.__contains__(confidence, "anomaly_or_guard_presence")
+            if grain == "original_candidate":
+                if has_presence:
+                    return False
+                original_refs.append(ref)
+            elif grain == "supplemental_hypothesis":
+                if not has_presence:
+                    return False
+                presence = dict.__getitem__(confidence, "anomaly_or_guard_presence")
+                if type(presence) is not str or presence not in CAUSAL_CONFIDENCES:
+                    return False
+            else:
+                return False
+
+        if (
+            len(original_refs) != ADJUDICATION_COUNT_CONTRACT["original_candidate"]
+            or len(set(original_refs)) != len(original_refs)
+            or frozenset(original_refs) != CANONICAL_ORIGINAL_REFS
+            or canonical_ref_set_sha256(set(original_refs)) != ORIGINAL_REF_SET_SHA256
+        ):
+            return False
+        try:
+            crosswalk_digest = crosswalk_target_binding_sha256(doc)
+        except ValueError as internal:
+            _discard_internal_exception(internal)
+            internal = None
+            return False
+        if (
+            crosswalk_digest != MAPPING_CROSSWALK_SHA256
+            or dict.get(contract, "mapping_crosswalk_sha256") != crosswalk_digest
+        ):
+            return False
+        receipt = dict.get(contract, "original_presence_external_receipt")
+        expected_receipt = {
+            "state": "externally_verified",
+            "policy_version": ORIGINAL_PRESENCE_DERIVATION_VERSION,
+            "ruling_ref": ORIGINAL_PRESENCE_DERIVATION_RULING_REF,
+            "original_count": ADJUDICATION_COUNT_CONTRACT["original_candidate"],
+            "derived_presence": "high",
+            "original_ref_set_sha256": ORIGINAL_REF_SET_SHA256,
+            "crosswalk_projection_profile": CROSSWALK_PROJECTION_PROFILE,
+            "target_binding_crosswalk_sha256": crosswalk_digest,
+            "audit_contract": R11A_PRESEAL_AUDIT_CONTRACT,
+            "receipt_sha256": ORIGINAL_PRESENCE_RECEIPT_SHA256,
+        }
+        if type(receipt) is not dict or not _source_record_exact_keys(
+            receipt, frozenset(expected_receipt)
+        ):
+            return False
+        for field, expected in expected_receipt.items():
+            if dict.__getitem__(receipt, field) != expected:
+                return False
+        return True
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        doc = None
+        adjudications = []
+        return False
+
+
 def semantic_commitment_payload(doc: dict) -> list[dict]:
     """Canonical, non-sensitive tuple set committed by the sealed contract."""
-    adjudications = [
-        (adjudication, rec["id"])
-        for rec in doc.get("records", ())
-        for adjudication in rec.get("adjudications", ())
-    ]
-    adjudications.extend(
-        (adjudication, "top_level_source_exclusion")
-        for adjudication in doc.get("source_exclusions", ())
-    )
-    return [
-        {
-            "ref": item["ref"],
-            "grain": item["grain"],
-            "classification": item["classification"],
-            "disposition": item["disposition"],
-            "normalized_class": item["normalized_class"],
-            "expected": {
-                "status": item["expected"]["status"],
-                "authority": item["expected"]["authority"],
-                "value_commitment": item["expected"]["value_ref"],
-            },
-            "causal_confidence": item["causal_confidence"],
-            "owner_lane": item["owner_lane"],
-            "privacy_class": item["privacy_class"],
-            "source_binding": {
-                "target_record_id": target_record_id,
-                "source_refs": sorted(
-                    f"{source['kind']}:{source['ref']}"
-                    for source in item["source_refs"]
-                ),
-                "source_event_refs": sorted(item["source_event_refs"]),
-            },
-        }
+    try:
+        if type(doc) is not dict:
+            _raise_presence_contract_error()
+        records = dict.get(doc, "records")
+        exclusions = dict.get(doc, "source_exclusions")
+        if type(records) is not list or type(exclusions) is not list:
+            _raise_presence_contract_error()
+        adjudications: list[tuple[dict, str]] = []
+        for record in list.__iter__(records):
+            if type(record) is not dict:
+                _raise_presence_contract_error()
+            target_record_id = dict.get(record, "id")
+            items = dict.get(record, "adjudications", [])
+            if type(target_record_id) is not str or type(items) is not list:
+                _raise_presence_contract_error()
+            for item in list.__iter__(items):
+                if type(item) is not dict:
+                    _raise_presence_contract_error()
+                adjudications.append((item, target_record_id))
+        for item in list.__iter__(exclusions):
+            if type(item) is not dict:
+                _raise_presence_contract_error()
+            adjudications.append((item, "top_level_source_exclusion"))
+    except ValueError:
+        raise
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        doc = None
+        _raise_presence_contract_error()
+
+    if not _presence_authority_is_valid(doc, adjudications):
+        doc = None
+        adjudications = []
+        _raise_presence_contract_error()
+
+    projected: list[dict] = []
+    try:
         for item, target_record_id in sorted(
-            adjudications, key=lambda value: value[0]["ref"]
-        )
-    ]
+            adjudications, key=lambda value: dict.__getitem__(value[0], "ref")
+        ):
+            confidence_input = dict.__getitem__(item, "causal_confidence")
+            confidence = {
+                axis: dict.__getitem__(confidence_input, axis)
+                for axis in (
+                    "expected_form",
+                    "runtime_mechanism",
+                    "smartkey_attribution",
+                )
+            }
+            if dict.__getitem__(item, "grain") == "original_candidate":
+                confidence["anomaly_or_guard_presence"] = "high"
+            else:
+                confidence["anomaly_or_guard_presence"] = dict.__getitem__(
+                    confidence_input, "anomaly_or_guard_presence"
+                )
+            projected.append(
+                {
+                    "ref": dict.__getitem__(item, "ref"),
+                    "grain": dict.__getitem__(item, "grain"),
+                    "classification": dict.__getitem__(item, "classification"),
+                    "disposition": dict.__getitem__(item, "disposition"),
+                    "normalized_class": dict.__getitem__(item, "normalized_class"),
+                    "expected": {
+                        "status": dict.__getitem__(item, "expected")["status"],
+                        "authority": dict.__getitem__(item, "expected")["authority"],
+                        "value_commitment": dict.__getitem__(item, "expected")[
+                            "value_ref"
+                        ],
+                    },
+                    "causal_confidence": confidence,
+                    "owner_lane": dict.__getitem__(item, "owner_lane"),
+                    "privacy_class": dict.__getitem__(item, "privacy_class"),
+                    "source_binding": {
+                        "target_record_id": target_record_id,
+                        "source_refs": sorted(
+                            f"{source['kind']}:{source['ref']}"
+                            for source in dict.__getitem__(item, "source_refs")
+                        ),
+                        "source_event_refs": sorted(
+                            dict.__getitem__(item, "source_event_refs")
+                        ),
+                    },
+                }
+            )
+        return projected
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        doc = None
+        adjudications = []
+        projected = []
+        _raise_presence_contract_error()
 
 
 def semantic_commitment_sha256(doc: dict) -> str:
@@ -2610,6 +2968,234 @@ def _canonical_sha256(value) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _raise_crosswalk_contract_error() -> None:
+    """Raise one fixed, non-reflective crosswalk boundary error."""
+    raise ValueError("E_CROSSWALK_CONTRACT") from None
+
+
+def _raise_source_scope_placement_error() -> None:
+    """Raise one fixed, non-reflective scoped-placement boundary error."""
+    raise ValueError("E_SOURCE_SCOPE_PLACEMENT") from None
+
+
+def _raise_presence_contract_error() -> None:
+    """Raise one fixed, non-reflective presence-authority boundary error."""
+    raise ValueError("E_ADJ_PRESENCE") from None
+
+
+def _private_target_binding_groups(doc) -> list[dict] | None:
+    """Derive only public target/ref grouping from a closed ratified inventory."""
+    try:
+        if type(doc) is not dict:
+            return None
+        records = dict.get(doc, "records")
+        exclusions = dict.get(doc, "source_exclusions")
+        if type(records) is not list or type(exclusions) is not list:
+            return None
+        if len(records) > PROJECTED_RECORD_COUNT or len(exclusions) > 2:
+            return None
+
+        groups: list[dict] = []
+        seen_refs: set[str] = set()
+        seen_record_ids: set[str] = set()
+        for record in list.__iter__(records):
+            if type(record) is not dict:
+                return None
+            adjudications = dict.get(record, "adjudications", [])
+            if type(adjudications) is not list:
+                return None
+            if not adjudications:
+                continue
+            target_id = dict.get(record, "id")
+            if (
+                type(target_id) is not str
+                or re.fullmatch(r"anom-[0-9a-f]{12}", target_id) is None
+                or target_id in seen_record_ids
+            ):
+                return None
+            seen_record_ids.add(target_id)
+            mapping_refs: list[str] = []
+            for item in list.__iter__(adjudications):
+                if type(item) is not dict:
+                    return None
+                grain = dict.get(item, "grain")
+                ref = dict.get(item, "ref")
+                if (
+                    type(grain) is not str
+                    or type(ref) is not str
+                    or ref not in CANONICAL_ADJUDICATION_REFS
+                    or not canonical_ref_matches_grain(grain, ref)
+                    or ref in seen_refs
+                ):
+                    return None
+                seen_refs.add(ref)
+                mapping_refs.append(ref)
+            mapping_refs.sort()
+            groups.append(
+                {
+                    "target_kind": "record",
+                    "target_id": target_id,
+                    "mapping_refs": mapping_refs,
+                }
+            )
+
+        for item in list.__iter__(exclusions):
+            if type(item) is not dict:
+                return None
+            grain = dict.get(item, "grain")
+            ref = dict.get(item, "ref")
+            if (
+                type(grain) is not str
+                or type(ref) is not str
+                or ref not in CANONICAL_ADJUDICATION_REFS
+                or not canonical_ref_matches_grain(grain, ref)
+                or ref in seen_refs
+            ):
+                return None
+            seen_refs.add(ref)
+            groups.append(
+                {
+                    "target_kind": "source_exclusion",
+                    "target_id": f"source-exclusion:{ref}",
+                    "mapping_refs": [ref],
+                }
+            )
+
+        if seen_refs != CANONICAL_ADJUDICATION_REFS:
+            return None
+        groups.sort(
+            key=lambda group: (
+                group["target_kind"],
+                group["target_id"],
+                tuple(group["mapping_refs"]),
+            )
+        )
+        return groups
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        doc = None
+        return None
+
+
+def crosswalk_target_binding_projection(doc: dict) -> dict:
+    """Project the closed public mapping-to-target grouping contract.
+
+    ``target_id`` is discriminated by ``target_kind``: it is the stable public
+    record ID for record groups and the stable public mapping identity for a
+    top-level source-exclusion group.  No source, HMAC, time, path, receipt or
+    semantic content enters this grouping-only projection.
+    """
+    groups = _private_target_binding_groups(doc)
+    doc = None
+    if groups is None:
+        _raise_crosswalk_contract_error()
+    return {"profile": CROSSWALK_PROJECTION_PROFILE, "groups": groups}
+
+
+def crosswalk_target_binding_sha256(doc: dict) -> str:
+    return _canonical_sha256(crosswalk_target_binding_projection(doc))
+
+
+def _private_source_scope_placements(doc) -> list[dict] | None:
+    """Derive the exact public adjudication/source-record placement set."""
+    try:
+        if type(doc) is not dict:
+            return None
+        records = dict.get(doc, "records")
+        exclusions = dict.get(doc, "source_exclusions")
+        if type(records) is not list or type(exclusions) is not list:
+            return None
+        if len(records) > PROJECTED_RECORD_COUNT or len(exclusions) > 2:
+            return None
+
+        items: list[dict] = []
+        for record in list.__iter__(records):
+            if type(record) is not dict:
+                return None
+            adjudications = dict.get(record, "adjudications", [])
+            if type(adjudications) is not list:
+                return None
+            for item in list.__iter__(adjudications):
+                if type(item) is not dict:
+                    return None
+                items.append(item)
+        for item in list.__iter__(exclusions):
+            if type(item) is not dict:
+                return None
+            items.append(item)
+        if len(items) != HMAC_SOURCE_SCOPE_BINDING_COUNT:
+            return None
+
+        placements: list[dict] = []
+        seen_adjudications: set[str] = set()
+        seen_source_records: set[str] = set()
+        for item in items:
+            grain = dict.get(item, "grain")
+            adjudication_ref = dict.get(item, "ref")
+            source_refs = dict.get(item, "source_refs")
+            if (
+                type(grain) is not str
+                or type(adjudication_ref) is not str
+                or adjudication_ref not in CANONICAL_ADJUDICATION_REFS
+                or not canonical_ref_matches_grain(grain, adjudication_ref)
+                or adjudication_ref in seen_adjudications
+                or type(source_refs) is not list
+            ):
+                return None
+            seen_adjudications.add(adjudication_ref)
+            source_record_refs: list[str] = []
+            for source in list.__iter__(source_refs):
+                if type(source) is not dict:
+                    return None
+                kind = dict.get(source, "kind")
+                ref = dict.get(source, "ref")
+                if type(kind) is not str or type(ref) is not str:
+                    return None
+                if kind == "source_record":
+                    if not typed_hmac_ref_matches(ref, "source_record"):
+                        return None
+                    source_record_refs.append(ref)
+            if len(source_record_refs) != 1:
+                return None
+            source_record_ref = source_record_refs[0]
+            if source_record_ref in seen_source_records:
+                return None
+            seen_source_records.add(source_record_ref)
+            placements.append(
+                {
+                    "adjudication_ref": adjudication_ref,
+                    "source_record_ref": source_record_ref,
+                }
+            )
+        if seen_adjudications != CANONICAL_ADJUDICATION_REFS:
+            return None
+        placements.sort(
+            key=lambda placement: (
+                placement["adjudication_ref"],
+                placement["source_record_ref"],
+            )
+        )
+        return placements
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        doc = None
+        return None
+
+
+def source_scope_placement_projection(doc: dict) -> dict:
+    placements = _private_source_scope_placements(doc)
+    doc = None
+    if placements is None:
+        _raise_source_scope_placement_error()
+    return {"profile": SOURCE_SCOPE_PLACEMENT_PROFILE, "placements": placements}
+
+
+def source_scope_placement_sha256(doc: dict) -> str:
+    return _canonical_sha256(source_scope_placement_projection(doc))
 
 
 _ENHANCED_RECORD_FIELDS = frozenset(
@@ -2769,12 +3355,50 @@ def _check_adjudication_contract(
                 "be a nonzero lowercase sha256"
             )
         else:
-            actual_semantic = semantic_commitment_sha256(doc)
-            if stored_semantic != actual_semantic:
+            try:
+                actual_semantic = semantic_commitment_sha256(doc)
+            except ValueError as internal:
+                _discard_internal_exception(internal)
+                internal = None
+                actual_semantic = None
+                errors.append(
+                    "E_ADJ_PRESENCE: $.adjudication_contract: original presence "
+                    "authority proof is incomplete or inconsistent"
+                )
+            if actual_semantic is not None and stored_semantic != actual_semantic:
                 errors.append(
                     "E_ADJ_COMMITMENT: $.adjudication_contract: semantic tuple "
                     "commitment does not match mapped adjudications"
                 )
+        try:
+            actual_crosswalk = crosswalk_target_binding_sha256(doc)
+        except ValueError as internal:
+            _discard_internal_exception(internal)
+            internal = None
+            actual_crosswalk = None
+        if (
+            actual_crosswalk is None
+            or contract.get("mapping_crosswalk_sha256") != actual_crosswalk
+        ):
+            errors.append(
+                "E_ADJ_CROSSWALK: $.adjudication_contract.mapping_crosswalk_sha256: "
+                "digest does not match the closed target-binding projection"
+            )
+        try:
+            actual_placement = source_scope_placement_sha256(doc)
+        except ValueError as internal:
+            _discard_internal_exception(internal)
+            internal = None
+            actual_placement = None
+        if (
+            actual_placement is None
+            or contract.get("source_scope_placement_sha256") != actual_placement
+        ):
+            errors.append(
+                "E_SOURCE_SCOPE_PLACEMENT: "
+                "$.adjudication_contract.source_scope_placement_sha256: digest "
+                "does not match the exact public scoped-placement projection"
+            )
         stored_legacy = contract.get("legacy_projection_sha256")
         if not isinstance(stored_legacy, str) or not DIGEST_NONZERO_RE.fullmatch(
             stored_legacy
@@ -2910,6 +3534,54 @@ def _check_hmac_contract_preflight(
                 "not match the pinned construction"
             )
 
+    placement_count: int | None = None
+    actual_crosswalk: str | None = None
+    actual_placement: str | None = None
+    actual_semantic: str | None = None
+    try:
+        placement_projection = source_scope_placement_projection(doc)
+        placement_count = len(placement_projection["placements"])
+        actual_placement = _canonical_sha256(placement_projection)
+    except ValueError as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        errors.append(
+            "E_SOURCE_SCOPE_PLACEMENT: $: scoped source-record placements are "
+            "not a complete globally unique 159-binding set"
+        )
+    try:
+        actual_crosswalk = crosswalk_target_binding_sha256(doc)
+    except ValueError as internal:
+        _discard_internal_exception(internal)
+        internal = None
+    try:
+        actual_semantic = semantic_commitment_sha256(doc)
+    except ValueError as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        errors.append(
+            "E_ADJ_PRESENCE: $: original presence authority proof is incomplete "
+            "or inconsistent"
+        )
+
+    if (
+        actual_placement is None
+        or contract.get("source_scope_placement_sha256") != actual_placement
+    ):
+        errors.append(
+            "E_SOURCE_SCOPE_PLACEMENT: "
+            "$.adjudication_contract.source_scope_placement_sha256: digest "
+            "does not match the exact public scoped-placement projection"
+        )
+    if (
+        actual_crosswalk is None
+        or contract.get("mapping_crosswalk_sha256") != actual_crosswalk
+    ):
+        errors.append(
+            "E_ADJ_CROSSWALK: $.adjudication_contract.mapping_crosswalk_sha256: "
+            "digest does not match the closed target-binding projection"
+        )
+
     key_id = contract.get("hmac_key_id")
     if not isinstance(key_id, str) or re.fullmatch(HMAC_KEY_ID_PATTERN, key_id) is None:
         errors.append(
@@ -2924,8 +3596,32 @@ def _check_hmac_contract_preflight(
             "external private recomputation declaration is required"
         )
     else:
+        receipt_fields = frozenset(
+            {
+                "state",
+                "scheme",
+                "key_id",
+                "contract_version",
+                "resource_contract_version",
+                "resource_contract_sha256",
+                "vector_set_sha256",
+                "coverage",
+                "receipt_sha256",
+                "source_scope_policy_version",
+                "crosswalk_projection_profile",
+                "source_scope_placement_profile",
+                "audit_contract",
+                "registry_schema_version",
+                "source_scope_binding_count",
+                "mapping_crosswalk_sha256",
+                "source_scope_placement_sha256",
+                "semantic_commitment_sha256",
+            }
+        )
         receipt_ok = (
-            receipt.get("state") == HMAC_RECEIPT_STATE
+            type(receipt) is dict
+            and _source_record_exact_keys(receipt, receipt_fields)
+            and receipt.get("state") == HMAC_RECEIPT_STATE
             and receipt.get("scheme") == HMAC_SCHEME
             and receipt.get("key_id") == key_id
             and receipt.get("contract_version") == HMAC_CONTRACT_VERSION
@@ -2934,6 +3630,26 @@ def _check_hmac_contract_preflight(
             and receipt.get("resource_contract_sha256") == HMAC_RESOURCE_CONTRACT_SHA256
             and receipt.get("vector_set_sha256") == HMAC_VECTOR_SET_SHA256
             and receipt.get("coverage") == HMAC_RECEIPT_COVERAGE
+            and receipt.get("source_scope_policy_version")
+            == RECONSTRUCTION_FRAGMENT_POLICY_VERSION
+            and receipt.get("crosswalk_projection_profile")
+            == CROSSWALK_PROJECTION_PROFILE
+            and receipt.get("source_scope_placement_profile")
+            == SOURCE_SCOPE_PLACEMENT_PROFILE
+            and receipt.get("audit_contract") == R11A_PRESEAL_AUDIT_CONTRACT
+            and receipt.get("registry_schema_version") == 1
+            and receipt.get("source_scope_binding_count") == placement_count
+            and receipt.get("source_scope_binding_count")
+            == HMAC_SOURCE_SCOPE_BINDING_COUNT
+            and receipt.get("mapping_crosswalk_sha256") == actual_crosswalk
+            and receipt.get("mapping_crosswalk_sha256")
+            == contract.get("mapping_crosswalk_sha256")
+            and receipt.get("source_scope_placement_sha256") == actual_placement
+            and receipt.get("source_scope_placement_sha256")
+            == contract.get("source_scope_placement_sha256")
+            and receipt.get("semantic_commitment_sha256") == actual_semantic
+            and receipt.get("semantic_commitment_sha256")
+            == contract.get("semantic_commitment_sha256")
             and isinstance(receipt.get("receipt_sha256"), str)
             and DIGEST_NONZERO_RE.fullmatch(receipt["receipt_sha256"]) is not None
         )
@@ -2989,6 +3705,23 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
     if not isinstance(doc, dict):
         return
     records = doc.get("records")
+    has_enhanced_record = isinstance(records, list) and any(
+        isinstance(record, dict)
+        and isinstance(record.get("adjudications"), list)
+        and bool(record["adjudications"])
+        for record in records
+    )
+    has_enhanced_exclusion = isinstance(doc.get("source_exclusions"), list) and bool(
+        doc["source_exclusions"]
+    )
+    if has_enhanced_record or has_enhanced_exclusion or "adjudication_contract" in doc:
+        # R11a is deliberately preparatory: its self-derived algorithm digest
+        # is not the final private authority pin.  R11b alone may hard-pin the
+        # synthesized digest and remove this code-owned, unconditional HOLD.
+        errors.append(
+            "E_R3_IMPORT_HOLD: $: R11a enhanced documents remain unavailable "
+            "until the separately audited R11b authority seal"
+        )
     if isinstance(records, list):
         for index, record in enumerate(records):
             if not isinstance(record, dict):
@@ -3191,6 +3924,15 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
         "registry_projection_sha256",
         "baseline_record_set_sha256",
         "baseline_external_receipt",
+        "normalized_tuple_matrix_sha256",
+        "reconstruction_fragment_policy_version",
+        "crosswalk_projection_profile",
+        "source_scope_placement_profile",
+        "source_scope_placement_sha256",
+        "original_presence_derivation_version",
+        "original_presence_derivation_ruling_ref",
+        "original_ref_set_sha256",
+        "original_presence_external_receipt",
         "hmac_contract_version",
         "hmac_domain_payload_profiles",
         "hmac_domain_root_types",
@@ -3224,10 +3966,30 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
             "resource_contract_sha256": HMAC_RESOURCE_CONTRACT_SHA256,
             "vector_set_sha256": HMAC_VECTOR_SET_SHA256,
             "coverage": HMAC_RECEIPT_COVERAGE,
+            "source_scope_policy_version": (RECONSTRUCTION_FRAGMENT_POLICY_VERSION),
+            "crosswalk_projection_profile": CROSSWALK_PROJECTION_PROFILE,
+            "source_scope_placement_profile": SOURCE_SCOPE_PLACEMENT_PROFILE,
+            "audit_contract": R11A_PRESEAL_AUDIT_CONTRACT,
+            "registry_schema_version": 1,
+            "source_scope_binding_count": HMAC_SOURCE_SCOPE_BINDING_COUNT,
+            "mapping_crosswalk_sha256": MAPPING_CROSSWALK_SHA256,
+            "source_scope_placement_sha256": SOURCE_SCOPE_PLACEMENT_SHA256,
         },
         "baseline_external_receipt": {
             "state": BASELINE_RECEIPT_STATE,
             "record_count": RECORD_SHAPE_CONTRACT["baseline_update_record_count"],
+        },
+        "original_presence_external_receipt": {
+            "state": "externally_verified",
+            "policy_version": ORIGINAL_PRESENCE_DERIVATION_VERSION,
+            "ruling_ref": ORIGINAL_PRESENCE_DERIVATION_RULING_REF,
+            "original_count": ADJUDICATION_COUNT_CONTRACT["original_candidate"],
+            "derived_presence": "high",
+            "original_ref_set_sha256": ORIGINAL_REF_SET_SHA256,
+            "crosswalk_projection_profile": CROSSWALK_PROJECTION_PROFILE,
+            "target_binding_crosswalk_sha256": MAPPING_CROSSWALK_SHA256,
+            "audit_contract": R11A_PRESEAL_AUDIT_CONTRACT,
+            "receipt_sha256": ORIGINAL_PRESENCE_RECEIPT_SHA256,
         },
     }
     for definition, constants in receipt_contracts.items():
@@ -3244,6 +4006,23 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
                     f"E_SCHEMA_DRIFT: schema {definition} pin {field!r} differs "
                     "from validator contract"
                 )
+            if field not in receipt_required:
+                errors.append(
+                    f"E_SCHEMA_DRIFT: schema {definition} must require {field!r}"
+                )
+    for definition, fields in {
+        "hmac_external_receipt": {
+            "key_id",
+            "receipt_sha256",
+            "semantic_commitment_sha256",
+        },
+        "baseline_external_receipt": {
+            "approved_record_set_sha256",
+            "receipt_sha256",
+        },
+    }.items():
+        receipt_required = set(definitions.get(definition, {}).get("required", ()))
+        for field in fields:
             if field not in receipt_required:
                 errors.append(
                     f"E_SCHEMA_DRIFT: schema {definition} must require {field!r}"
@@ -3265,6 +4044,7 @@ def validate_document(doc, schema: dict) -> list[str]:
     disposition_refs = {disposition: set() for disposition in ADJUDICATION_DISPOSITIONS}
     source_fragments: dict[str, set[str]] = {}
     event_owners: dict[str, str] = {}
+    source_record_owners: dict[str, str] = {}
     for i, rec in enumerate(doc["records"]):
         path = f"$.records[{i}]"
         _check_identity(rec, path, errors)
@@ -3289,6 +4069,7 @@ def validate_document(doc, schema: dict) -> list[str]:
             disposition_refs,
             source_fragments,
             event_owners,
+            source_record_owners,
         )
     for index, adjudication in enumerate(doc.get("source_exclusions", ())):
         path = f"$.source_exclusions[{index}]"
@@ -3301,6 +4082,7 @@ def validate_document(doc, schema: dict) -> list[str]:
             grain_refs,
             disposition_refs,
             event_owners,
+            source_record_owners,
         )
         if (
             adjudication["grain"] != "supplemental_hypothesis"

@@ -50,18 +50,32 @@
       "required": [
         "state", "scheme", "key_id", "contract_version",
         "resource_contract_version", "resource_contract_sha256",
-        "vector_set_sha256", "coverage", "receipt_sha256"
+        "vector_set_sha256", "coverage", "receipt_sha256",
+        "source_scope_policy_version", "crosswalk_projection_profile",
+        "source_scope_placement_profile", "audit_contract",
+        "registry_schema_version", "source_scope_binding_count",
+        "mapping_crosswalk_sha256", "source_scope_placement_sha256",
+        "semantic_commitment_sha256"
       ],
       "properties": {
         "state": { "const": "externally_verified" },
         "scheme": { "const": "smartkey-g0-hmac-sha256-v1" },
         "key_id": { "$ref": "#/$defs/hmac_key_id" },
-        "contract_version": { "const": "smartkey-g0-hmac-byte-contract-v3" },
+        "contract_version": { "const": "smartkey-g0-hmac-byte-contract-v4" },
         "resource_contract_version": { "const": "smartkey-g0-hmac-resource-contract-v1" },
         "resource_contract_sha256": { "const": "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab" },
-        "vector_set_sha256": { "const": "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192" },
-        "coverage": { "const": "all-refs-domain-serialization-resource-key-id-private-recomputation-v2" },
-        "receipt_sha256": { "$ref": "#/$defs/sha256_nonzero" }
+        "vector_set_sha256": { "const": "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c" },
+        "coverage": { "const": "all-refs-domain-serialization-resource-key-id-adjudication-scope-uniqueness-whole-source-private-recomputation-v3" },
+        "receipt_sha256": { "$ref": "#/$defs/sha256_nonzero" },
+        "source_scope_policy_version": { "const": "smartkey-g0-source-ref-scoped-cap-v1" },
+        "crosswalk_projection_profile": { "const": "smartkey-g0-crosswalk-target-binding-v2" },
+        "source_scope_placement_profile": { "const": "smartkey-g0-source-scope-placement-v1" },
+        "audit_contract": { "const": "g0-r11a-preseal-crosswalk" },
+        "registry_schema_version": { "const": 1 },
+        "source_scope_binding_count": { "const": 159 },
+        "mapping_crosswalk_sha256": { "const": "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6" },
+        "source_scope_placement_sha256": { "const": "c4f2a3a642a15c0a62ce9bb5904adfdec43721e88af65be1577f68d7e122f119" },
+        "semantic_commitment_sha256": { "$ref": "#/$defs/sha256_nonzero" }
       }
     },
     "baseline_external_receipt": {
@@ -73,6 +87,28 @@
         "record_count": { "const": 20 },
         "approved_record_set_sha256": { "$ref": "#/$defs/sha256_nonzero" },
         "receipt_sha256": { "$ref": "#/$defs/sha256_nonzero" }
+      }
+    },
+    "original_presence_external_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state", "policy_version", "ruling_ref", "original_count",
+        "derived_presence", "original_ref_set_sha256",
+        "crosswalk_projection_profile", "target_binding_crosswalk_sha256",
+        "audit_contract", "receipt_sha256"
+      ],
+      "properties": {
+        "state": { "const": "externally_verified" },
+        "policy_version": { "const": "smartkey-g0-original-retained-exactly-once-presence-v1" },
+        "ruling_ref": { "const": "4e0198426714" },
+        "original_count": { "const": 106 },
+        "derived_presence": { "const": "high" },
+        "original_ref_set_sha256": { "const": "6a2d167b00ece704a369772c76b231821513b0da5602ab960c16ac9bed78a3f2" },
+        "crosswalk_projection_profile": { "const": "smartkey-g0-crosswalk-target-binding-v2" },
+        "target_binding_crosswalk_sha256": { "const": "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6" },
+        "audit_contract": { "const": "g0-r11a-preseal-crosswalk" },
+        "receipt_sha256": { "const": "6e9d2931631a284fb25e0f60e354eb42e42f026a5032d5f58db3a1a7e07b96ee" }
       }
     },
     "utc_or_null": {
@@ -199,8 +235,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "anomaly_or_guard_presence", "expected_form",
-            "runtime_mechanism", "smartkey_attribution"
+            "expected_form", "runtime_mechanism", "smartkey_attribution"
           ],
           "properties": {
             "anomaly_or_guard_presence": { "$ref": "#/$defs/causal_confidence" },
@@ -234,7 +269,13 @@
         "source_exclusion_count", "projected_record_count",
         "bug_record_count", "guard_record_count", "legacy_record_count",
         "baseline_update_record_count", "new_record_count",
-        "canonical_ref_set_sha256", "semantic_commitment_algorithm",
+        "canonical_ref_set_sha256", "normalized_tuple_matrix_sha256",
+        "reconstruction_fragment_policy_version",
+        "crosswalk_projection_profile", "source_scope_placement_profile",
+        "source_scope_placement_sha256",
+        "original_presence_derivation_version",
+        "original_presence_derivation_ruling_ref", "original_ref_set_sha256",
+        "original_presence_external_receipt", "semantic_commitment_algorithm",
         "semantic_commitment_sha256", "legacy_projection_sha256",
         "registry_projection_sha256", "baseline_commitment_algorithm",
         "baseline_record_set_sha256", "baseline_external_receipt",
@@ -250,8 +291,8 @@
         "state": { "const": "sealed" },
         "ruling_ref": { "const": "6e0704632fef" },
         "artifact_sha256": { "const": "92c6dd612be8095d54dc385044c60e9d33e91d0ed9e9f62f6701c87722edbb72" },
-        "mapping_crosswalk_sha256": { "const": "7838b51bf55fbe7f7ac2ec7e1f5fbb0285df425242b1cbcfeaccaa3a0a6902a4" },
-        "audit_contract": { "const": "g0-r2-security-crosswalk" },
+        "mapping_crosswalk_sha256": { "const": "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6" },
+        "audit_contract": { "const": "g0-r11a-preseal-crosswalk" },
         "original_count": { "const": 106 },
         "supplemental_count": { "const": 53 },
         "bug_candidate_count": { "const": 125 },
@@ -264,6 +305,15 @@
         "baseline_update_record_count": { "const": 20 },
         "new_record_count": { "const": 82 },
         "canonical_ref_set_sha256": { "const": "81168506c76776f060aaf9cd71bb4ed0e2fbde31b286ac30b69823bc8a54a5ee" },
+        "normalized_tuple_matrix_sha256": { "const": "4c32653fa93b8dbe2ca48b5ee42cb4d733aec6ebc374c2ca712f558203237a04" },
+        "reconstruction_fragment_policy_version": { "const": "smartkey-g0-source-ref-scoped-cap-v1" },
+        "crosswalk_projection_profile": { "const": "smartkey-g0-crosswalk-target-binding-v2" },
+        "source_scope_placement_profile": { "const": "smartkey-g0-source-scope-placement-v1" },
+        "source_scope_placement_sha256": { "const": "c4f2a3a642a15c0a62ce9bb5904adfdec43721e88af65be1577f68d7e122f119" },
+        "original_presence_derivation_version": { "const": "smartkey-g0-original-retained-exactly-once-presence-v1" },
+        "original_presence_derivation_ruling_ref": { "const": "4e0198426714" },
+        "original_ref_set_sha256": { "const": "6a2d167b00ece704a369772c76b231821513b0da5602ab960c16ac9bed78a3f2" },
+        "original_presence_external_receipt": { "$ref": "#/$defs/original_presence_external_receipt" },
         "semantic_commitment_algorithm": { "const": "sha256-canonical-json-v1" },
         "semantic_commitment_sha256": { "$ref": "#/$defs/sha256_nonzero" },
         "legacy_projection_sha256": {
@@ -282,14 +332,14 @@
         "baseline_external_receipt": { "$ref": "#/$defs/baseline_external_receipt" },
         "hmac_scheme": { "const": "smartkey-g0-hmac-sha256-v1" },
         "hmac_min_key_bytes": { "const": 32 },
-        "hmac_contract_version": { "const": "smartkey-g0-hmac-byte-contract-v3" },
+        "hmac_contract_version": { "const": "smartkey-g0-hmac-byte-contract-v4" },
         "hmac_domains": { "const": ["value", "event", "metadata", "source_record"] },
         "hmac_domain_payload_profiles": {
           "const": {
             "value": "scalar_utf8",
             "event": "project_canonical_json_v1",
             "metadata": "project_canonical_json_v1",
-            "source_record": "smartkey-g0-source-record-semantic-v1"
+            "source_record": "smartkey-g0-source-record-adjudication-scoped-semantic-v2"
           }
         },
         "hmac_domain_root_types": {
@@ -319,7 +369,7 @@
         "hmac_scalar_payload_encoding": { "const": "exact-utf8-scalar-no-normalization-v1" },
         "hmac_structured_payload_encoding": { "const": "smartkey-g0-canonical-json-v1" },
         "hmac_input_frame": { "const": "ascii-scheme-nul-domain-nul-u64be-length-payload-v1" },
-        "hmac_vector_set_sha256": { "const": "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192" },
+        "hmac_vector_set_sha256": { "const": "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c" },
         "hmac_key_id": { "$ref": "#/$defs/hmac_key_id" },
         "hmac_external_receipt": { "$ref": "#/$defs/hmac_external_receipt" }
       }

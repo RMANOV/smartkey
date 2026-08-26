@@ -28,9 +28,12 @@ _VALIDATOR = _ANOMALIES / "validate.py"
 
 _AUTHORITY_VERSION = "smartkey-g0-semantic-authority-projection-v2"
 _SOURCE_RECORD_PROFILE = "smartkey-g0-source-record-semantic-v1"
-_HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v3"
-_OLD_HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v2"
-_OLD_SOURCE_RECORD_PROFILE = "project_canonical_json_v1"
+_CURRENT_SOURCE_RECORD_PROFILE = (
+    "smartkey-g0-source-record-adjudication-scoped-semantic-v2"
+)
+_HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v4"
+_OLD_HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v3"
+_OLD_SOURCE_RECORD_PROFILE = _SOURCE_RECORD_PROFILE
 _OLD_VECTOR_SET_SHA256 = (
     "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
 )
@@ -39,6 +42,9 @@ _PRE_R9_VECTOR_SET_SHA256 = (
 )
 _V3_VECTOR_SET_SHA256 = (
     "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192"
+)
+_V4_VECTOR_SET_SHA256 = (
+    "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c"
 )
 _SYNTHETIC_KEY_ID = "0123456789abcdef0123456789abcdef"
 _PUBLIC_VECTOR_KEY = b"smartkey-g0-public-synthetic-vector-key-v1"
@@ -471,7 +477,32 @@ def _envelope_builder():
     assert callable(builder), (
         "G0-R8 RED: missing public source_record_identity_envelope contract"
     )
-    return builder
+    scope_ref = sorted(V.CANONICAL_ORIGINAL_REFS)[0]
+    adjudication = {
+        "grain": "original_candidate",
+        "ref": scope_ref,
+        "classification": "synthetic-ignored",
+        "disposition": "synthetic-ignored",
+        "normalized_class": "synthetic-ignored",
+        "expected": {"synthetic": "ignored"},
+        "causal_confidence": {"synthetic": "ignored"},
+        "owner_lane": "synthetic-ignored",
+        "privacy_class": "synthetic-ignored",
+        "source_refs": ["synthetic-ignored"],
+        "source_event_refs": ["synthetic-ignored"],
+    }
+
+    def scoped(source_record):
+        return builder(source_record, adjudication)
+
+    return scoped
+
+
+def _current_source_vector_envelope() -> dict:
+    envelope = copy.deepcopy(_SOURCE_VECTOR_ENVELOPE)
+    envelope["profile"] = _CURRENT_SOURCE_RECORD_PROFILE
+    envelope["scope_ref"] = sorted(V.CANONICAL_ORIGINAL_REFS)[0]
+    return envelope
 
 
 def _assert_stable_hmac_contract_error(call, marker: str | None = None) -> None:
@@ -495,42 +526,21 @@ def _assert_hmac_contract_rejected(envelope, marker: str | None = None) -> None:
 
 
 def _synthetic_hmac_contract() -> dict:
-    receipt_sha256 = hashlib.sha256(b"synthetic-hmac-receipt").hexdigest()
-    return {
-        "hmac_scheme": V.HMAC_SCHEME,
-        "hmac_min_key_bytes": V.HMAC_MIN_KEY_BYTES,
-        "hmac_contract_version": V.HMAC_CONTRACT_VERSION,
-        "hmac_domains": list(V.HMAC_DOMAINS),
-        "hmac_domain_payload_profiles": copy.deepcopy(V.HMAC_DOMAIN_PAYLOAD_PROFILES),
-        "hmac_domain_root_types": copy.deepcopy(V.HMAC_DOMAIN_ROOT_TYPES),
-        "hmac_resource_contract_version": V.HMAC_RESOURCE_CONTRACT_VERSION,
-        "hmac_resource_limits": copy.deepcopy(V.HMAC_RESOURCE_LIMITS),
-        "hmac_resource_contract_sha256": V.HMAC_RESOURCE_CONTRACT_SHA256,
-        "hmac_scalar_payload_encoding": V.HMAC_SCALAR_PAYLOAD_ENCODING,
-        "hmac_structured_payload_encoding": V.HMAC_STRUCTURED_PAYLOAD_ENCODING,
-        "hmac_input_frame": V.HMAC_INPUT_FRAME,
-        "hmac_vector_set_sha256": V.HMAC_VECTOR_SET_SHA256,
-        "hmac_key_id": _SYNTHETIC_KEY_ID,
-        "hmac_external_receipt": {
-            "state": V.HMAC_RECEIPT_STATE,
-            "scheme": V.HMAC_SCHEME,
-            "key_id": _SYNTHETIC_KEY_ID,
-            "contract_version": V.HMAC_CONTRACT_VERSION,
-            "resource_contract_version": V.HMAC_RESOURCE_CONTRACT_VERSION,
-            "resource_contract_sha256": V.HMAC_RESOURCE_CONTRACT_SHA256,
-            "vector_set_sha256": V.HMAC_VECTOR_SET_SHA256,
-            "coverage": V.HMAC_RECEIPT_COVERAGE,
-            "receipt_sha256": receipt_sha256,
-        },
-    }
+    from ibus import test_anomaly_registry as R10
+
+    return copy.deepcopy(R10._synthetic_r2_doc()["adjudication_contract"])
 
 
 def _hmac_preflight_errors(contract: dict) -> list[str]:
+    from ibus import test_anomaly_registry as R10
+
+    doc = R10._synthetic_r2_doc()
+    doc["adjudication_contract"] = contract
     errors: list[str] = []
     V._check_hmac_contract_preflight(
-        {"records": []},
+        doc,
         contract,
-        [("$.synthetic", {})],
+        V._adjudication_locations(doc),
         errors,
     )
     return errors
@@ -792,12 +802,14 @@ def test_g0_r8_authority_and_source_record_profile_versions_are_pinned():
     assert getattr(V, "SEMANTIC_AUTHORITY_PROJECTION_VERSION", None) == (
         _AUTHORITY_VERSION
     )
-    assert getattr(V, "SOURCE_RECORD_HMAC_PROFILE", None) == _SOURCE_RECORD_PROFILE
+    assert getattr(V, "SOURCE_RECORD_HMAC_PROFILE", None) == (
+        _CURRENT_SOURCE_RECORD_PROFILE
+    )
     assert V.HMAC_DOMAIN_PAYLOAD_PROFILES == {
         "value": "scalar_utf8",
         "event": "project_canonical_json_v1",
         "metadata": "project_canonical_json_v1",
-        "source_record": _SOURCE_RECORD_PROFILE,
+        "source_record": _CURRENT_SOURCE_RECORD_PROFILE,
     }
 
 
@@ -810,7 +822,7 @@ def test_g0_r8_hmac_contract_version_is_bumped_and_pinned_everywhere():
     assert contract["hmac_contract_version"]["const"] == _HMAC_CONTRACT_VERSION
     assert receipt["contract_version"]["const"] == _HMAC_CONTRACT_VERSION
     assert contract["hmac_domain_payload_profiles"]["const"]["source_record"] == (
-        _SOURCE_RECORD_PROFILE
+        _CURRENT_SOURCE_RECORD_PROFILE
     )
 
 
@@ -832,18 +844,11 @@ def test_g0_r8_source_record_public_vector_pins_independent_bytes_and_mac():
     assert reference_frame.hex() == _SOURCE_VECTOR_FRAME_HEX
     assert reference_mac == _SOURCE_VECTOR_MAC_SHA256
 
+    _assert_hmac_contract_rejected(_SOURCE_VECTOR_ENVELOPE)
     envelope = _envelope_builder()(_synthetic_merged_source_record())
-    assert envelope == _SOURCE_VECTOR_ENVELOPE
-    assert V.hmac_payload_bytes("source_record", envelope) == reference_payload
-    assert V.hmac_frame_bytes("source_record", envelope) == reference_frame
-    assert (
-        hmac.new(
-            _PUBLIC_VECTOR_KEY,
-            V.hmac_frame_bytes("source_record", envelope),
-            hashlib.sha256,
-        ).hexdigest()
-        == _SOURCE_VECTOR_MAC_SHA256
-    )
+    assert envelope == _current_source_vector_envelope()
+    assert V.hmac_payload_bytes("source_record", envelope) != reference_payload
+    assert V.hmac_frame_bytes("source_record", envelope) != reference_frame
 
 
 def test_g0_r8_complete_v3_vector_set_is_exact_and_fails_closed():
@@ -861,21 +866,22 @@ def test_g0_r8_complete_v3_vector_set_is_exact_and_fails_closed():
     schema = _schema()
     contract_schema = schema["$defs"]["adjudication_contract"]["properties"]
     receipt_schema = schema["$defs"]["hmac_external_receipt"]["properties"]
-    assert V.HMAC_VECTOR_SET_SHA256 == _V3_VECTOR_SET_SHA256
-    assert V.SEALED_CONTRACT_CONSTS["hmac_vector_set_sha256"] == (_V3_VECTOR_SET_SHA256)
-    assert contract_schema["hmac_vector_set_sha256"]["const"] == (_V3_VECTOR_SET_SHA256)
-    assert receipt_schema["vector_set_sha256"]["const"] == _V3_VECTOR_SET_SHA256
+    assert V.HMAC_VECTOR_SET_SHA256 == _V4_VECTOR_SET_SHA256
+    assert V.SEALED_CONTRACT_CONSTS["hmac_vector_set_sha256"] == (_V4_VECTOR_SET_SHA256)
+    assert contract_schema["hmac_vector_set_sha256"]["const"] == (_V4_VECTOR_SET_SHA256)
+    assert receipt_schema["vector_set_sha256"]["const"] == _V4_VECTOR_SET_SHA256
 
     contract = _synthetic_hmac_contract()
-    assert contract["hmac_vector_set_sha256"] == _V3_VECTOR_SET_SHA256
+    assert contract["hmac_vector_set_sha256"] == _V4_VECTOR_SET_SHA256
     assert contract["hmac_external_receipt"]["vector_set_sha256"] == (
-        _V3_VECTOR_SET_SHA256
+        _V4_VECTOR_SET_SHA256
     )
     arbitrary_sha = "a" * 64
     assert arbitrary_sha not in {
         _OLD_VECTOR_SET_SHA256,
         _PRE_R9_VECTOR_SET_SHA256,
         _V3_VECTOR_SET_SHA256,
+        _V4_VECTOR_SET_SHA256,
     }
     contract["hmac_vector_set_sha256"] = arbitrary_sha
     contract["hmac_external_receipt"]["vector_set_sha256"] = arbitrary_sha
@@ -920,7 +926,7 @@ def test_g0_r8_wrong_source_profile_error_is_stable_and_nonreflective():
 def test_g0_r8_source_record_identity_envelope_has_exact_closed_shape():
     source = _synthetic_merged_source_record()
     envelope = _envelope_builder()(source)
-    assert envelope == _SOURCE_VECTOR_ENVELOPE
+    assert envelope == _current_source_vector_envelope()
 
     payload = V.hmac_payload_bytes("source_record", envelope)
     frame = V.hmac_frame_bytes("source_record", envelope)
@@ -1027,6 +1033,7 @@ def test_g0_r8_arbitrary_nonwhitelist_source_input_is_nondecisional(
 ):
     whitelist = {
         "profile",
+        "scope_ref",
         "merged_id",
         "source_schema_version",
         "platform",
@@ -1047,7 +1054,7 @@ def test_g0_r8_arbitrary_nonwhitelist_source_input_is_nondecisional(
     second_payload = V.hmac_payload_bytes("source_record", second_envelope)
     first_frame = V.hmac_frame_bytes("source_record", first_envelope)
     second_frame = V.hmac_frame_bytes("source_record", second_envelope)
-    assert first_envelope == second_envelope == _SOURCE_VECTOR_ENVELOPE
+    assert first_envelope == second_envelope == _current_source_vector_envelope()
     assert first_payload == second_payload
     assert first_frame == second_frame
     assert hmac.new(_PUBLIC_VECTOR_KEY, first_frame, hashlib.sha256).digest() == (
@@ -1136,6 +1143,7 @@ def test_g0_r8_each_included_source_field_is_decisional(field):
     "field",
     [
         "profile",
+        "scope_ref",
         "merged_id",
         "source_schema_version",
         "platform",
@@ -1161,6 +1169,7 @@ def test_g0_r8_source_record_envelope_rejects_extra_root_key_nonreflectively():
     ("field", "replacement"),
     [
         ("profile", _OLD_SOURCE_RECORD_PROFILE),
+        ("scope_ref", "orig:synthetic-invalid"),
         ("profile", ""),
         ("profile", 1),
         ("merged_id", "f" * 63),
@@ -1394,7 +1403,7 @@ def test_g0_r8_overlapping_nonduplicate_segments_remain_valid():
     assert segments[0] != segments[1]
     assert segments[3]["end_char"] == 4 < segments[4]["end_char"] == 6
     assert V.hmac_payload_bytes("source_record", envelope) == (
-        _SOURCE_VECTOR_PAYLOAD_BYTES
+        _reference_canonical_json_bytes(envelope)
     )
 
 

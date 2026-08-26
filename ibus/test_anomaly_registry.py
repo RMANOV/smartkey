@@ -78,6 +78,12 @@ def _codes(errors: list[str]) -> set[str]:
     return {e.split(":", 1)[0] for e in errors}
 
 
+def _assert_r11a_hold_only(doc: dict) -> None:
+    errors = V.validate_document(doc, _schema())
+    assert len(errors) == 1
+    assert errors[0].startswith("E_R3_IMPORT_HOLD:")
+
+
 def _find(doc: dict, observed: str, expected: str) -> dict:
     for rec in doc["records"]:
         if (
@@ -396,33 +402,37 @@ def _r2_semantic_payload(doc: dict) -> list[dict]:
         (adjudication, "top_level_source_exclusion")
         for adjudication in doc.get("source_exclusions", ())
     )
-    return [
-        {
-            "ref": adj["ref"],
-            "grain": adj["grain"],
-            "classification": adj["classification"],
-            "disposition": adj["disposition"],
-            "normalized_class": adj["normalized_class"],
-            "expected": {
-                "status": adj["expected"]["status"],
-                "authority": adj["expected"]["authority"],
-                "value_commitment": adj["expected"]["value_ref"],
-            },
-            "causal_confidence": adj["causal_confidence"],
-            "owner_lane": adj["owner_lane"],
-            "privacy_class": adj["privacy_class"],
-            "source_binding": {
-                "target_record_id": target_record_id,
-                "source_refs": sorted(
-                    f"{source['kind']}:{source['ref']}" for source in adj["source_refs"]
-                ),
-                "source_event_refs": sorted(adj["source_event_refs"]),
-            },
-        }
-        for adj, target_record_id in sorted(
-            adjudications, key=lambda item: item[0]["ref"]
+    projected = []
+    for adj, target_record_id in sorted(adjudications, key=lambda item: item[0]["ref"]):
+        confidence = copy.deepcopy(adj["causal_confidence"])
+        if adj["grain"] == "original_candidate":
+            confidence["anomaly_or_guard_presence"] = "high"
+        projected.append(
+            {
+                "ref": adj["ref"],
+                "grain": adj["grain"],
+                "classification": adj["classification"],
+                "disposition": adj["disposition"],
+                "normalized_class": adj["normalized_class"],
+                "expected": {
+                    "status": adj["expected"]["status"],
+                    "authority": adj["expected"]["authority"],
+                    "value_commitment": adj["expected"]["value_ref"],
+                },
+                "causal_confidence": confidence,
+                "owner_lane": adj["owner_lane"],
+                "privacy_class": adj["privacy_class"],
+                "source_binding": {
+                    "target_record_id": target_record_id,
+                    "source_refs": sorted(
+                        f"{source['kind']}:{source['ref']}"
+                        for source in adj["source_refs"]
+                    ),
+                    "source_event_refs": sorted(adj["source_event_refs"]),
+                },
+            }
         )
-    ]
+    return projected
 
 
 def _r2_semantic_digest(doc: dict) -> str:
@@ -522,6 +532,11 @@ def _r4_baseline_set_digest(doc: dict) -> str:
 def _refresh_r3_commitments(doc: dict) -> None:
     contract = doc["adjudication_contract"]
     contract["semantic_commitment_sha256"] = _r2_semantic_digest(doc)
+    hmac_receipt = contract.get("hmac_external_receipt")
+    if isinstance(hmac_receipt, dict):
+        hmac_receipt["semantic_commitment_sha256"] = contract[
+            "semantic_commitment_sha256"
+        ]
     contract["legacy_projection_sha256"] = _r3_legacy_projection_digest(doc)
     contract["registry_projection_sha256"] = _r3_registry_projection_digest(doc)
 
@@ -544,7 +559,6 @@ def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
             "value_ref": _synthetic_hmac_ref("value", f"r2:{ordinal}"),
         }
         confidence = {
-            "anomaly_or_guard_presence": "high",
             "expected_form": "high",
             "runtime_mechanism": "low",
             "smartkey_attribution": "low",
@@ -561,7 +575,6 @@ def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
             "value_ref": None,
         }
         confidence = {
-            "anomaly_or_guard_presence": "high",
             "expected_form": "not_applicable",
             "runtime_mechanism": "not_applicable",
             "smartkey_attribution": "not_applicable",
@@ -584,7 +597,6 @@ def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
             "value_ref": None,
         }
         confidence = {
-            "anomaly_or_guard_presence": "high",
             "expected_form": "not_applicable",
             "runtime_mechanism": "not_applicable",
             "smartkey_attribution": "not_applicable",
@@ -598,6 +610,8 @@ def _r2_adjudication(ref: str, ordinal: int, disposition: str) -> dict:
                 "ref": _synthetic_hmac_ref("metadata", f"r2:receipt:{ordinal}"),
             },
         ]
+    if grain == "supplemental_hypothesis":
+        confidence["anomaly_or_guard_presence"] = "high"
     return {
         "grain": grain,
         "ref": ref,
@@ -732,8 +746,10 @@ def _synthetic_r2_doc() -> dict:
             "state": "sealed",
             "ruling_ref": "6e0704632fef",
             "artifact_sha256": "92c6dd612be8095d54dc385044c60e9d33e91d0ed9e9f62f6701c87722edbb72",
-            "mapping_crosswalk_sha256": "7838b51bf55fbe7f7ac2ec7e1f5fbb0285df425242b1cbcfeaccaa3a0a6902a4",
-            "audit_contract": "g0-r2-security-crosswalk",
+            "mapping_crosswalk_sha256": (
+                "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6"
+            ),
+            "audit_contract": "g0-r11a-preseal-crosswalk",
             "original_count": 106,
             "supplemental_count": 53,
             "bug_candidate_count": 125,
@@ -746,6 +762,44 @@ def _synthetic_r2_doc() -> dict:
             "baseline_update_record_count": 20,
             "new_record_count": 82,
             "canonical_ref_set_sha256": "81168506c76776f060aaf9cd71bb4ed0e2fbde31b286ac30b69823bc8a54a5ee",
+            "normalized_tuple_matrix_sha256": "4c32653fa93b8dbe2ca48b5ee42cb4d733aec6ebc374c2ca712f558203237a04",
+            "reconstruction_fragment_policy_version": (
+                "smartkey-g0-source-ref-scoped-cap-v1"
+            ),
+            "crosswalk_projection_profile": ("smartkey-g0-crosswalk-target-binding-v2"),
+            "source_scope_placement_profile": ("smartkey-g0-source-scope-placement-v1"),
+            "source_scope_placement_sha256": (
+                "c4f2a3a642a15c0a62ce9bb5904adfdec43721e88af65be1577f68d7e122f119"
+            ),
+            "original_presence_derivation_version": (
+                "smartkey-g0-original-retained-exactly-once-presence-v1"
+            ),
+            "original_presence_derivation_ruling_ref": "4e0198426714",
+            "original_ref_set_sha256": (
+                "6a2d167b00ece704a369772c76b231821513b0da5602ab960c16ac9bed78a3f2"
+            ),
+            "original_presence_external_receipt": {
+                "state": "externally_verified",
+                "policy_version": (
+                    "smartkey-g0-original-retained-exactly-once-presence-v1"
+                ),
+                "ruling_ref": "4e0198426714",
+                "original_count": 106,
+                "derived_presence": "high",
+                "original_ref_set_sha256": (
+                    "6a2d167b00ece704a369772c76b231821513b0da5602ab960c16ac9bed78a3f2"
+                ),
+                "crosswalk_projection_profile": (
+                    "smartkey-g0-crosswalk-target-binding-v2"
+                ),
+                "target_binding_crosswalk_sha256": (
+                    "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6"
+                ),
+                "audit_contract": "g0-r11a-preseal-crosswalk",
+                "receipt_sha256": (
+                    "6e9d2931631a284fb25e0f60e354eb42e42f026a5032d5f58db3a1a7e07b96ee"
+                ),
+            },
             "semantic_commitment_algorithm": "sha256-canonical-json-v1",
             "semantic_commitment_sha256": "f" * 64,
             "legacy_projection_sha256": "e" * 64,
@@ -760,13 +814,15 @@ def _synthetic_r2_doc() -> dict:
             },
             "hmac_scheme": "smartkey-g0-hmac-sha256-v1",
             "hmac_min_key_bytes": 32,
-            "hmac_contract_version": "smartkey-g0-hmac-byte-contract-v3",
+            "hmac_contract_version": "smartkey-g0-hmac-byte-contract-v4",
             "hmac_domains": ["value", "event", "metadata", "source_record"],
             "hmac_domain_payload_profiles": {
                 "value": "scalar_utf8",
                 "event": "project_canonical_json_v1",
                 "metadata": "project_canonical_json_v1",
-                "source_record": "smartkey-g0-source-record-semantic-v1",
+                "source_record": (
+                    "smartkey-g0-source-record-adjudication-scoped-semantic-v2"
+                ),
             },
             "hmac_domain_root_types": {
                 "value": "exact_str",
@@ -794,25 +850,42 @@ def _synthetic_r2_doc() -> dict:
             "hmac_structured_payload_encoding": "smartkey-g0-canonical-json-v1",
             "hmac_input_frame": ("ascii-scheme-nul-domain-nul-u64be-length-payload-v1"),
             "hmac_vector_set_sha256": (
-                "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192"
+                "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c"
             ),
             "hmac_key_id": _R4_SYNTHETIC_KEY_ID,
             "hmac_external_receipt": {
                 "state": "externally_verified",
                 "scheme": "smartkey-g0-hmac-sha256-v1",
                 "key_id": _R4_SYNTHETIC_KEY_ID,
-                "contract_version": "smartkey-g0-hmac-byte-contract-v3",
+                "contract_version": "smartkey-g0-hmac-byte-contract-v4",
                 "resource_contract_version": ("smartkey-g0-hmac-resource-contract-v1"),
                 "resource_contract_sha256": (
                     "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab"
                 ),
                 "vector_set_sha256": (
-                    "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192"
+                    "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c"
                 ),
                 "coverage": (
-                    "all-refs-domain-serialization-resource-key-id-private-"
-                    "recomputation-v2"
+                    "all-refs-domain-serialization-resource-key-id-adjudication-"
+                    "scope-uniqueness-whole-source-private-recomputation-v3"
                 ),
+                "source_scope_policy_version": ("smartkey-g0-source-ref-scoped-cap-v1"),
+                "crosswalk_projection_profile": (
+                    "smartkey-g0-crosswalk-target-binding-v2"
+                ),
+                "source_scope_placement_profile": (
+                    "smartkey-g0-source-scope-placement-v1"
+                ),
+                "audit_contract": "g0-r11a-preseal-crosswalk",
+                "registry_schema_version": 1,
+                "source_scope_binding_count": 159,
+                "mapping_crosswalk_sha256": (
+                    "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6"
+                ),
+                "source_scope_placement_sha256": (
+                    "c4f2a3a642a15c0a62ce9bb5904adfdec43721e88af65be1577f68d7e122f119"
+                ),
+                "semantic_commitment_sha256": "d" * 64,
                 "receipt_sha256": _synthetic_opaque_ref("r4:hmac-receipt"),
             },
         },
@@ -1152,7 +1225,7 @@ def test_schema_enum_drift_is_detected():
 
 # -------------------------------------------- G0 adjudication contract (RED)
 def test_exact_synthetic_adjudication_contract_validates_cleanly():
-    assert V.validate_document(_synthetic_r2_doc(), _schema()) == []
+    _assert_r11a_hold_only(_synthetic_r2_doc())
 
 
 def test_adjudication_enum_is_strict():
@@ -1294,7 +1367,7 @@ def test_contract_provenance_pins_survive_schema_and_document_tampering():
     assert "E_SCHEMA_DRIFT" in _codes(V.validate_document(doc, schema))
 
 
-def test_cross_record_source_budget_blocks_reconstructable_payload():
+def test_cross_record_source_scope_reuse_is_rejected_before_aggregation():
     doc = _synthetic_r2_doc()
     for rec in doc["records"][:5]:
         rec["adjudications"][0]["source_refs"] = [
@@ -1303,11 +1376,11 @@ def test_cross_record_source_budget_blocks_reconstructable_payload():
                 "ref": _synthetic_hmac_ref("source_record", "source:shared"),
             }
         ]
-    _refresh_r3_commitments(doc)
-    assert "E_PRIV_AGGREGATE" in _codes(V.validate_document(doc, _schema()))
+    codes = _codes(V.validate_document(doc, _schema()))
+    assert {"E_ADJ_SOURCE_SCOPE", "E_SOURCE_SCOPE_PLACEMENT"} <= codes
 
 
-def test_source_budget_allows_bounded_isolated_synthetic_tokens():
+def test_source_scope_reuse_is_rejected_even_when_fragment_budget_is_bounded():
     doc = _synthetic_r2_doc()
     for rec in doc["records"][:4]:
         rec["adjudications"][0]["source_refs"] = [
@@ -1316,8 +1389,8 @@ def test_source_budget_allows_bounded_isolated_synthetic_tokens():
                 "ref": _synthetic_hmac_ref("source_record", "source:bounded"),
             }
         ]
-    _refresh_r3_commitments(doc)
-    assert V.validate_document(doc, _schema()) == []
+    codes = _codes(V.validate_document(doc, _schema()))
+    assert {"E_ADJ_SOURCE_SCOPE", "E_SOURCE_SCOPE_PLACEMENT"} <= codes
 
 
 def test_source_budget_does_not_count_opaque_metadata_as_payload():
@@ -1341,7 +1414,7 @@ def test_g0_r2_exact_159_to_111_shape_validates_without_raw_data():
     assert sum("adjudications" in rec for rec in doc["records"]) == 102
     assert sum(len(rec.get("adjudications", ())) for rec in doc["records"]) == 157
     assert len(doc["source_exclusions"]) == 2
-    assert V.validate_document(doc, _schema()) == []
+    _assert_r11a_hold_only(doc)
 
 
 def test_g0_r2_schema_is_valid_draft_2020_12():
@@ -1379,7 +1452,7 @@ def test_g0_r2_count_preserving_tuple_substitution_breaks_commitment():
     assert "E_ADJ_COMMITMENT" in _codes(V.validate_document(doc, _schema()))
 
 
-def test_g0_r2_count_preserving_target_record_rebinding_breaks_commitment():
+def test_g0_r2_count_preserving_target_rebinding_breaks_presence_and_crosswalk():
     doc = _synthetic_r2_doc()
     source = doc["records"][0]
     target = doc["records"][1]
@@ -1392,7 +1465,8 @@ def test_g0_r2_count_preserving_target_record_rebinding_breaks_commitment():
         }
         rec["occurrence_count"] = len(events)
         rec["repeat"] = len(events) > 1
-    assert "E_ADJ_COMMITMENT" in _codes(V.validate_document(doc, _schema()))
+    codes = _codes(V.validate_document(doc, _schema()))
+    assert {"E_ADJ_CROSSWALK", "E_ADJ_PRESENCE"} <= codes
 
 
 def test_g0_r2_ref_set_is_pinned_not_merely_counted():
@@ -1462,7 +1536,7 @@ def test_g0_r2_expected_envelope_is_per_adjudication_for_fan_in():
         adjudications[0]["expected"]["value_ref"]
         != adjudications[1]["expected"]["value_ref"]
     )
-    assert V.validate_document(doc, _schema()) == []
+    _assert_r11a_hold_only(doc)
 
 
 def test_g0_r2_expected_authority_status_matrix_is_strict():
@@ -1478,22 +1552,14 @@ def test_g0_r2_expected_authority_status_matrix_is_strict():
 def test_g0_r2_redacted_unique_expected_needs_no_literal_token():
     doc = _synthetic_r2_doc()
     rec = doc["records"][20]
-    rec["observed"] = {
-        "token": "[redacted]",
-        "script": "latin",
-        "descriptor": None,
-    }
-    rec["expected"] = {
-        "token": None,
-        "script": "unknown",
-        "descriptor": _synthetic_hmac_ref("metadata", "r2:redacted:expected"),
-    }
-    rec["privacy_classification"] = "redacted"
-    for adjudication in rec["adjudications"]:
-        adjudication["privacy_class"] = "redacted"
-    _refresh_identity(rec)
-    _refresh_r3_commitments(doc)
-    assert V.validate_document(doc, _schema()) == []
+    assert rec["observed"]["token"] is None
+    assert rec["expected"]["token"] is None
+    assert rec["privacy_classification"] == "redacted"
+    assert all(
+        adjudication["privacy_class"] == "redacted"
+        for adjudication in rec["adjudications"]
+    )
+    _assert_r11a_hold_only(doc)
 
 
 def test_g0_r2_redaction_applies_to_expected_side_too():
@@ -1762,7 +1828,7 @@ def test_g0_r2_full_multi_mapping_closure_coverage_is_valid():
     _r2_add_bug_evidence(rec, covered)
     rec["status"] = "verified"
     _refresh_r3_commitments(doc)
-    assert V.validate_document(doc, _schema()) == []
+    _assert_r11a_hold_only(doc)
 
 
 def test_g0_r2_guard_uses_ruling_receipt_not_fabricated_unit_test():
@@ -2767,7 +2833,15 @@ def test_g0_r5_sealed_contract_rejects_missing_serialization_pin(field):
 
 def test_g0_r5_domain_payload_inventory_is_exact_and_float_free():
     assert hasattr(V, "HMAC_DOMAIN_PAYLOAD_PROFILES")
-    assert V.HMAC_DOMAIN_PAYLOAD_PROFILES == _R5_DOMAIN_PROFILES
+    assert {
+        domain: V.HMAC_DOMAIN_PAYLOAD_PROFILES[domain]
+        for domain in ("value", "event", "metadata")
+    } == {
+        domain: _R5_DOMAIN_PROFILES[domain] for domain in ("value", "event", "metadata")
+    }
+    assert V.HMAC_DOMAIN_PAYLOAD_PROFILES["source_record"] == (
+        "smartkey-g0-source-record-adjudication-scoped-semantic-v2"
+    )
     assert V.HMAC_STRUCTURED_PAYLOAD_ENCODING == "smartkey-g0-canonical-json-v1"
 
 
@@ -2838,15 +2912,21 @@ def test_g0_r5_project_canonical_json_parser_rejects_ambiguous_input(encoded):
 
 def test_g0_r5_all_domain_vectors_pin_payload_frame_mac_and_receipt():
     assert len(_R5_PUBLIC_VECTOR_KEY) >= 32
-    assert getattr(V, "HMAC_VECTOR_SET_SHA256", None) == _R5_VECTOR_SET_SHA256
+    assert getattr(V, "HMAC_VECTOR_SET_SHA256", None) == (
+        "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c"
+    )
     receipt_items = []
     for vector in _R5_VECTORS:
-        payload = V.hmac_payload_bytes(vector["domain"], vector["value"])
-        frame = _r5_frame_bytes(vector["domain"], vector["value"])
-        mac = hmac.new(_R5_PUBLIC_VECTOR_KEY, frame, hashlib.sha256).hexdigest()
-        assert payload.hex() == vector["payload_hex"]
-        assert frame.hex() == vector["frame_hex"]
-        assert mac == vector["mac_sha256"]
+        if vector["domain"] == "source_record":
+            with pytest.raises(ValueError, match="^E_HMAC_CONTRACT$"):
+                V.hmac_payload_bytes(vector["domain"], vector["value"])
+        else:
+            payload = V.hmac_payload_bytes(vector["domain"], vector["value"])
+            frame = _r5_frame_bytes(vector["domain"], vector["value"])
+            mac = hmac.new(_R5_PUBLIC_VECTOR_KEY, frame, hashlib.sha256).hexdigest()
+            assert payload.hex() == vector["payload_hex"]
+            assert frame.hex() == vector["frame_hex"]
+            assert mac == vector["mac_sha256"]
         receipt_items.append(
             {
                 "name": vector["name"],
@@ -2872,7 +2952,7 @@ def test_g0_r5_receipt_binds_contract_version_profiles_and_vector_set():
     doc = _synthetic_r2_doc()
     receipt = doc["adjudication_contract"]["hmac_external_receipt"]
     assert receipt.get("contract_version") == getattr(V, "HMAC_CONTRACT_VERSION", None)
-    assert receipt.get("vector_set_sha256") == _R5_VECTOR_SET_SHA256
+    assert receipt.get("vector_set_sha256") == V.HMAC_VECTOR_SET_SHA256
 
 
 def test_g0_r5_local_projection_reseal_cannot_relax_payload_profiles():
@@ -2893,7 +2973,7 @@ _R6_ERROR_DEPTH = "canonical_depth"
 _R6_ERROR_CYCLE = "canonical_cycle"
 _R6_ERROR_ROOT = "canonical_root"
 _R6_ERROR_INTERNAL = "canonical_internal"
-_R6_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v3"
+_R6_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v4"
 _R6_RESOURCE_VERSION = "smartkey-g0-hmac-resource-contract-v1"
 _R6_RESOURCE_LIMITS = {
     "max_raw_utf8_bytes": 262_144,
@@ -2915,7 +2995,7 @@ _R6_DOMAIN_ROOT_TYPES = {
 }
 _R6_RESOURCE_SHA256 = "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab"
 _R6_VECTOR_SET_SHA256 = (
-    "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192"
+    "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c"
 )
 _R6_EVENT_VALUE = {
     "active": True,
@@ -3462,8 +3542,10 @@ def test_g0_r6_structured_hmac_root_rejects_hostile_dict_subclass(domain):
 def test_g0_r6_structured_hmac_domains_accept_nested_scalars_and_arrays(domain):
     if domain == "source_record":
         value = copy.deepcopy(_R5_VECTORS[3]["value"])
-        assert V.hmac_payload_bytes(domain, value) == bytes.fromhex(
-            _R5_VECTORS[3]["payload_hex"]
+        value["profile"] = V.SOURCE_RECORD_HMAC_PROFILE
+        value["scope_ref"] = "orig:0123456789abcdef"
+        assert V.hmac_payload_bytes(domain, value) == (
+            V.canonical_structured_payload_bytes(value)
         )
     else:
         value = {"nested": [None, True, 1, "synthetic", {"ok": False}]}

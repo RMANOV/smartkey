@@ -127,13 +127,15 @@ public `null`.
 
 The unchanged 20-record legacy registry may omit the G0 layer. As soon as one
 enhanced adjudication or source exclusion exists, `adjudication_contract` is
-mandatory and `state` must be `sealed`. It pins ruling `6e0704632fef`, the
-metadata-only resealed adjudication receipt SHA-256
-`92c6dd612be8095d54dc385044c60e9d33e91d0ed9e9f62f6701c87722edbb72`,
-the stale-but-structurally-audited mapping-draft receipt
-`7838b51bf55fbe7f7ac2ec7e1f5fbb0285df425242b1cbcfeaccaa3a0a6902a4`,
-and the merged security/crosswalk contract version. The mapping draft is an
-import-HOLD input, not current registry data.
+mandatory and `state` must be `sealed`. R11a is deliberately a preparatory
+contract: it pins audit stage `g0-r11a-preseal-crosswalk`, target-binding
+projection `smartkey-g0-crosswalk-target-binding-v2`, and the self-derived
+synthetic crosswalk digest
+`dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6`.
+That digest is not the final private authority pin. Every enhanced R11a shape
+therefore receives the unconditional code-owned `E_R3_IMPORT_HOLD`; no document
+or receipt field can bypass it. A later, separately audited R11b change alone
+may hard-pin the privately synthesized commitment and remove the hold.
 
 The sealed accounting is exact: 106 original refs + 53 supplemental refs,
 classified as 125 bug candidates + 32 guards + 2 source exclusions. Dedup
@@ -181,6 +183,12 @@ Each `adjudications[]` item contains no prose and has these fields:
 - `causal_confidence` — independent `anomaly_or_guard_presence`,
   `expected_form`, `runtime_mechanism`, and `smartkey_attribution` axes. Each is
   `none|low|medium|high|not_applicable`; one axis never stands in for another.
+  Original mappings omit caller-supplied presence: under ruling
+  `4e0198426714`, the exact 106-ref retained-once proof derives only that axis as
+  `high`. Supplemental mappings retain an explicit presence value. The closed
+  external receipt binds the exact original-ref set, target-binding crosswalk,
+  policy version and preparatory audit stage; it cannot raise confidence on
+  expected form, runtime mechanism, SmartKey attribution, or any other axis.
 - `owner_lane` — one of the ratified G0-G6/deferred lane identifiers from
   `schema.json`, constrained by an exact classification-to-lane allow matrix.
   Outside-product, guard and language-quality lanes cannot be borrowed by an
@@ -192,7 +200,10 @@ Each `adjudications[]` item contains no prose and has these fields:
 - `source_refs` — non-empty opaque `{kind, ref}` pairs. At least one
   `source_record` is mandatory; its ref uses the `source_record` HMAC
   domain, while ruling/receipt/span/other refs use the `metadata` domain.
-  Refs contain no path, label, sentence or user text. Every guard mapping —
+  Exactly one source-record ref is bound to each adjudication, and that public
+  scoped ref is globally unique across record mappings and source exclusions.
+  Event and metadata refs may still be shared. Refs contain no path, label,
+  sentence or user text. Every guard mapping —
   including a guard in a mixed bug/guard record — independently needs its own
   adjudication `ruling` or `receipt` ref.
 - `source_event_refs` — non-empty canonical
@@ -213,10 +224,11 @@ smartkey-g0-hmac-sha256-v1:<domain>:<key_id>:<64-lowercase-hex-MAC>
 `key_id` is a public random 32-lowercase-hex rotation-epoch identifier; it is
 not the key. Every reference in one sealed contract must use that contract's
 pinned `key_id`. A MAC suffix cannot be reused across domains or key epochs;
-an identical same-domain reference may be shared where several mappings cite
-the same source.
+an identical event/metadata-domain reference may be shared where several
+mappings cite the same evidence. A public `source_record` ref is scoped to one
+canonical adjudication and may not be reused by another mapping.
 
-The byte contract is pinned as `smartkey-g0-hmac-byte-contract-v3`. The future
+The byte contract is pinned as `smartkey-g0-hmac-byte-contract-v4`. The future
 private importer uses one cryptographically random key of at least 32 bytes,
 stored only in its mode-`0600` private corpus — never in this repository,
 debate messages or logs. The complete domain inventory is deliberately small
@@ -227,7 +239,7 @@ and contains no floating-point payload:
 | `value` | `scalar_utf8` | one exact built-in Unicode-scalar `str`, encoded as its exact UTF-8 bytes without normalization |
 | `event` | `project_canonical_json_v1` | one exact built-in `dict` event identity/evidence envelope |
 | `metadata` | `project_canonical_json_v1` | one exact built-in `dict` metadata/receipt envelope |
-| `source_record` | `smartkey-g0-source-record-semantic-v1` | one exact built-in `dict` whole-merged-source semantic envelope |
+| `source_record` | `smartkey-g0-source-record-adjudication-scoped-semantic-v2` | one exact built-in `dict` whole-merged-source semantic envelope bound to one canonical adjudication ref |
 
 The generic event and metadata envelopes, plus the closed source-record
 envelope defined below, need only null, booleans, safe integers,
@@ -261,17 +273,23 @@ RFC 8785/JCS compatibility:
    Arrays and the other supported scalar types remain valid only below a
    structured root.
 
-The public `source_record_identity_envelope(source_record)` builder accepts
-one whole merged-source record and no policy arguments. It hardcodes profile
-`smartkey-g0-source-record-semantic-v1`, copies only `merged_id`,
+The public `source_record_identity_envelope(source_record, adjudication)`
+builder accepts one whole merged-source record plus its complete authoritative
+containing adjudication. The second argument is mandatory; it is not a signer
+scope, salt, override, or caller-selected policy. The builder reads only the
+ratified `grain`/`ref` pair from that complete mapping and derives `scope_ref`
+as the exact canonical adjudication ref. It rejects missing, partial,
+wrong-grain, malformed, and unratified mappings. It hardcodes profile
+`smartkey-g0-source-record-adjudication-scoped-semantic-v2`, copies only `merged_id`,
 `source_schema_version`, `platform`, `authorship_confidence`,
 `excluded_segments`, and `raw_sha256` into fresh built-in containers, and
 ignores every other input field. In particular, timestamps, text, paths,
 session/source hashes, reconstruction/file receipts, adjudication/action data,
-event/unit/location candidates and `source_event_refs` cannot affect this
-domain. Event, unit and location identity remains independently decisional in
-the `event` HMAC lane. `raw_sha256` is the approved merged-source field; it is
-never populated from a full reconstructed-file receipt fallback.
+event/unit/location candidates, caller `scope_ref`/salt, ordinals and
+`source_event_refs` cannot affect this domain. Event, unit and location
+identity remains independently decisional in the `event` HMAC lane.
+`raw_sha256` is the approved merged-source field; it is never populated from a
+full reconstructed-file receipt fallback.
 
 The builder output, its canonical payload bytes, and its complete framed MAC
 input are **PRIVATE pre-HMAC material**. Except for the deliberately synthetic
@@ -285,8 +303,9 @@ in the public timestamp-authority projection are semantic public values, not
 unknown-string sentinels and not permission to expose source material.
 
 The HMAC-facing source envelope is closed: those six copied fields plus the
-fixed `profile` are all required and no extras are allowed. `merged_id` and
-`raw_sha256` are exactly 64 lowercase hex characters; the four other root
+fixed `profile` and derived `scope_ref` are all required and no extras are
+allowed. `merged_id` and
+`raw_sha256` are exactly 64 lowercase hex characters; the five other root
 strings are non-empty. `excluded_segments` is an exact built-in list of exact
 built-in dictionaries, each with only `authorship_confidence`, `start_char`,
 `end_char`, and `reason`. Its strings are non-empty, and its positions are
@@ -378,14 +397,19 @@ independent re-derivation and re-receipting of every reference. The public
 validator checks scheme/domain syntax, pinned-key consistency and
 cross-domain/key-epoch suffix reuse; it cannot prove secret derivation. The
 external private receipt must recompute every reference, domain, serialization
-choice and key ID. It must bind the byte-contract version, exact domain profile
-and root maps, resource-contract version and digest, and vector-set receipt
-`2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192`.
-The v3 change replaces the former generic source-record profile with the
-closed whole-source semantic profile. A v2 contract, generic source profile,
-or stale/arbitrary vector receipt is rejected; migration requires complete
-private re-derivation and re-receipting of every affected reference rather
-than locally relabelling an old MAC.
+choice and key ID. For every one of the 159 placements it recomputes the closed
+whole-source envelope plus its exact canonical adjudication `scope_ref`, proves
+one-to-one placement/global source-ref nonreuse, and binds the semantic,
+target-crosswalk and scoped-placement commitments, registry schema, key epoch,
+byte/resource contracts, coverage string and vector-set receipt
+`8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c`.
+The v4 change replaces the linkable whole-source v1 reference with an
+adjudication-scoped v2 reference. A v3 contract, unscoped v1 source profile,
+wrong scope, reused source ref, or stale/arbitrary vector receipt is rejected;
+migration requires complete private re-derivation and re-receipting rather
+than locally relabelling an old MAC. The full-source raw SHA and complete
+pre-HMAC envelope remain private sidecar material and are never public receipt
+fields.
 
 ### Public synthetic interoperability vectors
 
@@ -397,14 +421,15 @@ its public fixture `key_id` is `0123456789abcdef0123456789abcdef`.
 It is not a production/private key and must never be reused by an importer.
 For each row, HMAC-SHA256 is computed over the complete frame described above.
 
-The four typed inputs, written using their accepted raw-JSON spellings except
-for the scalar first row, are:
+The first three current typed inputs, plus the historical unscoped source
+template used to derive the two current scoped twins, are written below using
+their accepted raw-JSON spellings except for the scalar first row:
 
 ```text
 value_non_ascii = café
 event_nested = {"active":true,"count":2,"event":"synthetic","parts":["alpha",null,{"ok":false}],"unit_separator":"\u001f","\ue000":"bmp","\ud800\udc00":"astral"}
 metadata_escaping = {"control":"\b\t\n\f\r\u0000","label":"café","quote":"\"\\/"}
-source_record_whole_source_semantic_v1 = {
+source_record_whole_source_semantic_v1_historical = {
   "profile":"smartkey-g0-source-record-semantic-v1",
   "merged_id":"c0045ec8791a7f514f4addc5982ecfbdd9e28ab80bdaea91f5e6fbc6dfbf395e",
   "source_schema_version":"synthetic-source-v1",
@@ -429,14 +454,31 @@ source_record_whole_source_semantic_v1 = {
 | `value_non_ascii` / `value` / `scalar_utf8` | `636166c3a9` | `736d6172746b65792d67302d686d61632d7368613235362d76310076616c7565000000000000000005636166c3a9` | `134f37d80a6cf037adb96d129c300af20c98ecd25c325fa99bb0c43791a5fda1` |
 | `event_nested` / `event` / `project_canonical_json_v1` | `7b22616374697665223a747275652c22636f756e74223a322c226576656e74223a2273796e746865746963222c227061727473223a5b22616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d2c22756e69745f736570617261746f72223a225c7530303166222c22ee8080223a22626d70222c22f0908080223a2261737472616c227d` | `736d6172746b65792d67302d686d61632d7368613235362d7631006576656e740000000000000000877b22616374697665223a747275652c22636f756e74223a322c226576656e74223a2273796e746865746963222c227061727473223a5b22616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d2c22756e69745f736570617261746f72223a225c7530303166222c22ee8080223a22626d70222c22f0908080223a2261737472616c227d` | `800c5952070ce32356a99537c95d2eeec515a854a7356379623d5ae4001ae94d` |
 | `metadata_escaping` / `metadata` / `project_canonical_json_v1` | `7b22636f6e74726f6c223a225c625c745c6e5c665c725c7530303030222c226c6162656c223a22636166c3a9222c2271756f7465223a225c225c5c2f227d` | `736d6172746b65792d67302d686d61632d7368613235362d7631006d6574616461746100000000000000003e7b22636f6e74726f6c223a225c625c745c6e5c665c725c7530303030222c226c6162656c223a22636166c3a9222c2271756f7465223a225c225c5c2f227d` | `3c190f2b02d21c5dec8e31ce21c0bd45abdc0187f157f9329d351d5295f667b2` |
-| `source_record_whole_source_semantic_v1` / `source_record` / `smartkey-g0-source-record-semantic-v1` | `7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d636f6e666964656e6365222c226578636c756465645f7365676d656e7473223a5b7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d62657461222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d7a756c75222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a362c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616161222c22656e645f63686172223a31322c22726561736f6e223a2273796e7468657469632d616161222c2273746172745f63686172223a387d2c7b22617574686f72736869705f636f6e666964656e6365223a22ee8080222c22656e645f63686172223a32302c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a31367d2c7b22617574686f72736869705f636f6e666964656e6365223a22f0908080222c22656e645f63686172223a32302c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a31367d5d2c226d65726765645f6964223a2263303034356563383739316137663531346634616464633539383265636662646439653238616238306264616561393166356536666263366466626633393565222c22706c6174666f726d223a2273796e7468657469632d706c6174666f726d222c2270726f66696c65223a22736d6172746b65792d67302d736f757263652d7265636f72642d73656d616e7469632d7631222c227261775f736861323536223a2235366438393066343335373766313666303333353865613063393462623762643765316536383634623930383538356532346265353461653237333463643536222c22736f757263655f736368656d615f76657273696f6e223a2273796e7468657469632d736f757263652d7631227d` | `736d6172746b65792d67302d686d61632d7368613235362d763100736f757263655f7265636f72640000000000000004627b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d636f6e666964656e6365222c226578636c756465645f7365676d656e7473223a5b7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d62657461222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d7a756c75222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a362c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616161222c22656e645f63686172223a31322c22726561736f6e223a2273796e7468657469632d616161222c2273746172745f63686172223a387d2c7b22617574686f72736869705f636f6e666964656e6365223a22ee8080222c22656e645f63686172223a32302c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a31367d2c7b22617574686f72736869705f636f6e666964656e6365223a22f0908080222c22656e645f63686172223a32302c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a31367d5d2c226d65726765645f6964223a2263303034356563383739316137663531346634616464633539383265636662646439653238616238306264616561393166356536666263366466626633393565222c22706c6174666f726d223a2273796e7468657469632d706c6174666f726d222c2270726f66696c65223a22736d6172746b65792d67302d736f757263652d7265636f72642d73656d616e7469632d7631222c227261775f736861323536223a2235366438393066343335373766313666303333353865613063393462623762643765316536383634623930383538356532346265353461653237333463643536222c22736f757263655f736368656d615f76657273696f6e223a2273796e7468657469632d736f757263652d7631227d` | `dec2460826116e6f9e907387f617f9d26371b024202b4f8a064ed3a22b6869e4` |
+| `source_record_whole_source_semantic_v1_historical` / `source_record` / `smartkey-g0-source-record-semantic-v1` | `7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d636f6e666964656e6365222c226578636c756465645f7365676d656e7473223a5b7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d62657461222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d7a756c75222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a362c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616161222c22656e645f63686172223a31322c22726561736f6e223a2273796e7468657469632d616161222c2273746172745f63686172223a387d2c7b22617574686f72736869705f636f6e666964656e6365223a22ee8080222c22656e645f63686172223a32302c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a31367d2c7b22617574686f72736869705f636f6e666964656e6365223a22f0908080222c22656e645f63686172223a32302c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a31367d5d2c226d65726765645f6964223a2263303034356563383739316137663531346634616464633539383265636662646439653238616238306264616561393166356536666263366466626633393565222c22706c6174666f726d223a2273796e7468657469632d706c6174666f726d222c2270726f66696c65223a22736d6172746b65792d67302d736f757263652d7265636f72642d73656d616e7469632d7631222c227261775f736861323536223a2235366438393066343335373766313666303333353865613063393462623762643765316536383634623930383538356532346265353461653237333463643536222c22736f757263655f736368656d615f76657273696f6e223a2273796e7468657469632d736f757263652d7631227d` | `736d6172746b65792d67302d686d61632d7368613235362d763100736f757263655f7265636f72640000000000000004627b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d636f6e666964656e6365222c226578636c756465645f7365676d656e7473223a5b7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d62657461222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d7a756c75222c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616c706861222c22656e645f63686172223a362c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468657469632d616161222c22656e645f63686172223a31322c22726561736f6e223a2273796e7468657469632d616161222c2273746172745f63686172223a387d2c7b22617574686f72736869705f636f6e666964656e6365223a22ee8080222c22656e645f63686172223a32302c22726561736f6e223a2273796e7468657469632d7a756c75222c2273746172745f63686172223a31367d2c7b22617574686f72736869705f636f6e666964656e6365223a22f0908080222c22656e645f63686172223a32302c22726561736f6e223a2273796e7468657469632d616c706861222c2273746172745f63686172223a31367d5d2c226d65726765645f6964223a2263303034356563383739316137663531346634616464633539383265636662646439653238616238306264616561393166356536666263366466626633393565222c22706c6174666f726d223a2273796e7468657469632d706c6174666f726d222c2270726f66696c65223a22736d6172746b65792d67302d736f757263652d7265636f72642d73656d616e7469632d7631222c227261775f736861323536223a2235366438393066343335373766313666303333353865613063393462623762643765316536383634623930383538356532346265353461653237333463643536222c22736f757263655f736368656d615f76657273696f6e223a2273796e7468657469632d736f757263652d7631227d` | `dec2460826116e6f9e907387f617f9d26371b024202b4f8a064ed3a22b6869e4` |
 
-The R9 source-record payload is 1,122 bytes with SHA-256
+The historical R9 source-record payload is 1,122 bytes with SHA-256
 `7b8d1279410057383ffd99ce74a87b0ba6cea1845c1631ad332a9fc4deac2684`.
 Its complete frame is 1,171 bytes with SHA-256
 `b4a28343a32c4f15a71157f5f56ea95681273b88a8ffb8c72d04ec3d7c219e36`,
 and its HMAC-SHA256 is
 `dec2460826116e6f9e907387f617f9d26371b024202b4f8a064ed3a22b6869e4`.
+It is deliberately rejected by the current v4 contract and remains published
+only as a downgrade fixture.
+
+The current v4 source vectors are exact transformations of that public
+synthetic source template: replace `profile` with
+`smartkey-g0-source-record-adjudication-scoped-semantic-v2` and add exactly one
+`scope_ref`. No other field or value changes. Canonical sorted-key JSON and the
+frame above therefore reproduce these complete current pins:
+
+| current vector / exact `scope_ref` | payload length / SHA-256 | frame length / SHA-256 | HMAC-SHA256 |
+|---|---|---|---|
+| `source_record_adjudication_scoped_semantic_v2_original` / `orig:0123456789abcdef` | 1,178 / `c0b1b1b5df60f7f3a9f2a3b5164560153b5c5312b810bedc90ad639632f6feb0` | 1,227 / `85272754b5a81698924859c7f8d67fb5a05b75dd4926e5668980dfe05142f66c` | `449e7353f1489ea1a2f265fd8f1ab8aff8fe68d0ef6068c7c2a767b5a52fba11` |
+| `source_record_adjudication_scoped_semantic_v2_supplemental` / `supp:G000:H000` | 1,171 / `3effba1df5a71aa4e2709b71025931ed39d0d55b9a39d450faf140af26f16b5a` | 1,220 / `a0d02fb33b35fe1946597d9dac2d3ceaddf4a9dd4117538a7c9c5b8b089d179a` | `68993f816d23bb8e8c5a0c88b1d715421b87b496835faa3c1dc6a7ab3fef620b` |
+
+Together with the three unchanged rows above, the complete five-vector
+manifest SHA-256 is
+`8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c`.
 
 The vector-set receipt is SHA-256 over the compact, ASCII-escaped,
 sorted-key JSON array used in `ibus/test_anomaly_registry.py`; each item binds
@@ -450,7 +492,7 @@ UTF-16 `.sort()` produces the opposite order and therefore is not compliant.
 Tests pin an explicit Node code-point comparator alongside Python output, and
 OpenSSL independently recomputes each published HMAC.
 
-The source-record vector independently repeats that boundary in two segments
+The source-record twins independently repeat that boundary in two segments
 with identical positions. Scalar/UTF-8 ordering places the U+E000 authorship
 value first; UTF-16 code-unit ordering and reason-first ordering both reverse
 the pair and therefore produce a different payload, frame, MAC and vector-set
@@ -580,12 +622,15 @@ boundary. Redacted/metadata-only new records use null/placeholder sides plus
 typed metadata/value refs.
 
 The aggregate gate walks values and dynamic keys, assigns every
-reconstruction-bearing fragment from both values and dynamic keys to each
-linked opaque `source_record`, and
-rejects more than eight distinct fragments across linked records
-(`E_PRIV_AGGREGATE`). Typed metadata HMAC refs do not consume the
-budget. This closes split-record and split-field reconstruction attacks; there
-is no production-data exception. Validation errors are non-reflective: they
+reconstruction-bearing fragment from both values and dynamic keys to its one
+publicly linkable, adjudication-scoped `source_record` ref, and rejects more
+than eight distinct fragments for that ref (`E_PRIV_AGGREGATE`). Each mapping
+is bounded independently; the validator does not recreate or publish a hidden
+whole-source grouping, and there is no public-token or production-data
+exemption. Typed metadata HMAC refs do not consume the budget. The external
+private receipt, not the public validator, binds whole-source provenance to
+all scoped placements without releasing a stable whole-source alias.
+Validation errors are non-reflective: they
 report a code, a safe JSON path and an expected shape/type (optionally a safe
 length/count), never a rejected token, key, dedup value or corpus fragment.
 
