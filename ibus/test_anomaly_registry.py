@@ -27,6 +27,7 @@ import tempfile
 import time
 
 import pytest
+from jsonschema import Draft202012Validator
 
 os.environ.setdefault(
     "SMARTKEY_PHASEA_DATA", tempfile.mkdtemp(prefix="smartkey-test-phasea-")
@@ -1343,10 +1344,9 @@ def test_g0_r2_exact_159_to_111_shape_validates_without_raw_data():
     assert V.validate_document(doc, _schema()) == []
 
 
-def test_g0_r2_schema_is_valid_draft_2020_12_when_jsonschema_is_available():
-    jsonschema = pytest.importorskip("jsonschema")
-    jsonschema.Draft202012Validator.check_schema(_schema())
-    jsonschema.Draft202012Validator(_schema()).validate(_synthetic_r2_doc())
+def test_g0_r2_schema_is_valid_draft_2020_12():
+    Draft202012Validator.check_schema(_schema())
+    Draft202012Validator(_schema()).validate(_synthetic_r2_doc())
 
 
 def test_g0_r2_legacy_registry_may_omit_adjudication_contract():
@@ -2191,8 +2191,7 @@ def test_g0_r3_enhanced_red_test_waiver_is_forbidden():
 
 
 def test_g0_r3_whole_fixture_validates_under_external_draft_2020_12():
-    jsonschema = pytest.importorskip("jsonschema")
-    validator = jsonschema.Draft202012Validator(_schema())
+    validator = Draft202012Validator(_schema())
     validator.validate(_synthetic_r2_doc())
 
 

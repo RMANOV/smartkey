@@ -18,6 +18,7 @@ import tracemalloc
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -547,9 +548,8 @@ def test_g0_r8_last_seen_utc_key_accepts_explicit_json_null():
 
 
 def test_g0_r8_external_draft202012_accepts_required_timestamp_nulls():
-    jsonschema = pytest.importorskip("jsonschema")
     document = _synthetic_doc(_synthetic_record(recorded_utc=None, last_seen_utc=None))
-    errors = list(jsonschema.Draft202012Validator(_schema()).iter_errors(document))
+    errors = list(Draft202012Validator(_schema()).iter_errors(document))
     assert errors == []
 
 
