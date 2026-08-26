@@ -40,7 +40,10 @@ FULL_HEX_IDENTIFIER = r"(?<![0-9a-f])[0-9a-f]{40}(?:[0-9a-f]{24})?(?![0-9a-f])"
 SHARD_TEXT_LABEL = r"(?:claude|codex)[ _.-]shard(?:[ _.-]manifest)?"
 SHARD_FILENAME = r"(?:claude|codex)[_.-]shard(?:[_.-]manifest)?\.jsonl?"
 SHARD_REFERENCE = r"(?:" + SHARD_FILENAME + r"|" + SHARD_TEXT_LABEL + r")"
-SHARD_TERMINAL = r"(?![A-Za-z0-9_.-])"
+SHARD_LEFT_BOUNDARY = r"(?<![A-Za-z0-9_.-])"
+SHARD_RIGHT_BOUNDARY = r"(?![A-Za-z0-9_.-])"
+BOUNDED_SHARD_REFERENCE = SHARD_LEFT_BOUNDARY + SHARD_REFERENCE + SHARD_RIGHT_BOUNDARY
+BOUNDED_SHARD_FILENAME = SHARD_LEFT_BOUNDARY + SHARD_FILENAME + SHARD_RIGHT_BOUNDARY
 SOURCE_LABEL = r"source[-_](?:session|record|path)(?:[-_](?:hash|digest))?"
 DIGEST_LABEL = r"(?:sha(?:-?256)?|digest|hash|receipt)"
 LABEL_SEPARATOR = r"(?:[^\S\r\n]|[_:=()/.`-])"
@@ -96,9 +99,7 @@ PRIVATE_CORRELATION_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b"
-        + SHARD_REFERENCE
-        + SHARD_TERMINAL
+        BOUNDED_SHARD_REFERENCE
         + r"[^\r\n]{0,47}"
         + LABEL_SEPARATOR
         + DIGEST_LABEL
@@ -107,8 +108,8 @@ PRIVATE_CORRELATION_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b"
-        + SHARD_TEXT_LABEL
+        SHARD_LEFT_BOUNDARY
+        + SHARD_REFERENCE
         + LABEL_SEPARATOR
         + DIGEST_LABEL
         + r"\b\s*[:=]?\s*"
@@ -119,31 +120,25 @@ PRIVATE_CORRELATION_PATTERNS = (
         r"\b(?:sha(?:-?256)?|digest)\s*\(\s*(?:"
         + SOURCE_LABEL
         + r"|"
+        + SHARD_LEFT_BOUNDARY
         + SHARD_REFERENCE
         + r")\s*\)\s*[:=]\s*"
         + HEX_IDENTIFIER,
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?<![A-Za-z0-9_.-])"
-        + SHARD_FILENAME
-        + r"(?![A-Za-z0-9_.-])\s*[:=]\s*"
-        + FULL_HEX_IDENTIFIER,
+        BOUNDED_SHARD_FILENAME + r"\s*[:=]\s*" + FULL_HEX_IDENTIFIER,
         re.IGNORECASE,
     ),
     re.compile(
         r"\b(?:sha(?:-?256)?|digest|hash|checksum)\b\s*[:=]?\s*"
         + FULL_HEX_IDENTIFIER
-        + r"[^\r\n]{0,47}(?<![A-Za-z0-9_.-])"
-        + SHARD_FILENAME
-        + r"(?![A-Za-z0-9_.-])",
+        + r"[^\r\n]{0,47}"
+        + BOUNDED_SHARD_FILENAME,
         re.IGNORECASE,
     ),
     re.compile(
-        FULL_HEX_IDENTIFIER
-        + r"[^\S\r\n]+\*?(?<![A-Za-z0-9_.-])"
-        + SHARD_FILENAME
-        + r"(?![A-Za-z0-9_.-])",
+        FULL_HEX_IDENTIFIER + r"[^\S\r\n]+\*?" + BOUNDED_SHARD_FILENAME,
         re.IGNORECASE,
     ),
 )

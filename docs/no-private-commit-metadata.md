@@ -110,8 +110,9 @@ Use a harmless bootstrap pull request to prove all of the following before
 making the metadata job required:
 
 1. the native workflow run and check suite are attached to the exact PR head
-   SHA, while logs confirm that workflow code and the policy checkout came from
-   the exact base SHA;
+   SHA, while logs separately confirm that the workflow definition and in-job
+   `GITHUB_SHA` came from the trusted default-branch context and the scanner
+   checkout used the exact PR base SHA;
 2. the observed context name and source are the values the repository rules
    can require—do not infer them from this file;
 3. a synthetic forbidden commit makes the trusted check fail **and** the rules
@@ -148,7 +149,7 @@ patterns include:
 (?i)(^|[^A-Za-z0-9_./\\-])file://([A-Za-z0-9._~:@!$&'()*+,;=%\[\]-]+)?/[A-Z]:/Users/[^/[:space:]`]+(/|$)
 (?i)(^|[^A-Za-z0-9.-])(https?://)?(www\.)?claude\.ai/code/[A-Za-z0-9][A-Za-z0-9_-]{11,127}([^A-Za-z0-9_-]|$)
 (?i)(private|anomaly)[ _-]?corpus[ _-]+receipt[\t ]*[:=]?[\t ]*[0-9a-f]{12,64}
-(?i)(claude|codex)[_.-]shard([_.-]manifest)?\.jsonl?[\t ]*[:=][\t ]*[0-9a-f]{40}([0-9a-f]{24})?([^0-9a-f]|$)
+(?i)(^|[^A-Za-z0-9_.-])(claude|codex)[_.-]shard([_.-]manifest)?\.jsonl?[\t ]*[:=][\t ]*[0-9a-f]{40}([0-9a-f]{24})?([^0-9a-f]|$)
 (?i)(^|[^0-9a-f])[0-9a-f]{40}([0-9a-f]{24})?[\t ]+\*?(claude|codex)[_.-]shard([_.-]manifest)?\.jsonl?([^A-Za-z0-9_.-]|$)
 ```
 

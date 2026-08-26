@@ -80,6 +80,28 @@ class CommitMetadataGateTests(unittest.TestCase):
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             self.fail(f"stdout was not one deterministic ASCII JSON object: {error}")
 
+    def assert_correlation_table(
+        self,
+        cases: list[tuple[str, str, bool]],
+    ) -> None:
+        process = self.run_gate(
+            "--stdin",
+            message=(
+                "Synthetic subject\n\n"
+                + "\n".join(value for _name, value, _reject in cases)
+                + "\n"
+            ),
+        )
+        expected = {
+            (line_number, "private_corpus_correlation")
+            for line_number, (_name, _value, reject) in enumerate(cases, start=3)
+            if reject
+        }
+        self.assertEqual(process.returncode, 1 if expected else 0, process.stderr)
+        payload = self.assert_payload(process)
+        actual = {(item["line"], item["rule"]) for item in payload["violations"]}
+        self.assertEqual(actual, expected, [name for name, _value, _reject in cases])
+
     def test_exact_forbidden_trailer_key_is_case_insensitive(self) -> None:
         for trailer in (
             "Claude-Session: synthetic-value",
@@ -414,14 +436,178 @@ class CommitMetadataGateTests(unittest.TestCase):
                     },
                 )
 
+    def test_all_policy_separators_bind_both_shard_reference_classes(self) -> None:
+        separators = (" ", "\t", "_", ":", "=", "(", ")", "/", ".", "`", "-")
+        references = (
+            ("text", "codex_shard_manifest"),
+            ("filename", "claude_shard_manifest.json"),
+        )
+        digest_labels = ("digest", "sha", "sha256", "sha-256", "hash", "receipt")
+        cases = []
+        for reference_name, reference in references:
+            for index, separator in enumerate(separators):
+                digest_label = digest_labels[index % len(digest_labels)]
+                cases.append(
+                    (
+                        f"{reference_name}-separator-{index}",
+                        f"{reference}{separator}{digest_label}: {'a' * 64}",
+                        True,
+                    )
+                )
+        self.assert_correlation_table(cases)
+
+    def test_shard_reference_left_boundaries_are_consistent_by_form(self) -> None:
+        references = (
+            ("text", "codex_shard_manifest"),
+            ("filename", "claude_shard_manifest.json"),
+        )
+        prefixes = (
+            ("standalone", "", True),
+            ("path", "docs/", True),
+            ("word", "not", False),
+            ("underscore", "not_", False),
+            ("hyphen", "not-", False),
+            ("dot", "not.", False),
+            ("identifier", "identifier9", False),
+        )
+        digest = "b" * 64
+        cases = []
+        for prefix_name, prefix, reject in prefixes:
+            for reference_name, reference in references:
+                cases.extend(
+                    (
+                        (
+                            f"immediate-{reference_name}-{prefix_name}",
+                            f"{prefix}{reference}_digest: {digest}",
+                            reject,
+                        ),
+                        (
+                            f"context-{reference_name}-{prefix_name}",
+                            f"{prefix}{reference} evidence digest: {digest}",
+                            reject,
+                        ),
+                    )
+                )
+
+            filename = f"{prefix}claude_shard_manifest.json"
+            cases.extend(
+                (
+                    (
+                        f"direct-filename-{prefix_name}",
+                        f"{filename}={'c' * 40}",
+                        reject,
+                    ),
+                    (
+                        f"labelled-first-filename-{prefix_name}",
+                        f"sha256: {'d' * 40} {filename}",
+                        reject,
+                    ),
+                    (
+                        f"bare-filename-{prefix_name}",
+                        f"{'e' * 40}  {filename}",
+                        reject and prefix_name != "path",
+                    ),
+                )
+            )
+        self.assert_correlation_table(cases)
+
+    def test_shard_reference_suffix_near_misses_are_consistent_by_form(self) -> None:
+        references = (
+            ("text", "codex_shard_manifest"),
+            ("filename", "claude_shard_manifest.json"),
+        )
+        suffixes = (".bak", ".jsonx", "-extra", "_extra", ".old")
+        digest = "f" * 64
+        cases = []
+        for reference_name, reference in references:
+            for suffix in suffixes:
+                cases.append(
+                    (
+                        f"context-{reference_name}-{suffix}",
+                        f"{reference}{suffix} evidence digest: {digest}",
+                        False,
+                    )
+                )
+
+        for suffix in suffixes:
+            filename = f"claude_shard_manifest.json{suffix}"
+            cases.extend(
+                (
+                    (f"direct-filename-{suffix}", f"{filename}={'1' * 40}", False),
+                    (
+                        f"labelled-first-filename-{suffix}",
+                        f"sha256: {'2' * 40} {filename}",
+                        False,
+                    ),
+                    (
+                        f"bare-filename-{suffix}",
+                        f"{'3' * 40}  {filename}",
+                        False,
+                    ),
+                )
+            )
+        self.assert_correlation_table(cases)
+
+    def test_shard_digest_lengths_are_preserved_by_form(self) -> None:
+        references = (
+            ("text", "codex_shard_manifest"),
+            ("filename", "claude_shard_manifest.json"),
+        )
+        sizes = (39, 40, 41, 63, 64, 65)
+        cases = []
+        for reference_name, reference in references:
+            for size in sizes:
+                labelled_reject = size <= 64
+                digest = "4" * size
+                cases.extend(
+                    (
+                        (
+                            f"immediate-{reference_name}-{size}",
+                            f"{reference}_digest: {digest}",
+                            labelled_reject,
+                        ),
+                        (
+                            f"context-{reference_name}-{size}",
+                            f"{reference} evidence digest: {digest}",
+                            labelled_reject,
+                        ),
+                    )
+                )
+
+        for size in sizes:
+            full_digest_reject = size in {40, 64}
+            digest = "5" * size
+            cases.extend(
+                (
+                    (
+                        f"direct-filename-{size}",
+                        f"claude_shard_manifest.json={digest}",
+                        full_digest_reject,
+                    ),
+                    (
+                        f"labelled-first-filename-{size}",
+                        f"sha256: {digest} claude_shard_manifest.json",
+                        full_digest_reject,
+                    ),
+                    (
+                        f"bare-filename-{size}",
+                        f"{digest}  claude_shard_manifest.json",
+                        full_digest_reject,
+                    ),
+                )
+            )
+        self.assert_correlation_table(cases)
+
     def test_direct_manifest_re2_example_has_exact_digest_length(self) -> None:
         candidates = [
             line
             for line in POLICY_DOC.read_text(encoding="utf-8").splitlines()
-            if line.startswith("(?i)(claude|codex)[_.-]shard") and "[:=]" in line
+            if "(claude|codex)[_.-]shard" in line and "[:=]" in line
         ]
         self.assertEqual(len(candidates), 1)
         pattern = re.compile(candidates[0])
+        self.assertTrue(pattern.pattern.startswith("(?i)(^|"))
+        self.assertNotIn("(?<", pattern.pattern)
 
         for size in (40, 64):
             with self.subTest(valid_size=size):
@@ -432,6 +618,20 @@ class CommitMetadataGateTests(unittest.TestCase):
             with self.subTest(oversized=size):
                 value = "claude_shard_manifest.json=" + ("d" * size)
                 self.assertIsNone(pattern.search(value))
+
+        prefixes = (
+            ("standalone", "", True),
+            ("path", "docs/", True),
+            ("word", "not", False),
+            ("underscore", "not_", False),
+            ("hyphen", "not-", False),
+            ("dot", "not.", False),
+            ("identifier", "identifier9", False),
+        )
+        for prefix_name, prefix, should_match in prefixes:
+            with self.subTest(prefix=prefix_name):
+                value = prefix + "claude_shard_manifest.json=" + ("e" * 40)
+                self.assertEqual(pattern.search(value) is not None, should_match)
 
     def test_known_first_party_code_correlation_is_bounded(self) -> None:
         rejected = (
