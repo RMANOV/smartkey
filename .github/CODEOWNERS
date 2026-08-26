@@ -1,0 +1,4 @@
+/.github/CODEOWNERS @RMANOV
+/.github/workflows/ @RMANOV
+/tools/check_commit_metadata.py @RMANOV
+/tests/test_no_new_private_metadata.py @RMANOV

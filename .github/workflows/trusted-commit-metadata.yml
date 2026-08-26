@@ -1,0 +1,75 @@
+{
+  "name": "Trusted Commit Metadata",
+  "on": {
+    "pull_request_target": {
+      "branches": ["main", "master"],
+      "types": ["opened", "reopened", "synchronize", "edited"]
+    },
+    "push": {
+      "branches": ["main", "master"]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "trusted-commit-metadata": {
+      "name": "Trusted commit metadata enforcement",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 5,
+      "permissions": {
+        "contents": "read"
+      },
+      "steps": [
+        {
+          "name": "Check out trusted pull-request base policy",
+          "if": "github.event_name == 'pull_request_target'",
+          "uses": "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+          "with": {
+            "ref": "${{ github.event.pull_request.base.sha }}",
+            "fetch-depth": 0,
+            "persist-credentials": false
+          }
+        },
+        {
+          "name": "Check out published push policy",
+          "if": "github.event_name == 'push'",
+          "uses": "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "fetch-depth": 0,
+            "persist-credentials": false
+          }
+        },
+        {
+          "name": "Set up pinned Python",
+          "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+          "with": {
+            "python-version": "3.12"
+          }
+        },
+        {
+          "name": "Fetch pull-request head as Git objects only",
+          "if": "github.event_name == 'pull_request_target'",
+          "env": {
+            "PR_NUMBER": "${{ github.event.pull_request.number }}"
+          },
+          "run": "git fetch --no-tags --no-write-fetch-head --filter=blob:none origin \"refs/pull/$PR_NUMBER/head\" >/dev/null 2>&1 || true"
+        },
+        {
+          "name": "Fetch pushed before-boundary as Git objects only",
+          "if": "github.event_name == 'push'",
+          "env": {
+            "BEFORE_SHA": "${{ github.event.before }}",
+            "DELETED": "${{ github.event.deleted }}"
+          },
+          "run": "if [ \"$DELETED\" != \"true\" ] && [ \"$BEFORE_SHA\" != \"0000000000000000000000000000000000000000\" ]; then\n  git fetch --no-tags --no-write-fetch-head --filter=blob:none origin \"$BEFORE_SHA\" >/dev/null 2>&1 || true\nfi"
+        },
+        {
+          "name": "Enforce trusted commit metadata policy",
+          "run": "python tools/check_commit_metadata.py --event-name \"$GITHUB_EVENT_NAME\" --event-file \"$GITHUB_EVENT_PATH\""
+        }
+      ]
+    }
+  }
+}

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Reject new commit-message metadata that can correlate private sessions.
+"""Reject new commit metadata that can correlate private sessions.
 
-The command emits one canonical JSON object and never includes matched text or
-trailer values in diagnostics.  Exit status is 0 for a clean scan, 1 for
-policy violations, and 2 for an input/Git error.
+The command emits one canonical JSON object and never includes matched text,
+paths, trailer values, Git stderr, or exception strings in diagnostics. Exit
+status is 0 for a clean scan, 1 for policy violations, and 2 for a fixed-code
+input or Git failure.
 """
 
 from __future__ import annotations
@@ -11,19 +12,43 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+from pathlib import Path
 import re
 import subprocess
 import sys
+from typing import BinaryIO
 
 
 SCHEMA_VERSION = 1
 FORBIDDEN_TRAILER_KEY = "claude-session"
 
+MAX_COMMITS = 128
+MAX_MESSAGE_BYTES = 256 * 1024
+MAX_COMMIT_OBJECT_BYTES = MAX_MESSAGE_BYTES + (128 * 1024)
+MAX_EVENT_BYTES = 1024 * 1024
+MAX_GIT_OUTPUT_BYTES = MAX_COMMIT_OBJECT_BYTES
+GIT_TIMEOUT_SECONDS = 10
+
+OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+ZERO_OBJECT_IDS = {"0" * 40, "0" * 64}
+PATH_PREFIX = r"(?:^|[\s\"'(<`=:])"
+HEX_IDENTIFIER = r"(?<![0-9a-f])[0-9a-f]{12,64}(?![0-9a-f])"
+SHARD_LABEL = r"(?:claude|codex)[ _-]shard(?:[ _-]manifest)?(?:\.jsonl?)?"
+SOURCE_LABEL = r"source[-_](?:session|record|path)(?:[-_](?:hash|digest))?"
+DIGEST_LABEL = r"(?:sha(?:-?256)?|digest|hash|receipt)"
+LABEL_SEPARATOR = r"(?:[^\S\r\n]|[_:=()/.`-])"
+
 PRIVATE_HOME_PATTERNS = (
-    re.compile(r"(?:^|[\s\"'(<])/(?:home|Users)/[^/\s]+/", re.IGNORECASE),
-    re.compile(r"\b[A-Z]:[\\/]Users[\\/][^\\/\s]+[\\/]", re.IGNORECASE),
     re.compile(
-        r"(?:^|[\s\"'(<])~[\\/](?:\.claude|\.codex|\.local[\\/]state[\\/]smartkey)(?:[\\/]|$)",
+        PATH_PREFIX + r"/(?:(?:home|Users)/[^/\s`]+|root)(?:[\\/]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        PATH_PREFIX + r"[A-Z]:[\\/]Users[\\/][^\\/\s`]+(?:[\\/]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        PATH_PREFIX + r"(?:\$HOME|\$\{HOME\}|%USERPROFILE%|~)[\\/]",
         re.IGNORECASE,
     ),
 )
@@ -32,26 +57,46 @@ PRIVATE_SESSION_PATTERNS = (
         r"(?:^|[\\/])\.(?:claude|codex)[\\/](?:projects|sessions)(?:[\\/]|$)",
         re.IGNORECASE,
     ),
-    re.compile(r"\bclaude\.ai/(?:code/)?session/[^\s]+", re.IGNORECASE),
+    re.compile(
+        r"(?<![A-Za-z0-9.-])(?:https?://)?(?:www\.)?claude\.ai/"
+        r"(?:code/[A-Za-z0-9][A-Za-z0-9_-]{11,127}|"
+        r"(?:code/)?session/[A-Za-z0-9][A-Za-z0-9_-]{11,127})"
+        r"(?![A-Za-z0-9_-])",
+        re.IGNORECASE,
+    ),
 )
 PRIVATE_CORPUS_PATTERNS = (
     re.compile(r"(?:^|[\\/])anomaly-corpus(?:[\\/]|$)", re.IGNORECASE),
     re.compile(r"\banchor-[0-9]{8}T[0-9]{6}(?:[+-][0-9]{4}|Z)\b", re.IGNORECASE),
 )
 PRIVATE_CORRELATION_PATTERNS = (
-    re.compile(r"\bsource_(?:session|record|path)_hash\b\s*[:=]", re.IGNORECASE),
-    re.compile(r"\bactive_transcript_cross_check\b", re.IGNORECASE),
-    re.compile(r"\bsource_boundary_inventory_sha256\b", re.IGNORECASE),
     re.compile(
-        r"\b(?:private|anomaly)[ _-]?corpus\s+receipt\b\s*[:=]?\s*[0-9a-f]{12,64}\b",
+        r"\bsource[-_](?:session|record|path)[-_](?:hash|digest)\b\s*[:=]",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bactive[-_]transcript[-_]cross[-_]check\b", re.IGNORECASE),
+    re.compile(r"\bsource[-_]boundary[-_]inventory[-_]sha256\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:private|anomaly)[ _-]?corpus[ _-]+receipt\b\s*[:=]?\s*" + HEX_IDENTIFIER,
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bclaude_shard\.jsonl\b[^\r\n]{0,40}\b(?:sha(?:-?256)?|hash)\b\s*[:=]?\s*[0-9a-f]{12,64}\b",
+        r"\b"
+        + SHARD_LABEL
+        + r"[^\r\n]{0,47}"
+        + LABEL_SEPARATOR
+        + DIGEST_LABEL
+        + r"\b\s*[:=]?\s*"
+        + HEX_IDENTIFIER,
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:claude|codex)[ _-]?shard\b[^\r\n]{0,40}\b(?:sha(?:-?256)?|hash|receipt)\b\s*[:=]?\s*[0-9a-f]{12,64}\b",
+        r"\b(?:sha(?:-?256)?|digest)\s*\(\s*(?:"
+        + SOURCE_LABEL
+        + r"|"
+        + SHARD_LABEL
+        + r")\s*\)\s*[:=]\s*"
+        + HEX_IDENTIFIER,
         re.IGNORECASE,
     ),
 )
@@ -59,7 +104,18 @@ TRAILER_LINE_RE = re.compile(r"^\s*claude-session\s*[:=]", re.IGNORECASE)
 
 
 class InputError(Exception):
-    """A safe-to-report input failure without private exception details."""
+    """A fixed-code input failure safe to report without exception details."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class SafeArgumentParser(argparse.ArgumentParser):
+    """Convert parser failures into non-reflective machine-readable errors."""
+
+    def error(self, message: str) -> None:  # noqa: ARG002
+        raise InputError("invalid_arguments")
 
 
 @dataclass(frozen=True)
@@ -69,23 +125,69 @@ class MessageSource:
     message: str
 
 
-def _run_git(arguments: list[str], *, message: str | None = None) -> str:
-    process = subprocess.run(
-        ["git", *arguments],
-        input=message,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+@dataclass(frozen=True)
+class EventSelection:
+    ranges: tuple[str, ...] = ()
+    skip: bool = False
+
+
+def _run_git(
+    arguments: list[str],
+    *,
+    input_bytes: bytes | None = None,
+    max_output_bytes: int = MAX_GIT_OUTPUT_BYTES,
+) -> bytes:
+    try:
+        process = subprocess.run(
+            ["git", *arguments],
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise InputError("git_timeout") from error
+    except OSError as error:
+        raise InputError("git_unavailable") from error
     if process.returncode != 0:
         raise InputError("git_operation_failed")
+    if len(process.stdout) > max_output_bytes:
+        raise InputError("git_output_too_large")
     return process.stdout
 
 
+def _decode_utf8(value: bytes) -> str:
+    try:
+        return value.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise InputError("invalid_utf8") from error
+
+
+def _decode_ascii(value: bytes, error_code: str) -> str:
+    try:
+        return value.decode("ascii", errors="strict")
+    except UnicodeDecodeError as error:
+        raise InputError(error_code) from error
+
+
+def _read_bounded(stream: BinaryIO, limit: int, error_code: str) -> bytes:
+    try:
+        value = stream.read(limit + 1)
+    except OSError as error:
+        raise InputError("input_unavailable") from error
+    if len(value) > limit:
+        raise InputError(error_code)
+    return value
+
+
 def _canonical_trailer_keys(message: str) -> list[str]:
-    parsed = _run_git(
-        ["-c", "trailer.separators=:=", "interpret-trailers", "--parse"],
-        message=message,
+    parsed = _decode_utf8(
+        _run_git(
+            ["-c", "trailer.separators=:=", "interpret-trailers", "--parse"],
+            input_bytes=message.encode("utf-8"),
+            max_output_bytes=MAX_MESSAGE_BYTES,
+        )
     )
     keys: list[str] = []
     for line in parsed.splitlines():
@@ -143,34 +245,216 @@ def scan_message(source: MessageSource) -> list[dict[str, object]]:
 
 
 def _reject_option_like_revision(revision: str) -> None:
-    if not revision or revision.startswith("-"):
+    if (
+        not revision
+        or revision.startswith("-")
+        or any(character.isspace() for character in revision)
+    ):
         raise InputError("invalid_revision")
 
 
+def _resolve_commit(revision: str, unavailable_code: str) -> str:
+    _reject_option_like_revision(revision)
+    try:
+        output = _run_git(
+            ["rev-parse", "--verify", f"{revision}^{{commit}}"],
+            max_output_bytes=256,
+        )
+    except InputError as error:
+        if error.code == "git_operation_failed":
+            raise InputError(unavailable_code) from error
+        raise
+    commit = _decode_ascii(output, "invalid_commit_identity").strip()
+    if not OBJECT_ID_RE.fullmatch(commit):
+        raise InputError("invalid_commit_identity")
+    return commit
+
+
+def _is_shallow_repository() -> bool:
+    output = _decode_ascii(
+        _run_git(
+            ["rev-parse", "--is-shallow-repository"],
+            max_output_bytes=16,
+        ),
+        "git_operation_failed",
+    ).strip()
+    if output not in {"true", "false"}:
+        raise InputError("git_operation_failed")
+    return output == "true"
+
+
+def _commits_for_range(revision_range: str) -> list[str]:
+    _reject_option_like_revision(revision_range)
+    if "..." in revision_range:
+        raise InputError("invalid_revision")
+
+    if ".." in revision_range:
+        parts = revision_range.split("..")
+        if len(parts) != 2 or not all(parts):
+            raise InputError("invalid_revision")
+        before = _resolve_commit(parts[0], "boundary_unavailable")
+        after = _resolve_commit(parts[1], "boundary_unavailable")
+        if before == after:
+            return []
+        if _is_shallow_repository():
+            raise InputError("shallow_history_unavailable")
+        normalized_range = f"{before}..{after}"
+    else:
+        if _is_shallow_repository():
+            raise InputError("shallow_history_unavailable")
+        normalized_range = _resolve_commit(revision_range, "revision_unavailable")
+
+    try:
+        output = _run_git(
+            [
+                "rev-list",
+                "--reverse",
+                "--topo-order",
+                f"--max-count={MAX_COMMITS + 1}",
+                normalized_range,
+                "--",
+            ],
+            max_output_bytes=(MAX_COMMITS + 1) * 66,
+        )
+    except InputError as error:
+        if error.code == "git_operation_failed":
+            raise InputError("boundary_unavailable") from error
+        raise
+    commits = [
+        line
+        for line in _decode_ascii(output, "invalid_commit_identity").splitlines()
+        if line
+    ]
+    if len(commits) > MAX_COMMITS:
+        raise InputError("commit_limit_exceeded")
+    if any(not OBJECT_ID_RE.fullmatch(commit) for commit in commits):
+        raise InputError("invalid_commit_identity")
+    return commits
+
+
+def _read_event(path_text: str) -> dict[str, object]:
+    try:
+        with Path(path_text).open("rb") as stream:
+            raw = _read_bounded(stream, MAX_EVENT_BYTES, "event_too_large")
+    except OSError as error:
+        raise InputError("event_unavailable") from error
+    try:
+        value = json.loads(_decode_utf8(raw))
+    except (ValueError, RecursionError) as error:
+        raise InputError("invalid_event") from error
+    if not isinstance(value, dict):
+        raise InputError("invalid_event")
+    return value
+
+
+def _event_object_id(value: object) -> str:
+    if not isinstance(value, str) or not OBJECT_ID_RE.fullmatch(value):
+        raise InputError("invalid_event")
+    return value
+
+
+def _nested_object_id(payload: dict[str, object], *keys: str) -> str:
+    value: object = payload
+    for key in keys:
+        if not isinstance(value, dict) or key not in value:
+            raise InputError("invalid_event")
+        value = value[key]
+    return _event_object_id(value)
+
+
+def _select_event_range(event_name: str, payload: dict[str, object]) -> EventSelection:
+    if event_name == "push":
+        if payload.get("deleted") is True:
+            return EventSelection(skip=True)
+        before = _event_object_id(payload.get("before"))
+        after = _event_object_id(payload.get("after"))
+        if after in ZERO_OBJECT_IDS:
+            raise InputError("invalid_event")
+        if payload.get("created") is True or before in ZERO_OBJECT_IDS:
+            # Push creation lacks a trustworthy pre-existing-ref snapshot in the
+            # payload. Failing closed avoids silently scanning older history.
+            raise InputError("creation_boundary_unprovable")
+        return EventSelection(ranges=(f"{before}..{after}",))
+
+    if event_name == "pull_request_target":
+        base = _nested_object_id(payload, "pull_request", "base", "sha")
+        head = _nested_object_id(payload, "pull_request", "head", "sha")
+        return EventSelection(ranges=(f"{base}..{head}",))
+
+    # The workflow does not subscribe to merge_group and promises no check for it.
+    raise InputError("unsupported_event")
+
+
 def _commits_from_inputs(ranges: list[str], commits: list[str]) -> list[str]:
-    resolved: set[str] = set()
+    if len(ranges) + len(commits) > MAX_COMMITS:
+        raise InputError("commit_limit_exceeded")
+    resolved: list[str] = []
+    seen: set[str] = set()
     for revision_range in ranges:
-        _reject_option_like_revision(revision_range)
-        output = _run_git(["rev-list", "--reverse", "--topo-order", revision_range])
-        resolved.update(line for line in output.splitlines() if line)
+        for commit in _commits_for_range(revision_range):
+            if commit not in seen:
+                seen.add(commit)
+                resolved.append(commit)
+                if len(resolved) > MAX_COMMITS:
+                    raise InputError("commit_limit_exceeded")
     for revision in commits:
-        _reject_option_like_revision(revision)
-        commit = _run_git(["rev-parse", "--verify", f"{revision}^{{commit}}"]).strip()
-        if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
-            raise InputError("invalid_commit_identity")
-        resolved.add(commit)
-    return sorted(resolved)
+        commit = _resolve_commit(revision, "commit_unavailable")
+        if commit not in seen:
+            seen.add(commit)
+            resolved.append(commit)
+            if len(resolved) > MAX_COMMITS:
+                raise InputError("commit_limit_exceeded")
+    return resolved
+
+
+def _read_commit_message(commit: str) -> str:
+    size_output = _decode_ascii(
+        _run_git(["cat-file", "-s", commit], max_output_bytes=32),
+        "invalid_commit_object",
+    ).strip()
+    try:
+        object_size = int(size_output)
+    except ValueError as error:
+        raise InputError("invalid_commit_object") from error
+    if object_size < 0 or object_size > MAX_COMMIT_OBJECT_BYTES:
+        raise InputError("message_too_large")
+    commit_object = _run_git(
+        ["cat-file", "commit", commit], max_output_bytes=MAX_COMMIT_OBJECT_BYTES
+    )
+    header, separator, message = commit_object.partition(b"\n\n")
+    if not separator or not header:
+        raise InputError("invalid_commit_object")
+    if len(message) > MAX_MESSAGE_BYTES:
+        raise InputError("message_too_large")
+    return _decode_utf8(message)
 
 
 def _collect_sources(args: argparse.Namespace) -> list[MessageSource]:
+    event_selected = args.event_file is not None or args.event_name is not None
+    direct_selected = bool(args.stdin or args.ranges or args.commits)
+    if event_selected and direct_selected:
+        raise InputError("invalid_arguments")
+    if event_selected and (args.event_file is None or args.event_name is None):
+        raise InputError("invalid_arguments")
+    if not event_selected and not direct_selected:
+        raise InputError("no_input_selected")
+
+    ranges = list(args.ranges)
+    commits = list(args.commits)
+    if event_selected:
+        selection = _select_event_range(args.event_name, _read_event(args.event_file))
+        if selection.skip:
+            return []
+        ranges.extend(selection.ranges)
+
     sources: list[MessageSource] = []
     if args.stdin:
-        sources.append(MessageSource("stdin", "stdin:0", sys.stdin.read()))
-    for commit in _commits_from_inputs(args.ranges, args.commits):
-        message = _run_git(["show", "-s", "--format=%B", commit, "--"])
-        sources.append(MessageSource("commit", commit, message))
-    if not sources:
-        raise InputError("no_input_selected")
+        message_bytes = _read_bounded(
+            sys.stdin.buffer, MAX_MESSAGE_BYTES, "message_too_large"
+        )
+        sources.append(MessageSource("stdin", "stdin:0", _decode_utf8(message_bytes)))
+    for commit in _commits_from_inputs(ranges, commits):
+        sources.append(MessageSource("commit", commit, _read_commit_message(commit)))
     return sources
 
 
@@ -186,18 +470,20 @@ def _emit(payload: dict[str, object]) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = SafeArgumentParser(
         description="Reject private session/corpus metadata in commit messages."
     )
     parser.add_argument("--range", dest="ranges", action="append", default=[])
     parser.add_argument("--commit", dest="commits", action="append", default=[])
     parser.add_argument("--stdin", action="store_true")
+    parser.add_argument("--event-name")
+    parser.add_argument("--event-file")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
     try:
+        args = _parser().parse_args(argv)
         sources = _collect_sources(args)
         violations = [
             violation for source in sources for violation in scan_message(source)
@@ -205,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
     except InputError as error:
         _emit(
             {
-                "error": str(error),
+                "error": error.code,
                 "schema_version": SCHEMA_VERSION,
                 "status": "error",
             }

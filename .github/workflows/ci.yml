@@ -11,51 +11,36 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  commit-metadata:
-    name: No private commit metadata
+  commit-metadata-tests:
+    name: Commit metadata unit tests (untrusted head)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
       - name: Test commit-message gate
         run: python -m unittest discover -s tests -p 'test_no_new_private_metadata.py' -v
-      - name: Scan pull-request commits
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python tools/check_commit_metadata.py --range "$BASE_SHA..$HEAD_SHA"
-      - name: Scan pushed commits
-        if: github.event_name == 'push'
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          zero_sha="0000000000000000000000000000000000000000"
-          if [ "$BEFORE_SHA" = "$zero_sha" ] || ! git cat-file -e "$BEFORE_SHA^{commit}"; then
-            python tools/check_commit_metadata.py --range "$HEAD_SHA"
-          else
-            python tools/check_commit_metadata.py --range "$BEFORE_SHA..$HEAD_SHA"
-          fi
 
   test-linux:
     name: Test (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p smartkey-core
       - run: cargo test -p smartkey-mac
       - run: cargo test -p smartkey-playground
       - run: cargo check -p smartkey-py
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
       - name: Test IBus adapter against current native core
@@ -79,7 +64,9 @@ jobs:
     name: Build (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -94,7 +81,9 @@ jobs:
     name: Build (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p smartkey-core
@@ -106,7 +95,9 @@ jobs:
     name: Benchmarks (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run benchmarks
@@ -122,7 +113,9 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -134,7 +127,9 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
