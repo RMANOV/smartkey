@@ -1,8 +1,7 @@
 """R11a RED contracts for sealed tuple, scope, and import authority.
 
 Every fixture in this module is synthetic or reuses the already-public,
-deidentified contract fixtures.  No registry data, private source material,
-path, timestamp receipt, or key is read.
+deidentified contract fixtures.  No private candidate or corpus data is read.
 """
 
 from __future__ import annotations
@@ -12,6 +11,8 @@ import hashlib
 import hmac
 import inspect
 import json
+import tracemalloc
+from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -46,6 +47,9 @@ _ORIGINAL_REF_SET_SHA256 = (
 )
 _CROSSWALK_SHA256 = "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6"
 _PLACEMENT_SHA256 = "c4f2a3a642a15c0a62ce9bb5904adfdec43721e88af65be1577f68d7e122f119"
+_PRESENCE_RECEIPT_SHA256 = (
+    "6e9d2931631a284fb25e0f60e354eb42e42f026a5032d5f58db3a1a7e07b96ee"
+)
 _ORIGINAL_SCOPE = R10._CANONICAL_ORIGINAL_REFS[0]
 _SUPPLEMENTAL_SCOPE = R10._canonical_supplemental_refs()[0]
 _VECTOR_ORIGINAL_SCOPE = "orig:0123456789abcdef"
@@ -179,6 +183,16 @@ def _codes(errors: list[str]) -> set[str]:
     return {error.split(":", 1)[0] for error in errors}
 
 
+def _synthetic_presence_receipt_sha256(
+    domain: str, epoch: str, *, variant: str | None = None
+) -> str:
+    """Return a test-only opaque receipt under one explicit fixture grammar."""
+    label = f"r11:presence-receipt:{domain}:{epoch}"
+    if variant is not None:
+        label += f":{variant}"
+    return hashlib.sha256(f"synthetic:{label}".encode("utf-8")).hexdigest()
+
+
 def _required_constant(name: str, expected):
     actual = getattr(V, name, None)
     assert actual == expected, f"R11a RED: missing or stale {name}"
@@ -188,11 +202,15 @@ def _required_constant(name: str, expected):
 def _scoped_builder():
     builder = getattr(V, "source_record_identity_envelope", None)
     assert callable(builder), "R11a RED: missing scoped source-record builder"
-    parameters = tuple(inspect.signature(builder).parameters)
+    signature = inspect.signature(builder)
+    parameters = tuple(signature.parameters)
     assert parameters == (
         "source_record",
         "adjudication",
     ), "R11a RED: source-record builder must derive scope from adjudication"
+    assert signature.parameters["adjudication"].default is inspect.Parameter.empty, (
+        "R11a RED: adjudication authority cannot have a default"
+    )
     return builder
 
 
@@ -306,12 +324,27 @@ _SCOPED_VECTOR_PINS = {
 def _assert_hmac_contract_error(call, marker: str | None = None) -> None:
     with pytest.raises(ValueError) as caught:
         call()
-    assert caught.value.args == ("E_HMAC_CONTRACT",)
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
+    error = caught.value
+    assert type(error) is ValueError
+    assert error.args == ("E_HMAC_CONTRACT",)
+    assert vars(error) == {}
+    assert error.__cause__ is None
+    assert error.__context__ is None
     if marker is not None:
-        assert marker not in repr(caught.value.args)
-        assert marker not in repr(vars(caught.value))
+        assert not R10._r6_value_contains_marker(error.args, marker)
+        assert not R10._r6_value_contains_marker(vars(error), marker)
+        assert not R10._r6_value_contains_marker(error.__cause__, marker)
+        assert not R10._r6_value_contains_marker(error.__context__, marker)
+        production_path = Path(V.__file__).resolve()
+        production_frames = 0
+        traceback_cursor = error.__traceback__
+        while traceback_cursor is not None:
+            frame = traceback_cursor.tb_frame
+            if Path(frame.f_code.co_filename).resolve() == production_path:
+                production_frames += 1
+                assert not R10._r6_value_contains_marker(frame.f_locals, marker)
+            traceback_cursor = traceback_cursor.tb_next
+        assert production_frames > 0
 
 
 def _assert_presence_contract_error(call) -> None:
@@ -510,7 +543,7 @@ def _r11_doc() -> dict:
                 "crosswalk_projection_profile": _CROSSWALK_PROFILE,
                 "target_binding_crosswalk_sha256": "0" * 64,
                 "audit_contract": _PRESEAL_AUDIT_CONTRACT,
-                "receipt_sha256": R10._synthetic_opaque_ref("r11:presence-receipt"),
+                "receipt_sha256": _PRESENCE_RECEIPT_SHA256,
             },
             "hmac_contract_version": _HMAC_CONTRACT_VERSION,
             "hmac_domain_payload_profiles": {
@@ -804,6 +837,120 @@ def test_r11_b2_builder_derives_exact_scope_from_containing_adjudication(scope_r
     }
 
 
+def test_r11_b2_builder_requires_explicit_adjudication_argument():
+    builder = getattr(V, "source_record_identity_envelope", None)
+    assert callable(builder), "R11a RED: missing scoped source-record builder"
+    with pytest.raises(TypeError):
+        builder(_source_input())
+
+
+def test_r11_b2_builder_signature_has_required_adjudication_without_default():
+    builder = _scoped_builder()
+    parameter = inspect.signature(builder).parameters["adjudication"]
+    assert parameter.default is inspect.Parameter.empty
+
+
+def test_r11_b2_builder_does_not_mutate_inputs_or_return_mutable_aliases():
+    builder = _scoped_builder()
+    source = _source_input()
+    adjudication = _authoritative_adjudication(_ORIGINAL_SCOPE)
+    source_before = copy.deepcopy(source)
+    adjudication_before = copy.deepcopy(adjudication)
+
+    envelope = builder(source, adjudication)
+
+    assert source == source_before
+    assert adjudication == adjudication_before
+    assert envelope is not source
+    assert envelope["excluded_segments"] is not source["excluded_segments"]
+    assert all(
+        projected is not supplied
+        for projected, supplied in zip(
+            envelope["excluded_segments"],
+            source["excluded_segments"],
+            strict=True,
+        )
+    )
+    envelope["excluded_segments"][0]["reason"] = "synthetic-mutated-result"
+    envelope["scope_ref"] = _SUPPLEMENTAL_SCOPE
+    assert source == source_before
+    assert adjudication == adjudication_before
+
+
+def test_r11_b2_adjudication_ignored_values_are_not_scanned_or_deep_copied():
+    marker = "synthetic-adjudication-ignored-tripwire"
+
+    class IgnoredTripwire:
+        touched = False
+
+        def _trip(self, *_args, **_kwargs):
+            self.touched = True
+            raise AssertionError(marker)
+
+        __copy__ = _trip
+        __deepcopy__ = _trip
+        __iter__ = _trip
+        __len__ = _trip
+        __repr__ = _trip
+
+    ignored = IgnoredTripwire()
+    adjudication = _authoritative_adjudication(_ORIGINAL_SCOPE)
+    for field in (
+        "classification",
+        "disposition",
+        "normalized_class",
+        "expected",
+        "causal_confidence",
+        "owner_lane",
+        "privacy_class",
+        "source_refs",
+        "source_event_refs",
+    ):
+        adjudication[field] = ignored
+
+    envelope = _scoped_builder()(_source_input(), adjudication)
+
+    assert envelope == _reference_scoped_envelope(_ORIGINAL_SCOPE)
+    assert ignored.touched is False
+
+
+def test_r11_b2_repeated_builder_ignores_preallocated_large_shared_adjudication_data():
+    allocation_ceiling = 8 * V.HMAC_RESOURCE_LIMITS["max_canonical_payload_bytes"]
+    shared_ignored = bytearray(b"s" * (2 * allocation_ceiling))
+    adjudication = _authoritative_adjudication(_ORIGINAL_SCOPE)
+    for field in (
+        "expected",
+        "causal_confidence",
+        "source_refs",
+        "source_event_refs",
+    ):
+        adjudication[field] = shared_ignored
+    builder = _scoped_builder()
+    source = _source_input()
+
+    result = None
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    try:
+        for _iteration in range(64):
+            result = builder(source, adjudication)
+        _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result == _reference_scoped_envelope(_ORIGINAL_SCOPE)
+    assert all(
+        adjudication[field] is shared_ignored
+        for field in (
+            "expected",
+            "causal_confidence",
+            "source_refs",
+            "source_event_refs",
+        )
+    )
+    assert peak_bytes <= allocation_ceiling
+
+
 def test_r11_b2_scoped_builder_keeps_private_material_warning_explicit():
     wording = inspect.getdoc(V.source_record_identity_envelope) or ""
     assert "PRIVATE pre-HMAC" in wording
@@ -903,6 +1050,8 @@ def test_r11_b2_builder_rejects_canonical_but_unratified_scope():
     [
         "missing_grain",
         "missing_ref",
+        "partial_mapping",
+        "none_adjudication",
         "bare_ref",
         "wrong_grain_type",
         "wrong_ref_type",
@@ -923,6 +1072,10 @@ def test_r11_b2_authoritative_builder_rejects_non_authoritative_scope_inputs(
         mapping.pop("grain")
     elif mutation == "missing_ref":
         mapping.pop("ref")
+    elif mutation == "partial_mapping":
+        mapping = {"grain": mapping["grain"], "ref": mapping["ref"]}
+    elif mutation == "none_adjudication":
+        mapping = None
     elif mutation == "bare_ref":
         mapping = _ORIGINAL_SCOPE
     elif mutation == "wrong_grain_type":
@@ -959,24 +1112,78 @@ def test_r11_b2_authoritative_builder_rejects_mapping_and_source_alias_subclasse
     marker = "synthetic-alias-marker"
 
     class MappingAlias(dict):
-        def __getitem__(self, key):
+        def __init__(self, value):
+            dict.__init__(self, value)
+            dict.__setitem__(self, "synthetic_marker", marker)
+            self.touched = False
+
+        def _trip(self, *_args, **_kwargs):
+            self.touched = True
             raise AssertionError(marker)
 
+        __contains__ = _trip
+        __deepcopy__ = _trip
+        __getitem__ = _trip
+        __iter__ = _trip
+        __len__ = _trip
+        copy = _trip
+        get = _trip
+        items = _trip
+        keys = _trip
+        values = _trip
+
     builder = _scoped_builder()
+    adjudication_alias = MappingAlias(_authoritative_adjudication(_ORIGINAL_SCOPE))
     _assert_hmac_contract_error(
-        lambda: builder(
-            _source_input(),
-            MappingAlias(_authoritative_adjudication(_ORIGINAL_SCOPE)),
-        ),
+        lambda: builder(_source_input(), adjudication_alias),
         marker,
     )
+    assert adjudication_alias.touched is False
+
+    source_alias = MappingAlias(_source_input())
     _assert_hmac_contract_error(
         lambda: builder(
-            MappingAlias(_source_input()),
+            source_alias,
             _authoritative_adjudication(_ORIGINAL_SCOPE),
         ),
         marker,
     )
+    assert source_alias.touched is False
+
+
+@pytest.mark.parametrize("field", ["grain", "ref"])
+def test_r11_b2_authoritative_builder_rejects_hostile_string_aliases(field):
+    marker = f"synthetic-hostile-{field}-marker"
+
+    class HostileStr(str):
+        def __new__(cls, value):
+            instance = str.__new__(cls, value)
+            instance.marker = marker
+            instance.touched = False
+            return instance
+
+        def _trip(self, *_args, **_kwargs):
+            self.touched = True
+            raise AssertionError(marker)
+
+        __eq__ = _trip
+        __hash__ = _trip
+        __len__ = _trip
+        __repr__ = _trip
+        __str__ = _trip
+        encode = _trip
+        startswith = _trip
+
+    adjudication = _authoritative_adjudication(_ORIGINAL_SCOPE)
+    value = "original_candidate" if field == "grain" else _ORIGINAL_SCOPE
+    alias = HostileStr(value)
+    adjudication[field] = alias
+
+    _assert_hmac_contract_error(
+        lambda: _scoped_builder()(_source_input(), adjudication),
+        marker,
+    )
+    assert alias.touched is False
 
 
 def test_r11_b2_direct_nonsecret_vector_encoder_accepts_fixed_synthetic_scopes_only():
@@ -1292,7 +1499,7 @@ def test_r11_b3_private_presence_receipt_fixture_is_independently_pinned():
         "crosswalk_projection_profile": _CROSSWALK_PROFILE,
         "target_binding_crosswalk_sha256": contract["mapping_crosswalk_sha256"],
         "audit_contract": _PRESEAL_AUDIT_CONTRACT,
-        "receipt_sha256": R10._synthetic_opaque_ref("r11:presence-receipt"),
+        "receipt_sha256": _PRESENCE_RECEIPT_SHA256,
     }
 
 
@@ -1374,6 +1581,7 @@ def test_r11_b3_projection_does_not_mutate_input_or_raise_other_confidence_axes(
 
 
 _PRESENCE_RECEIPT_BOUND_FIELDS = (
+    "state",
     "policy_version",
     "ruling_ref",
     "original_count",
@@ -1416,12 +1624,44 @@ def test_r11_b3_presence_receipt_is_closed_against_caller_override():
     assert _PRESENCE_ERROR in _codes(V.validate_document(doc, R10._schema()))
 
 
-@pytest.mark.parametrize("replacement", [None, [], "0" * 64])
-def test_r11_b3_presence_receipt_digest_requires_nonzero_sha256(replacement):
+@pytest.mark.parametrize(
+    ("mutation", "replacement"),
+    [
+        ("missing", None),
+        ("null", None),
+        ("wrong_type", []),
+        ("zero", "0" * 64),
+        ("malformed_nonzero", "g" * 64),
+        (
+            "wrong_domain",
+            _synthetic_presence_receipt_sha256("other-domain", "epoch-v1"),
+        ),
+        (
+            "wrong_epoch",
+            _synthetic_presence_receipt_sha256("original-presence", "epoch-v2"),
+        ),
+        (
+            "valid_digest_substitution",
+            _synthetic_presence_receipt_sha256(
+                "original-presence", "epoch-v1", variant="substituted"
+            ),
+        ),
+    ],
+)
+def test_r11_b3_presence_receipt_sha_is_exact_and_cannot_be_substituted(
+    mutation, replacement
+):
     doc = _r11_doc()
-    doc["adjudication_contract"]["original_presence_external_receipt"][
-        "receipt_sha256"
-    ] = replacement
+    receipt = doc["adjudication_contract"]["original_presence_external_receipt"]
+    assert receipt["receipt_sha256"] == _PRESENCE_RECEIPT_SHA256
+    assert _PRESENCE_RECEIPT_SHA256 == _synthetic_presence_receipt_sha256(
+        "original-presence", "epoch-v1"
+    )
+    assert V.DIGEST_NONZERO_RE.fullmatch(_PRESENCE_RECEIPT_SHA256) is not None
+    if mutation == "missing":
+        receipt.pop("receipt_sha256")
+    else:
+        receipt["receipt_sha256"] = replacement
     _assert_presence_contract_error(lambda: V.semantic_commitment_payload(doc))
     assert _PRESENCE_ERROR in _codes(V.validate_document(doc, R10._schema()))
 
@@ -1478,13 +1718,19 @@ def test_r11_crosswalk_projection_is_closed_target_binding_and_independently_pin
             tuple(group["mapping_refs"]),
         ),
     )
+    record_ids = {record["id"] for record in doc["records"]}
     for group in projection["groups"]:
         assert set(group) == {"target_kind", "target_id", "mapping_refs"}
         assert group["target_kind"] in {"record", "source_exclusion"}
+        # target_id is discriminated by target_kind: a public record ID for a
+        # record group, or the stable public mapping identity for an exclusion.
         if group["target_kind"] == "record":
-            assert group["target_id"].startswith("anom-")
+            assert group["target_id"] in record_ids
         else:
-            assert group["target_id"].startswith("source-exclusion:")
+            assert len(group["mapping_refs"]) == 1
+            assert group["target_id"] == (
+                f"source-exclusion:{group['mapping_refs'][0]}"
+            )
         assert group["mapping_refs"] == sorted(group["mapping_refs"])
     encoded = json.dumps(projection, sort_keys=True)
     for forbidden in (
@@ -1607,6 +1853,18 @@ def test_r11_enhanced_candidate_is_unconditionally_held_after_other_checks_pass(
     assert errors[0].startswith(f"{_IMPORT_HOLD}:")
 
 
+def test_r11a_preseal_staging_cannot_be_mistaken_for_final_r3_authority():
+    doc = _r11_doc()
+    contract = doc["adjudication_contract"]
+    # Ruling 7af114092d26: R11a binds the preparatory audit and a
+    # self-derived synthetic algorithm digest, but HOLD remains unconditional.
+    # Only R11b may hard-pin the privately synthesized final digest and remove it.
+    assert contract["audit_contract"] == _PRESEAL_AUDIT_CONTRACT
+    assert contract["mapping_crosswalk_sha256"] == _reference_crosswalk_sha256(doc)
+    assert contract["mapping_crosswalk_sha256"] == _CROSSWALK_SHA256
+    assert _IMPORT_HOLD in _codes(V.validate_document(doc, R10._schema()))
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -1620,7 +1878,6 @@ def test_r11_enhanced_candidate_is_unconditionally_held_after_other_checks_pass(
         "future_pin",
         "invalid_count",
         "invalid_ref",
-        "locally_resealed_commitments",
     ],
 )
 def test_r11_import_hold_survives_malformed_or_untrusted_enhanced_contract(mutation):
@@ -1645,13 +1902,77 @@ def test_r11_import_hold_survives_malformed_or_untrusted_enhanced_contract(mutat
         contract["audit_contract"] = "g0-r99-unratified"
     elif mutation == "invalid_count":
         contract["original_count"] += 1
-    elif mutation == "invalid_ref":
-        doc["records"][0]["adjudications"][0]["ref"] = "orig:0000000000000000"
     else:
-        contract["semantic_commitment_sha256"] = _reference_semantic_sha256(doc)
-        contract["mapping_crosswalk_sha256"] = _reference_crosswalk_sha256(doc)
-        contract["source_scope_placement_sha256"] = _reference_placement_sha256(doc)
-        contract["registry_projection_sha256"] = R10._r3_registry_projection_digest(doc)
+        assert mutation == "invalid_ref"
+        doc["records"][0]["adjudications"][0]["ref"] = "orig:0000000000000000"
+    assert _IMPORT_HOLD in _codes(V.validate_document(doc, R10._schema()))
+
+
+def test_r11_import_hold_survives_real_attacker_relocation_and_local_reseal():
+    doc = _r11_doc()
+    contract = doc["adjudication_contract"]
+    baseline_commitments = {
+        field: contract[field]
+        for field in (
+            "semantic_commitment_sha256",
+            "mapping_crosswalk_sha256",
+            "source_scope_placement_sha256",
+            "registry_projection_sha256",
+        )
+    }
+    moved = doc["records"][0]["adjudications"].pop(0)
+    doc["records"][1]["adjudications"].append(moved)
+
+    source = next(
+        item for item in moved["source_refs"] if item["kind"] == "source_record"
+    )
+    original_source_ref = source["ref"]
+    used_source_refs = {
+        item["ref"]
+        for record in doc["records"]
+        for adjudication in record.get("adjudications", ())
+        for item in adjudication["source_refs"]
+        if item["kind"] == "source_record"
+    }
+    used_source_refs.update(
+        item["ref"]
+        for adjudication in doc["source_exclusions"]
+        for item in adjudication["source_refs"]
+        if item["kind"] == "source_record"
+    )
+    substituted_ref = R10._synthetic_hmac_ref(
+        "source_record", "r11-attacker-unique-substitution"
+    )
+    assert substituted_ref not in used_source_refs
+    source["ref"] = substituted_ref
+    assert source["ref"] != original_source_ref
+
+    contract["semantic_commitment_sha256"] = _reference_semantic_sha256(doc)
+    contract["mapping_crosswalk_sha256"] = _reference_crosswalk_sha256(doc)
+    contract["source_scope_placement_sha256"] = _reference_placement_sha256(doc)
+    hmac_receipt = contract["hmac_external_receipt"]
+    hmac_receipt["semantic_commitment_sha256"] = contract["semantic_commitment_sha256"]
+    hmac_receipt["mapping_crosswalk_sha256"] = contract["mapping_crosswalk_sha256"]
+    hmac_receipt["source_scope_placement_sha256"] = contract[
+        "source_scope_placement_sha256"
+    ]
+    contract["original_presence_external_receipt"][
+        "target_binding_crosswalk_sha256"
+    ] = contract["mapping_crosswalk_sha256"]
+    contract["legacy_projection_sha256"] = R10._r3_legacy_projection_digest(doc)
+    contract["registry_projection_sha256"] = R10._r3_registry_projection_digest(doc)
+
+    assert contract["semantic_commitment_sha256"] == _reference_semantic_sha256(doc)
+    assert contract["mapping_crosswalk_sha256"] == _reference_crosswalk_sha256(doc)
+    assert contract["source_scope_placement_sha256"] == (
+        _reference_placement_sha256(doc)
+    )
+    assert contract["registry_projection_sha256"] == (
+        R10._r3_registry_projection_digest(doc)
+    )
+    assert all(
+        contract[field] != baseline_commitments[field] for field in baseline_commitments
+    )
     assert _IMPORT_HOLD in _codes(V.validate_document(doc, R10._schema()))
 
 
