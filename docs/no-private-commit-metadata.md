@@ -58,8 +58,9 @@ closed in a shallow repository; fetch the required history before retrying.
 
 `.github/workflows/trusted-commit-metadata.yml` uses
 `pull_request_target` only for commit metadata enforcement. GitHub loads the
-workflow definition from the trusted default-branch context. Inside the job,
-the scanner policy is checked out from the exact pull-request base SHA: the job:
+workflow definition and in-job `GITHUB_SHA` from the trusted default-branch
+context. Independently, the scanner policy is checked out from the exact
+pull-request base SHA: the job:
 
 1. checks out the exact pull-request base SHA, with credentials not persisted;
 2. fetches the base repository's `refs/pull/<number>/head` as Git objects only;
@@ -143,21 +144,23 @@ patterns include:
 (?i)(^|[[:space:]"'(<`=,;\[\]])(/(home|Users)/[^/[:space:]`]+|/root)([/\\]|$)
 (?i)(^|[[:space:]"'(<`=,;\[\]])[A-Z]:[/\\]Users[/\\][^/\\[:space:]`]+([/\\]|$)
 (?i)(^|[[:space:]"'(<`=,;\[\]])(\$HOME|\$\{HOME\}|%USERPROFILE%|~)[/\\]
-(?i)(^|[[:space:]"'(<`=:,;\[\]])file://([A-Za-z0-9._~:@!$&'()*+,;=%\[\]-]+)?/((home|Users)/[^/[:space:]`]+|root)(/|$)
-(?i)(^|[[:space:]"'(<`=:,;\[\]])file://([A-Za-z0-9._~:@!$&'()*+,;=%\[\]-]+)?/[A-Z]:/Users/[^/[:space:]`]+(/|$)
+(?i)(^|[^A-Za-z0-9_./\\-])file://([A-Za-z0-9._~:@!$&'()*+,;=%\[\]-]+)?/((home|Users)/[^/[:space:]`]+|root)(/|$)
+(?i)(^|[^A-Za-z0-9_./\\-])file://([A-Za-z0-9._~:@!$&'()*+,;=%\[\]-]+)?/[A-Z]:/Users/[^/[:space:]`]+(/|$)
 (?i)(^|[^A-Za-z0-9.-])(https?://)?(www\.)?claude\.ai/code/[A-Za-z0-9][A-Za-z0-9_-]{11,127}([^A-Za-z0-9_-]|$)
 (?i)(private|anomaly)[ _-]?corpus[ _-]+receipt[\t ]*[:=]?[\t ]*[0-9a-f]{12,64}
-(?i)(claude|codex)[_.-]shard([_.-]manifest)?\.jsonl?[\t ]*[:=][\t ]*[0-9a-f]{40}([0-9a-f]{24})?
+(?i)(claude|codex)[_.-]shard([_.-]manifest)?\.jsonl?[\t ]*[:=][\t ]*[0-9a-f]{40}([0-9a-f]{24})?([^0-9a-f]|$)
 (?i)(^|[^0-9a-f])[0-9a-f]{40}([0-9a-f]{24})?[\t ]+\*?(claude|codex)[_.-]shard([_.-]manifest)?\.jsonl?([^A-Za-z0-9_.-]|$)
 ```
 
-RE2 has no look-around, and a regex rule cannot reproduce Git's canonical
-trailer parsing or every URL/path boundary without unacceptable false
-positives. The patterns above intentionally cover only bounded forms; the
-repository scanner remains the richer policy. Audit existing controlled-branch
-history first, account for legacy matches, activate rules externally, exercise
-both rejection and acceptance on a bootstrap branch, and read back the exact
-rule mode/pattern/scope. Repository code cannot activate or verify that state.
+RE2 has no look-around, so the file-URI examples use a consuming predecessor
+group equivalent to the scanner's one-character negative predecessor check. A
+regex rule cannot reproduce Git's canonical trailer parsing or every URL/path
+boundary without unacceptable false positives. The patterns above
+intentionally cover only bounded forms; the repository scanner remains the
+richer policy. Audit existing controlled-branch history first, account for
+legacy matches, activate rules externally, exercise both rejection and
+acceptance on a bootstrap branch, and read back the exact rule
+mode/pattern/scope. Repository code cannot activate or verify that state.
 
 The push-triggered run is explicitly **post-publication detection**, never
 prevention. A clean push result does not prove that an active ruleset blocked
@@ -185,6 +188,9 @@ error codes without a traceback or reflected value.
 This remains a no-new commit-message gate, not a general secret scanner. It
 does not inspect file contents, Git notes, annotated tags, branch names,
 issue/PR text, build artifacts, already-published history outside the selected
-range, or encoded/obfuscated values. Pattern checks can conservatively reject
-synthetic documentation that looks private. Remediation is manual; the tool
-never prints the detected value and never rewrites a commit.
+range, or encoded/obfuscated values. File-URI coverage specifically requires a
+literal `file://` scheme and literal home-directory components; encoded or
+otherwise obfuscated spellings remain out of contract. Pattern checks can
+conservatively reject synthetic documentation that looks private. Remediation
+is manual; the tool never prints the detected value and never rewrites a
+commit.

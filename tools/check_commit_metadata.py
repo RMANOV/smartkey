@@ -34,11 +34,13 @@ EVENT_OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
 ZERO_EVENT_OBJECT_ID = "0" * 40
 PATH_PREFIX = r"(?:^|[\s\"'(<`=,;\[\]]|(?<![\\/][A-Za-z]):)"
 FILE_URI_AUTHORITY = r"(?:[A-Za-z0-9._~!$&'()*+,;=:%@\[\]-]+)?"
-FILE_URI_PREFIX = r"(?:^|[\s\"'(<`=:,;\[\]])file://" + FILE_URI_AUTHORITY + r"/"
+FILE_URI_PREFIX = r"(?<![A-Za-z0-9_./\\-])file://" + FILE_URI_AUTHORITY + r"/"
 HEX_IDENTIFIER = r"(?<![0-9a-f])[0-9a-f]{12,64}(?![0-9a-f])"
 FULL_HEX_IDENTIFIER = r"(?<![0-9a-f])[0-9a-f]{40}(?:[0-9a-f]{24})?(?![0-9a-f])"
-SHARD_LABEL = r"(?:claude|codex)[ _.-]shard(?:[ _.-]manifest)?(?:\.jsonl?)?"
+SHARD_TEXT_LABEL = r"(?:claude|codex)[ _.-]shard(?:[ _.-]manifest)?"
 SHARD_FILENAME = r"(?:claude|codex)[_.-]shard(?:[_.-]manifest)?\.jsonl?"
+SHARD_REFERENCE = r"(?:" + SHARD_FILENAME + r"|" + SHARD_TEXT_LABEL + r")"
+SHARD_TERMINAL = r"(?![A-Za-z0-9_.-])"
 SOURCE_LABEL = r"source[-_](?:session|record|path)(?:[-_](?:hash|digest))?"
 DIGEST_LABEL = r"(?:sha(?:-?256)?|digest|hash|receipt)"
 LABEL_SEPARATOR = r"(?:[^\S\r\n]|[_:=()/.`-])"
@@ -95,8 +97,18 @@ PRIVATE_CORRELATION_PATTERNS = (
     ),
     re.compile(
         r"\b"
-        + SHARD_LABEL
+        + SHARD_REFERENCE
+        + SHARD_TERMINAL
         + r"[^\r\n]{0,47}"
+        + LABEL_SEPARATOR
+        + DIGEST_LABEL
+        + r"\b\s*[:=]?\s*"
+        + HEX_IDENTIFIER,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b"
+        + SHARD_TEXT_LABEL
         + LABEL_SEPARATOR
         + DIGEST_LABEL
         + r"\b\s*[:=]?\s*"
@@ -107,7 +119,7 @@ PRIVATE_CORRELATION_PATTERNS = (
         r"\b(?:sha(?:-?256)?|digest)\s*\(\s*(?:"
         + SOURCE_LABEL
         + r"|"
-        + SHARD_LABEL
+        + SHARD_REFERENCE
         + r")\s*\)\s*[:=]\s*"
         + HEX_IDENTIFIER,
         re.IGNORECASE,

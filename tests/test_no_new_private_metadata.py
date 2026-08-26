@@ -18,6 +18,7 @@ from contextlib import redirect_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / "tools" / "check_commit_metadata.py"
+POLICY_DOC = ROOT / "docs" / "no-private-commit-metadata.md"
 TRUSTED_WORKFLOW = ROOT / ".github" / "workflows" / "trusted-commit-metadata.yml"
 PINNED_CHECKOUT = "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
 PINNED_SETUP_PYTHON = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
@@ -225,6 +226,43 @@ class CommitMetadataGateTests(unittest.TestCase):
                 )
                 self.assertEqual(process.returncode, 0, process.stderr)
 
+    def test_file_uri_boundary_accepts_punctuation_but_not_path_prefixes(
+        self,
+    ) -> None:
+        for delimiter in (")", ">", "}", "?", "#", "&"):
+            with self.subTest(delimiter=delimiter):
+                process = self.run_gate(
+                    "--stdin",
+                    message=(
+                        "Synthetic subject\n\nReference: "
+                        f"{delimiter}file://host.example/home/sample-account/private\n"
+                    ),
+                )
+                self.assertEqual(process.returncode, 1, process.stderr)
+                self.assertIn(
+                    "private_home_path",
+                    {
+                        item["rule"]
+                        for item in self.assert_payload(process)["violations"]
+                    },
+                )
+
+        benign = (
+            "notfile://host.example/home/sample-account/relative",
+            "docs/file://host.example/home/sample-account/relative",
+            (
+                "https://host.example/path/"
+                "file://nested.example/home/sample-account/public"
+            ),
+        )
+        for value in benign:
+            with self.subTest(benign=value[:24]):
+                process = self.run_gate(
+                    "--stdin",
+                    message=f"Synthetic subject\n\nReference: {value}\n",
+                )
+                self.assertEqual(process.returncode, 0, process.stderr)
+
     def test_private_correlation_labels_fail_but_ordinary_shas_pass(self) -> None:
         synthetic_correlation_messages = (
             "Synthetic subject\n\nsource_session_hash: " + "a" * 64 + "\n",
@@ -335,6 +373,65 @@ class CommitMetadataGateTests(unittest.TestCase):
             with self.subTest(benign_number=benign.index(message)):
                 process = self.run_gate("--stdin", message=message)
                 self.assertEqual(process.returncode, 0, process.stderr)
+
+    def test_shard_label_near_misses_do_not_correlate(self) -> None:
+        digest = "a" * 64
+        near_misses = (
+            f"claude_shard_manifest.json.bak digest: {digest}",
+            f"claude_shard_manifest.jsonx digest: {digest}",
+            f"claude shardiness digest: {digest}",
+            f"claude_shard_manifestation digest: {digest}",
+        )
+        for value in near_misses:
+            with self.subTest(value=value[:36]):
+                process = self.run_gate(
+                    "--stdin",
+                    message=f"Synthetic subject\n\nReference: {value}\n",
+                )
+                self.assertEqual(process.returncode, 0, process.stderr)
+
+    def test_bounded_textual_and_exact_shard_labels_still_correlate(self) -> None:
+        digest = "b" * 64
+        correlations = (
+            f"claude_shard_manifest_digest: {digest}",
+            f"codex-shard-manifest-hash={digest}",
+            f"claude.shard.manifest.json digest: {digest}",
+            f"codex-shard-manifest.jsonl sha256: {digest}",
+            f"Claude shard SHA-256: {digest}",
+        )
+        for value in correlations:
+            with self.subTest(value=value[:36]):
+                process = self.run_gate(
+                    "--stdin",
+                    message=f"Synthetic subject\n\nReference: {value}\n",
+                )
+                self.assertEqual(process.returncode, 1, process.stderr)
+                self.assertIn(
+                    "private_corpus_correlation",
+                    {
+                        item["rule"]
+                        for item in self.assert_payload(process)["violations"]
+                    },
+                )
+
+    def test_direct_manifest_re2_example_has_exact_digest_length(self) -> None:
+        candidates = [
+            line
+            for line in POLICY_DOC.read_text(encoding="utf-8").splitlines()
+            if line.startswith("(?i)(claude|codex)[_.-]shard") and "[:=]" in line
+        ]
+        self.assertEqual(len(candidates), 1)
+        pattern = re.compile(candidates[0])
+
+        for size in (40, 64):
+            with self.subTest(valid_size=size):
+                value = "claude_shard_manifest.json=" + ("c" * size)
+                self.assertIsNotNone(pattern.search(value))
+
+        for size in (41, 65):
+            with self.subTest(oversized=size):
+                value = "claude_shard_manifest.json=" + ("d" * size)
+                self.assertIsNone(pattern.search(value))
 
     def test_known_first_party_code_correlation_is_bounded(self) -> None:
         rejected = (
