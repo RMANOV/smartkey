@@ -334,7 +334,7 @@ SEMANTIC_COMMITMENT_ALGORITHM = "sha256-canonical-json-v1"
 HMAC_SCHEME = "smartkey-g0-hmac-sha256-v1"
 HMAC_DOMAINS = ("value", "event", "metadata", "source_record")
 HMAC_MIN_KEY_BYTES = 32
-HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v1"
+HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v2"
 HMAC_SCALAR_PAYLOAD_ENCODING = "exact-utf8-scalar-no-normalization-v1"
 HMAC_STRUCTURED_PAYLOAD_ENCODING = "smartkey-g0-canonical-json-v1"
 HMAC_DOMAIN_PAYLOAD_PROFILES = {
@@ -343,11 +343,35 @@ HMAC_DOMAIN_PAYLOAD_PROFILES = {
     "metadata": "project_canonical_json_v1",
     "source_record": "project_canonical_json_v1",
 }
+HMAC_DOMAIN_ROOT_TYPES = {
+    "value": "exact_str",
+    "event": "exact_dict",
+    "metadata": "exact_dict",
+    "source_record": "exact_dict",
+}
+HMAC_RESOURCE_CONTRACT_VERSION = "smartkey-g0-hmac-resource-contract-v1"
+HMAC_RESOURCE_LIMITS = {
+    "max_raw_utf8_bytes": 262_144,
+    "max_canonical_payload_bytes": 65_536,
+    "max_lexical_nesting_depth": 32,
+    "max_typed_nesting_depth": 32,
+    "max_total_nodes": 4_096,
+    "max_array_members": 1_024,
+    "max_object_members": 512,
+    "max_string_utf8_bytes": 65_528,
+    "max_key_utf8_bytes": 1_024,
+    "max_integer_token_digits": 16,
+}
+HMAC_RESOURCE_CONTRACT_SHA256 = (
+    "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab"
+)
 HMAC_INPUT_FRAME = "ascii-scheme-nul-domain-nul-u64be-length-payload-v1"
-HMAC_RECEIPT_COVERAGE = "all-refs-domain-serialization-key-id-private-recomputation-v1"
+HMAC_RECEIPT_COVERAGE = (
+    "all-refs-domain-serialization-resource-key-id-private-recomputation-v2"
+)
 HMAC_RECEIPT_STATE = "externally_verified"
 HMAC_VECTOR_SET_SHA256 = (
-    "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f"
+    "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
 )
 CANONICAL_JSON_SAFE_INTEGER_MAX = 9_007_199_254_740_991
 BASELINE_RECEIPT_STATE = "externally_verified"
@@ -374,6 +398,10 @@ SEALED_CONTRACT_CONSTS = {
     "hmac_contract_version": HMAC_CONTRACT_VERSION,
     "hmac_domains": list(HMAC_DOMAINS),
     "hmac_domain_payload_profiles": HMAC_DOMAIN_PAYLOAD_PROFILES,
+    "hmac_domain_root_types": HMAC_DOMAIN_ROOT_TYPES,
+    "hmac_resource_contract_version": HMAC_RESOURCE_CONTRACT_VERSION,
+    "hmac_resource_limits": HMAC_RESOURCE_LIMITS,
+    "hmac_resource_contract_sha256": HMAC_RESOURCE_CONTRACT_SHA256,
     "hmac_scalar_payload_encoding": HMAC_SCALAR_PAYLOAD_ENCODING,
     "hmac_structured_payload_encoding": HMAC_STRUCTURED_PAYLOAD_ENCODING,
     "hmac_input_frame": HMAC_INPUT_FRAME,
@@ -417,162 +445,648 @@ CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
 LATIN_RE = re.compile(r"[A-Za-z]")
 
 
+CANONICAL_ERROR_TYPE = "canonical_type"
+CANONICAL_ERROR_SYNTAX = "canonical_syntax"
+CANONICAL_ERROR_BOUNDS = "canonical_bounds"
+CANONICAL_ERROR_RESOURCE = "canonical_resource"
+CANONICAL_ERROR_DEPTH = "canonical_depth"
+CANONICAL_ERROR_CYCLE = "canonical_cycle"
+CANONICAL_ERROR_ROOT = "canonical_root"
+CANONICAL_ERROR_INTERNAL = "canonical_internal"
+CANONICAL_ERROR_CODES = frozenset(
+    {
+        CANONICAL_ERROR_TYPE,
+        CANONICAL_ERROR_SYNTAX,
+        CANONICAL_ERROR_BOUNDS,
+        CANONICAL_ERROR_RESOURCE,
+        CANONICAL_ERROR_DEPTH,
+        CANONICAL_ERROR_CYCLE,
+        CANONICAL_ERROR_ROOT,
+        CANONICAL_ERROR_INTERNAL,
+    }
+)
+
+
 class CanonicalJsonError(ValueError):
-    """A value or raw JSON input is outside project canonical JSON v1."""
+    """A non-reflective public failure from the canonical payload boundary."""
 
 
-_CANONICAL_JSON_SHORT_ESCAPES = {
-    "\b": r"\b",
-    "\t": r"\t",
-    "\n": r"\n",
-    "\f": r"\f",
-    "\r": r"\r",
+class _CanonicalAbort(Exception):
+    """Private bounded-parser control flow; never escapes to a caller."""
+
+    def __init__(self, code: str):
+        self.code = code
+        Exception.__init__(self, code)
+
+
+_CANONICAL_JSON_ESCAPE_BYTES = {
+    '"': b'\\"',
+    "\\": b"\\\\",
+    "\b": b"\\b",
+    "\t": b"\\t",
+    "\n": b"\\n",
+    "\f": b"\\f",
+    "\r": b"\\r",
 }
+_JSON_SIMPLE_ESCAPE_CODE_POINTS = {
+    '"': 0x22,
+    "\\": 0x5C,
+    "/": 0x2F,
+    "b": 0x08,
+    "f": 0x0C,
+    "n": 0x0A,
+    "r": 0x0D,
+    "t": 0x09,
+}
+_JSON_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_JSON_TOKEN_DELIMITERS = frozenset(" \t\r\n,]}")
 
 
-def _canonical_json_string(value: str) -> str:
-    pieces = ['"']
+def _raise_canonical_error(code: str) -> None:
+    """Raise from a frame that has never received private input."""
+    if type(code) is not str or code not in CANONICAL_ERROR_CODES:
+        code = CANONICAL_ERROR_INTERNAL
+    raise CanonicalJsonError(code)
+
+
+def _discard_internal_exception(error: BaseException) -> None:
+    """Break decoder/raw traceback references before returning a safe code."""
+    if isinstance(error, json.JSONDecodeError):
+        error.doc = ""
+        error.pos = 0
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+
+
+def _utf8_width(code_point: int) -> int:
+    if code_point <= 0x7F:
+        return 1
+    if code_point <= 0x7FF:
+        return 2
+    if code_point <= 0xFFFF:
+        return 3
+    return 4
+
+
+def _scan_raw_string(text: str, start: int) -> tuple[str | None, int, int]:
+    """Return ``(code, end, decoded_utf8_bytes)`` without materialising text."""
+    index = start + 1
+    decoded_bytes = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        code_point = ord(char)
+        if char == '"':
+            return None, index + 1, decoded_bytes
+        if char != "\\":
+            if code_point <= 0x1F or 0xD800 <= code_point <= 0xDFFF:
+                return CANONICAL_ERROR_SYNTAX, index, 0
+            decoded_bytes += _utf8_width(code_point)
+            if decoded_bytes > HMAC_RESOURCE_LIMITS["max_string_utf8_bytes"]:
+                return CANONICAL_ERROR_RESOURCE, index, 0
+            index += 1
+            continue
+        if index + 1 >= length:
+            return CANONICAL_ERROR_SYNTAX, index, 0
+        escape = text[index + 1]
+        if escape in _JSON_SIMPLE_ESCAPE_CODE_POINTS:
+            decoded_bytes += _utf8_width(_JSON_SIMPLE_ESCAPE_CODE_POINTS[escape])
+            index += 2
+            continue
+        if escape != "u" or index + 6 > length:
+            return CANONICAL_ERROR_SYNTAX, index, 0
+        digits = text[index + 2 : index + 6]
+        if any(digit not in _JSON_HEX_DIGITS for digit in digits):
+            return CANONICAL_ERROR_SYNTAX, index, 0
+        code_point = int(digits, 16)
+        index += 6
+        if 0xD800 <= code_point <= 0xDBFF:
+            if index + 6 > length or text[index : index + 2] != "\\u":
+                return CANONICAL_ERROR_SYNTAX, index, 0
+            low_digits = text[index + 2 : index + 6]
+            if any(digit not in _JSON_HEX_DIGITS for digit in low_digits):
+                return CANONICAL_ERROR_SYNTAX, index, 0
+            low = int(low_digits, 16)
+            if not 0xDC00 <= low <= 0xDFFF:
+                return CANONICAL_ERROR_SYNTAX, index, 0
+            code_point = 0x10000 + ((code_point - 0xD800) << 10) + (low - 0xDC00)
+            index += 6
+        elif 0xDC00 <= code_point <= 0xDFFF:
+            return CANONICAL_ERROR_SYNTAX, index, 0
+        decoded_bytes += _utf8_width(code_point)
+        if decoded_bytes > HMAC_RESOURCE_LIMITS["max_string_utf8_bytes"]:
+            return CANONICAL_ERROR_RESOURCE, index, 0
+    return CANONICAL_ERROR_SYNTAX, index, 0
+
+
+def _scan_raw_resources(text: str) -> str | None:
+    """Bound raw input before ``json.loads`` can materialise containers."""
+    raw_limit = HMAC_RESOURCE_LIMITS["max_raw_utf8_bytes"]
+    if len(text) > raw_limit:
+        return CANONICAL_ERROR_RESOURCE
+    raw_utf8_bytes = 0
+    for char in text:
+        code_point = ord(char)
+        if 0xD800 <= code_point <= 0xDFFF:
+            return CANONICAL_ERROR_SYNTAX
+        raw_utf8_bytes += _utf8_width(code_point)
+        if raw_utf8_bytes > raw_limit:
+            return CANONICAL_ERROR_RESOURCE
+
+    stack: list[list[object]] = []
+    nodes = 0
+    index = 0
+    length = len(text)
+
+    def consume_value_node() -> str | None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > HMAC_RESOURCE_LIMITS["max_total_nodes"]:
+            return CANONICAL_ERROR_RESOURCE
+        if stack and stack[-1][0] == "array":
+            stack[-1][1] = int(stack[-1][1]) + 1
+            if stack[-1][1] > HMAC_RESOURCE_LIMITS["max_array_members"]:
+                return CANONICAL_ERROR_RESOURCE
+        return None
+
+    while index < length:
+        char = text[index]
+        if char in " \t\r\n,:":
+            index += 1
+            continue
+        if char == '"':
+            code, end, decoded_bytes = _scan_raw_string(text, index)
+            if code is not None:
+                stack = None
+                return code
+            lookahead = end
+            while lookahead < length and text[lookahead] in " \t\r\n":
+                lookahead += 1
+            if lookahead < length and text[lookahead] == ":":
+                if not stack or stack[-1][0] != "object":
+                    stack = None
+                    return CANONICAL_ERROR_SYNTAX
+                stack[-1][1] = int(stack[-1][1]) + 1
+                if stack[-1][1] > HMAC_RESOURCE_LIMITS["max_object_members"]:
+                    stack = None
+                    return CANONICAL_ERROR_RESOURCE
+                nodes += 1
+                if nodes > HMAC_RESOURCE_LIMITS["max_total_nodes"]:
+                    stack = None
+                    return CANONICAL_ERROR_RESOURCE
+                if decoded_bytes > HMAC_RESOURCE_LIMITS["max_key_utf8_bytes"]:
+                    stack = None
+                    return CANONICAL_ERROR_RESOURCE
+            else:
+                code = consume_value_node()
+                if code is not None:
+                    stack = None
+                    return code
+            index = end
+            continue
+        if char in "[{":
+            code = consume_value_node()
+            if code is not None:
+                stack = None
+                return code
+            stack.append(["array" if char == "[" else "object", 0])
+            if len(stack) > HMAC_RESOURCE_LIMITS["max_lexical_nesting_depth"]:
+                stack = None
+                return CANONICAL_ERROR_DEPTH
+            index += 1
+            continue
+        if char in "]}":
+            expected = "array" if char == "]" else "object"
+            if not stack or stack[-1][0] != expected:
+                stack = None
+                return CANONICAL_ERROR_SYNTAX
+            stack.pop()
+            index += 1
+            continue
+        if char == "-" or char in "0123456789":
+            end = index + 1
+            while end < length and text[end] not in _JSON_TOKEN_DELIMITERS:
+                end += 1
+            token = text[index:end]
+            digits = token[1:] if token.startswith("-") else token
+            if token == "-Infinity":
+                stack = None
+                return CANONICAL_ERROR_BOUNDS
+            if any(marker in token for marker in ".eE+"):
+                stack = None
+                return CANONICAL_ERROR_BOUNDS
+            if not digits or any(digit not in "0123456789" for digit in digits):
+                stack = None
+                return CANONICAL_ERROR_SYNTAX
+            if len(digits) > HMAC_RESOURCE_LIMITS["max_integer_token_digits"]:
+                stack = None
+                return CANONICAL_ERROR_RESOURCE
+            if token == "-0":
+                stack = None
+                return CANONICAL_ERROR_BOUNDS
+            code = consume_value_node()
+            if code is not None:
+                stack = None
+                return code
+            index = end
+            continue
+        matched_literal = False
+        for literal in ("true", "false", "null"):
+            if text.startswith(literal, index):
+                code = consume_value_node()
+                if code is not None:
+                    stack = None
+                    return code
+                index += len(literal)
+                matched_literal = True
+                break
+        if matched_literal:
+            continue
+        index += 1
+    if stack:
+        stack = None
+        return CANONICAL_ERROR_SYNTAX
+    stack = None
+    return None
+
+
+def _append_output(output: bytearray, fragment: bytes) -> str | None:
+    if (
+        len(output) + len(fragment)
+        > HMAC_RESOURCE_LIMITS["max_canonical_payload_bytes"]
+    ):
+        return CANONICAL_ERROR_RESOURCE
+    output.extend(fragment)
+    return None
+
+
+def _encode_string_into(
+    value: str, output: bytearray, *, key: bool = False
+) -> str | None:
+    maximum = HMAC_RESOURCE_LIMITS[
+        "max_key_utf8_bytes" if key else "max_string_utf8_bytes"
+    ]
+    if len(value) > maximum:
+        return CANONICAL_ERROR_RESOURCE
+    utf8_bytes = 0
     for char in value:
         code_point = ord(char)
         if 0xD800 <= code_point <= 0xDFFF:
-            raise CanonicalJsonError("string contains a non-Unicode scalar value")
-        if char == '"':
-            pieces.append(r"\"")
-        elif char == "\\":
-            pieces.append(r"\\")
-        elif char in _CANONICAL_JSON_SHORT_ESCAPES:
-            pieces.append(_CANONICAL_JSON_SHORT_ESCAPES[char])
-        elif code_point <= 0x1F:
-            pieces.append(f"\\u{code_point:04x}")
-        else:
-            pieces.append(char)
-    pieces.append('"')
-    return "".join(pieces)
+            return CANONICAL_ERROR_TYPE
+        utf8_bytes += _utf8_width(code_point)
+        if utf8_bytes > maximum:
+            return CANONICAL_ERROR_RESOURCE
+    code = _append_output(output, b'"')
+    if code is not None:
+        return code
+    for char in value:
+        code_point = ord(char)
+        if 0xD800 <= code_point <= 0xDFFF:
+            return CANONICAL_ERROR_TYPE
+        fragment = _CANONICAL_JSON_ESCAPE_BYTES.get(char)
+        if fragment is None:
+            if code_point <= 0x1F:
+                fragment = f"\\u{code_point:04x}".encode("ascii")
+            else:
+                fragment = char.encode("utf-8")
+        code = _append_output(output, fragment)
+        if code is not None:
+            return code
+    return _append_output(output, b'"')
 
 
-def _canonical_json_text(value, active_containers: set[int]) -> str:
+def _consume_typed_node(state: dict[str, object]) -> str | None:
+    state["nodes"] = int(state["nodes"]) + 1
+    if state["nodes"] > HMAC_RESOURCE_LIMITS["max_total_nodes"]:
+        return CANONICAL_ERROR_RESOURCE
+    return None
+
+
+def _encode_typed_value(
+    value, output: bytearray, state: dict[str, object], depth: int
+) -> str | None:
+    code = _consume_typed_node(state)
+    if code is not None:
+        return code
+    value_type = type(value)
     if value is None:
-        return "null"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, int):
+        return _append_output(output, b"null")
+    if value_type is bool:
+        return _append_output(output, b"true" if value else b"false")
+    if value_type is int:
         if abs(value) > CANONICAL_JSON_SAFE_INTEGER_MAX:
-            raise CanonicalJsonError("integer is outside the safe canonical range")
-        return str(value)
-    if isinstance(value, float):
-        raise CanonicalJsonError("floating-point values are not supported")
-    if isinstance(value, str):
-        return _canonical_json_string(value)
-    if isinstance(value, (list, dict)):
-        identity = id(value)
-        if identity in active_containers:
-            raise CanonicalJsonError("cyclic containers are not supported")
-        active_containers.add(identity)
+            return CANONICAL_ERROR_BOUNDS
+        return _append_output(output, str(value).encode("ascii"))
+    if value_type is str:
+        return _encode_string_into(value, output)
+    if value_type not in (list, dict):
+        return CANONICAL_ERROR_TYPE
+
+    next_depth = depth + 1
+    if next_depth > HMAC_RESOURCE_LIMITS["max_typed_nesting_depth"]:
+        return CANONICAL_ERROR_DEPTH
+    identity = id(value)
+    active = state["active"]
+    if identity in active:
+        return CANONICAL_ERROR_CYCLE
+    active.add(identity)
+    try:
+        if value_type is list:
+            if len(value) > HMAC_RESOURCE_LIMITS["max_array_members"]:
+                return CANONICAL_ERROR_RESOURCE
+            code = _append_output(output, b"[")
+            if code is not None:
+                return code
+            for index, item in enumerate(value):
+                if index:
+                    code = _append_output(output, b",")
+                    if code is not None:
+                        return code
+                code = _encode_typed_value(item, output, state, next_depth)
+                if code is not None:
+                    return code
+            return _append_output(output, b"]")
+
+        if len(value) > HMAC_RESOURCE_LIMITS["max_object_members"]:
+            return CANONICAL_ERROR_RESOURCE
+        for key in value:
+            if type(key) is not str:
+                return CANONICAL_ERROR_TYPE
+        sorted_keys = sorted(value)
         try:
-            if isinstance(value, list):
-                return (
-                    "["
-                    + ",".join(
-                        _canonical_json_text(item, active_containers) for item in value
-                    )
-                    + "]"
-                )
-            if any(not isinstance(key, str) for key in value):
-                raise CanonicalJsonError("object keys must be strings")
-            return (
-                "{"
-                + ",".join(
-                    _canonical_json_string(key)
-                    + ":"
-                    + _canonical_json_text(value[key], active_containers)
-                    for key in sorted(value)
-                )
-                + "}"
-            )
+            code = _append_output(output, b"{")
+            if code is not None:
+                return code
+            for index, key in enumerate(sorted_keys):
+                if index:
+                    code = _append_output(output, b",")
+                    if code is not None:
+                        return code
+                code = _consume_typed_node(state)
+                if code is not None:
+                    return code
+                code = _encode_string_into(key, output, key=True)
+                if code is not None:
+                    return code
+                code = _append_output(output, b":")
+                if code is not None:
+                    return code
+                code = _encode_typed_value(value[key], output, state, next_depth)
+                if code is not None:
+                    return code
+            return _append_output(output, b"}")
         finally:
-            active_containers.remove(identity)
-    raise CanonicalJsonError("value type is outside the canonical JSON domain")
+            sorted_keys = None
+    finally:
+        active.remove(identity)
 
 
-def canonical_structured_payload_bytes(value) -> bytes:
-    """Encode an already-typed value as project canonical JSON v1 bytes.
+def _private_encode(value) -> tuple[str | None, bytes | None]:
+    output = bytearray()
+    state: dict[str, object] = {"nodes": 0, "active": set()}
+    try:
+        code = _encode_typed_value(value, output, state, 0)
+    except RecursionError as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        code = CANONICAL_ERROR_DEPTH
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        code = CANONICAL_ERROR_INTERNAL
+    value = None
+    state = None
+    if code is not None:
+        output = None
+        return code, None
+    payload = bytes(output)
+    output = None
+    return None, payload
 
-    This typed-value boundary cannot observe duplicate keys or whether an
-    integer zero was originally spelled ``-0``. Raw importers must call
-    :func:`parse_project_canonical_json` before using this encoder.
-    """
-    return _canonical_json_text(value, set()).encode("utf-8")
 
-
-def parse_project_canonical_json(text: str):
-    """Parse raw JSON without losing duplicate-key or numeric-spelling checks."""
-    if not isinstance(text, str):
-        raise CanonicalJsonError("raw canonical JSON input must be text")
+def _private_parse(text: str) -> tuple[str | None, object | None]:
+    parsed = None
+    try:
+        code = _scan_raw_resources(text)
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        text = None
+        return CANONICAL_ERROR_INTERNAL, None
+    if code is not None:
+        text = None
+        return code, None
 
     def parse_integer(token: str) -> int:
+        digits = token[1:] if token.startswith("-") else token
+        if len(digits) > HMAC_RESOURCE_LIMITS["max_integer_token_digits"]:
+            raise _CanonicalAbort(CANONICAL_ERROR_RESOURCE)
         if token == "-0":
-            raise CanonicalJsonError("negative zero is not canonical")
+            raise _CanonicalAbort(CANONICAL_ERROR_BOUNDS)
         value = int(token)
         if abs(value) > CANONICAL_JSON_SAFE_INTEGER_MAX:
-            raise CanonicalJsonError("integer is outside the safe canonical range")
+            raise _CanonicalAbort(CANONICAL_ERROR_BOUNDS)
         return value
 
     def reject_float(_token: str):
-        raise CanonicalJsonError("floating-point syntax is not supported")
+        raise _CanonicalAbort(CANONICAL_ERROR_BOUNDS)
 
     def reject_constant(_token: str):
-        raise CanonicalJsonError("non-finite numeric syntax is not supported")
+        raise _CanonicalAbort(CANONICAL_ERROR_BOUNDS)
 
     def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
         result = {}
         for key, value in pairs:
             if key in result:
-                raise CanonicalJsonError("duplicate object keys are not supported")
+                result = None
+                pairs = None
+                raise _CanonicalAbort(CANONICAL_ERROR_SYNTAX)
             result[key] = value
+        pairs = None
         return result
 
     try:
-        value = json.loads(
+        parsed = json.loads(
             text,
             parse_int=parse_integer,
             parse_float=reject_float,
             parse_constant=reject_constant,
             object_pairs_hook=reject_duplicate_keys,
         )
-    except CanonicalJsonError:
-        raise
-    except (json.JSONDecodeError, UnicodeError) as exc:
-        raise CanonicalJsonError("input is not valid project canonical JSON") from exc
-    canonical_structured_payload_bytes(value)
-    return value
+    except _CanonicalAbort as internal:
+        code = internal.code
+        _discard_internal_exception(internal)
+        internal = None
+        text = None
+        parsed = None
+        return code, None
+    except json.JSONDecodeError as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        text = None
+        parsed = None
+        return CANONICAL_ERROR_SYNTAX, None
+    except RecursionError as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        text = None
+        parsed = None
+        return CANONICAL_ERROR_DEPTH, None
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        text = None
+        parsed = None
+        return CANONICAL_ERROR_INTERNAL, None
+
+    text = None
+    encoded_result = _private_encode(parsed)
+    code = encoded_result[0]
+    encoded_result = None
+    if code is not None:
+        parsed = None
+        return code, None
+    result = parsed
+    parsed = None
+    return None, result
+
+
+def canonical_structured_payload_bytes(value) -> bytes:
+    """Encode an exact-built-in typed value as bounded canonical JSON bytes."""
+    code, payload = _private_encode(value)
+    value = None
+    if code is not None:
+        public_code = code
+        code = None
+        payload = None
+        _raise_canonical_error(public_code)
+    return payload
+
+
+def parse_project_canonical_json(text: str):
+    """Parse bounded raw JSON before syntax information can be erased."""
+    if type(text) is not str:
+        text = None
+        _raise_canonical_error(CANONICAL_ERROR_TYPE)
+    code, parsed = _private_parse(text)
+    text = None
+    if code is not None:
+        public_code = code
+        code = None
+        parsed = None
+        _raise_canonical_error(public_code)
+    return parsed
+
+
+def _private_hmac_payload(domain: str, value) -> tuple[str | None, bytes | None]:
+    if type(domain) is not str:
+        domain = None
+        value = None
+        return CANONICAL_ERROR_TYPE, None
+    profile = HMAC_DOMAIN_PAYLOAD_PROFILES.get(domain)
+    if profile is None:
+        domain = None
+        value = None
+        return CANONICAL_ERROR_ROOT, None
+    if profile == "scalar_utf8":
+        if type(value) is not str:
+            domain = None
+            value = None
+            return CANONICAL_ERROR_TYPE, None
+        maximum = HMAC_RESOURCE_LIMITS["max_string_utf8_bytes"]
+        try:
+            if len(value) > maximum:
+                domain = None
+                value = None
+                return CANONICAL_ERROR_RESOURCE, None
+            utf8_bytes = 0
+            for char in value:
+                code_point = ord(char)
+                if 0xD800 <= code_point <= 0xDFFF:
+                    domain = None
+                    value = None
+                    return CANONICAL_ERROR_TYPE, None
+                utf8_bytes += _utf8_width(code_point)
+                if utf8_bytes > maximum:
+                    domain = None
+                    value = None
+                    return CANONICAL_ERROR_RESOURCE, None
+            payload = value.encode("utf-8")
+        except Exception as internal:
+            _discard_internal_exception(internal)
+            internal = None
+            domain = None
+            value = None
+            return CANONICAL_ERROR_INTERNAL, None
+        value = None
+        domain = None
+        if (
+            len(payload) > maximum
+            or len(payload) > HMAC_RESOURCE_LIMITS["max_canonical_payload_bytes"]
+        ):
+            payload = None
+            return CANONICAL_ERROR_RESOURCE, None
+        return None, payload
+    if type(value) is not dict:
+        domain = None
+        value = None
+        return CANONICAL_ERROR_ROOT, None
+    domain = None
+    return _private_encode(value)
 
 
 def hmac_payload_bytes(domain: str, value) -> bytes:
-    """Encode a typed value with the payload profile fixed for its HMAC domain."""
-    profile = HMAC_DOMAIN_PAYLOAD_PROFILES.get(domain)
-    if profile is None:
-        raise CanonicalJsonError("HMAC domain is outside the sealed contract")
-    if profile == "scalar_utf8":
-        if not isinstance(value, str):
-            raise CanonicalJsonError("scalar UTF-8 payload must be a string")
-        _canonical_json_string(value)  # Validate Unicode scalar values without quoting.
-        return value.encode("utf-8")
-    return canonical_structured_payload_bytes(value)
+    """Encode a bounded exact-root payload fixed for its public HMAC domain."""
+    code, payload = _private_hmac_payload(domain, value)
+    domain = None
+    value = None
+    if code is not None:
+        public_code = code
+        code = None
+        payload = None
+        _raise_canonical_error(public_code)
+    return payload
+
+
+def _private_hmac_frame(domain: str, value) -> tuple[str | None, bytes | None]:
+    code, payload = _private_hmac_payload(domain, value)
+    value = None
+    if code is not None:
+        domain = None
+        payload = None
+        return code, None
+    try:
+        frame = (
+            HMAC_SCHEME.encode("ascii")
+            + b"\0"
+            + domain.encode("ascii")
+            + b"\0"
+            + len(payload).to_bytes(8, "big", signed=False)
+            + payload
+        )
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        domain = None
+        payload = None
+        return CANONICAL_ERROR_INTERNAL, None
+    domain = None
+    payload = None
+    return None, frame
 
 
 def hmac_frame_bytes(domain: str, value) -> bytes:
-    """Return the exact versioned/domain-separated HMAC input frame."""
-    payload = hmac_payload_bytes(domain, value)
-    return (
-        HMAC_SCHEME.encode("ascii")
-        + b"\0"
-        + domain.encode("ascii")
-        + b"\0"
-        + len(payload).to_bytes(8, "big", signed=False)
-        + payload
-    )
+    """Return the exact bounded versioned/domain-separated HMAC input frame."""
+    code, frame = _private_hmac_frame(domain, value)
+    domain = None
+    value = None
+    if code is not None:
+        public_code = code
+        code = None
+        frame = None
+        _raise_canonical_error(public_code)
+    return frame
 
 
 # Fields whose values are commit SHAs (40 hex or "unknown") by contract.
@@ -2039,6 +2553,10 @@ def _check_hmac_contract_preflight(
         "hmac_contract_version": HMAC_CONTRACT_VERSION,
         "hmac_domains": list(HMAC_DOMAINS),
         "hmac_domain_payload_profiles": HMAC_DOMAIN_PAYLOAD_PROFILES,
+        "hmac_domain_root_types": HMAC_DOMAIN_ROOT_TYPES,
+        "hmac_resource_contract_version": HMAC_RESOURCE_CONTRACT_VERSION,
+        "hmac_resource_limits": HMAC_RESOURCE_LIMITS,
+        "hmac_resource_contract_sha256": HMAC_RESOURCE_CONTRACT_SHA256,
         "hmac_scalar_payload_encoding": HMAC_SCALAR_PAYLOAD_ENCODING,
         "hmac_structured_payload_encoding": HMAC_STRUCTURED_PAYLOAD_ENCODING,
         "hmac_input_frame": HMAC_INPUT_FRAME,
@@ -2070,6 +2588,9 @@ def _check_hmac_contract_preflight(
             and receipt.get("scheme") == HMAC_SCHEME
             and receipt.get("key_id") == key_id
             and receipt.get("contract_version") == HMAC_CONTRACT_VERSION
+            and receipt.get("resource_contract_version")
+            == HMAC_RESOURCE_CONTRACT_VERSION
+            and receipt.get("resource_contract_sha256") == HMAC_RESOURCE_CONTRACT_SHA256
             and receipt.get("vector_set_sha256") == HMAC_VECTOR_SET_SHA256
             and receipt.get("coverage") == HMAC_RECEIPT_COVERAGE
             and isinstance(receipt.get("receipt_sha256"), str)
@@ -2079,7 +2600,7 @@ def _check_hmac_contract_preflight(
             errors.append(
                 "E_HMAC_CONTRACT: $.adjudication_contract.hmac_external_receipt: "
                 "declaration does not cover the pinned scheme, domain, "
-                "serialization and key epoch"
+                "serialization, resource profile and key epoch"
             )
 
     strings: list[tuple[tuple, str]] = []
@@ -2331,6 +2852,10 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
         "baseline_external_receipt",
         "hmac_contract_version",
         "hmac_domain_payload_profiles",
+        "hmac_domain_root_types",
+        "hmac_resource_contract_version",
+        "hmac_resource_limits",
+        "hmac_resource_contract_sha256",
         "hmac_vector_set_sha256",
         "hmac_key_id",
         "hmac_external_receipt",
@@ -2354,6 +2879,8 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
             "state": HMAC_RECEIPT_STATE,
             "scheme": HMAC_SCHEME,
             "contract_version": HMAC_CONTRACT_VERSION,
+            "resource_contract_version": HMAC_RESOURCE_CONTRACT_VERSION,
+            "resource_contract_sha256": HMAC_RESOURCE_CONTRACT_SHA256,
             "vector_set_sha256": HMAC_VECTOR_SET_SHA256,
             "coverage": HMAC_RECEIPT_COVERAGE,
         },

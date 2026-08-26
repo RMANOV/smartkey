@@ -49,15 +49,18 @@
       "additionalProperties": false,
       "required": [
         "state", "scheme", "key_id", "contract_version",
+        "resource_contract_version", "resource_contract_sha256",
         "vector_set_sha256", "coverage", "receipt_sha256"
       ],
       "properties": {
         "state": { "const": "externally_verified" },
         "scheme": { "const": "smartkey-g0-hmac-sha256-v1" },
         "key_id": { "$ref": "#/$defs/hmac_key_id" },
-        "contract_version": { "const": "smartkey-g0-hmac-byte-contract-v1" },
-        "vector_set_sha256": { "const": "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f" },
-        "coverage": { "const": "all-refs-domain-serialization-key-id-private-recomputation-v1" },
+        "contract_version": { "const": "smartkey-g0-hmac-byte-contract-v2" },
+        "resource_contract_version": { "const": "smartkey-g0-hmac-resource-contract-v1" },
+        "resource_contract_sha256": { "const": "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab" },
+        "vector_set_sha256": { "const": "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb" },
+        "coverage": { "const": "all-refs-domain-serialization-resource-key-id-private-recomputation-v2" },
         "receipt_sha256": { "$ref": "#/$defs/sha256_nonzero" }
       }
     },
@@ -236,7 +239,9 @@
         "registry_projection_sha256", "baseline_commitment_algorithm",
         "baseline_record_set_sha256", "baseline_external_receipt",
         "hmac_scheme", "hmac_min_key_bytes", "hmac_contract_version",
-        "hmac_domains", "hmac_domain_payload_profiles",
+        "hmac_domains", "hmac_domain_payload_profiles", "hmac_domain_root_types",
+        "hmac_resource_contract_version", "hmac_resource_limits",
+        "hmac_resource_contract_sha256",
         "hmac_scalar_payload_encoding", "hmac_structured_payload_encoding",
         "hmac_input_frame", "hmac_vector_set_sha256",
         "hmac_key_id", "hmac_external_receipt"
@@ -277,7 +282,7 @@
         "baseline_external_receipt": { "$ref": "#/$defs/baseline_external_receipt" },
         "hmac_scheme": { "const": "smartkey-g0-hmac-sha256-v1" },
         "hmac_min_key_bytes": { "const": 32 },
-        "hmac_contract_version": { "const": "smartkey-g0-hmac-byte-contract-v1" },
+        "hmac_contract_version": { "const": "smartkey-g0-hmac-byte-contract-v2" },
         "hmac_domains": { "const": ["value", "event", "metadata", "source_record"] },
         "hmac_domain_payload_profiles": {
           "const": {
@@ -287,10 +292,34 @@
             "source_record": "project_canonical_json_v1"
           }
         },
+        "hmac_domain_root_types": {
+          "const": {
+            "value": "exact_str",
+            "event": "exact_dict",
+            "metadata": "exact_dict",
+            "source_record": "exact_dict"
+          }
+        },
+        "hmac_resource_contract_version": { "const": "smartkey-g0-hmac-resource-contract-v1" },
+        "hmac_resource_limits": {
+          "const": {
+            "max_raw_utf8_bytes": 262144,
+            "max_canonical_payload_bytes": 65536,
+            "max_lexical_nesting_depth": 32,
+            "max_typed_nesting_depth": 32,
+            "max_total_nodes": 4096,
+            "max_array_members": 1024,
+            "max_object_members": 512,
+            "max_string_utf8_bytes": 65528,
+            "max_key_utf8_bytes": 1024,
+            "max_integer_token_digits": 16
+          }
+        },
+        "hmac_resource_contract_sha256": { "const": "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab" },
         "hmac_scalar_payload_encoding": { "const": "exact-utf8-scalar-no-normalization-v1" },
         "hmac_structured_payload_encoding": { "const": "smartkey-g0-canonical-json-v1" },
         "hmac_input_frame": { "const": "ascii-scheme-nul-domain-nul-u64be-length-payload-v1" },
-        "hmac_vector_set_sha256": { "const": "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f" },
+        "hmac_vector_set_sha256": { "const": "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb" },
         "hmac_key_id": { "$ref": "#/$defs/hmac_key_id" },
         "hmac_external_receipt": { "$ref": "#/$defs/hmac_external_receipt" }
       }

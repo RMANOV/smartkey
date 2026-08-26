@@ -758,7 +758,7 @@ def _synthetic_r2_doc() -> dict:
             },
             "hmac_scheme": "smartkey-g0-hmac-sha256-v1",
             "hmac_min_key_bytes": 32,
-            "hmac_contract_version": "smartkey-g0-hmac-byte-contract-v1",
+            "hmac_contract_version": "smartkey-g0-hmac-byte-contract-v2",
             "hmac_domains": ["value", "event", "metadata", "source_record"],
             "hmac_domain_payload_profiles": {
                 "value": "scalar_utf8",
@@ -766,23 +766,50 @@ def _synthetic_r2_doc() -> dict:
                 "metadata": "project_canonical_json_v1",
                 "source_record": "project_canonical_json_v1",
             },
+            "hmac_domain_root_types": {
+                "value": "exact_str",
+                "event": "exact_dict",
+                "metadata": "exact_dict",
+                "source_record": "exact_dict",
+            },
+            "hmac_resource_contract_version": ("smartkey-g0-hmac-resource-contract-v1"),
+            "hmac_resource_limits": {
+                "max_raw_utf8_bytes": 262_144,
+                "max_canonical_payload_bytes": 65_536,
+                "max_lexical_nesting_depth": 32,
+                "max_typed_nesting_depth": 32,
+                "max_total_nodes": 4_096,
+                "max_array_members": 1_024,
+                "max_object_members": 512,
+                "max_string_utf8_bytes": 65_528,
+                "max_key_utf8_bytes": 1_024,
+                "max_integer_token_digits": 16,
+            },
+            "hmac_resource_contract_sha256": (
+                "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab"
+            ),
             "hmac_scalar_payload_encoding": ("exact-utf8-scalar-no-normalization-v1"),
             "hmac_structured_payload_encoding": "smartkey-g0-canonical-json-v1",
             "hmac_input_frame": ("ascii-scheme-nul-domain-nul-u64be-length-payload-v1"),
             "hmac_vector_set_sha256": (
-                "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f"
+                "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
             ),
             "hmac_key_id": _R4_SYNTHETIC_KEY_ID,
             "hmac_external_receipt": {
                 "state": "externally_verified",
                 "scheme": "smartkey-g0-hmac-sha256-v1",
                 "key_id": _R4_SYNTHETIC_KEY_ID,
-                "contract_version": "smartkey-g0-hmac-byte-contract-v1",
+                "contract_version": "smartkey-g0-hmac-byte-contract-v2",
+                "resource_contract_version": ("smartkey-g0-hmac-resource-contract-v1"),
+                "resource_contract_sha256": (
+                    "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab"
+                ),
                 "vector_set_sha256": (
-                    "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f"
+                    "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
                 ),
                 "coverage": (
-                    "all-refs-domain-serialization-key-id-private-recomputation-v1"
+                    "all-refs-domain-serialization-resource-key-id-private-"
+                    "recomputation-v2"
                 ),
                 "receipt_sha256": _synthetic_opaque_ref("r4:hmac-receipt"),
             },
@@ -2476,20 +2503,27 @@ _R5_VECTORS = (
             "count": 2,
             "event": "synthetic",
             "parts": ["alpha", None, {"ok": False}],
+            "unit_separator": "\x1f",
+            "\ue000": "bmp",
+            "\U00010000": "astral",
         },
         "payload_hex": (
             "7b22616374697665223a747275652c22636f756e74223a322c226576656e7422"
             "3a2273796e746865746963222c227061727473223a5b22616c706861222c6e75"
-            "6c6c2c7b226f6b223a66616c73657d5d7d"
+            "6c6c2c7b226f6b223a66616c73657d5d2c22756e69745f736570617261746f"
+            "72223a225c7530303166222c22ee8080223a22626d70222c22f0908080223a22"
+            "61737472616c227d"
         ),
         "frame_hex": (
             "736d6172746b65792d67302d686d61632d7368613235362d7631006576656e74"
-            "0000000000000000517b22616374697665223a747275652c22636f756e74223a"
+            "0000000000000000877b22616374697665223a747275652c22636f756e74223a"
             "322c226576656e74223a2273796e746865746963222c227061727473223a5b22"
-            "616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d7d"
+            "616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d2c22756e6974"
+            "5f736570617261746f72223a225c7530303166222c22ee8080223a22626d7022"
+            "2c22f0908080223a2261737472616c227d"
         ),
         "mac_sha256": (
-            "15fe13ea61be04ae11ad44f24bdffb2bc15bf3ad4086686a9a816f2c432ea319"
+            "800c5952070ce32356a99537c95d2eeec515a854a7356379623d5ae4001ae94d"
         ),
     },
     {
@@ -2539,7 +2573,7 @@ _R5_VECTORS = (
     },
 )
 _R5_VECTOR_SET_SHA256 = (
-    "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f"
+    "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
 )
 
 
@@ -2722,5 +2756,667 @@ def test_g0_r5_local_projection_reseal_cannot_relax_payload_profiles():
     doc["adjudication_contract"]["hmac_domain_payload_profiles"] = {
         domain: "ambiguous_json" for domain in _R5_DOMAIN_PROFILES
     }
+    _refresh_r3_commitments(doc)
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+# ---------------------------------------- G0 adjudication contract revision 6
+_R6_ERROR_TYPE = "canonical_type"
+_R6_ERROR_SYNTAX = "canonical_syntax"
+_R6_ERROR_BOUNDS = "canonical_bounds"
+_R6_ERROR_RESOURCE = "canonical_resource"
+_R6_ERROR_DEPTH = "canonical_depth"
+_R6_ERROR_CYCLE = "canonical_cycle"
+_R6_ERROR_ROOT = "canonical_root"
+_R6_ERROR_INTERNAL = "canonical_internal"
+_R6_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v2"
+_R6_RESOURCE_VERSION = "smartkey-g0-hmac-resource-contract-v1"
+_R6_RESOURCE_LIMITS = {
+    "max_raw_utf8_bytes": 262_144,
+    "max_canonical_payload_bytes": 65_536,
+    "max_lexical_nesting_depth": 32,
+    "max_typed_nesting_depth": 32,
+    "max_total_nodes": 4_096,
+    "max_array_members": 1_024,
+    "max_object_members": 512,
+    "max_string_utf8_bytes": 65_528,
+    "max_key_utf8_bytes": 1_024,
+    "max_integer_token_digits": 16,
+}
+_R6_DOMAIN_ROOT_TYPES = {
+    "value": "exact_str",
+    "event": "exact_dict",
+    "metadata": "exact_dict",
+    "source_record": "exact_dict",
+}
+_R6_RESOURCE_SHA256 = "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab"
+_R6_VECTOR_SET_SHA256 = (
+    "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
+)
+_R6_EVENT_VALUE = {
+    "active": True,
+    "count": 2,
+    "event": "synthetic",
+    "parts": ["alpha", None, {"ok": False}],
+    "unit_separator": "\x1f",
+    "\ue000": "bmp",
+    "\U00010000": "astral",
+}
+_R6_EVENT_PAYLOAD_HEX = (
+    "7b22616374697665223a747275652c22636f756e74223a322c226576656e7422"
+    "3a2273796e746865746963222c227061727473223a5b22616c706861222c6e75"
+    "6c6c2c7b226f6b223a66616c73657d5d2c22756e69745f736570617261746f"
+    "72223a225c7530303166222c22ee8080223a22626d70222c22f0908080223a22"
+    "61737472616c227d"
+)
+_R6_EVENT_FRAME_HEX = (
+    "736d6172746b65792d67302d686d61632d7368613235362d7631006576656e74"
+    "0000000000000000877b22616374697665223a747275652c22636f756e74223a"
+    "322c226576656e74223a2273796e746865746963222c227061727473223a5b22"
+    "616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d2c22756e6974"
+    "5f736570617261746f72223a225c7530303166222c22ee8080223a22626d7022"
+    "2c22f0908080223a2261737472616c227d"
+)
+_R6_EVENT_MAC = "800c5952070ce32356a99537c95d2eeec515a854a7356379623d5ae4001ae94d"
+
+
+class _R6BenignInt(int):
+    pass
+
+
+class _R6BenignStr(str):
+    pass
+
+
+class _R6BenignList(list):
+    pass
+
+
+class _R6BenignDict(dict):
+    pass
+
+
+class _R6HostileInt(int):
+    def __new__(cls, value):
+        instance = int.__new__(cls, value)
+        instance.touched = False
+        return instance
+
+    def _trip(self, *_args, **_kwargs):
+        self.touched = True
+        raise RuntimeError("hostile integer override executed")
+
+    __abs__ = _trip
+    __int__ = _trip
+    __index__ = _trip
+    __str__ = _trip
+
+
+class _R6HostileStr(str):
+    def __new__(cls, value, *, armed=True):
+        instance = str.__new__(cls, value)
+        instance.armed = armed
+        instance.touched = False
+        return instance
+
+    def _trip(self, *_args, **_kwargs):
+        if self.armed:
+            self.touched = True
+            raise RuntimeError("hostile string override executed")
+        return None
+
+    def __iter__(self):
+        self._trip()
+        return str.__iter__(self)
+
+    def __len__(self):
+        self._trip()
+        return str.__len__(self)
+
+    def encode(self, *args, **kwargs):
+        self._trip()
+        return str.encode(self, *args, **kwargs)
+
+    def __hash__(self):
+        if self.armed:
+            self._trip()
+        return str.__hash__(self)
+
+    def __lt__(self, other):
+        self._trip()
+        return str.__lt__(self, other)
+
+
+class _R6HostileList(list):
+    def __init__(self, value):
+        list.__init__(self, value)
+        self.touched = False
+
+    def _trip(self, *_args, **_kwargs):
+        self.touched = True
+        raise RuntimeError("hostile list override executed")
+
+    __iter__ = _trip
+    __len__ = _trip
+    __getitem__ = _trip
+
+
+class _R6HostileDict(dict):
+    def __init__(self, value):
+        dict.__init__(self, value)
+        self.touched = False
+
+    def _trip(self, *_args, **_kwargs):
+        self.touched = True
+        raise RuntimeError("hostile dict override executed")
+
+    __iter__ = _trip
+    __len__ = _trip
+    __getitem__ = _trip
+    items = _trip
+    keys = _trip
+
+
+def _r6_value_contains_marker(value, marker: str, seen: set[int] | None = None) -> bool:
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    if isinstance(value, str):
+        return str.__contains__(value, marker)
+    if isinstance(value, bytes):
+        return bytes.__contains__(value, marker.encode("utf-8"))
+    if isinstance(value, tuple):
+        return any(_r6_value_contains_marker(item, marker, seen) for item in value)
+    if isinstance(value, list):
+        return any(
+            _r6_value_contains_marker(item, marker, seen)
+            for item in list.__iter__(value)
+        )
+    if isinstance(value, dict):
+        return any(
+            _r6_value_contains_marker(key, marker, seen)
+            or _r6_value_contains_marker(item, marker, seen)
+            for key, item in dict.items(value)
+        )
+    try:
+        attributes = object.__getattribute__(value, "__dict__")
+    except (AttributeError, TypeError):
+        return False
+    return _r6_value_contains_marker(attributes, marker, seen)
+
+
+def _r6_clean_error(call, expected_code: str, marker: str | None = None):
+    with pytest.raises(V.CanonicalJsonError) as caught:
+        call()
+    error = caught.value
+    assert error.args == (expected_code,)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    if marker is not None:
+        assert not _r6_value_contains_marker(error.args, marker)
+        assert not _r6_value_contains_marker(vars(error), marker)
+        traceback_cursor = error.__traceback__
+        while traceback_cursor is not None:
+            frame = traceback_cursor.tb_frame
+            if Path(frame.f_code.co_filename).resolve() != Path(__file__).resolve():
+                assert not _r6_value_contains_marker(frame.f_locals, marker)
+            traceback_cursor = traceback_cursor.tb_next
+    return error
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        _R6BenignInt(1),
+        _R6BenignStr("synthetic"),
+        _R6BenignList([None]),
+        _R6BenignDict({"key": None}),
+    ],
+)
+def test_g0_r6_typed_encoder_rejects_every_benign_builtin_subclass(value):
+    _r6_clean_error(lambda: V.canonical_structured_payload_bytes(value), _R6_ERROR_TYPE)
+
+
+def test_g0_r6_raw_parser_requires_exact_builtin_string():
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json(_R6BenignStr("{}")),
+        _R6_ERROR_TYPE,
+    )
+
+
+def test_g0_r6_scalar_value_requires_exact_builtin_string():
+    _r6_clean_error(
+        lambda: V.hmac_payload_bytes("value", _R6BenignStr("synthetic")),
+        _R6_ERROR_TYPE,
+    )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: _R6HostileInt(1),
+        lambda: _R6HostileStr("private_hostile_marker"),
+        lambda: _R6HostileList([None]),
+        lambda: _R6HostileDict({"key": None}),
+    ],
+)
+def test_g0_r6_hostile_typed_subclass_override_is_never_invoked(factory):
+    value = factory()
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(value),
+        _R6_ERROR_TYPE,
+        "private_hostile_marker",
+    )
+    assert value.touched is False
+
+
+def test_g0_r6_hostile_raw_string_override_is_never_invoked():
+    value = _R6HostileStr('{"private_hostile_marker":null}')
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json(value),
+        _R6_ERROR_TYPE,
+        "private_hostile_marker",
+    )
+    assert value.touched is False
+
+
+def test_g0_r6_hostile_scalar_string_override_is_never_invoked():
+    value = _R6HostileStr("private_hostile_marker")
+    _r6_clean_error(
+        lambda: V.hmac_payload_bytes("value", value),
+        _R6_ERROR_TYPE,
+        "private_hostile_marker",
+    )
+    assert value.touched is False
+
+
+def test_g0_r6_hostile_dictionary_key_override_is_never_invoked():
+    key = _R6HostileStr("private_hostile_marker", armed=False)
+    value = {key: None}
+    key.armed = True
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(value),
+        _R6_ERROR_TYPE,
+        "private_hostile_marker",
+    )
+    assert key.touched is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_code"),
+    [
+        ('{"private_raw_marker":', _R6_ERROR_SYNTAX),
+        ('{"key":"private_raw_marker","key":null}', _R6_ERROR_SYNTAX),
+        ("-0", _R6_ERROR_BOUNDS),
+        ("1.0", _R6_ERROR_BOUNDS),
+        ("NaN", _R6_ERROR_BOUNDS),
+        ("Infinity", _R6_ERROR_BOUNDS),
+        ("-Infinity", _R6_ERROR_BOUNDS),
+        ("9007199254740992", _R6_ERROR_BOUNDS),
+    ],
+)
+def test_g0_r6_raw_failures_are_fixed_nonreflective_errors(raw, expected_code):
+    marker = "private_raw_marker" if "private_raw_marker" in raw else None
+    _r6_clean_error(lambda: V.parse_project_canonical_json(raw), expected_code, marker)
+
+
+def test_g0_r6_typed_failure_drops_sensitive_traceback_locals():
+    value = {"key": "private_typed_marker\ud800"}
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(value),
+        _R6_ERROR_TYPE,
+        "private_typed_marker",
+    )
+
+
+def test_g0_r6_cycle_failure_is_normalized_and_nonreflective():
+    value = {"private_cycle_marker": []}
+    value["private_cycle_marker"].append(value)
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(value),
+        _R6_ERROR_CYCLE,
+        "private_cycle_marker",
+    )
+
+
+def test_g0_r6_unexpected_scanner_failure_is_normalized_and_nonreflective(monkeypatch):
+    def fail_scanner(_text):
+        raise RuntimeError("private_internal_marker")
+
+    monkeypatch.setattr(V, "_scan_raw_resources", fail_scanner)
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json('{"private_internal_marker":null}'),
+        _R6_ERROR_INTERNAL,
+        "private_internal_marker",
+    )
+
+
+def test_g0_r6_unexpected_encoder_failure_is_normalized_and_nonreflective(monkeypatch):
+    def fail_encoder(_value, _output, _state, _depth):
+        raise RuntimeError("private_internal_marker")
+
+    monkeypatch.setattr(V, "_encode_typed_value", fail_encoder)
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes({"private_internal_marker": None}),
+        _R6_ERROR_INTERNAL,
+        "private_internal_marker",
+    )
+
+
+def test_g0_r6_unexpected_scalar_failure_is_normalized_and_nonreflective(monkeypatch):
+    def fail_scalar(_char):
+        raise RuntimeError("private_internal_marker")
+
+    monkeypatch.setattr(V, "ord", fail_scalar, raising=False)
+    _r6_clean_error(
+        lambda: V.hmac_payload_bytes("value", "private_internal_marker"),
+        _R6_ERROR_INTERNAL,
+        "private_internal_marker",
+    )
+
+
+def _r6_nested_dict(depth: int):
+    value = None
+    for _index in range(depth):
+        value = {"x": value}
+    return value
+
+
+def _r6_node_boundary(extra_node: bool):
+    lengths = [1_024, 1_024, 1_024, 1_015 + int(extra_node)]
+    return {f"k{index}": [None] * length for index, length in enumerate(lengths)}
+
+
+def test_g0_r6_resource_contract_constants_are_exact():
+    assert V.HMAC_CONTRACT_VERSION == _R6_CONTRACT_VERSION
+    assert V.HMAC_RESOURCE_CONTRACT_VERSION == _R6_RESOURCE_VERSION
+    assert V.HMAC_RESOURCE_LIMITS == _R6_RESOURCE_LIMITS
+    assert V.HMAC_DOMAIN_ROOT_TYPES == _R6_DOMAIN_ROOT_TYPES
+    assert V.HMAC_RESOURCE_CONTRACT_SHA256 == _R6_RESOURCE_SHA256
+    encoded = json.dumps(
+        {
+            "version": _R6_RESOURCE_VERSION,
+            "domain_root_types": _R6_DOMAIN_ROOT_TYPES,
+            "limits": _R6_RESOURCE_LIMITS,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    assert hashlib.sha256(encoded).hexdigest() == _R6_RESOURCE_SHA256
+
+
+def test_g0_r6_raw_utf8_byte_boundary_passes_and_plus_one_fails():
+    maximum = _R6_RESOURCE_LIMITS["max_raw_utf8_bytes"]
+    at_limit = "{}" + " " * (maximum - 2)
+    assert V.parse_project_canonical_json(at_limit) == {}
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json(at_limit + " "), _R6_ERROR_RESOURCE
+    )
+    multibyte_value = "é" * 32_764
+    multibyte = json.dumps(multibyte_value, ensure_ascii=False)
+    multibyte += " " * (maximum - len(multibyte.encode("utf-8")))
+    assert len(multibyte.encode("utf-8")) == maximum
+    assert V.parse_project_canonical_json(multibyte) == multibyte_value
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json(multibyte + " "),
+        _R6_ERROR_RESOURCE,
+    )
+
+
+def test_g0_r6_string_and_canonical_payload_boundary_passes_plus_one_fails():
+    maximum = _R6_RESOURCE_LIMITS["max_string_utf8_bytes"]
+    payload = V.canonical_structured_payload_bytes({"x": "a" * maximum})
+    assert len(payload) == _R6_RESOURCE_LIMITS["max_canonical_payload_bytes"]
+    assert V.parse_project_canonical_json(payload.decode("ascii")) == {
+        "x": "a" * maximum
+    }
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes({"x": "a" * (maximum + 1)}),
+        _R6_ERROR_RESOURCE,
+    )
+
+    at_payload_limit = {"a": "a" * 32_760, "b": "b" * 32_761}
+    assert len(V.canonical_structured_payload_bytes(at_payload_limit)) == 65_536
+    over_payload_limit = {"a": "a" * 32_760, "b": "b" * 32_762}
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(over_payload_limit),
+        _R6_ERROR_RESOURCE,
+    )
+
+
+def test_g0_r6_key_byte_boundary_passes_and_plus_one_fails():
+    maximum = _R6_RESOURCE_LIMITS["max_key_utf8_bytes"]
+    assert V.canonical_structured_payload_bytes({"k" * maximum: None})
+    raw_at_limit = json.dumps({"k" * maximum: None}, separators=(",", ":"))
+    assert V.parse_project_canonical_json(raw_at_limit) == {"k" * maximum: None}
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes({"k" * (maximum + 1): None}),
+        _R6_ERROR_RESOURCE,
+    )
+
+
+def test_g0_r6_array_member_boundary_passes_and_plus_one_fails_raw_and_typed():
+    maximum = _R6_RESOURCE_LIMITS["max_array_members"]
+    assert V.canonical_structured_payload_bytes({"items": [None] * maximum})
+    raw_at_limit = "[" + ",".join("null" for _index in range(maximum)) + "]"
+    assert len(V.parse_project_canonical_json(raw_at_limit)) == maximum
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes({"items": [None] * (maximum + 1)}),
+        _R6_ERROR_RESOURCE,
+    )
+    raw = "[" + ",".join("null" for _index in range(maximum + 1)) + "]"
+    _r6_clean_error(lambda: V.parse_project_canonical_json(raw), _R6_ERROR_RESOURCE)
+
+
+def test_g0_r6_object_member_boundary_passes_and_plus_one_fails_raw_and_typed():
+    maximum = _R6_RESOURCE_LIMITS["max_object_members"]
+    at_limit = {f"k{index}": None for index in range(maximum)}
+    assert V.canonical_structured_payload_bytes(at_limit)
+    raw_at_limit = json.dumps(at_limit, separators=(",", ":"), sort_keys=True)
+    assert V.parse_project_canonical_json(raw_at_limit) == at_limit
+    over_limit = {f"k{index}": None for index in range(maximum + 1)}
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(over_limit),
+        _R6_ERROR_RESOURCE,
+    )
+    raw = json.dumps(over_limit, separators=(",", ":"), sort_keys=True)
+    _r6_clean_error(lambda: V.parse_project_canonical_json(raw), _R6_ERROR_RESOURCE)
+
+
+def test_g0_r6_total_node_boundary_passes_and_plus_one_fails():
+    at_limit = _r6_node_boundary(False)
+    assert V.canonical_structured_payload_bytes(at_limit)
+    assert (
+        V.parse_project_canonical_json(json.dumps(at_limit, separators=(",", ":")))
+        == at_limit
+    )
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(_r6_node_boundary(True)),
+        _R6_ERROR_RESOURCE,
+    )
+    raw_over_limit = json.dumps(_r6_node_boundary(True), separators=(",", ":"))
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json(raw_over_limit), _R6_ERROR_RESOURCE
+    )
+
+
+def test_g0_r6_depth_boundary_passes_and_plus_one_fails_raw_and_typed():
+    maximum = _R6_RESOURCE_LIMITS["max_typed_nesting_depth"]
+    at_limit = _r6_nested_dict(maximum)
+    assert V.canonical_structured_payload_bytes(at_limit)
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(_r6_nested_dict(maximum + 1)),
+        _R6_ERROR_DEPTH,
+    )
+    assert (
+        V.parse_project_canonical_json(json.dumps(at_limit, separators=(",", ":")))
+        == at_limit
+    )
+    raw_over_limit = json.dumps(_r6_nested_dict(maximum + 1), separators=(",", ":"))
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json(raw_over_limit), _R6_ERROR_DEPTH
+    )
+
+
+@pytest.mark.parametrize("digits", [4_300, 4_301])
+def test_g0_r6_python_integer_threshold_inputs_are_preflight_bounded(digits):
+    raw = "9" * digits
+    _r6_clean_error(lambda: V.parse_project_canonical_json(raw), _R6_ERROR_RESOURCE)
+
+
+def test_g0_r6_safe_integer_boundary_passes_and_next_value_is_bounded():
+    assert V.parse_project_canonical_json("9007199254740991") == 9_007_199_254_740_991
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json("9007199254740992"),
+        _R6_ERROR_BOUNDS,
+    )
+
+
+def test_g0_r6_shallow_huge_inputs_fail_with_contract_errors():
+    raw = " " * 1_000_000
+    _r6_clean_error(lambda: V.parse_project_canonical_json(raw), _R6_ERROR_RESOURCE)
+    huge_string = "x" * 1_000_000
+    _r6_clean_error(
+        lambda: V.parse_project_canonical_json(json.dumps(huge_string)),
+        _R6_ERROR_RESOURCE,
+    )
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(huge_string),
+        _R6_ERROR_RESOURCE,
+    )
+    typed = [None] * 100_000
+    _r6_clean_error(
+        lambda: V.canonical_structured_payload_bytes(typed), _R6_ERROR_RESOURCE
+    )
+
+
+@pytest.mark.parametrize("domain", ["event", "metadata", "source_record"])
+@pytest.mark.parametrize("value", [None, True, 1, "synthetic", []])
+def test_g0_r6_structured_hmac_domains_require_exact_dict_root(domain, value):
+    _r6_clean_error(lambda: V.hmac_payload_bytes(domain, value), _R6_ERROR_ROOT)
+
+
+@pytest.mark.parametrize("domain", ["event", "metadata", "source_record"])
+def test_g0_r6_structured_hmac_root_rejects_hostile_dict_subclass(domain):
+    value = _R6HostileDict({"private_hostile_marker": None})
+    _r6_clean_error(
+        lambda: V.hmac_payload_bytes(domain, value),
+        _R6_ERROR_ROOT,
+        "private_hostile_marker",
+    )
+    assert value.touched is False
+
+
+@pytest.mark.parametrize("domain", ["event", "metadata", "source_record"])
+def test_g0_r6_structured_hmac_domains_accept_nested_scalars_and_arrays(domain):
+    value = {"nested": [None, True, 1, "synthetic", {"ok": False}]}
+    assert V.hmac_payload_bytes(domain, value).startswith(b'{"nested":[')
+
+
+def test_g0_r6_event_vector_pins_codepoint_order_control_escape_frame_and_mac():
+    payload = V.hmac_payload_bytes("event", _R6_EVENT_VALUE)
+    frame = V.hmac_frame_bytes("event", _R6_EVENT_VALUE)
+    assert payload.hex() == _R6_EVENT_PAYLOAD_HEX
+    assert frame.hex() == _R6_EVENT_FRAME_HEX
+    assert hmac.new(_R5_PUBLIC_VECTOR_KEY, frame, hashlib.sha256).hexdigest() == (
+        _R6_EVENT_MAC
+    )
+    assert payload.index("\ue000".encode("utf-8")) < payload.index(
+        "\U00010000".encode("utf-8")
+    )
+    assert b"\\u001f" in payload
+
+
+def test_g0_r6_node_explicit_codepoint_sort_matches_and_default_sort_fails():
+    script = r"""
+const value = {
+  active: true,
+  count: 2,
+  event: "synthetic",
+  parts: ["alpha", null, {ok: false}],
+  unit_separator: "\u001f",
+  "\uE000": "bmp",
+  "\u{10000}": "astral",
+};
+const compareCodePoints = (left, right) => {
+  const a = Array.from(left, char => char.codePointAt(0));
+  const b = Array.from(right, char => char.codePointAt(0));
+  for (let index = 0; index < Math.min(a.length, b.length); index++) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return a.length - b.length;
+};
+const encode = (item, comparator) => {
+  if (item === null || typeof item !== "object") return JSON.stringify(item);
+  if (Array.isArray(item)) return "[" + item.map(v => encode(v, comparator)).join(",") + "]";
+  return "{" + Object.keys(item).sort(comparator).map(
+    key => JSON.stringify(key) + ":" + encode(item[key], comparator)
+  ).join(",") + "}";
+};
+process.stdout.write(
+  Buffer.from(encode(value, compareCodePoints)).toString("hex") + "\n" +
+  Buffer.from(encode(value, undefined)).toString("hex") + "\n"
+);
+"""
+    result = subprocess.run(
+        ["node", "-e", script], check=True, capture_output=True, text=True
+    )
+    explicit_hex, default_hex = result.stdout.splitlines()
+    assert explicit_hex == _R6_EVENT_PAYLOAD_HEX
+    assert default_hex != _R6_EVENT_PAYLOAD_HEX
+
+
+def test_g0_r6_vector_set_and_sealed_resource_receipt_are_pinned():
+    assert V.HMAC_VECTOR_SET_SHA256 == _R6_VECTOR_SET_SHA256
+    doc = _synthetic_r2_doc()
+    contract = doc["adjudication_contract"]
+    assert contract.get("hmac_contract_version") == _R6_CONTRACT_VERSION
+    assert contract.get("hmac_resource_contract_version") == _R6_RESOURCE_VERSION
+    assert contract.get("hmac_resource_limits") == _R6_RESOURCE_LIMITS
+    assert contract.get("hmac_domain_root_types") == _R6_DOMAIN_ROOT_TYPES
+    assert contract.get("hmac_resource_contract_sha256") == _R6_RESOURCE_SHA256
+    assert contract.get("hmac_vector_set_sha256") == _R6_VECTOR_SET_SHA256
+    receipt = contract["hmac_external_receipt"]
+    assert receipt.get("contract_version") == _R6_CONTRACT_VERSION
+    assert receipt.get("resource_contract_version") == _R6_RESOURCE_VERSION
+    assert receipt.get("resource_contract_sha256") == _R6_RESOURCE_SHA256
+    assert receipt.get("vector_set_sha256") == _R6_VECTOR_SET_SHA256
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("hmac_resource_contract_version", "unversioned"),
+        ("hmac_resource_limits", {**_R6_RESOURCE_LIMITS, "max_total_nodes": 4_097}),
+        ("hmac_domain_root_types", {**_R6_DOMAIN_ROOT_TYPES, "event": "any"}),
+        ("hmac_resource_contract_sha256", "f" * 64),
+        ("hmac_vector_set_sha256", "f" * 64),
+    ],
+)
+def test_g0_r6_local_projection_reseal_cannot_tamper_contract(field, replacement):
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"][field] = replacement
+    _refresh_r3_commitments(doc)
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("contract_version", "unversioned"),
+        ("resource_contract_version", "unversioned"),
+        ("resource_contract_sha256", "f" * 64),
+        ("vector_set_sha256", "f" * 64),
+    ],
+)
+def test_g0_r6_external_receipt_cannot_tamper_resource_or_vector_contract(
+    field, replacement
+):
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"]["hmac_external_receipt"][field] = replacement
     _refresh_r3_commitments(doc)
     assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))

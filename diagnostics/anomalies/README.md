@@ -194,7 +194,7 @@ pinned `key_id`. A MAC suffix cannot be reused across domains or key epochs;
 an identical same-domain reference may be shared where several mappings cite
 the same source.
 
-The byte contract is pinned as `smartkey-g0-hmac-byte-contract-v1`. The future
+The byte contract is pinned as `smartkey-g0-hmac-byte-contract-v2`. The future
 private importer uses one cryptographically random key of at least 32 bytes,
 stored only in its mode-`0600` private corpus — never in this repository,
 debate messages or logs. The complete domain inventory is deliberately small
@@ -202,10 +202,10 @@ and contains no floating-point payload:
 
 | domain | payload profile | imported value shape |
 |---|---|---|
-| `value` | `scalar_utf8` | one Unicode-scalar string, encoded as its exact UTF-8 bytes without normalization |
-| `event` | `project_canonical_json_v1` | event identity/evidence envelope |
-| `metadata` | `project_canonical_json_v1` | metadata/receipt envelope |
-| `source_record` | `project_canonical_json_v1` | source identity/evidence envelope |
+| `value` | `scalar_utf8` | one exact built-in Unicode-scalar `str`, encoded as its exact UTF-8 bytes without normalization |
+| `event` | `project_canonical_json_v1` | one exact built-in `dict` event identity/evidence envelope |
+| `metadata` | `project_canonical_json_v1` | one exact built-in `dict` metadata/receipt envelope |
+| `source_record` | `project_canonical_json_v1` | one exact built-in `dict` source identity/evidence envelope |
 
 The three structured envelopes need only null, booleans, safe integers,
 Unicode-scalar strings, arrays and string-key objects. They use
@@ -224,11 +224,71 @@ RFC 8785/JCS compatibility:
    `\b`, `\t`, `\n`, `\f`, `\r`; other U+0000–U+001F controls use lowercase
    `\u00xx`. Slash is not escaped. Every other Unicode scalar is emitted
    literally and the final text is UTF-8 encoded. Lone surrogates are rejected.
-4. A raw importer must first call `parse_project_canonical_json`, which sees
-   and rejects duplicate keys and textual `-0` before parsing erases that
-   information. `canonical_structured_payload_bytes` is a separate typed-value
-   encoder: it rejects unsupported typed values but cannot recover duplicate
-   keys or numeric spelling already discarded by another parser.
+4. A raw importer must first call `parse_project_canonical_json` with an exact
+   built-in `str`. It sees and rejects duplicate keys and textual `-0` before
+   parsing erases that information. `canonical_structured_payload_bytes` is a
+   separate typed-value encoder: it accepts only exact built-in `None`, `bool`,
+   `int`, `str`, `list` and `dict` values with exact built-in `str` keys. It
+   cannot recover duplicate keys or numeric spelling already discarded by
+   another parser. Subclasses are rejected before any overridden method can be
+   invoked.
+5. HMAC payloads add a root-shape gate: `value` is an exact built-in `str`,
+   while `event`, `metadata` and `source_record` are exact built-in `dict`
+   envelopes. Arrays and the other supported scalar types remain valid only
+   below a structured root.
+
+The resource profile is independently pinned as
+`smartkey-g0-hmac-resource-contract-v1`. The schema lane inventories one
+scalar value and three per-reference object envelopes; it does not authorize
+placing the complete 111-record projection in a single payload. Those objects
+carry bounded identifiers, enum-like metadata, safe integer counters and
+short arrays/objects. The published 159-reference and 111-record cardinalities
+remain well below the container/node ceilings, while byte ceilings leave
+substantial room for future envelope fields without permitting unbounded
+materialization:
+
+The inventory used for those ceilings is public structure, not private corpus
+measurement: a record has 28 declared fields, an adjudication has 12, the
+longest declared field name is 27 UTF-8 bytes, a typed HMAC ref is at most 138
+bytes, a registry token is at most 40 Unicode scalars (160 UTF-8 bytes at the
+worst scalar width), the sealed import has exactly 159 adjudication refs,
+and the deepest current record/adjudication shape is four containers. Thus the
+member, key/string, array and depth limits provide at least 18x, 37x/409x,
+6.4x and 8x headroom respectively. There is no real importer or private-data
+measurement in this schema-only lane; integration must prove each reviewed
+envelope fits these public limits or revise and independently re-receipt the
+contract rather than silently widening it.
+
+| resource | exact public limit |
+|---|---:|
+| raw JSON UTF-8 bytes | 262,144 |
+| canonical payload bytes | 65,536 |
+| lexical nesting depth before parsing | 32 |
+| typed nesting depth | 32 |
+| total nodes, including object keys | 4,096 |
+| members in one array | 1,024 |
+| members in one object | 512 |
+| one string's UTF-8 bytes | 65,528 |
+| one key's UTF-8 bytes | 1,024 |
+| digits in one raw integer token | 16 |
+
+The raw boundary counts UTF-8 bytes, lexical depth, nodes, members, decoded
+string/key bytes and integer digits before `json.loads` can materialize a
+container or integer. The typed encoder walks with explicit node/depth/member
+budgets and appends to a byte buffer only while the canonical-payload budget
+remains. Boundary values are contractual; every `+1` case fails closed.
+Malformed input, duplicate keys, unsupported types/numbers, resource excess,
+depth excess, cycles, bad roots and unexpected internals become one of the
+fixed non-reflective codes `canonical_syntax`, `canonical_type`,
+`canonical_bounds`, `canonical_resource`, `canonical_depth`,
+`canonical_cycle`, `canonical_root` or `canonical_internal`. The public
+exception is raised from a clean helper after the private parser/encoder has
+discarded raw values, typed containers and internal decoder exceptions; it has
+no cause or context and never echoes a value or key.
+
+The resource-contract digest is SHA-256 over compact sorted-key ASCII JSON of
+its version, exact domain-root map and limit map:
+`50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab`.
 
 The exact MAC input is the concatenation of:
 
@@ -247,9 +307,9 @@ independent re-derivation and re-receipting of every reference. The public
 validator checks scheme/domain syntax, pinned-key consistency and
 cross-domain/key-epoch suffix reuse; it cannot prove secret derivation. The
 external private receipt must recompute every reference, domain, serialization
-choice and key ID. It must bind the byte-contract version, the exact domain
-profile map and vector-set receipt
-`50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f`.
+choice and key ID. It must bind the byte-contract version, exact domain profile
+and root maps, resource-contract version and digest, and vector-set receipt
+`7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb`.
 
 ### Public synthetic interoperability vectors
 
@@ -266,7 +326,7 @@ for the scalar first row, are:
 
 ```text
 value_non_ascii = café
-event_nested = {"active":true,"count":2,"event":"synthetic","parts":["alpha",null,{"ok":false}]}
+event_nested = {"active":true,"count":2,"event":"synthetic","parts":["alpha",null,{"ok":false}],"unit_separator":"\u001f","\ue000":"bmp","\ud800\udc00":"astral"}
 metadata_escaping = {"control":"\b\t\n\f\r\u0000","label":"café","quote":"\"\\/"}
 source_record_integer_edges = {"max":9007199254740991,"min":-9007199254740991,"records":[1,0,-1]}
 ```
@@ -274,7 +334,7 @@ source_record_integer_edges = {"max":9007199254740991,"min":-9007199254740991,"r
 | name / domain / profile | payload hex | complete framed-input hex | HMAC-SHA256 |
 |---|---|---|---|
 | `value_non_ascii` / `value` / `scalar_utf8` | `636166c3a9` | `736d6172746b65792d67302d686d61632d7368613235362d76310076616c7565000000000000000005636166c3a9` | `134f37d80a6cf037adb96d129c300af20c98ecd25c325fa99bb0c43791a5fda1` |
-| `event_nested` / `event` / `project_canonical_json_v1` | `7b22616374697665223a747275652c22636f756e74223a322c226576656e74223a2273796e746865746963222c227061727473223a5b22616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d7d` | `736d6172746b65792d67302d686d61632d7368613235362d7631006576656e740000000000000000517b22616374697665223a747275652c22636f756e74223a322c226576656e74223a2273796e746865746963222c227061727473223a5b22616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d7d` | `15fe13ea61be04ae11ad44f24bdffb2bc15bf3ad4086686a9a816f2c432ea319` |
+| `event_nested` / `event` / `project_canonical_json_v1` | `7b22616374697665223a747275652c22636f756e74223a322c226576656e74223a2273796e746865746963222c227061727473223a5b22616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d2c22756e69745f736570617261746f72223a225c7530303166222c22ee8080223a22626d70222c22f0908080223a2261737472616c227d` | `736d6172746b65792d67302d686d61632d7368613235362d7631006576656e740000000000000000877b22616374697665223a747275652c22636f756e74223a322c226576656e74223a2273796e746865746963222c227061727473223a5b22616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d2c22756e69745f736570617261746f72223a225c7530303166222c22ee8080223a22626d70222c22f0908080223a2261737472616c227d` | `800c5952070ce32356a99537c95d2eeec515a854a7356379623d5ae4001ae94d` |
 | `metadata_escaping` / `metadata` / `project_canonical_json_v1` | `7b22636f6e74726f6c223a225c625c745c6e5c665c725c7530303030222c226c6162656c223a22636166c3a9222c2271756f7465223a225c225c5c2f227d` | `736d6172746b65792d67302d686d61632d7368613235362d7631006d6574616461746100000000000000003e7b22636f6e74726f6c223a225c625c745c6e5c665c725c7530303030222c226c6162656c223a22636166c3a9222c2271756f7465223a225c225c5c2f227d` | `3c190f2b02d21c5dec8e31ce21c0bd45abdc0187f157f9329d351d5295f667b2` |
 | `source_record_integer_edges` / `source_record` / `project_canonical_json_v1` | `7b226d6178223a393030373139393235343734303939312c226d696e223a2d393030373139393235343734303939312c227265636f726473223a5b312c302c2d315d7d` | `736d6172746b65792d67302d686d61632d7368613235362d763100736f757263655f7265636f72640000000000000000437b226d6178223a393030373139393235343734303939312c226d696e223a2d393030373139393235343734303939312c227265636f726473223a5b312c302c2d315d7d` | `121118ba0fc9558a6870837176a3e5c5fa028522391ab0cc067609a4e3a0630e` |
 
@@ -283,6 +343,12 @@ sorted-key JSON array used in `ibus/test_anomaly_registry.py`; each item binds
 `name`, `domain`, `profile`, `key_id`, `key_hex`, `payload_hex`, `frame_hex`
 and `mac_sha256`. This public set is an interoperability check, not authority
 for private derivation or real imported data.
+
+The event vector deliberately combines U+001F, BMP key U+E000 and astral key
+U+10000. Code-point ordering places U+E000 before U+10000; JavaScript's default
+UTF-16 `.sort()` produces the opposite order and therefore is not compliant.
+Tests pin an explicit Node code-point comparator alongside Python output, and
+OpenSSL independently recomputes each published HMAC.
 
 ## Exact semantic commitment
 
