@@ -109,25 +109,57 @@ def test_r11a_a_valid_exact_11_and_12_key_authority_shapes_remain_green(
 def test_r11a_a_exact_allowed_authority_field_set_is_required_at_valid_sizes(
     include_optional_key,
 ):
-    marker = "synthetic_unexpected_authority_field"
-    adjudication = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
-    if include_optional_key:
-        adjudication["expected_form_status"] = "synthetic-ignored-status"
-        expected_size = 12
-    else:
-        adjudication.pop("expected_form_status", None)
-        expected_size = 11
-    classification = adjudication.pop("classification")
-    adjudication[marker] = classification
-    assert len(adjudication) == expected_size
-    assert all(type(key) is str for key in dict.__iter__(adjudication))
-    assert "classification" not in adjudication
-
-    error, _peak_bytes = _capture_fixed_error(
-        lambda: V.source_record_identity_envelope(R11._source_input(), adjudication)
+    required_fields = (
+        "grain",
+        "ref",
+        "classification",
+        "disposition",
+        "normalized_class",
+        "expected",
+        "causal_confidence",
+        "owner_lane",
+        "privacy_class",
+        "source_refs",
+        "source_event_refs",
     )
+    assert len(required_fields) == len(set(required_fields)) == 11
 
-    _assert_fixed_nonreflective_error(error, _HMAC_ERROR, marker)
+    for index, missing_field in enumerate(required_fields):
+        marker = f"synthetic_unexpected_authority_field_{index:02d}"
+        adjudication = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
+        if include_optional_key:
+            adjudication["expected_form_status"] = "synthetic-ignored-status"
+            expected_size = 12
+        else:
+            adjudication.pop("expected_form_status", None)
+            expected_size = 11
+        replaced_value = adjudication.pop(missing_field)
+        adjudication[marker] = replaced_value
+        assert len(adjudication) == expected_size
+        assert all(type(key) is str for key in dict.__iter__(adjudication))
+        assert missing_field not in adjudication
+
+        error, _peak_bytes = _capture_fixed_error(
+            lambda: V.source_record_identity_envelope(R11._source_input(), adjudication)
+        )
+
+        _assert_fixed_nonreflective_error(error, _HMAC_ERROR, marker)
+
+    if include_optional_key:
+        marker = "synthetic_unexpected_authority_field_11"
+        adjudication = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
+        adjudication.pop("expected_form_status", None)
+        assert (
+            tuple(field for field in required_fields if field not in adjudication) == ()
+        )
+        adjudication[marker] = "synthetic-unknown-twelfth-slot"
+        assert len(adjudication) == 12
+
+        error, _peak_bytes = _capture_fixed_error(
+            lambda: V.source_record_identity_envelope(R11._source_input(), adjudication)
+        )
+
+        _assert_fixed_nonreflective_error(error, _HMAC_ERROR, marker)
 
 
 def test_r11a_a_oversized_exact_authority_keyset_fails_with_bounded_peak():
@@ -397,25 +429,44 @@ def test_r11a_c_multiple_enhanced_markers_deduplicate_to_one_hold():
 
 
 def test_r11a_c_nested_only_markers_in_final_record_emit_one_hold():
-    doc = _legacy_doc()
     markers = (
         "adjudications",
         "fix_evidence",
         "record_origin",
         "baseline_record_sha256",
     )
-    assert "adjudication_contract" not in doc
-    assert "source_exclusions" not in doc
-    assert len(doc["records"]) > 1
-    assert all(
-        marker not in record for record in doc["records"][:-1] for marker in markers
-    )
+    assert len(markers) == len(set(markers)) == 4
+    individual_hold_counts = []
     for marker in markers:
+        doc = _legacy_doc()
+        assert "adjudication_contract" not in doc
+        assert "source_exclusions" not in doc
+        assert len(doc["records"]) > 1
+        assert all(
+            enhanced_marker not in record
+            for record in doc["records"]
+            for enhanced_marker in markers
+        )
         doc["records"][-1][marker] = None
 
-    errors = V.validate_document(doc, R10._schema())
+        errors = V.validate_document(doc, R10._schema())
 
-    assert len(_hold_errors(errors)) == 1
+        individual_hold_counts.append(len(_hold_errors(errors)))
+
+    combined_doc = _legacy_doc()
+    assert "adjudication_contract" not in combined_doc
+    assert "source_exclusions" not in combined_doc
+    assert len(combined_doc["records"]) > 1
+    assert all(
+        marker not in record for record in combined_doc["records"] for marker in markers
+    )
+    for marker in markers:
+        combined_doc["records"][-1][marker] = None
+
+    combined_errors = V.validate_document(combined_doc, R10._schema())
+
+    assert individual_hold_counts == [1, 1, 1, 1]
+    assert len(_hold_errors(combined_errors)) == 1
 
 
 def test_r11a_c_hostile_mapping_overrides_cannot_hide_present_marker():
