@@ -105,6 +105,31 @@ def test_r11a_a_valid_exact_11_and_12_key_authority_shapes_remain_green(
     ) == R11._reference_scoped_envelope(R11._ORIGINAL_SCOPE)
 
 
+@pytest.mark.parametrize("include_optional_key", [False, True])
+def test_r11a_a_exact_allowed_authority_field_set_is_required_at_valid_sizes(
+    include_optional_key,
+):
+    marker = "synthetic_unexpected_authority_field"
+    adjudication = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
+    if include_optional_key:
+        adjudication["expected_form_status"] = "synthetic-ignored-status"
+        expected_size = 12
+    else:
+        adjudication.pop("expected_form_status", None)
+        expected_size = 11
+    classification = adjudication.pop("classification")
+    adjudication[marker] = classification
+    assert len(adjudication) == expected_size
+    assert all(type(key) is str for key in dict.__iter__(adjudication))
+    assert "classification" not in adjudication
+
+    error, _peak_bytes = _capture_fixed_error(
+        lambda: V.source_record_identity_envelope(R11._source_input(), adjudication)
+    )
+
+    _assert_fixed_nonreflective_error(error, _HMAC_ERROR, marker)
+
+
 def test_r11a_a_oversized_exact_authority_keyset_fails_with_bounded_peak():
     marker = "synthetic-oversized-authority-key-marker"
     adjudication = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
@@ -369,6 +394,28 @@ def test_r11a_c_multiple_enhanced_markers_deduplicate_to_one_hold():
 
     without_contract_errors = V.validate_document(without_contract, R10._schema())
     assert len(_hold_errors(without_contract_errors)) == 1
+
+
+def test_r11a_c_nested_only_markers_in_final_record_emit_one_hold():
+    doc = _legacy_doc()
+    markers = (
+        "adjudications",
+        "fix_evidence",
+        "record_origin",
+        "baseline_record_sha256",
+    )
+    assert "adjudication_contract" not in doc
+    assert "source_exclusions" not in doc
+    assert len(doc["records"]) > 1
+    assert all(
+        marker not in record for record in doc["records"][:-1] for marker in markers
+    )
+    for marker in markers:
+        doc["records"][-1][marker] = None
+
+    errors = V.validate_document(doc, R10._schema())
+
+    assert len(_hold_errors(errors)) == 1
 
 
 def test_r11a_c_hostile_mapping_overrides_cannot_hide_present_marker():
