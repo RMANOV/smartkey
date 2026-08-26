@@ -30,15 +30,27 @@ MAX_GIT_OUTPUT_BYTES = MAX_COMMIT_OBJECT_BYTES
 GIT_TIMEOUT_SECONDS = 10
 
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
-ZERO_OBJECT_IDS = {"0" * 40, "0" * 64}
-PATH_PREFIX = r"(?:^|[\s\"'(<`=:])"
+EVENT_OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
+ZERO_EVENT_OBJECT_ID = "0" * 40
+PATH_PREFIX = r"(?:^|[\s\"'(<`=,;\[\]]|(?<![\\/][A-Za-z]):)"
+FILE_URI_PREFIX = r"(?:^|[\s\"'(<`=:,;\[\]])file:///"
 HEX_IDENTIFIER = r"(?<![0-9a-f])[0-9a-f]{12,64}(?![0-9a-f])"
+FULL_HEX_IDENTIFIER = r"(?<![0-9a-f])[0-9a-f]{40}(?:[0-9a-f]{24})?(?![0-9a-f])"
 SHARD_LABEL = r"(?:claude|codex)[ _-]shard(?:[ _-]manifest)?(?:\.jsonl?)?"
+SHARD_FILENAME = r"(?:claude|codex)[_-]shard(?:[_-]manifest)?\.jsonl?"
 SOURCE_LABEL = r"source[-_](?:session|record|path)(?:[-_](?:hash|digest))?"
 DIGEST_LABEL = r"(?:sha(?:-?256)?|digest|hash|receipt)"
 LABEL_SEPARATOR = r"(?:[^\S\r\n]|[_:=()/.`-])"
 
 PRIVATE_HOME_PATTERNS = (
+    re.compile(
+        FILE_URI_PREFIX + r"(?:(?:home|Users)/[^/\s`]+|root)(?:[\\/]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        FILE_URI_PREFIX + r"[A-Z]:/Users/[^/\s`]+(?:/|$)",
+        re.IGNORECASE,
+    ),
     re.compile(
         PATH_PREFIX + r"/(?:(?:home|Users)/[^/\s`]+|root)(?:[\\/]|$)",
         re.IGNORECASE,
@@ -97,6 +109,21 @@ PRIVATE_CORRELATION_PATTERNS = (
         + SHARD_LABEL
         + r")\s*\)\s*[:=]\s*"
         + HEX_IDENTIFIER,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?<![A-Za-z0-9_.-])"
+        + SHARD_FILENAME
+        + r"(?![A-Za-z0-9_.-])\s*[:=]\s*"
+        + FULL_HEX_IDENTIFIER,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:sha(?:-?256)?|digest|hash|checksum)\b\s*[:=]?\s*"
+        + FULL_HEX_IDENTIFIER
+        + r"[^\r\n]{0,47}(?<![A-Za-z0-9_.-])"
+        + SHARD_FILENAME
+        + r"(?![A-Za-z0-9_.-])",
         re.IGNORECASE,
     ),
 )
@@ -348,9 +375,15 @@ def _read_event(path_text: str) -> dict[str, object]:
 
 
 def _event_object_id(value: object) -> str:
-    if not isinstance(value, str) or not OBJECT_ID_RE.fullmatch(value):
+    if not isinstance(value, str) or not EVENT_OBJECT_ID_RE.fullmatch(value):
         raise InputError("invalid_event")
-    return value
+    return value.casefold()
+
+
+def _event_boolean(payload: dict[str, object], key: str) -> bool:
+    if key not in payload or type(payload[key]) is not bool:
+        raise InputError("invalid_event")
+    return bool(payload[key])
 
 
 def _nested_object_id(payload: dict[str, object], *keys: str) -> str:
@@ -364,16 +397,27 @@ def _nested_object_id(payload: dict[str, object], *keys: str) -> str:
 
 def _select_event_range(event_name: str, payload: dict[str, object]) -> EventSelection:
     if event_name == "push":
-        if payload.get("deleted") is True:
-            return EventSelection(skip=True)
+        created = _event_boolean(payload, "created")
+        deleted = _event_boolean(payload, "deleted")
         before = _event_object_id(payload.get("before"))
         after = _event_object_id(payload.get("after"))
-        if after in ZERO_OBJECT_IDS:
+        before_is_zero = before == ZERO_EVENT_OBJECT_ID
+        after_is_zero = after == ZERO_EVENT_OBJECT_ID
+
+        if created and deleted:
             raise InputError("invalid_event")
-        if payload.get("created") is True or before in ZERO_OBJECT_IDS:
+        if deleted:
+            if created or before_is_zero or not after_is_zero:
+                raise InputError("invalid_event")
+            return EventSelection(skip=True)
+        if created:
+            if deleted or not before_is_zero or after_is_zero:
+                raise InputError("invalid_event")
             # Push creation lacks a trustworthy pre-existing-ref snapshot in the
             # payload. Failing closed avoids silently scanning older history.
             raise InputError("creation_boundary_unprovable")
+        if before_is_zero or after_is_zero:
+            raise InputError("invalid_event")
         return EventSelection(ranges=(f"{before}..{after}",))
 
     if event_name == "pull_request_target":

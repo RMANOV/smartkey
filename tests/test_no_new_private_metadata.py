@@ -21,6 +21,13 @@ TOOL = ROOT / "tools" / "check_commit_metadata.py"
 TRUSTED_WORKFLOW = ROOT / ".github" / "workflows" / "trusted-commit-metadata.yml"
 PINNED_CHECKOUT = "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
 PINNED_SETUP_PYTHON = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+PINNED_RUST_TOOLCHAIN = (
+    "dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c"
+)
+PINNED_RUST_CACHE = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+PINNED_UPLOAD_ARTIFACT = (
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+)
 
 
 class CommitMetadataGateTests(unittest.TestCase):
@@ -140,6 +147,12 @@ class CommitMetadataGateTests(unittest.TestCase):
             "path=/home/sample-account/synthetic-private-note.md",
             "path:/home/sample-account/synthetic-private-note.md",
             "`/home/sample-account/synthetic-private-note.md`",
+            ",/home/sample-account/synthetic-private-note.md",
+            "[/Users/sample-account/synthetic-private-note.md]",
+            ";C:\\Users\\sample-account\\synthetic-private-note.md",
+            "file:///home/sample-account/synthetic-private-note.md",
+            "file:///Users/sample-account/synthetic-private-note.md",
+            "file:///C:/Users/sample-account/synthetic-private-note.md",
         )
         for synthetic_path in synthetic_paths:
             with self.subTest(path_kind=synthetic_paths.index(synthetic_path)):
@@ -159,6 +172,10 @@ class CommitMetadataGateTests(unittest.TestCase):
         benign_locations = (
             "https://example.invalid/home/sample-account/public",
             "https://example.invalid/code/syntheticopaque1234",
+            "https://example.invalid/Users/sample-account/public",
+            "https://example.invalid/C:/Users/sample-account/public",
+            "file:///opt/public",
+            "file:///tmp/Users-guide.txt",
             "/opt/root/public",
             "docs/home/sample-account/public",
         )
@@ -188,6 +205,18 @@ class CommitMetadataGateTests(unittest.TestCase):
             "Synthetic subject\n\ndigest(codex_shard_manifest)=" + "5" * 64 + "\n",
             "Synthetic subject\n\nclaude_shard_manifest_digest: " + "8" * 64 + "\n",
             "Synthetic subject\n\ncodex_shard_manifest_sha256=" + "9" * 64 + "\n",
+            "Synthetic subject\n\nclaude_shard_manifest.json=" + "a" * 40 + "\n",
+            "Synthetic subject\n\ncodex-shard.jsonl: " + "b" * 64 + "\n",
+            (
+                "Synthetic subject\n\nsha256: "
+                + "c" * 64
+                + " claude_shard_manifest.json\n"
+            ),
+            (
+                "Synthetic subject\n\nchecksum="
+                + "d" * 40
+                + " codex-shard-manifest.json\n"
+            ),
         )
         for message in synthetic_correlation_messages:
             process = self.run_gate("--stdin", message=message)
@@ -208,6 +237,17 @@ class CommitMetadataGateTests(unittest.TestCase):
         process = self.run_gate("--stdin", message=benign)
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(self.assert_payload(process)["status"], "pass")
+
+        benign_correlations = (
+            "Synthetic subject\n\nclaude_shard_manifest.json\n",
+            "Synthetic subject\n\nordinary_manifest.json=" + "a" * 64 + "\n",
+            ("Synthetic subject\n\nsha256: " + "b" * 64 + " ordinary_manifest.json\n"),
+            "Synthetic subject\n\ncodex-shard-manifest.json=abc123\n",
+        )
+        for message in benign_correlations:
+            with self.subTest(message=message[:32]):
+                process = self.run_gate("--stdin", message=message)
+                self.assertEqual(process.returncode, 0, process.stderr)
 
     def test_known_first_party_code_correlation_is_bounded(self) -> None:
         rejected = (
@@ -389,6 +429,92 @@ class CommitMetadataGateTests(unittest.TestCase):
                 },
             )
             self.assert_safe_error(creation, "creation_boundary_unprovable")
+
+    def test_malformed_event_payload_matrix_fails_closed_before_any_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            self.init_repository(repository)
+            head = self.commit(repository, "Synthetic head")
+            zero = "0" * 40
+            normal = {
+                "before": head,
+                "after": head,
+                "created": False,
+                "deleted": False,
+            }
+
+            malformed_pushes = {
+                "missing_before": {
+                    key: value for key, value in normal.items() if key != "before"
+                },
+                "missing_after": {
+                    key: value for key, value in normal.items() if key != "after"
+                },
+                "missing_created": {
+                    key: value for key, value in normal.items() if key != "created"
+                },
+                "missing_deleted": {
+                    key: value for key, value in normal.items() if key != "deleted"
+                },
+                "created_string": {**normal, "created": "false"},
+                "deleted_string": {**normal, "deleted": "true"},
+                "created_integer": {**normal, "created": 0},
+                "deleted_integer": {**normal, "deleted": 1},
+                "both_flags_true": {**normal, "created": True, "deleted": True},
+                "deletion_after_nonzero": {**normal, "deleted": True},
+                "deletion_before_zero": {
+                    "before": zero,
+                    "after": zero,
+                    "created": False,
+                    "deleted": True,
+                },
+                "deletion_invalid_before": {
+                    "before": "not-an-object-id",
+                    "after": zero,
+                    "created": False,
+                    "deleted": True,
+                },
+                "creation_before_nonzero": {**normal, "created": True},
+                "creation_after_zero": {
+                    "before": zero,
+                    "after": zero,
+                    "created": True,
+                    "deleted": False,
+                },
+                "normal_before_zero": {**normal, "before": zero},
+                "normal_after_zero": {**normal, "after": zero},
+                "before_64_hex": {**normal, "before": "a" * 64},
+                "after_64_hex": {**normal, "after": "b" * 64},
+                "before_non_hex": {**normal, "before": "g" * 40},
+                "after_non_hex": {**normal, "after": "z" * 40},
+                "before_short": {**normal, "before": "a" * 39},
+                "after_long": {**normal, "after": "b" * 41},
+            }
+            for case, payload in malformed_pushes.items():
+                with self.subTest(case=case):
+                    process = self.run_event(repository, "push", payload)
+                    self.assert_safe_error(process, "invalid_event")
+
+            malformed_pull_requests = {
+                "missing_base": {"pull_request": {"head": {"sha": head}}},
+                "missing_head": {"pull_request": {"base": {"sha": head}}},
+                "base_64_hex": {
+                    "pull_request": {
+                        "base": {"sha": "a" * 64},
+                        "head": {"sha": head},
+                    }
+                },
+                "head_short": {
+                    "pull_request": {
+                        "base": {"sha": head},
+                        "head": {"sha": "b" * 39},
+                    }
+                },
+            }
+            for case, payload in malformed_pull_requests.items():
+                with self.subTest(case=case):
+                    process = self.run_event(repository, "pull_request_target", payload)
+                    self.assert_safe_error(process, "invalid_event")
 
     def test_force_push_scans_after_only_and_pull_request_target_scans_base_head(
         self,
@@ -690,7 +816,7 @@ class CommitMetadataGateTests(unittest.TestCase):
         self.assertIn("tools/check_commit_metadata.py", run_commands)
         self.assertIn("--event-file", run_commands)
 
-    def test_codeowners_and_untrusted_head_job_do_not_claim_enforcement(self) -> None:
+    def test_codeowners_and_all_workflow_actions_are_immutable(self) -> None:
         codeowners = (ROOT / ".github" / "CODEOWNERS").read_text(encoding="utf-8")
         for protected_path in (
             "/.github/CODEOWNERS",
@@ -709,19 +835,31 @@ class CommitMetadataGateTests(unittest.TestCase):
         self.assertIn("Commit metadata unit tests (untrusted head)", ci_text)
         self.assertNotIn("Scan pull-request commits", ci_text)
         self.assertNotIn("Scan pushed commits", ci_text)
+        self.assertRegex(ci_text, r"(?m)^permissions:\n  contents: read$")
+
+        workflow_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        )
         action_refs = set(
-            re.findall(r"actions/(?:checkout|setup-python)@[0-9A-Za-z._-]+", ci_text)
+            re.findall(r'(?:"uses"\s*:\s*"|uses:\s*)([^"\s]+)', workflow_text)
         )
         self.assertEqual(
             action_refs,
             {
                 PINNED_CHECKOUT,
                 PINNED_SETUP_PYTHON,
+                PINNED_RUST_TOOLCHAIN,
+                PINNED_RUST_CACHE,
+                PINNED_UPLOAD_ARTIFACT,
             },
         )
+        for action_ref in action_refs:
+            self.assertRegex(action_ref, r"^[^@\s]+@[0-9a-f]{40}$")
         self.assertEqual(
-            ci_text.count(PINNED_CHECKOUT),
-            ci_text.count("persist-credentials: false"),
+            workflow_text.count(PINNED_CHECKOUT),
+            workflow_text.count("persist-credentials: false")
+            + workflow_text.count('"persist-credentials": false'),
         )
 
     def init_repository(self, repository: Path) -> None:
