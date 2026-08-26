@@ -1,4 +1,4 @@
-"""G0-R8 RED contracts for timestamp authority and source-record identity.
+"""G0-R9 RED contracts for timestamp authority and source-record identity.
 
 These fixtures are synthetic and intentionally contain no corpus values, real
 record identifiers, private paths, or reconstructed-source material.  The
@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -32,8 +33,11 @@ _OLD_SOURCE_RECORD_PROFILE = "project_canonical_json_v1"
 _OLD_VECTOR_SET_SHA256 = (
     "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
 )
-_V3_VECTOR_SET_SHA256 = (
+_PRE_R9_VECTOR_SET_SHA256 = (
     "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f"
+)
+_V3_VECTOR_SET_SHA256 = (
+    "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192"
 )
 _SYNTHETIC_KEY_ID = "0123456789abcdef0123456789abcdef"
 _PUBLIC_VECTOR_KEY = b"smartkey-g0-public-synthetic-vector-key-v1"
@@ -81,6 +85,18 @@ _SOURCE_VECTOR_ENVELOPE = {
             "end_char": 12,
             "reason": "synthetic-aaa",
         },
+        {
+            "authorship_confidence": "\ue000",
+            "start_char": 16,
+            "end_char": 20,
+            "reason": "synthetic-zulu",
+        },
+        {
+            "authorship_confidence": "\U00010000",
+            "start_char": 16,
+            "end_char": 20,
+            "reason": "synthetic-alpha",
+        },
     ],
     "raw_sha256": ("56d890f43577f16f03358ea0c94bb7bd7e1e6864b908585e24be54ae2734cd56"),
 }
@@ -105,7 +121,13 @@ _SOURCE_VECTOR_PAYLOAD_HEX = (
     "2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e"
     "666964656e6365223a2273796e7468657469632d616161222c22656e645f6368"
     "6172223a31322c22726561736f6e223a2273796e7468657469632d616161222c"
-    "2273746172745f63686172223a387d5d2c226d65726765645f6964223a226330"
+    "2273746172745f63686172223a387d2c7b22617574686f72736869705f636f6e"
+    "666964656e6365223a22ee8080222c22656e645f63686172223a32302c227265"
+    "61736f6e223a2273796e7468657469632d7a756c75222c2273746172745f6368"
+    "6172223a31367d2c7b22617574686f72736869705f636f6e666964656e636522"
+    "3a22f0908080222c22656e645f63686172223a32302c22726561736f6e223a22"
+    "73796e7468657469632d616c706861222c2273746172745f63686172223a3136"
+    "7d5d2c226d65726765645f6964223a226330"
     "3034356563383739316137663531346634616464633539383265636662646439"
     "653238616238306264616561393166356536666263366466626633393565222c"
     "22706c6174666f726d223a2273796e7468657469632d706c6174666f726d222c"
@@ -119,11 +141,11 @@ _SOURCE_VECTOR_PAYLOAD_HEX = (
 _SOURCE_VECTOR_PAYLOAD_BYTES = bytes.fromhex(_SOURCE_VECTOR_PAYLOAD_HEX)
 _SOURCE_VECTOR_FRAME_HEX = (
     "736d6172746b65792d67302d686d61632d7368613235362d763100736f757263"
-    "655f7265636f72640000000000000003b0" + _SOURCE_VECTOR_PAYLOAD_HEX
+    "655f7265636f7264000000000000000462" + _SOURCE_VECTOR_PAYLOAD_HEX
 )
 _SOURCE_VECTOR_FRAME_BYTES = bytes.fromhex(_SOURCE_VECTOR_FRAME_HEX)
 _SOURCE_VECTOR_MAC_SHA256 = (
-    "76f946e28426dd9264533c26bca65c1470842bf50332c0c1b22a318c9e4b83ce"
+    "dec2460826116e6f9e907387f617f9d26371b024202b4f8a064ed3a22b6869e4"
 )
 _V3_VECTOR_RECEIPTS = [
     {
@@ -261,6 +283,33 @@ def _segment_order_key(segment: dict) -> tuple:
     )
 
 
+def _segment_scalar_order_key(segment: dict) -> tuple:
+    return (
+        segment["start_char"],
+        segment["end_char"],
+        tuple(ord(char) for char in segment["authorship_confidence"]),
+        tuple(ord(char) for char in segment["reason"]),
+    )
+
+
+def _segment_utf16_order_key(segment: dict) -> tuple:
+    return (
+        segment["start_char"],
+        segment["end_char"],
+        segment["authorship_confidence"].encode("utf-16-be"),
+        segment["reason"].encode("utf-16-be"),
+    )
+
+
+def _segment_reason_first_order_key(segment: dict) -> tuple:
+    return (
+        segment["start_char"],
+        segment["end_char"],
+        segment["reason"].encode("utf-8"),
+        segment["authorship_confidence"].encode("utf-8"),
+    )
+
+
 def _load_validator():
     spec = importlib.util.spec_from_file_location(
         "smartkey_anomaly_timestamp_authority_red", _VALIDATOR
@@ -386,7 +435,7 @@ def _synthetic_merged_source_record() -> dict:
         "platform": _SOURCE_VECTOR_ENVELOPE["platform"],
         "authorship_confidence": _SOURCE_VECTOR_ENVELOPE["authorship_confidence"],
         "excluded_segments": [
-            copy.deepcopy(segments[index]) for index in (5, 3, 1, 4, 0, 2)
+            copy.deepcopy(segments[index]) for index in (7, 5, 3, 1, 6, 4, 0, 2)
         ],
         "raw_sha256": _SOURCE_VECTOR_ENVELOPE["raw_sha256"],
         "raw_text": "synthetic excluded source text",
@@ -807,6 +856,7 @@ def test_g0_r8_complete_v3_vector_set_is_exact_and_fails_closed():
     ).encode("utf-8")
     assert reference_vector_set == stdlib_vector_set
     assert hashlib.sha256(reference_vector_set).hexdigest() == (_V3_VECTOR_SET_SHA256)
+    assert _V3_VECTOR_SET_SHA256 != _PRE_R9_VECTOR_SET_SHA256
 
     schema = _schema()
     contract_schema = schema["$defs"]["adjudication_contract"]["properties"]
@@ -822,7 +872,11 @@ def test_g0_r8_complete_v3_vector_set_is_exact_and_fails_closed():
         _V3_VECTOR_SET_SHA256
     )
     arbitrary_sha = "a" * 64
-    assert arbitrary_sha not in {_OLD_VECTOR_SET_SHA256, _V3_VECTOR_SET_SHA256}
+    assert arbitrary_sha not in {
+        _OLD_VECTOR_SET_SHA256,
+        _PRE_R9_VECTOR_SET_SHA256,
+        _V3_VECTOR_SET_SHA256,
+    }
     contract["hmac_vector_set_sha256"] = arbitrary_sha
     contract["hmac_external_receipt"]["vector_set_sha256"] = arbitrary_sha
     errors = _hmac_preflight_errors(contract)
@@ -1134,7 +1188,115 @@ def test_g0_r8_source_record_envelope_rejects_wrong_root_contract(
     _assert_hmac_contract_rejected(envelope)
 
 
-def test_g0_r8_segment_order_is_position_then_utf8_fields_with_crossovers():
+def test_g0_r9_builder_rejects_oversize_before_large_transient_allocation():
+    maximum_payload_bytes = V.HMAC_RESOURCE_LIMITS["max_canonical_payload_bytes"]
+    allocation_ceiling = 8 * maximum_payload_bytes
+    shared_8k_text = "s" * 8192
+    segments = [
+        {
+            "authorship_confidence": shared_8k_text,
+            "start_char": index * 2,
+            "end_char": index * 2 + 1,
+            "reason": shared_8k_text,
+        }
+        for index in range(64)
+    ]
+    source = _synthetic_merged_source_record()
+    source["excluded_segments"] = segments
+    builder = _envelope_builder()
+
+    assert type(shared_8k_text) is str
+    assert len(shared_8k_text.encode("utf-8")) == 8192
+    assert len({id(segment) for segment in segments}) == 64
+    assert all(type(segment) is dict for segment in segments)
+    assert all(
+        segment["authorship_confidence"] is shared_8k_text
+        and segment["reason"] is shared_8k_text
+        for segment in segments
+    )
+    assert len(segments) * 2 * 8192 > maximum_payload_bytes
+
+    error = None
+    result = None
+    tracemalloc.start()
+    try:
+        result = builder(source)
+    except Exception as caught:
+        error = caught
+    finally:
+        _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+    assert result is None
+    assert type(error) is ValueError
+    assert error.args == ("E_HMAC_CONTRACT",)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert vars(error) == {}
+    assert peak_bytes <= allocation_ceiling
+
+
+def test_g0_r9_input_field_lookup_ignores_extras_and_checks_all_six(monkeypatch):
+    required_fields = (
+        "merged_id",
+        "source_schema_version",
+        "platform",
+        "authorship_confidence",
+        "excluded_segments",
+        "raw_sha256",
+    )
+
+    class HostileSource(dict):
+        def __init__(self):
+            super().__init__()
+            self.iter_calls = 0
+            self.contains_calls = 0
+
+        def __iter__(self):
+            self.iter_calls += 1
+            raise AssertionError("source iteration override was invoked")
+
+        def __contains__(self, key):
+            self.contains_calls += 1
+            raise AssertionError("source membership override was invoked")
+
+    class IgnoredExtraTripwire:
+        def __contains__(self, key):
+            if key not in required_fields:
+                raise AssertionError("ignored source metadata was consulted")
+            return True
+
+    def source_missing(missing_field=None):
+        source = HostileSource()
+        dict.__setitem__(source, "synthetic-ignored-before", None)
+        for field in required_fields:
+            if field != missing_field:
+                dict.__setitem__(source, field, None)
+        dict.__setitem__(source, "synthetic-ignored-after", None)
+        return source
+
+    complete = source_missing()
+    assert (
+        tuple(field for field in required_fields if dict.__contains__(complete, field))
+        == required_fields
+    )
+    monkeypatch.setattr(
+        V,
+        "_SOURCE_RECORD_INPUT_FIELD_SET",
+        IgnoredExtraTripwire(),
+    )
+
+    assert V._source_record_has_input_fields(complete) is True
+    incomplete = [source_missing(field) for field in required_fields]
+    assert [V._source_record_has_input_fields(source) for source in incomplete] == [
+        False,
+    ] * 6
+    for source in [complete, *incomplete]:
+        assert source.iter_calls == 0
+        assert source.contains_calls == 0
+
+
+def test_g0_r9_segment_order_is_position_then_utf8_fields_with_crossovers():
     source = _synthetic_merged_source_record()
     input_segments = source["excluded_segments"]
     expected = _SOURCE_VECTOR_ENVELOPE["excluded_segments"]
@@ -1154,7 +1316,19 @@ def test_g0_r8_segment_order_is_position_then_utf8_fields_with_crossovers():
         (0, 4, "synthetic-zulu", "synthetic-zulu"),
         (0, 6, "synthetic-alpha", "synthetic-alpha"),
         (8, 12, "synthetic-aaa", "synthetic-aaa"),
+        (16, 20, "\ue000", "synthetic-zulu"),
+        (16, 20, "\U00010000", "synthetic-alpha"),
     ]
+
+    crossovers = expected[-2:]
+    assert sorted(crossovers, key=_segment_order_key) == crossovers
+    assert sorted(crossovers, key=_segment_scalar_order_key) == crossovers
+    assert sorted(crossovers, key=_segment_utf16_order_key) == list(
+        reversed(crossovers)
+    )
+    assert sorted(crossovers, key=_segment_reason_first_order_key) == list(
+        reversed(crossovers)
+    )
 
     label_first = sorted(
         input_segments,
