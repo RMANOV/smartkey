@@ -34,6 +34,13 @@ pub mod session_cache;
 pub mod tech_vocab;
 pub mod typing_regime;
 
+// F4 Phase R (ruling 221af6d0a1c8): lane RED-test modules live in separate
+// files so parallel test authors never edit the same file.
+#[cfg(test)]
+mod f4_lane_ab_tests;
+#[cfg(test)]
+mod f4_lane_cde_tests;
+
 pub use ensemble::SmartKeyEngine;
 pub use input::InputMethodCore;
 pub use master_loop::MasterLoop;

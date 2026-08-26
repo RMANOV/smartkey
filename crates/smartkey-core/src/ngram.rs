@@ -69,6 +69,25 @@ impl NgramTrie {
         node.frequency = Some(frequency);
     }
 
+    /// Exact-match corpus frequency of `word`, or `None` when the word is not
+    /// stored as a complete entry.
+    ///
+    /// F4 Phase R read-only helper (ruling 221af6d0a1c8, lanes A/B): the
+    /// delimiter-time resolver must compare *exact* word evidence, not the
+    /// strongest prefix completion.  `prefix_search(word, 1)` cannot provide
+    /// that — its top-1 hit is the most frequent *completion*, so an exact
+    /// word dominated by a longer word (`stat` vs `state`) would be reported
+    /// as absent.  This walks the trie to the terminal node and reads its own
+    /// frequency, independent of any completion ranking.  No existing path
+    /// calls it yet.
+    pub fn exact_frequency(&self, word: &str) -> Option<u32> {
+        let mut node = &self.root;
+        for ch in word.chars() {
+            node = node.children.get(&ch)?;
+        }
+        node.frequency
+    }
+
     /// Return all words that start with `prefix`, sorted by frequency
     /// descending, truncated to `limit`. An empty prefix returns the
     /// highest-frequency words across the entire trie.
@@ -722,5 +741,21 @@ mod tests {
             "'fxnctin' should match 'function' within distance 2: got {:?}",
             results
         );
+    }
+
+    /// F4 Phase R plumbing: exact lookup is independent of prefix ranking.
+    #[test]
+    fn exact_frequency_is_not_masked_by_a_dominant_longer_word() {
+        let mut trie = NgramTrie::new();
+        trie.insert("stat", 100);
+        trie.insert("state", 600_000);
+
+        assert_eq!(trie.exact_frequency("stat"), Some(100));
+        assert_eq!(trie.exact_frequency("state"), Some(600_000));
+        assert_eq!(trie.exact_frequency("sta"), None, "prefix, not a word");
+        assert_eq!(trie.exact_frequency("status"), None);
+        assert_eq!(trie.exact_frequency(""), None);
+        // Contrast: the top-1 prefix hit is the completion, not the word.
+        assert_eq!(trie.prefix_search("stat", 1)[0].word, "state");
     }
 }

@@ -854,6 +854,9 @@ impl InputMethodCore {
                 }
                 if self.dual_buffer.is_some() && !self.current_word.is_empty() {
                     // Full-word composing: commit entire preedit word at once.
+                    // F4 Phase R: `resolve_word_boundary()` is the designated
+                    // pre-commit hook for this branch (see its docs).  Not
+                    // wired until GREEN — the displayed interpretation commits.
                     // The word has been in composing mode the whole time — the
                     // user sees the correct script; now we finalize it.
                     let word = self.current_word.clone();
@@ -1318,6 +1321,54 @@ impl InputMethodCore {
     /// The word currently being typed.
     pub fn current_word(&self) -> &str {
         &self.current_word
+    }
+
+    /// Read-only view of the prediction engine (F4 Phase R plumbing so lane
+    /// tests in sibling modules can inspect exact vs prefix evidence).  The
+    /// three test-gated views below have no production caller yet; GREEN
+    /// lifts the gate when the resolver consumes them.
+    #[cfg(test)]
+    pub(crate) fn engine(&self) -> &SmartKeyEngine {
+        &self.engine
+    }
+
+    /// Read-only view of the active dual buffer; `None` outside a
+    /// dual-buffer word (F4 Phase R plumbing for lane tests).
+    #[cfg(test)]
+    pub(crate) fn dual_buffer(&self) -> Option<&DualBuffer> {
+        self.dual_buffer.as_ref()
+    }
+
+    /// The contextual language prior currently injected by the master loop
+    /// (surrounding text / light profile), if any (F4 Phase R plumbing).
+    #[cfg(test)]
+    pub(crate) fn active_lang_prior(&self) -> Option<LangId> {
+        self.active_hints.as_ref().and_then(|h| h.lang_prior)
+    }
+
+    /// Delimiter-time pre-commit resolver for a dual-buffer word.
+    ///
+    /// F4 Phase R stub — baseline behaviour, GREEN pending ADVOCATE PASS
+    /// (ruling 221af6d0a1c8, lanes A/B/C; design: docs/f4-phase-r-design.md).
+    ///
+    /// Contract: called exactly once when a delimiter arrives while a
+    /// dual-buffer word is in preedit — from the `Key::Space | Key::Return`
+    /// composing branch of `handle_key` (and the non-alphabetic `Key::Char`
+    /// composing guard), BEFORE `current_word` is cloned and committed.  It
+    /// compares exact EN/BG word evidence (`SmartKeyEngine::score_exact_both`)
+    /// with the prior/momentum and the buffer's `provenance()`, and returns
+    /// `Some(text)` when the word to commit differs from the displayed
+    /// `current_word` — choosing `en_text()` or `bg_text()` only, never a
+    /// third string.  The caller then commits that text exactly once,
+    /// forwards the delimiter exactly once and updates the learned language
+    /// atomically; it never emits `ReplaceWord`.  `None` means "keep the
+    /// displayed interpretation".
+    ///
+    /// NOT yet wired into the delimiter path: the stub always returns `None`
+    /// and mutates nothing, so lane D tests calling it directly fail
+    /// behaviourally while every baseline flow is unchanged.
+    pub fn resolve_word_boundary(&mut self) -> Option<String> {
+        None
     }
 
     /// Whether ghost text is currently displayed.
@@ -4793,5 +4844,70 @@ mod lang_prior_tests {
         assert_eq!(type_word(&mut core, &IMASH), "имаш");
         core.handle_key(press_raw(57));
         assert_eq!(type_word(&mut core, &IS), "is");
+    }
+}
+
+/// F4 Phase R plumbing smoke (ruling 221af6d0a1c8): the test-only views and
+/// the resolver stub are wired and behaviour-neutral.  Lane RED tests live in
+/// `f4_lane_ab_tests.rs` / `f4_lane_cde_tests.rs`, never here.
+#[cfg(test)]
+mod f4_plumbing_tests {
+    use super::*;
+    use crate::dual_buffer::ScoreProvenance;
+
+    fn press_raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn views_expose_engine_buffer_and_prior_without_changing_behaviour() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("stat", 100, LangId::En);
+        core.load_word_lang("статия", 12_000, LangId::Bg);
+        assert!(core.dual_buffer().is_none());
+        assert_eq!(core.active_lang_prior(), None);
+
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(LangId::En),
+            ..Default::default()
+        });
+        assert_eq!(core.active_lang_prior(), Some(LangId::En));
+
+        for code in [31, 20, 30, 20] {
+            core.handle_key(press_raw(code)); // s t a t
+        }
+        let db = core
+            .dual_buffer()
+            .expect("dual buffer is active inside a raw-key word");
+        assert_eq!((db.en_text(), db.bg_text()), ("stat", "стат"));
+        assert_eq!(
+            core.engine().score_exact_both(db.en_text(), db.bg_text()),
+            (100.0, 0.0)
+        );
+        assert_eq!(db.provenance(), ScoreProvenance::Corpus);
+    }
+
+    #[test]
+    fn resolver_stub_is_inert_and_not_on_the_delimiter_path() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("статия", 12_000, LangId::Bg);
+        for code in [31, 20, 30, 20, 23, 16] {
+            core.handle_key(press_raw(code)); // s t a t i q / с т а т и я
+        }
+        let shown = core.current_word().to_string();
+
+        assert_eq!(core.resolve_word_boundary(), None);
+        assert_eq!(core.current_word(), shown, "the stub mutates nothing");
+
+        let actions = core.handle_key(press_raw(57)); // Space
+        let commits = actions
+            .iter()
+            .filter(|a| matches!(a, Action::CommitText(t) if *t == shown))
+            .count();
+        assert_eq!(commits, 1, "the displayed interpretation commits once");
+        assert!(actions.iter().any(|a| matches!(a, Action::ForwardKey)));
     }
 }
