@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -757,18 +758,29 @@ def _synthetic_r2_doc() -> dict:
             },
             "hmac_scheme": "smartkey-g0-hmac-sha256-v1",
             "hmac_min_key_bytes": 32,
+            "hmac_contract_version": "smartkey-g0-hmac-byte-contract-v1",
             "hmac_domains": ["value", "event", "metadata", "source_record"],
+            "hmac_domain_payload_profiles": {
+                "value": "scalar_utf8",
+                "event": "project_canonical_json_v1",
+                "metadata": "project_canonical_json_v1",
+                "source_record": "project_canonical_json_v1",
+            },
             "hmac_scalar_payload_encoding": ("exact-utf8-scalar-no-normalization-v1"),
-            "hmac_structured_payload_encoding": (
-                "rfc8259-canonical-json-utf8-sorted-keys-compact-"
-                "no-unicode-normalization-v1"
-            ),
+            "hmac_structured_payload_encoding": "smartkey-g0-canonical-json-v1",
             "hmac_input_frame": ("ascii-scheme-nul-domain-nul-u64be-length-payload-v1"),
+            "hmac_vector_set_sha256": (
+                "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f"
+            ),
             "hmac_key_id": _R4_SYNTHETIC_KEY_ID,
             "hmac_external_receipt": {
                 "state": "externally_verified",
                 "scheme": "smartkey-g0-hmac-sha256-v1",
                 "key_id": _R4_SYNTHETIC_KEY_ID,
+                "contract_version": "smartkey-g0-hmac-byte-contract-v1",
+                "vector_set_sha256": (
+                    "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f"
+                ),
                 "coverage": (
                     "all-refs-domain-serialization-key-id-private-recomputation-v1"
                 ),
@@ -2432,3 +2444,283 @@ def test_g0_r4_same_mac_suffix_cannot_be_reused_across_domains():
         "event", "shared", suffix=suffix
     )
     assert "E_HMAC_SUFFIX" in _codes(V.validate_document(doc, _schema()))
+
+
+# ---------------------------------------- G0 adjudication contract revision 5
+_R5_PUBLIC_VECTOR_KEY = b"smartkey-g0-public-synthetic-vector-key-v1"
+_R5_DOMAIN_PROFILES = {
+    "value": "scalar_utf8",
+    "event": "project_canonical_json_v1",
+    "metadata": "project_canonical_json_v1",
+    "source_record": "project_canonical_json_v1",
+}
+_R5_VECTORS = (
+    {
+        "name": "value_non_ascii",
+        "domain": "value",
+        "value": "café",
+        "payload_hex": "636166c3a9",
+        "frame_hex": (
+            "736d6172746b65792d67302d686d61632d7368613235362d76310076616c7565"
+            "000000000000000005636166c3a9"
+        ),
+        "mac_sha256": (
+            "134f37d80a6cf037adb96d129c300af20c98ecd25c325fa99bb0c43791a5fda1"
+        ),
+    },
+    {
+        "name": "event_nested",
+        "domain": "event",
+        "value": {
+            "active": True,
+            "count": 2,
+            "event": "synthetic",
+            "parts": ["alpha", None, {"ok": False}],
+        },
+        "payload_hex": (
+            "7b22616374697665223a747275652c22636f756e74223a322c226576656e7422"
+            "3a2273796e746865746963222c227061727473223a5b22616c706861222c6e75"
+            "6c6c2c7b226f6b223a66616c73657d5d7d"
+        ),
+        "frame_hex": (
+            "736d6172746b65792d67302d686d61632d7368613235362d7631006576656e74"
+            "0000000000000000517b22616374697665223a747275652c22636f756e74223a"
+            "322c226576656e74223a2273796e746865746963222c227061727473223a5b22"
+            "616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d7d"
+        ),
+        "mac_sha256": (
+            "15fe13ea61be04ae11ad44f24bdffb2bc15bf3ad4086686a9a816f2c432ea319"
+        ),
+    },
+    {
+        "name": "metadata_escaping",
+        "domain": "metadata",
+        "value": {
+            "control": "\b\t\n\f\r\x00",
+            "label": "café",
+            "quote": '"\\/',
+        },
+        "payload_hex": (
+            "7b22636f6e74726f6c223a225c625c745c6e5c665c725c7530303030222c226c"
+            "6162656c223a22636166c3a9222c2271756f7465223a225c225c5c2f227d"
+        ),
+        "frame_hex": (
+            "736d6172746b65792d67302d686d61632d7368613235362d7631006d65746164"
+            "61746100000000000000003e7b22636f6e74726f6c223a225c625c745c6e5c66"
+            "5c725c7530303030222c226c6162656c223a22636166c3a9222c2271756f7465"
+            "223a225c225c5c2f227d"
+        ),
+        "mac_sha256": (
+            "3c190f2b02d21c5dec8e31ce21c0bd45abdc0187f157f9329d351d5295f667b2"
+        ),
+    },
+    {
+        "name": "source_record_integer_edges",
+        "domain": "source_record",
+        "value": {
+            "max": 9_007_199_254_740_991,
+            "min": -9_007_199_254_740_991,
+            "records": [1, 0, -1],
+        },
+        "payload_hex": (
+            "7b226d6178223a393030373139393235343734303939312c226d696e223a2d3930"
+            "30373139393235343734303939312c227265636f726473223a5b312c302c2d315d"
+            "7d"
+        ),
+        "frame_hex": (
+            "736d6172746b65792d67302d686d61632d7368613235362d763100736f757263"
+            "655f7265636f72640000000000000000437b226d6178223a3930303731393932"
+            "35343734303939312c226d696e223a2d39303037313939323534373430393931"
+            "2c227265636f726473223a5b312c302c2d315d7d"
+        ),
+        "mac_sha256": (
+            "121118ba0fc9558a6870837176a3e5c5fa028522391ab0cc067609a4e3a0630e"
+        ),
+    },
+)
+_R5_VECTOR_SET_SHA256 = (
+    "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f"
+)
+
+
+def _r5_key_errors(doc: dict, key: str) -> list[str]:
+    code = "E_ADJ_KEYS"
+    return [
+        error
+        for error in V.validate_document(doc, _schema())
+        if error.startswith(code) and error.split(":", 2)[1].endswith(f".{key}")
+    ]
+
+
+@pytest.mark.parametrize("key", ["record_origin", "baseline_record_sha256"])
+def test_g0_r5_each_legacy_keep_forbids_enhanced_key_even_when_null(key):
+    doc = _synthetic_r2_doc()
+    for rec in doc["records"][102:]:
+        rec[key] = None
+    assert len(_r5_key_errors(doc, key)) == 9
+
+
+@pytest.mark.parametrize("key", ["record_origin", "baseline_record_sha256"])
+def test_g0_r5_every_enhanced_record_requires_both_origin_keys(key):
+    doc = _synthetic_r2_doc()
+    for rec in doc["records"][:102]:
+        rec.pop(key)
+    assert len(_r5_key_errors(doc, key)) == 102
+
+
+def test_g0_r5_new_record_requires_explicit_null_baseline_digest():
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][20]
+    rec.pop("baseline_record_sha256")
+    assert len(_r5_key_errors(doc, "baseline_record_sha256")) == 1
+
+
+@pytest.mark.parametrize("replacement", [None, "0" * 64, "f" * 64])
+def test_g0_r5_baseline_record_requires_nonzero_matching_independent_digest(
+    replacement,
+):
+    doc = _synthetic_r2_doc()
+    rec = doc["records"][0]
+    rec["baseline_record_sha256"] = replacement
+    codes = _codes(V.validate_document(doc, _schema()))
+    assert "E_BASELINE_AUTHORITY" in codes
+    assert replacement != _r4_baseline_record_digest(rec)
+
+
+def test_g0_r5_baseline_digest_key_cannot_be_omitted():
+    doc = _synthetic_r2_doc()
+    doc["records"][0].pop("baseline_record_sha256")
+    assert len(_r5_key_errors(doc, "baseline_record_sha256")) == 1
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "hmac_contract_version",
+        "hmac_domain_payload_profiles",
+        "hmac_vector_set_sha256",
+    ],
+)
+def test_g0_r5_sealed_contract_rejects_missing_serialization_pin(field):
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"].pop(field, None)
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))
+
+
+def test_g0_r5_domain_payload_inventory_is_exact_and_float_free():
+    assert hasattr(V, "HMAC_DOMAIN_PAYLOAD_PROFILES")
+    assert V.HMAC_DOMAIN_PAYLOAD_PROFILES == _R5_DOMAIN_PROFILES
+    assert V.HMAC_STRUCTURED_PAYLOAD_ENCODING == "smartkey-g0-canonical-json-v1"
+
+
+def _r5_canonical_bytes(value) -> bytes:
+    assert hasattr(V, "canonical_structured_payload_bytes")
+    return V.canonical_structured_payload_bytes(value)
+
+
+def _r5_frame_bytes(domain: str, value) -> bytes:
+    assert hasattr(V, "hmac_frame_bytes")
+    return V.hmac_frame_bytes(domain, value)
+
+
+def test_g0_r5_project_canonical_json_has_exact_nested_bytes():
+    event = _R5_VECTORS[1]
+    assert _r5_canonical_bytes(event["value"]).hex() == event["payload_hex"]
+
+
+def test_g0_r5_non_ascii_literal_and_escape_have_identical_canonical_bytes():
+    assert hasattr(V, "parse_project_canonical_json")
+    literal = V.parse_project_canonical_json('{"label":"café"}')
+    escaped = V.parse_project_canonical_json(r'{"label":"caf\u00e9"}')
+    expected = b'{"label":"caf\xc3\xa9"}'
+    assert _r5_canonical_bytes(literal) == expected
+    assert _r5_canonical_bytes(escaped) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        -0.0,
+        1.5,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        9_007_199_254_740_992,
+        -9_007_199_254_740_992,
+        "\ud800",
+    ],
+)
+def test_g0_r5_project_canonical_json_rejects_unsupported_values(value):
+    assert hasattr(V, "CanonicalJsonError")
+    with pytest.raises(V.CanonicalJsonError):
+        _r5_canonical_bytes(value)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "-0",
+        "1.0",
+        "1e0",
+        "9007199254740992",
+        "-9007199254740992",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        r'"\ud800"',
+        '{"duplicate":1,"duplicate":2}',
+    ],
+)
+def test_g0_r5_project_canonical_json_parser_rejects_ambiguous_input(encoded):
+    assert hasattr(V, "CanonicalJsonError")
+    assert hasattr(V, "parse_project_canonical_json")
+    with pytest.raises(V.CanonicalJsonError):
+        V.parse_project_canonical_json(encoded)
+
+
+def test_g0_r5_all_domain_vectors_pin_payload_frame_mac_and_receipt():
+    assert len(_R5_PUBLIC_VECTOR_KEY) >= 32
+    assert getattr(V, "HMAC_VECTOR_SET_SHA256", None) == _R5_VECTOR_SET_SHA256
+    receipt_items = []
+    for vector in _R5_VECTORS:
+        payload = V.hmac_payload_bytes(vector["domain"], vector["value"])
+        frame = _r5_frame_bytes(vector["domain"], vector["value"])
+        mac = hmac.new(_R5_PUBLIC_VECTOR_KEY, frame, hashlib.sha256).hexdigest()
+        assert payload.hex() == vector["payload_hex"]
+        assert frame.hex() == vector["frame_hex"]
+        assert mac == vector["mac_sha256"]
+        receipt_items.append(
+            {
+                "name": vector["name"],
+                "domain": vector["domain"],
+                "profile": _R5_DOMAIN_PROFILES[vector["domain"]],
+                "key_id": _R4_SYNTHETIC_KEY_ID,
+                "key_hex": _R5_PUBLIC_VECTOR_KEY.hex(),
+                "payload_hex": vector["payload_hex"],
+                "frame_hex": vector["frame_hex"],
+                "mac_sha256": vector["mac_sha256"],
+            }
+        )
+    encoded = json.dumps(
+        receipt_items,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert hashlib.sha256(encoded).hexdigest() == _R5_VECTOR_SET_SHA256
+
+
+def test_g0_r5_receipt_binds_contract_version_profiles_and_vector_set():
+    doc = _synthetic_r2_doc()
+    receipt = doc["adjudication_contract"]["hmac_external_receipt"]
+    assert receipt.get("contract_version") == getattr(V, "HMAC_CONTRACT_VERSION", None)
+    assert receipt.get("vector_set_sha256") == _R5_VECTOR_SET_SHA256
+
+
+def test_g0_r5_local_projection_reseal_cannot_relax_payload_profiles():
+    doc = _synthetic_r2_doc()
+    doc["adjudication_contract"]["hmac_domain_payload_profiles"] = {
+        domain: "ambiguous_json" for domain in _R5_DOMAIN_PROFILES
+    }
+    _refresh_r3_commitments(doc)
+    assert "E_HMAC_CONTRACT" in _codes(V.validate_document(doc, _schema()))

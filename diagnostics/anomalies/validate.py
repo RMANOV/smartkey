@@ -334,13 +334,22 @@ SEMANTIC_COMMITMENT_ALGORITHM = "sha256-canonical-json-v1"
 HMAC_SCHEME = "smartkey-g0-hmac-sha256-v1"
 HMAC_DOMAINS = ("value", "event", "metadata", "source_record")
 HMAC_MIN_KEY_BYTES = 32
+HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v1"
 HMAC_SCALAR_PAYLOAD_ENCODING = "exact-utf8-scalar-no-normalization-v1"
-HMAC_STRUCTURED_PAYLOAD_ENCODING = (
-    "rfc8259-canonical-json-utf8-sorted-keys-compact-no-unicode-normalization-v1"
-)
+HMAC_STRUCTURED_PAYLOAD_ENCODING = "smartkey-g0-canonical-json-v1"
+HMAC_DOMAIN_PAYLOAD_PROFILES = {
+    "value": "scalar_utf8",
+    "event": "project_canonical_json_v1",
+    "metadata": "project_canonical_json_v1",
+    "source_record": "project_canonical_json_v1",
+}
 HMAC_INPUT_FRAME = "ascii-scheme-nul-domain-nul-u64be-length-payload-v1"
 HMAC_RECEIPT_COVERAGE = "all-refs-domain-serialization-key-id-private-recomputation-v1"
 HMAC_RECEIPT_STATE = "externally_verified"
+HMAC_VECTOR_SET_SHA256 = (
+    "50aa96caa624f6b4159d18f553910060a0ffb13de6bb91fc5415459007b6fc4f"
+)
+CANONICAL_JSON_SAFE_INTEGER_MAX = 9_007_199_254_740_991
 BASELINE_RECEIPT_STATE = "externally_verified"
 BASELINE_COMMITMENT_ALGORITHM = "sha256-canonical-json-v1"
 RECORD_ORIGINS = ("new", "preexisting_public_baseline")
@@ -362,10 +371,13 @@ SEALED_CONTRACT_CONSTS = {
     "baseline_commitment_algorithm": BASELINE_COMMITMENT_ALGORITHM,
     "hmac_scheme": HMAC_SCHEME,
     "hmac_min_key_bytes": HMAC_MIN_KEY_BYTES,
+    "hmac_contract_version": HMAC_CONTRACT_VERSION,
     "hmac_domains": list(HMAC_DOMAINS),
+    "hmac_domain_payload_profiles": HMAC_DOMAIN_PAYLOAD_PROFILES,
     "hmac_scalar_payload_encoding": HMAC_SCALAR_PAYLOAD_ENCODING,
     "hmac_structured_payload_encoding": HMAC_STRUCTURED_PAYLOAD_ENCODING,
     "hmac_input_frame": HMAC_INPUT_FRAME,
+    "hmac_vector_set_sha256": HMAC_VECTOR_SET_SHA256,
 }
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -403,6 +415,166 @@ EXPECTED_VALUE_REF_RE = re.compile(
 UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z)?$")
 CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
 LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+class CanonicalJsonError(ValueError):
+    """A value or raw JSON input is outside project canonical JSON v1."""
+
+
+_CANONICAL_JSON_SHORT_ESCAPES = {
+    "\b": r"\b",
+    "\t": r"\t",
+    "\n": r"\n",
+    "\f": r"\f",
+    "\r": r"\r",
+}
+
+
+def _canonical_json_string(value: str) -> str:
+    pieces = ['"']
+    for char in value:
+        code_point = ord(char)
+        if 0xD800 <= code_point <= 0xDFFF:
+            raise CanonicalJsonError("string contains a non-Unicode scalar value")
+        if char == '"':
+            pieces.append(r"\"")
+        elif char == "\\":
+            pieces.append(r"\\")
+        elif char in _CANONICAL_JSON_SHORT_ESCAPES:
+            pieces.append(_CANONICAL_JSON_SHORT_ESCAPES[char])
+        elif code_point <= 0x1F:
+            pieces.append(f"\\u{code_point:04x}")
+        else:
+            pieces.append(char)
+    pieces.append('"')
+    return "".join(pieces)
+
+
+def _canonical_json_text(value, active_containers: set[int]) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):
+        if abs(value) > CANONICAL_JSON_SAFE_INTEGER_MAX:
+            raise CanonicalJsonError("integer is outside the safe canonical range")
+        return str(value)
+    if isinstance(value, float):
+        raise CanonicalJsonError("floating-point values are not supported")
+    if isinstance(value, str):
+        return _canonical_json_string(value)
+    if isinstance(value, (list, dict)):
+        identity = id(value)
+        if identity in active_containers:
+            raise CanonicalJsonError("cyclic containers are not supported")
+        active_containers.add(identity)
+        try:
+            if isinstance(value, list):
+                return (
+                    "["
+                    + ",".join(
+                        _canonical_json_text(item, active_containers) for item in value
+                    )
+                    + "]"
+                )
+            if any(not isinstance(key, str) for key in value):
+                raise CanonicalJsonError("object keys must be strings")
+            return (
+                "{"
+                + ",".join(
+                    _canonical_json_string(key)
+                    + ":"
+                    + _canonical_json_text(value[key], active_containers)
+                    for key in sorted(value)
+                )
+                + "}"
+            )
+        finally:
+            active_containers.remove(identity)
+    raise CanonicalJsonError("value type is outside the canonical JSON domain")
+
+
+def canonical_structured_payload_bytes(value) -> bytes:
+    """Encode an already-typed value as project canonical JSON v1 bytes.
+
+    This typed-value boundary cannot observe duplicate keys or whether an
+    integer zero was originally spelled ``-0``. Raw importers must call
+    :func:`parse_project_canonical_json` before using this encoder.
+    """
+    return _canonical_json_text(value, set()).encode("utf-8")
+
+
+def parse_project_canonical_json(text: str):
+    """Parse raw JSON without losing duplicate-key or numeric-spelling checks."""
+    if not isinstance(text, str):
+        raise CanonicalJsonError("raw canonical JSON input must be text")
+
+    def parse_integer(token: str) -> int:
+        if token == "-0":
+            raise CanonicalJsonError("negative zero is not canonical")
+        value = int(token)
+        if abs(value) > CANONICAL_JSON_SAFE_INTEGER_MAX:
+            raise CanonicalJsonError("integer is outside the safe canonical range")
+        return value
+
+    def reject_float(_token: str):
+        raise CanonicalJsonError("floating-point syntax is not supported")
+
+    def reject_constant(_token: str):
+        raise CanonicalJsonError("non-finite numeric syntax is not supported")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise CanonicalJsonError("duplicate object keys are not supported")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            text,
+            parse_int=parse_integer,
+            parse_float=reject_float,
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except CanonicalJsonError:
+        raise
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise CanonicalJsonError("input is not valid project canonical JSON") from exc
+    canonical_structured_payload_bytes(value)
+    return value
+
+
+def hmac_payload_bytes(domain: str, value) -> bytes:
+    """Encode a typed value with the payload profile fixed for its HMAC domain."""
+    profile = HMAC_DOMAIN_PAYLOAD_PROFILES.get(domain)
+    if profile is None:
+        raise CanonicalJsonError("HMAC domain is outside the sealed contract")
+    if profile == "scalar_utf8":
+        if not isinstance(value, str):
+            raise CanonicalJsonError("scalar UTF-8 payload must be a string")
+        _canonical_json_string(value)  # Validate Unicode scalar values without quoting.
+        return value.encode("utf-8")
+    return canonical_structured_payload_bytes(value)
+
+
+def hmac_frame_bytes(domain: str, value) -> bytes:
+    """Return the exact versioned/domain-separated HMAC input frame."""
+    payload = hmac_payload_bytes(domain, value)
+    return (
+        HMAC_SCHEME.encode("ascii")
+        + b"\0"
+        + domain.encode("ascii")
+        + b"\0"
+        + len(payload).to_bytes(8, "big", signed=False)
+        + payload
+    )
+
+
 # Fields whose values are commit SHAs (40 hex or "unknown") by contract.
 SHA_KEYS = frozenset({"build_sha", "commit", "fix_commit"})
 # Fields whose values are ledger/ruling/test identifiers or derived identity;
@@ -1430,18 +1602,18 @@ def _check_adjudication_record(
 ) -> None:
     adjudications = rec.get("adjudications")
     if not adjudications:
-        if (
-            rec.get("record_origin") is not None
-            or rec.get("baseline_record_sha256") is not None
-        ):
+        if "record_origin" in rec or "baseline_record_sha256" in rec:
             errors.append(
                 f"E_BASELINE_AUTHORITY: {path}: retained legacy records cannot "
                 "claim enhanced origin authority"
             )
         return
 
-    origin = rec.get("record_origin")
-    baseline_digest = rec.get("baseline_record_sha256")
+    if "record_origin" not in rec or "baseline_record_sha256" not in rec:
+        return
+
+    origin = rec["record_origin"]
+    baseline_digest = rec["baseline_record_sha256"]
     if origin == "preexisting_public_baseline":
         if (
             not isinstance(baseline_digest, str)
@@ -1864,10 +2036,13 @@ def _check_hmac_contract_preflight(
     expected_fields = {
         "hmac_scheme": HMAC_SCHEME,
         "hmac_min_key_bytes": HMAC_MIN_KEY_BYTES,
+        "hmac_contract_version": HMAC_CONTRACT_VERSION,
         "hmac_domains": list(HMAC_DOMAINS),
+        "hmac_domain_payload_profiles": HMAC_DOMAIN_PAYLOAD_PROFILES,
         "hmac_scalar_payload_encoding": HMAC_SCALAR_PAYLOAD_ENCODING,
         "hmac_structured_payload_encoding": HMAC_STRUCTURED_PAYLOAD_ENCODING,
         "hmac_input_frame": HMAC_INPUT_FRAME,
+        "hmac_vector_set_sha256": HMAC_VECTOR_SET_SHA256,
     }
     for field, expected in expected_fields.items():
         if contract.get(field) != expected:
@@ -1894,6 +2069,8 @@ def _check_hmac_contract_preflight(
             receipt.get("state") == HMAC_RECEIPT_STATE
             and receipt.get("scheme") == HMAC_SCHEME
             and receipt.get("key_id") == key_id
+            and receipt.get("contract_version") == HMAC_CONTRACT_VERSION
+            and receipt.get("vector_set_sha256") == HMAC_VECTOR_SET_SHA256
             and receipt.get("coverage") == HMAC_RECEIPT_COVERAGE
             and isinstance(receipt.get("receipt_sha256"), str)
             and DIGEST_NONZERO_RE.fullmatch(receipt["receipt_sha256"]) is not None
@@ -1949,6 +2126,41 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
     """Emit fail-closed domain codes even when structural validation fails."""
     if not isinstance(doc, dict):
         return
+    records = doc.get("records")
+    if isinstance(records, list):
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                continue
+            path = f"$.records[{index}]"
+            adjudications = record.get("adjudications")
+            enhanced = isinstance(adjudications, list) and bool(adjudications)
+            for key in ("record_origin", "baseline_record_sha256"):
+                present = key in record
+                if enhanced and not present:
+                    errors.append(
+                        f"E_ADJ_KEYS: {path}.{key}: enhanced record requires this key"
+                    )
+                elif not enhanced and present:
+                    errors.append(
+                        f"E_ADJ_KEYS: {path}.{key}: legacy record forbids this key"
+                    )
+            if not enhanced or "baseline_record_sha256" not in record:
+                continue
+            origin = record.get("record_origin")
+            baseline_digest = record["baseline_record_sha256"]
+            if origin == "new" and baseline_digest is not None:
+                errors.append(
+                    f"E_BASELINE_AUTHORITY: {path}.baseline_record_sha256: new "
+                    "record requires an explicit null value"
+                )
+            elif origin == "preexisting_public_baseline" and (
+                not isinstance(baseline_digest, str)
+                or DIGEST_NONZERO_RE.fullmatch(baseline_digest) is None
+            ):
+                errors.append(
+                    f"E_BASELINE_AUTHORITY: {path}.baseline_record_sha256: "
+                    "baseline record requires a nonzero lowercase sha256"
+                )
     locations = _adjudication_locations(doc)
     contract = doc.get("adjudication_contract")
     _check_hmac_contract_preflight(doc, contract, locations, errors)
@@ -2117,6 +2329,9 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
         "registry_projection_sha256",
         "baseline_record_set_sha256",
         "baseline_external_receipt",
+        "hmac_contract_version",
+        "hmac_domain_payload_profiles",
+        "hmac_vector_set_sha256",
         "hmac_key_id",
         "hmac_external_receipt",
     ):
@@ -2138,6 +2353,8 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
         "hmac_external_receipt": {
             "state": HMAC_RECEIPT_STATE,
             "scheme": HMAC_SCHEME,
+            "contract_version": HMAC_CONTRACT_VERSION,
+            "vector_set_sha256": HMAC_VECTOR_SET_SHA256,
             "coverage": HMAC_RECEIPT_COVERAGE,
         },
         "baseline_external_receipt": {
@@ -2152,11 +2369,16 @@ def _check_schema_drift(schema: dict, errors: list[str]) -> None:
             errors.append(
                 f"E_SCHEMA_DRIFT: schema {definition} must close unknown fields"
             )
+        receipt_required = set(receipt_schema.get("required", ()))
         for field, expected in constants.items():
             if receipt_props.get(field, {}).get("const") != expected:
                 errors.append(
                     f"E_SCHEMA_DRIFT: schema {definition} pin {field!r} differs "
                     "from validator contract"
+                )
+            if field not in receipt_required:
+                errors.append(
+                    f"E_SCHEMA_DRIFT: schema {definition} must require {field!r}"
                 )
 
 
