@@ -25,13 +25,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Test IBus adapter against current native core
-        env:
-          SMARTKEY_REQUIRE_NATIVE_TESTS: "1"
+      - name: Prepare Python test environment
         run: |
           python -m venv "$RUNNER_TEMP/smartkey-ci-venv"
           . "$RUNNER_TEMP/smartkey-ci-venv/bin/activate"
           python -m pip install --disable-pip-version-check maturin pytest numpy scikit-learn
+      - name: Install pinned JSON Schema test contract
+        run: |
+          . "$RUNNER_TEMP/smartkey-ci-venv/bin/activate"
+          python -m pip install --disable-pip-version-check \
+            --require-hashes --only-binary=:all: \
+            -r requirements/schema-contract-py312-linux-x86_64.lock
+      - name: Verify pinned Draft 2020-12 test contract
+        run: |
+          . "$RUNNER_TEMP/smartkey-ci-venv/bin/activate"
+          python - <<'PY'
+          import platform
+          import sys
+          from importlib.metadata import version
+
+          from jsonschema import Draft202012Validator
+
+          expected_meta_schema = "https://json-schema.org/draft/2020-12/schema"
+          assert sys.version_info[:2] == (3, 12)
+          assert sys.platform == "linux"
+          assert platform.machine() == "x86_64"
+          assert version("jsonschema") == "4.26.0"
+          assert Draft202012Validator.META_SCHEMA["$schema"] == expected_meta_schema
+          assert Draft202012Validator.META_SCHEMA["$id"] == expected_meta_schema
+          Draft202012Validator.check_schema(Draft202012Validator.META_SCHEMA)
+          PY
+      - name: Test IBus adapter against current native core
+        env:
+          SMARTKEY_REQUIRE_NATIVE_TESTS: "1"
+        run: |
+          . "$RUNNER_TEMP/smartkey-ci-venv/bin/activate"
           build_sha="$(git rev-parse --verify HEAD)"
           test -z "$(git status --porcelain=v1 --untracked-files=normal)"
           SMARTKEY_BUILD_GIT_SHA="$build_sha" \
