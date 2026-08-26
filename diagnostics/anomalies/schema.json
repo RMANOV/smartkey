@@ -59,7 +59,7 @@
         "contract_version": { "const": "smartkey-g0-hmac-byte-contract-v3" },
         "resource_contract_version": { "const": "smartkey-g0-hmac-resource-contract-v1" },
         "resource_contract_sha256": { "const": "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab" },
-        "vector_set_sha256": { "const": "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f" },
+        "vector_set_sha256": { "const": "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192" },
         "coverage": { "const": "all-refs-domain-serialization-resource-key-id-private-recomputation-v2" },
         "receipt_sha256": { "$ref": "#/$defs/sha256_nonzero" }
       }
@@ -319,7 +319,7 @@
         "hmac_scalar_payload_encoding": { "const": "exact-utf8-scalar-no-normalization-v1" },
         "hmac_structured_payload_encoding": { "const": "smartkey-g0-canonical-json-v1" },
         "hmac_input_frame": { "const": "ascii-scheme-nul-domain-nul-u64be-length-payload-v1" },
-        "hmac_vector_set_sha256": { "const": "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f" },
+        "hmac_vector_set_sha256": { "const": "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192" },
         "hmac_key_id": { "$ref": "#/$defs/hmac_key_id" },
         "hmac_external_receipt": { "$ref": "#/$defs/hmac_external_receipt" }
       }

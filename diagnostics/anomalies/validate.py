@@ -374,7 +374,7 @@ HMAC_RECEIPT_COVERAGE = (
 )
 HMAC_RECEIPT_STATE = "externally_verified"
 HMAC_VECTOR_SET_SHA256 = (
-    "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f"
+    "2fa017fb46cfc08512ca0f9f6c8b4dafc56b3b28dab0bc8ab2fa9b45ae3c7192"
 )
 CANONICAL_JSON_SAFE_INTEGER_MAX = 9_007_199_254_740_991
 BASELINE_RECEIPT_STATE = "externally_verified"
@@ -1107,25 +1107,22 @@ def _raise_hmac_contract_error() -> None:
     raise ValueError(HMAC_CONTRACT_ERROR)
 
 
-def _source_record_text_bytes(value) -> bytes | None:
-    """Return bounded UTF-8 for one exact, non-empty source-contract string."""
+def _source_record_text_is_bounded(value) -> bool:
+    """Validate one exact source-contract string without materialising UTF-8."""
     if type(value) is not str or not value:
-        return None
+        return False
     maximum = HMAC_RESOURCE_LIMITS["max_string_utf8_bytes"]
     if len(value) > maximum:
-        return None
-    try:
-        encoded = value.encode("utf-8")
-    except Exception as internal:
-        _discard_internal_exception(internal)
-        internal = None
-        value = None
-        return None
-    value = None
-    if len(encoded) > maximum:
-        encoded = None
-        return None
-    return encoded
+        return False
+    utf8_bytes = 0
+    for char in value:
+        code_point = ord(char)
+        if 0xD800 <= code_point <= 0xDFFF:
+            return False
+        utf8_bytes += _utf8_width(code_point)
+        if utf8_bytes > maximum:
+            return False
+    return True
 
 
 def _source_record_exact_keys(value: dict, expected: frozenset[str]) -> bool:
@@ -1141,14 +1138,8 @@ def _source_record_exact_keys(value: dict, expected: frozenset[str]) -> bool:
 
 
 def _source_record_has_input_fields(value: dict) -> bool:
-    """Find only exact public input keys; all other source metadata is ignored."""
-    found: set[str] = set()
-    for key in dict.__iter__(value):
-        if type(key) is str and key in _SOURCE_RECORD_INPUT_FIELD_SET:
-            found.add(key)
-            if len(found) == len(_SOURCE_RECORD_INPUT_FIELDS):
-                return True
-    return False
+    """Check only the six public input keys; never consult ignored metadata."""
+    return all(dict.__contains__(value, field) for field in _SOURCE_RECORD_INPUT_FIELDS)
 
 
 def _private_source_record_segments(
@@ -1158,9 +1149,9 @@ def _private_source_record_segments(
         return None
     if len(value) > HMAC_RESOURCE_LIMITS["max_array_members"]:
         return None
-    captured: list[tuple[tuple[int, int, bytes, bytes], dict]] = []
-    seen: set[tuple[int, int, bytes, bytes]] = set()
-    previous: tuple[int, int, bytes, bytes] | None = None
+    captured: list[tuple[tuple[int, int, str, str], dict]] = []
+    seen: set[tuple[int, int, str, str]] = set()
+    previous: tuple[int, int, str, str] | None = None
     for segment in list.__iter__(value):
         if type(segment) is not dict or not _source_record_exact_keys(
             segment, _SOURCE_RECORD_SEGMENT_FIELD_SET
@@ -1170,11 +1161,9 @@ def _private_source_record_segments(
         start = dict.__getitem__(segment, "start_char")
         end = dict.__getitem__(segment, "end_char")
         reason = dict.__getitem__(segment, "reason")
-        authorship_bytes = _source_record_text_bytes(authorship)
-        reason_bytes = _source_record_text_bytes(reason)
         if (
-            authorship_bytes is None
-            or reason_bytes is None
+            not _source_record_text_is_bounded(authorship)
+            or not _source_record_text_is_bounded(reason)
             or type(start) is not int
             or type(end) is not int
             or start < 0
@@ -1182,7 +1171,10 @@ def _private_source_record_segments(
             or end > CANONICAL_JSON_SAFE_INTEGER_MAX
         ):
             return None
-        order_key = (start, end, authorship_bytes, reason_bytes)
+        # For valid Unicode scalars, Python string order and UTF-8 byte order
+        # are equivalent.  Keep strings here so validation never retains a
+        # second encoded copy; the canonical encoder alone materialises bytes.
+        order_key = (start, end, authorship, reason)
         if order_key in seen:
             return None
         if require_canonical_order and previous is not None and order_key < previous:
@@ -1235,9 +1227,9 @@ def _private_source_record_identity_envelope(
         if (
             type(merged_id) is not str
             or SHA256_RE.fullmatch(merged_id) is None
-            or _source_record_text_bytes(source_schema_version) is None
-            or _source_record_text_bytes(platform) is None
-            or _source_record_text_bytes(authorship_confidence) is None
+            or not _source_record_text_is_bounded(source_schema_version)
+            or not _source_record_text_is_bounded(platform)
+            or not _source_record_text_is_bounded(authorship_confidence)
             or excluded_segments is None
             or type(raw_sha256) is not str
             or SHA256_RE.fullmatch(raw_sha256) is None
