@@ -11,6 +11,39 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  commit-metadata:
+    name: No private commit metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test commit-message gate
+        run: python -m unittest discover -s tests -p 'test_no_new_private_metadata.py' -v
+      - name: Scan pull-request commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python tools/check_commit_metadata.py --range "$BASE_SHA..$HEAD_SHA"
+      - name: Scan pushed commits
+        if: github.event_name == 'push'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          zero_sha="0000000000000000000000000000000000000000"
+          if [ "$BEFORE_SHA" = "$zero_sha" ] || ! git cat-file -e "$BEFORE_SHA^{commit}"; then
+            python tools/check_commit_metadata.py --range "$HEAD_SHA"
+          else
+            python tools/check_commit_metadata.py --range "$BEFORE_SHA..$HEAD_SHA"
+          fi
+
   test-linux:
     name: Test (Linux)
     runs-on: ubuntu-latest
