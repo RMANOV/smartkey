@@ -32,8 +32,233 @@ _OLD_SOURCE_RECORD_PROFILE = "project_canonical_json_v1"
 _OLD_VECTOR_SET_SHA256 = (
     "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
 )
+_V3_VECTOR_SET_SHA256 = (
+    "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f"
+)
 _SYNTHETIC_KEY_ID = "0123456789abcdef0123456789abcdef"
-_SYNTHETIC_HMAC_KEY = b"smartkey-g0-r8-synthetic-vector-key"
+_PUBLIC_VECTOR_KEY = b"smartkey-g0-public-synthetic-vector-key-v1"
+_SAFE_INTEGER_MAX = 9_007_199_254_740_991
+_SOURCE_VECTOR_ENVELOPE = {
+    "profile": _SOURCE_RECORD_PROFILE,
+    "merged_id": ("c0045ec8791a7f514f4addc5982ecfbdd9e28ab80bdaea91f5e6fbc6dfbf395e"),
+    "source_schema_version": "synthetic-source-v1",
+    "platform": "synthetic-platform",
+    "authorship_confidence": "synthetic-confidence",
+    "excluded_segments": [
+        {
+            "authorship_confidence": "synthetic-alpha",
+            "start_char": 0,
+            "end_char": 4,
+            "reason": "synthetic-alpha",
+        },
+        {
+            "authorship_confidence": "synthetic-alpha",
+            "start_char": 0,
+            "end_char": 4,
+            "reason": "synthetic-zulu",
+        },
+        {
+            "authorship_confidence": "synthetic-beta",
+            "start_char": 0,
+            "end_char": 4,
+            "reason": "synthetic-alpha",
+        },
+        {
+            "authorship_confidence": "synthetic-zulu",
+            "start_char": 0,
+            "end_char": 4,
+            "reason": "synthetic-zulu",
+        },
+        {
+            "authorship_confidence": "synthetic-alpha",
+            "start_char": 0,
+            "end_char": 6,
+            "reason": "synthetic-alpha",
+        },
+        {
+            "authorship_confidence": "synthetic-aaa",
+            "start_char": 8,
+            "end_char": 12,
+            "reason": "synthetic-aaa",
+        },
+    ],
+    "raw_sha256": ("56d890f43577f16f03358ea0c94bb7bd7e1e6864b908585e24be54ae2734cd56"),
+}
+_SOURCE_VECTOR_PAYLOAD_HEX = (
+    "7b22617574686f72736869705f636f6e666964656e6365223a2273796e746865"
+    "7469632d636f6e666964656e6365222c226578636c756465645f7365676d656e"
+    "7473223a5b7b22617574686f72736869705f636f6e666964656e6365223a2273"
+    "796e7468657469632d616c706861222c22656e645f63686172223a342c227265"
+    "61736f6e223a2273796e7468657469632d616c706861222c2273746172745f63"
+    "686172223a307d2c7b22617574686f72736869705f636f6e666964656e636522"
+    "3a2273796e7468657469632d616c706861222c22656e645f63686172223a342c"
+    "22726561736f6e223a2273796e7468657469632d7a756c75222c227374617274"
+    "5f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e63"
+    "65223a2273796e7468657469632d62657461222c22656e645f63686172223a34"
+    "2c22726561736f6e223a2273796e7468657469632d616c706861222c22737461"
+    "72745f63686172223a307d2c7b22617574686f72736869705f636f6e66696465"
+    "6e6365223a2273796e7468657469632d7a756c75222c22656e645f6368617222"
+    "3a342c22726561736f6e223a2273796e7468657469632d7a756c75222c227374"
+    "6172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964"
+    "656e6365223a2273796e7468657469632d616c706861222c22656e645f636861"
+    "72223a362c22726561736f6e223a2273796e7468657469632d616c706861222c"
+    "2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e"
+    "666964656e6365223a2273796e7468657469632d616161222c22656e645f6368"
+    "6172223a31322c22726561736f6e223a2273796e7468657469632d616161222c"
+    "2273746172745f63686172223a387d5d2c226d65726765645f6964223a226330"
+    "3034356563383739316137663531346634616464633539383265636662646439"
+    "653238616238306264616561393166356536666263366466626633393565222c"
+    "22706c6174666f726d223a2273796e7468657469632d706c6174666f726d222c"
+    "2270726f66696c65223a22736d6172746b65792d67302d736f757263652d7265"
+    "636f72642d73656d616e7469632d7631222c227261775f736861323536223a22"
+    "3536643839306634333537376631366630333335386561306339346262376264"
+    "3765316536383634623930383538356532346265353461653237333463643536"
+    "222c22736f757263655f736368656d615f76657273696f6e223a2273796e7468"
+    "657469632d736f757263652d7631227d"
+)
+_SOURCE_VECTOR_PAYLOAD_BYTES = bytes.fromhex(_SOURCE_VECTOR_PAYLOAD_HEX)
+_SOURCE_VECTOR_FRAME_HEX = (
+    "736d6172746b65792d67302d686d61632d7368613235362d763100736f757263"
+    "655f7265636f72640000000000000003b0" + _SOURCE_VECTOR_PAYLOAD_HEX
+)
+_SOURCE_VECTOR_FRAME_BYTES = bytes.fromhex(_SOURCE_VECTOR_FRAME_HEX)
+_SOURCE_VECTOR_MAC_SHA256 = (
+    "76f946e28426dd9264533c26bca65c1470842bf50332c0c1b22a318c9e4b83ce"
+)
+_V3_VECTOR_RECEIPTS = [
+    {
+        "name": "value_non_ascii",
+        "domain": "value",
+        "profile": "scalar_utf8",
+        "key_id": _SYNTHETIC_KEY_ID,
+        "key_hex": _PUBLIC_VECTOR_KEY.hex(),
+        "payload_hex": "636166c3a9",
+        "frame_hex": (
+            "736d6172746b65792d67302d686d61632d7368613235362d76310076616c7565"
+            "000000000000000005636166c3a9"
+        ),
+        "mac_sha256": (
+            "134f37d80a6cf037adb96d129c300af20c98ecd25c325fa99bb0c43791a5fda1"
+        ),
+    },
+    {
+        "name": "event_nested",
+        "domain": "event",
+        "profile": "project_canonical_json_v1",
+        "key_id": _SYNTHETIC_KEY_ID,
+        "key_hex": _PUBLIC_VECTOR_KEY.hex(),
+        "payload_hex": (
+            "7b22616374697665223a747275652c22636f756e74223a322c226576656e7422"
+            "3a2273796e746865746963222c227061727473223a5b22616c706861222c6e75"
+            "6c6c2c7b226f6b223a66616c73657d5d2c22756e69745f736570617261746f"
+            "72223a225c7530303166222c22ee8080223a22626d70222c22f0908080223a22"
+            "61737472616c227d"
+        ),
+        "frame_hex": (
+            "736d6172746b65792d67302d686d61632d7368613235362d7631006576656e74"
+            "0000000000000000877b22616374697665223a747275652c22636f756e74223a"
+            "322c226576656e74223a2273796e746865746963222c227061727473223a5b22"
+            "616c706861222c6e756c6c2c7b226f6b223a66616c73657d5d2c22756e6974"
+            "5f736570617261746f72223a225c7530303166222c22ee8080223a22626d7022"
+            "2c22f0908080223a2261737472616c227d"
+        ),
+        "mac_sha256": (
+            "800c5952070ce32356a99537c95d2eeec515a854a7356379623d5ae4001ae94d"
+        ),
+    },
+    {
+        "name": "metadata_escaping",
+        "domain": "metadata",
+        "profile": "project_canonical_json_v1",
+        "key_id": _SYNTHETIC_KEY_ID,
+        "key_hex": _PUBLIC_VECTOR_KEY.hex(),
+        "payload_hex": (
+            "7b22636f6e74726f6c223a225c625c745c6e5c665c725c7530303030222c226c"
+            "6162656c223a22636166c3a9222c2271756f7465223a225c225c5c2f227d"
+        ),
+        "frame_hex": (
+            "736d6172746b65792d67302d686d61632d7368613235362d7631006d65746164"
+            "61746100000000000000003e7b22636f6e74726f6c223a225c625c745c6e5c66"
+            "5c725c7530303030222c226c6162656c223a22636166c3a9222c2271756f7465"
+            "223a225c225c5c2f227d"
+        ),
+        "mac_sha256": (
+            "3c190f2b02d21c5dec8e31ce21c0bd45abdc0187f157f9329d351d5295f667b2"
+        ),
+    },
+    {
+        "name": "source_record_whole_source_semantic_v1",
+        "domain": "source_record",
+        "profile": _SOURCE_RECORD_PROFILE,
+        "key_id": _SYNTHETIC_KEY_ID,
+        "key_hex": _PUBLIC_VECTOR_KEY.hex(),
+        "payload_hex": _SOURCE_VECTOR_PAYLOAD_HEX,
+        "frame_hex": _SOURCE_VECTOR_FRAME_HEX,
+        "mac_sha256": _SOURCE_VECTOR_MAC_SHA256,
+    },
+]
+
+
+def _reference_json_string_bytes(value: str) -> bytes:
+    assert type(value) is str
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _reference_canonical_json_bytes(value) -> bytes:
+    """Independent stdlib-only oracle; never calls the production encoder."""
+    if value is None:
+        return b"null"
+    if value is True:
+        return b"true"
+    if value is False:
+        return b"false"
+    if type(value) is int:
+        assert -_SAFE_INTEGER_MAX <= value <= _SAFE_INTEGER_MAX
+        return str(value).encode("ascii")
+    if type(value) is str:
+        return _reference_json_string_bytes(value)
+    if type(value) is list:
+        return (
+            b"["
+            + b",".join(_reference_canonical_json_bytes(item) for item in value)
+            + b"]"
+        )
+    if type(value) is dict:
+        assert all(type(key) is str for key in value)
+        keys = sorted(value, key=lambda key: tuple(ord(char) for char in key))
+        members = (
+            _reference_json_string_bytes(key)
+            + b":"
+            + _reference_canonical_json_bytes(value[key])
+            for key in keys
+        )
+        return b"{" + b",".join(members) + b"}"
+    raise AssertionError(f"unsupported reference type: {type(value).__name__}")
+
+
+def _reference_hmac_frame(domain: str, payload: bytes) -> bytes:
+    assert domain in {"value", "event", "metadata", "source_record"}
+    return (
+        b"smartkey-g0-hmac-sha256-v1"
+        + b"\0"
+        + domain.encode("ascii")
+        + b"\0"
+        + len(payload).to_bytes(8, "big", signed=False)
+        + payload
+    )
+
+
+def _segment_order_key(segment: dict) -> tuple:
+    return (
+        segment["start_char"],
+        segment["end_char"],
+        segment["authorship_confidence"].encode("utf-8"),
+        segment["reason"].encode("utf-8"),
+    )
 
 
 def _load_validator():
@@ -154,32 +379,16 @@ def _private_bytes(record: dict) -> bytes:
 
 def _synthetic_merged_source_record() -> dict:
     """One whole synthetic merged source, including non-decisional metadata."""
+    segments = _SOURCE_VECTOR_ENVELOPE["excluded_segments"]
     return {
-        "merged_id": hashlib.sha256(b"synthetic-merged-source").hexdigest(),
-        "source_schema_version": "synthetic-source-v1",
-        "platform": "synthetic-platform",
-        "authorship_confidence": "synthetic-high",
+        "merged_id": _SOURCE_VECTOR_ENVELOPE["merged_id"],
+        "source_schema_version": _SOURCE_VECTOR_ENVELOPE["source_schema_version"],
+        "platform": _SOURCE_VECTOR_ENVELOPE["platform"],
+        "authorship_confidence": _SOURCE_VECTOR_ENVELOPE["authorship_confidence"],
         "excluded_segments": [
-            {
-                "authorship_confidence": "synthetic-low",
-                "start_char": 8,
-                "end_char": 12,
-                "reason": "synthetic-beta",
-            },
-            {
-                "authorship_confidence": "synthetic-high",
-                "start_char": 0,
-                "end_char": 4,
-                "reason": "synthetic-beta",
-            },
-            {
-                "authorship_confidence": "synthetic-high",
-                "start_char": 0,
-                "end_char": 4,
-                "reason": "synthetic-alpha",
-            },
+            copy.deepcopy(segments[index]) for index in (5, 3, 1, 4, 0, 2)
         ],
-        "raw_sha256": hashlib.sha256(b"synthetic-merged-raw").hexdigest(),
+        "raw_sha256": _SOURCE_VECTOR_ENVELOPE["raw_sha256"],
         "raw_text": "synthetic excluded source text",
         "recorded_utc": "2026-08-26T12:00Z",
         "first_seen_utc": "2026-08-26T11:00Z",
@@ -198,7 +407,10 @@ def _synthetic_merged_source_record() -> dict:
         "action": "synthetic-excluded-action",
         "register": "synthetic-excluded-register",
         "classification": "synthetic-excluded-classification",
+        "event": "synthetic-excluded-event",
         "unit": "synthetic-excluded-unit",
+        "location": "synthetic-excluded-location",
+        "source_event_refs": ["synthetic-excluded-event-ref"],
         "key_id": "synthetic-excluded-key-id",
         "mac": "synthetic-excluded-mac",
     }
@@ -212,9 +424,9 @@ def _envelope_builder():
     return builder
 
 
-def _assert_hmac_contract_rejected(envelope, marker: str | None = None) -> None:
+def _assert_stable_hmac_contract_error(call, marker: str | None = None) -> None:
     with pytest.raises(Exception) as caught:
-        V.hmac_payload_bytes("source_record", envelope)
+        call()
     error = caught.value
     assert isinstance(error, ValueError)
     assert error.args == ("E_HMAC_CONTRACT",)
@@ -223,6 +435,13 @@ def _assert_hmac_contract_rejected(envelope, marker: str | None = None) -> None:
     if marker is not None:
         assert marker not in repr(error.args)
         assert marker not in repr(vars(error))
+
+
+def _assert_hmac_contract_rejected(envelope, marker: str | None = None) -> None:
+    _assert_stable_hmac_contract_error(
+        lambda: V.hmac_payload_bytes("source_record", envelope),
+        marker,
+    )
 
 
 def _synthetic_hmac_contract() -> dict:
@@ -550,6 +769,67 @@ def test_g0_r8_source_record_profile_bump_requires_a_new_vector_set():
     assert V.HMAC_VECTOR_SET_SHA256 != _OLD_VECTOR_SET_SHA256
 
 
+def test_g0_r8_source_record_public_vector_pins_independent_bytes_and_mac():
+    reference_payload = _reference_canonical_json_bytes(_SOURCE_VECTOR_ENVELOPE)
+    reference_frame = _reference_hmac_frame("source_record", reference_payload)
+    reference_mac = hmac.new(
+        _PUBLIC_VECTOR_KEY,
+        reference_frame,
+        hashlib.sha256,
+    ).hexdigest()
+    assert reference_payload == _SOURCE_VECTOR_PAYLOAD_BYTES
+    assert reference_payload.hex() == _SOURCE_VECTOR_PAYLOAD_HEX
+    assert reference_frame == _SOURCE_VECTOR_FRAME_BYTES
+    assert reference_frame.hex() == _SOURCE_VECTOR_FRAME_HEX
+    assert reference_mac == _SOURCE_VECTOR_MAC_SHA256
+
+    envelope = _envelope_builder()(_synthetic_merged_source_record())
+    assert envelope == _SOURCE_VECTOR_ENVELOPE
+    assert V.hmac_payload_bytes("source_record", envelope) == reference_payload
+    assert V.hmac_frame_bytes("source_record", envelope) == reference_frame
+    assert (
+        hmac.new(
+            _PUBLIC_VECTOR_KEY,
+            V.hmac_frame_bytes("source_record", envelope),
+            hashlib.sha256,
+        ).hexdigest()
+        == _SOURCE_VECTOR_MAC_SHA256
+    )
+
+
+def test_g0_r8_complete_v3_vector_set_is_exact_and_fails_closed():
+    reference_vector_set = _reference_canonical_json_bytes(_V3_VECTOR_RECEIPTS)
+    stdlib_vector_set = json.dumps(
+        _V3_VECTOR_RECEIPTS,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert reference_vector_set == stdlib_vector_set
+    assert hashlib.sha256(reference_vector_set).hexdigest() == (_V3_VECTOR_SET_SHA256)
+
+    schema = _schema()
+    contract_schema = schema["$defs"]["adjudication_contract"]["properties"]
+    receipt_schema = schema["$defs"]["hmac_external_receipt"]["properties"]
+    assert V.HMAC_VECTOR_SET_SHA256 == _V3_VECTOR_SET_SHA256
+    assert V.SEALED_CONTRACT_CONSTS["hmac_vector_set_sha256"] == (_V3_VECTOR_SET_SHA256)
+    assert contract_schema["hmac_vector_set_sha256"]["const"] == (_V3_VECTOR_SET_SHA256)
+    assert receipt_schema["vector_set_sha256"]["const"] == _V3_VECTOR_SET_SHA256
+
+    contract = _synthetic_hmac_contract()
+    assert contract["hmac_vector_set_sha256"] == _V3_VECTOR_SET_SHA256
+    assert contract["hmac_external_receipt"]["vector_set_sha256"] == (
+        _V3_VECTOR_SET_SHA256
+    )
+    arbitrary_sha = "a" * 64
+    assert arbitrary_sha not in {_OLD_VECTOR_SET_SHA256, _V3_VECTOR_SET_SHA256}
+    contract["hmac_vector_set_sha256"] = arbitrary_sha
+    contract["hmac_external_receipt"]["vector_set_sha256"] = arbitrary_sha
+    errors = _hmac_preflight_errors(contract)
+    assert _codes(errors) == {"E_HMAC_CONTRACT"}
+    assert arbitrary_sha not in "\n".join(errors)
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
@@ -586,42 +866,15 @@ def test_g0_r8_wrong_source_profile_error_is_stable_and_nonreflective():
 def test_g0_r8_source_record_identity_envelope_has_exact_closed_shape():
     source = _synthetic_merged_source_record()
     envelope = _envelope_builder()(source)
-    assert envelope == {
-        "profile": _SOURCE_RECORD_PROFILE,
-        "merged_id": source["merged_id"],
-        "source_schema_version": source["source_schema_version"],
-        "platform": source["platform"],
-        "authorship_confidence": source["authorship_confidence"],
-        "excluded_segments": [
-            {
-                "authorship_confidence": "synthetic-high",
-                "start_char": 0,
-                "end_char": 4,
-                "reason": "synthetic-alpha",
-            },
-            {
-                "authorship_confidence": "synthetic-high",
-                "start_char": 0,
-                "end_char": 4,
-                "reason": "synthetic-beta",
-            },
-            {
-                "authorship_confidence": "synthetic-low",
-                "start_char": 8,
-                "end_char": 12,
-                "reason": "synthetic-beta",
-            },
-        ],
-        "raw_sha256": source["raw_sha256"],
-    }
+    assert envelope == _SOURCE_VECTOR_ENVELOPE
 
     payload = V.hmac_payload_bytes("source_record", envelope)
     frame = V.hmac_frame_bytes("source_record", envelope)
-    prefix = V.HMAC_SCHEME.encode("ascii") + b"\0source_record\0"
-    assert payload == V.canonical_structured_payload_bytes(envelope)
-    assert frame == prefix + len(payload).to_bytes(8, "big") + payload
+    reference_payload = _reference_canonical_json_bytes(envelope)
+    assert payload == reference_payload
+    assert frame == _reference_hmac_frame("source_record", reference_payload)
 
-    encoded = V.canonical_structured_payload_bytes(envelope)
+    encoded = reference_payload
     for forbidden in (
         b"raw_text",
         b"recorded_utc",
@@ -639,7 +892,10 @@ def test_g0_r8_source_record_identity_envelope_has_exact_closed_shape():
         b"action",
         b"register",
         b"classification",
+        b"event",
         b"unit",
+        b"location",
+        b"source_event_refs",
         b"key_id",
         b"mac",
     ):
@@ -665,7 +921,10 @@ def test_g0_r8_source_record_identity_envelope_has_exact_closed_shape():
         ("action", "synthetic changed excluded action"),
         ("register", "synthetic changed excluded register"),
         ("classification", "synthetic changed excluded classification"),
+        ("event", "synthetic changed excluded event"),
         ("unit", "synthetic changed excluded unit"),
+        ("location", "synthetic changed excluded location"),
+        ("source_event_refs", ["synthetic-changed-event-ref"]),
         ("key_id", "synthetic changed excluded key id"),
         ("mac", "synthetic changed excluded mac"),
     ],
@@ -687,8 +946,88 @@ def test_g0_r8_excluded_source_metadata_is_nondecisional(field, replacement):
     assert first_envelope == second_envelope
     assert first_payload == second_payload
     assert first_frame == second_frame
-    assert hmac.new(_SYNTHETIC_HMAC_KEY, first_frame, hashlib.sha256).digest() == (
-        hmac.new(_SYNTHETIC_HMAC_KEY, second_frame, hashlib.sha256).digest()
+    assert hmac.new(_PUBLIC_VECTOR_KEY, first_frame, hashlib.sha256).digest() == (
+        hmac.new(_PUBLIC_VECTOR_KEY, second_frame, hashlib.sha256).digest()
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra_key", "first_value", "second_value"),
+    [
+        ("synthetic_extra_scalar", "synthetic-alpha", "synthetic-beta"),
+        ("synthetic_extra_integer", 1, 2),
+        ("synthetic_extra_boolean", False, True),
+        ("synthetic_extra_null", None, "synthetic-present"),
+        ("synthetic_extra_array", ["synthetic-alpha"], ["synthetic-beta"]),
+        (
+            "synthetic_extra_object",
+            {"synthetic": "alpha"},
+            {"synthetic": "beta"},
+        ),
+    ],
+)
+def test_g0_r8_arbitrary_nonwhitelist_source_input_is_nondecisional(
+    extra_key,
+    first_value,
+    second_value,
+):
+    whitelist = {
+        "profile",
+        "merged_id",
+        "source_schema_version",
+        "platform",
+        "authorship_confidence",
+        "excluded_segments",
+        "raw_sha256",
+    }
+    assert extra_key not in whitelist
+    builder = _envelope_builder()
+    first = _synthetic_merged_source_record()
+    second = copy.deepcopy(first)
+    first[extra_key] = first_value
+    second[extra_key] = second_value
+
+    first_envelope = builder(first)
+    second_envelope = builder(second)
+    first_payload = V.hmac_payload_bytes("source_record", first_envelope)
+    second_payload = V.hmac_payload_bytes("source_record", second_envelope)
+    first_frame = V.hmac_frame_bytes("source_record", first_envelope)
+    second_frame = V.hmac_frame_bytes("source_record", second_envelope)
+    assert first_envelope == second_envelope == _SOURCE_VECTOR_ENVELOPE
+    assert first_payload == second_payload
+    assert first_frame == second_frame
+    assert hmac.new(_PUBLIC_VECTOR_KEY, first_frame, hashlib.sha256).digest() == (
+        hmac.new(_PUBLIC_VECTOR_KEY, second_frame, hashlib.sha256).digest()
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("event", "synthetic-event-beta"),
+        ("unit", "synthetic-unit-beta"),
+        ("location", "synthetic-location-beta"),
+    ],
+)
+def test_g0_r8_event_lane_keeps_event_unit_and_location_decisional(
+    field,
+    replacement,
+):
+    first = {
+        "event": "synthetic-event-alpha",
+        "unit": "synthetic-unit-alpha",
+        "location": "synthetic-location-alpha",
+    }
+    second = copy.deepcopy(first)
+    second[field] = replacement
+    first_payload = V.hmac_payload_bytes("event", first)
+    second_payload = V.hmac_payload_bytes("event", second)
+    first_frame = V.hmac_frame_bytes("event", first)
+    second_frame = V.hmac_frame_bytes("event", second)
+    assert first_payload != second_payload
+    assert first_frame != second_frame
+    assert hmac.new(_PUBLIC_VECTOR_KEY, first_frame, hashlib.sha256).digest() != (
+        hmac.new(_PUBLIC_VECTOR_KEY, second_frame, hashlib.sha256).digest()
     )
 
 
@@ -734,8 +1073,8 @@ def test_g0_r8_each_included_source_field_is_decisional(field):
     assert first_envelope != second_envelope
     assert first_payload != second_payload
     assert first_frame != second_frame
-    assert hmac.new(_SYNTHETIC_HMAC_KEY, first_frame, hashlib.sha256).digest() != (
-        hmac.new(_SYNTHETIC_HMAC_KEY, second_frame, hashlib.sha256).digest()
+    assert hmac.new(_PUBLIC_VECTOR_KEY, first_frame, hashlib.sha256).digest() != (
+        hmac.new(_PUBLIC_VECTOR_KEY, second_frame, hashlib.sha256).digest()
     )
 
 
@@ -768,12 +1107,16 @@ def test_g0_r8_source_record_envelope_rejects_extra_root_key_nonreflectively():
     ("field", "replacement"),
     [
         ("profile", _OLD_SOURCE_RECORD_PROFILE),
+        ("profile", ""),
         ("profile", 1),
         ("merged_id", "f" * 63),
         ("merged_id", "g" * 64),
         ("merged_id", 1),
+        ("source_schema_version", ""),
         ("source_schema_version", 1),
+        ("platform", ""),
         ("platform", []),
+        ("authorship_confidence", ""),
         ("authorship_confidence", None),
         ("excluded_segments", {}),
         ("excluded_segments", [None]),
@@ -789,6 +1132,51 @@ def test_g0_r8_source_record_envelope_rejects_wrong_root_contract(
     envelope = _envelope_builder()(_synthetic_merged_source_record())
     envelope[field] = replacement
     _assert_hmac_contract_rejected(envelope)
+
+
+def test_g0_r8_segment_order_is_position_then_utf8_fields_with_crossovers():
+    source = _synthetic_merged_source_record()
+    input_segments = source["excluded_segments"]
+    expected = _SOURCE_VECTOR_ENVELOPE["excluded_segments"]
+    assert sorted(input_segments, key=_segment_order_key) == expected
+    assert [
+        (
+            segment["start_char"],
+            segment["end_char"],
+            segment["authorship_confidence"],
+            segment["reason"],
+        )
+        for segment in expected
+    ] == [
+        (0, 4, "synthetic-alpha", "synthetic-alpha"),
+        (0, 4, "synthetic-alpha", "synthetic-zulu"),
+        (0, 4, "synthetic-beta", "synthetic-alpha"),
+        (0, 4, "synthetic-zulu", "synthetic-zulu"),
+        (0, 6, "synthetic-alpha", "synthetic-alpha"),
+        (8, 12, "synthetic-aaa", "synthetic-aaa"),
+    ]
+
+    label_first = sorted(
+        input_segments,
+        key=lambda segment: (
+            segment["authorship_confidence"].encode("utf-8"),
+            segment["reason"].encode("utf-8"),
+            segment["start_char"],
+            segment["end_char"],
+        ),
+    )
+    start_then_label = sorted(
+        input_segments,
+        key=lambda segment: (
+            segment["start_char"],
+            segment["authorship_confidence"].encode("utf-8"),
+            segment["end_char"],
+            segment["reason"].encode("utf-8"),
+        ),
+    )
+    assert label_first != expected
+    assert start_then_label != expected
+    assert _envelope_builder()(source)["excluded_segments"] == expected
 
 
 def test_g0_r8_source_record_envelope_rejects_noncanonical_segment_order():
@@ -814,16 +1202,65 @@ def test_g0_r8_source_record_envelope_rejects_extra_segment_key_nonreflectively(
     _assert_hmac_contract_rejected(envelope, marker)
 
 
+def test_g0_r8_source_record_envelope_rejects_exact_duplicate_segment():
+    marker = "synthetic-duplicate-segment-marker"
+    envelope = _envelope_builder()(_synthetic_merged_source_record())
+    duplicate = copy.deepcopy(envelope["excluded_segments"][0])
+    duplicate["reason"] = marker
+    envelope["excluded_segments"].extend([duplicate, copy.deepcopy(duplicate)])
+    envelope["excluded_segments"].sort(key=_segment_order_key)
+    _assert_hmac_contract_rejected(envelope, marker)
+
+
+def test_g0_r8_overlapping_nonduplicate_segments_remain_valid():
+    envelope = _envelope_builder()(_synthetic_merged_source_record())
+    segments = envelope["excluded_segments"]
+    assert segments[0]["start_char"] == segments[1]["start_char"] == 0
+    assert segments[0]["end_char"] == segments[1]["end_char"] == 4
+    assert segments[0] != segments[1]
+    assert segments[3]["end_char"] == 4 < segments[4]["end_char"] == 6
+    assert V.hmac_payload_bytes("source_record", envelope) == (
+        _SOURCE_VECTOR_PAYLOAD_BYTES
+    )
+
+
+def test_g0_r8_segment_safe_integer_max_and_unlisted_strings_are_valid():
+    source = _synthetic_merged_source_record()
+    source["source_schema_version"] = "synthetic-unlisted-schema"
+    source["platform"] = "synthetic-unlisted-platform"
+    source["authorship_confidence"] = "synthetic-unlisted-root-confidence"
+    source["excluded_segments"] = [
+        {
+            "authorship_confidence": "synthetic-unlisted-segment-confidence",
+            "start_char": _SAFE_INTEGER_MAX - 1,
+            "end_char": _SAFE_INTEGER_MAX,
+            "reason": "synthetic-unlisted-reason",
+        }
+    ]
+    envelope = _envelope_builder()(source)
+    assert envelope["source_schema_version"] == "synthetic-unlisted-schema"
+    assert envelope["platform"] == "synthetic-unlisted-platform"
+    assert envelope["authorship_confidence"] == ("synthetic-unlisted-root-confidence")
+    assert envelope["excluded_segments"] == source["excluded_segments"]
+    assert V.hmac_payload_bytes("source_record", envelope)
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
         ("authorship_confidence", 1),
+        ("authorship_confidence", ""),
         ("start_char", -1),
         ("start_char", "0"),
         ("start_char", True),
+        ("start_char", 0.0),
+        ("start_char", 5),
         ("end_char", 0),
         ("end_char", "4"),
         ("end_char", True),
+        ("end_char", 4.0),
+        ("end_char", _SAFE_INTEGER_MAX + 1),
+        ("reason", ""),
         ("reason", []),
     ],
 )
