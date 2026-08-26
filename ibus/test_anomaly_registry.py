@@ -759,13 +759,13 @@ def _synthetic_r2_doc() -> dict:
             },
             "hmac_scheme": "smartkey-g0-hmac-sha256-v1",
             "hmac_min_key_bytes": 32,
-            "hmac_contract_version": "smartkey-g0-hmac-byte-contract-v2",
+            "hmac_contract_version": "smartkey-g0-hmac-byte-contract-v3",
             "hmac_domains": ["value", "event", "metadata", "source_record"],
             "hmac_domain_payload_profiles": {
                 "value": "scalar_utf8",
                 "event": "project_canonical_json_v1",
                 "metadata": "project_canonical_json_v1",
-                "source_record": "project_canonical_json_v1",
+                "source_record": "smartkey-g0-source-record-semantic-v1",
             },
             "hmac_domain_root_types": {
                 "value": "exact_str",
@@ -793,20 +793,20 @@ def _synthetic_r2_doc() -> dict:
             "hmac_structured_payload_encoding": "smartkey-g0-canonical-json-v1",
             "hmac_input_frame": ("ascii-scheme-nul-domain-nul-u64be-length-payload-v1"),
             "hmac_vector_set_sha256": (
-                "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
+                "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f"
             ),
             "hmac_key_id": _R4_SYNTHETIC_KEY_ID,
             "hmac_external_receipt": {
                 "state": "externally_verified",
                 "scheme": "smartkey-g0-hmac-sha256-v1",
                 "key_id": _R4_SYNTHETIC_KEY_ID,
-                "contract_version": "smartkey-g0-hmac-byte-contract-v2",
+                "contract_version": "smartkey-g0-hmac-byte-contract-v3",
                 "resource_contract_version": ("smartkey-g0-hmac-resource-contract-v1"),
                 "resource_contract_sha256": (
                     "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab"
                 ),
                 "vector_set_sha256": (
-                    "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
+                    "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f"
                 ),
                 "coverage": (
                     "all-refs-domain-serialization-resource-key-id-private-"
@@ -2480,7 +2480,7 @@ _R5_DOMAIN_PROFILES = {
     "value": "scalar_utf8",
     "event": "project_canonical_json_v1",
     "metadata": "project_canonical_json_v1",
-    "source_record": "project_canonical_json_v1",
+    "source_record": "smartkey-g0-source-record-semantic-v1",
 }
 _R5_VECTORS = (
     {
@@ -2550,31 +2550,131 @@ _R5_VECTORS = (
         ),
     },
     {
-        "name": "source_record_integer_edges",
+        "name": "source_record_whole_source_semantic_v1",
         "domain": "source_record",
         "value": {
-            "max": 9_007_199_254_740_991,
-            "min": -9_007_199_254_740_991,
-            "records": [1, 0, -1],
+            "profile": "smartkey-g0-source-record-semantic-v1",
+            "merged_id": (
+                "c0045ec8791a7f514f4addc5982ecfbdd9e28ab80bdaea91f5e6fbc6dfbf395e"
+            ),
+            "source_schema_version": "synthetic-source-v1",
+            "platform": "synthetic-platform",
+            "authorship_confidence": "synthetic-confidence",
+            "excluded_segments": [
+                {
+                    "authorship_confidence": "synthetic-alpha",
+                    "start_char": 0,
+                    "end_char": 4,
+                    "reason": "synthetic-alpha",
+                },
+                {
+                    "authorship_confidence": "synthetic-alpha",
+                    "start_char": 0,
+                    "end_char": 4,
+                    "reason": "synthetic-zulu",
+                },
+                {
+                    "authorship_confidence": "synthetic-beta",
+                    "start_char": 0,
+                    "end_char": 4,
+                    "reason": "synthetic-alpha",
+                },
+                {
+                    "authorship_confidence": "synthetic-zulu",
+                    "start_char": 0,
+                    "end_char": 4,
+                    "reason": "synthetic-zulu",
+                },
+                {
+                    "authorship_confidence": "synthetic-alpha",
+                    "start_char": 0,
+                    "end_char": 6,
+                    "reason": "synthetic-alpha",
+                },
+                {
+                    "authorship_confidence": "synthetic-aaa",
+                    "start_char": 8,
+                    "end_char": 12,
+                    "reason": "synthetic-aaa",
+                },
+            ],
+            "raw_sha256": (
+                "56d890f43577f16f03358ea0c94bb7bd7e1e6864b908585e24be54ae2734cd56"
+            ),
         },
         "payload_hex": (
-            "7b226d6178223a393030373139393235343734303939312c226d696e223a2d3930"
-            "30373139393235343734303939312c227265636f726473223a5b312c302c2d315d"
-            "7d"
+            "7b22617574686f72736869705f636f6e666964656e6365223a2273796e746865"
+            "7469632d636f6e666964656e6365222c226578636c756465645f7365676d656e"
+            "7473223a5b7b22617574686f72736869705f636f6e666964656e6365223a2273"
+            "796e7468657469632d616c706861222c22656e645f63686172223a342c227265"
+            "61736f6e223a2273796e7468657469632d616c706861222c2273746172745f63"
+            "686172223a307d2c7b22617574686f72736869705f636f6e666964656e636522"
+            "3a2273796e7468657469632d616c706861222c22656e645f63686172223a342c"
+            "22726561736f6e223a2273796e7468657469632d7a756c75222c227374617274"
+            "5f63686172223a307d2c7b22617574686f72736869705f636f6e666964656e63"
+            "65223a2273796e7468657469632d62657461222c22656e645f63686172223a34"
+            "2c22726561736f6e223a2273796e7468657469632d616c706861222c22737461"
+            "72745f63686172223a307d2c7b22617574686f72736869705f636f6e66696465"
+            "6e6365223a2273796e7468657469632d7a756c75222c22656e645f6368617222"
+            "3a342c22726561736f6e223a2273796e7468657469632d7a756c75222c227374"
+            "6172745f63686172223a307d2c7b22617574686f72736869705f636f6e666964"
+            "656e6365223a2273796e7468657469632d616c706861222c22656e645f636861"
+            "72223a362c22726561736f6e223a2273796e7468657469632d616c706861222c"
+            "2273746172745f63686172223a307d2c7b22617574686f72736869705f636f6e"
+            "666964656e6365223a2273796e7468657469632d616161222c22656e645f6368"
+            "6172223a31322c22726561736f6e223a2273796e7468657469632d616161222c"
+            "2273746172745f63686172223a387d5d2c226d65726765645f6964223a226330"
+            "3034356563383739316137663531346634616464633539383265636662646439"
+            "653238616238306264616561393166356536666263366466626633393565222c"
+            "22706c6174666f726d223a2273796e7468657469632d706c6174666f726d222c"
+            "2270726f66696c65223a22736d6172746b65792d67302d736f757263652d7265"
+            "636f72642d73656d616e7469632d7631222c227261775f736861323536223a22"
+            "3536643839306634333537376631366630333335386561306339346262376264"
+            "3765316536383634623930383538356532346265353461653237333463643536"
+            "222c22736f757263655f736368656d615f76657273696f6e223a2273796e7468"
+            "657469632d736f757263652d7631227d"
         ),
         "frame_hex": (
             "736d6172746b65792d67302d686d61632d7368613235362d763100736f757263"
-            "655f7265636f72640000000000000000437b226d6178223a3930303731393932"
-            "35343734303939312c226d696e223a2d39303037313939323534373430393931"
-            "2c227265636f726473223a5b312c302c2d315d7d"
+            "655f7265636f72640000000000000003b07b22617574686f72736869705f636f"
+            "6e666964656e6365223a2273796e7468657469632d636f6e666964656e636522"
+            "2c226578636c756465645f7365676d656e7473223a5b7b22617574686f727368"
+            "69705f636f6e666964656e6365223a2273796e7468657469632d616c70686122"
+            "2c22656e645f63686172223a342c22726561736f6e223a2273796e7468657469"
+            "632d616c706861222c2273746172745f63686172223a307d2c7b22617574686f"
+            "72736869705f636f6e666964656e6365223a2273796e7468657469632d616c70"
+            "6861222c22656e645f63686172223a342c22726561736f6e223a2273796e7468"
+            "657469632d7a756c75222c2273746172745f63686172223a307d2c7b22617574"
+            "686f72736869705f636f6e666964656e6365223a2273796e7468657469632d62"
+            "657461222c22656e645f63686172223a342c22726561736f6e223a2273796e74"
+            "68657469632d616c706861222c2273746172745f63686172223a307d2c7b2261"
+            "7574686f72736869705f636f6e666964656e6365223a2273796e746865746963"
+            "2d7a756c75222c22656e645f63686172223a342c22726561736f6e223a227379"
+            "6e7468657469632d7a756c75222c2273746172745f63686172223a307d2c7b22"
+            "617574686f72736869705f636f6e666964656e6365223a2273796e7468657469"
+            "632d616c706861222c22656e645f63686172223a362c22726561736f6e223a22"
+            "73796e7468657469632d616c706861222c2273746172745f63686172223a307d"
+            "2c7b22617574686f72736869705f636f6e666964656e6365223a2273796e7468"
+            "657469632d616161222c22656e645f63686172223a31322c22726561736f6e22"
+            "3a2273796e7468657469632d616161222c2273746172745f63686172223a387d"
+            "5d2c226d65726765645f6964223a226330303435656338373931613766353134"
+            "6634616464633539383265636662646439653238616238306264616561393166"
+            "356536666263366466626633393565222c22706c6174666f726d223a2273796e"
+            "7468657469632d706c6174666f726d222c2270726f66696c65223a22736d6172"
+            "746b65792d67302d736f757263652d7265636f72642d73656d616e7469632d76"
+            "31222c227261775f736861323536223a22353664383930663433353737663136"
+            "6630333335386561306339346262376264376531653638363462393038353835"
+            "6532346265353461653237333463643536222c22736f757263655f736368656d"
+            "615f76657273696f6e223a2273796e7468657469632d736f757263652d763122"
+            "7d"
         ),
         "mac_sha256": (
-            "121118ba0fc9558a6870837176a3e5c5fa028522391ab0cc067609a4e3a0630e"
+            "76f946e28426dd9264533c26bca65c1470842bf50332c0c1b22a318c9e4b83ce"
         ),
     },
 )
 _R5_VECTOR_SET_SHA256 = (
-    "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
+    "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f"
 )
 
 
@@ -2770,7 +2870,7 @@ _R6_ERROR_DEPTH = "canonical_depth"
 _R6_ERROR_CYCLE = "canonical_cycle"
 _R6_ERROR_ROOT = "canonical_root"
 _R6_ERROR_INTERNAL = "canonical_internal"
-_R6_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v2"
+_R6_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v3"
 _R6_RESOURCE_VERSION = "smartkey-g0-hmac-resource-contract-v1"
 _R6_RESOURCE_LIMITS = {
     "max_raw_utf8_bytes": 262_144,
@@ -2792,7 +2892,7 @@ _R6_DOMAIN_ROOT_TYPES = {
 }
 _R6_RESOURCE_SHA256 = "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab"
 _R6_VECTOR_SET_SHA256 = (
-    "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
+    "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f"
 )
 _R6_EVENT_VALUE = {
     "active": True,
@@ -2965,6 +3065,20 @@ def _r6_clean_error(call, expected_code: str, marker: str | None = None):
             if Path(frame.f_code.co_filename).resolve() != Path(__file__).resolve():
                 assert not _r6_value_contains_marker(frame.f_locals, marker)
             traceback_cursor = traceback_cursor.tb_next
+    return error
+
+
+def _r6_clean_hmac_contract_error(call, marker: str | None = None):
+    with pytest.raises(ValueError) as caught:
+        call()
+    error = caught.value
+    assert type(error) is ValueError
+    assert error.args == ("E_HMAC_CONTRACT",)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    if marker is not None:
+        assert not _r6_value_contains_marker(error.args, marker)
+        assert not _r6_value_contains_marker(vars(error), marker)
     return error
 
 
@@ -3298,24 +3412,39 @@ def test_g0_r6_shallow_huge_inputs_fail_with_contract_errors():
 @pytest.mark.parametrize("domain", ["event", "metadata", "source_record"])
 @pytest.mark.parametrize("value", [None, True, 1, "synthetic", []])
 def test_g0_r6_structured_hmac_domains_require_exact_dict_root(domain, value):
-    _r6_clean_error(lambda: V.hmac_payload_bytes(domain, value), _R6_ERROR_ROOT)
+    if domain == "source_record":
+        _r6_clean_hmac_contract_error(lambda: V.hmac_payload_bytes(domain, value))
+    else:
+        _r6_clean_error(lambda: V.hmac_payload_bytes(domain, value), _R6_ERROR_ROOT)
 
 
 @pytest.mark.parametrize("domain", ["event", "metadata", "source_record"])
 def test_g0_r6_structured_hmac_root_rejects_hostile_dict_subclass(domain):
     value = _R6HostileDict({"private_hostile_marker": None})
-    _r6_clean_error(
-        lambda: V.hmac_payload_bytes(domain, value),
-        _R6_ERROR_ROOT,
-        "private_hostile_marker",
-    )
+    if domain == "source_record":
+        _r6_clean_hmac_contract_error(
+            lambda: V.hmac_payload_bytes(domain, value),
+            "private_hostile_marker",
+        )
+    else:
+        _r6_clean_error(
+            lambda: V.hmac_payload_bytes(domain, value),
+            _R6_ERROR_ROOT,
+            "private_hostile_marker",
+        )
     assert value.touched is False
 
 
 @pytest.mark.parametrize("domain", ["event", "metadata", "source_record"])
 def test_g0_r6_structured_hmac_domains_accept_nested_scalars_and_arrays(domain):
-    value = {"nested": [None, True, 1, "synthetic", {"ok": False}]}
-    assert V.hmac_payload_bytes(domain, value).startswith(b'{"nested":[')
+    if domain == "source_record":
+        value = copy.deepcopy(_R5_VECTORS[3]["value"])
+        assert V.hmac_payload_bytes(domain, value) == bytes.fromhex(
+            _R5_VECTORS[3]["payload_hex"]
+        )
+    else:
+        value = {"nested": [None, True, 1, "synthetic", {"ok": False}]}
+        assert V.hmac_payload_bytes(domain, value).startswith(b'{"nested":[')
 
 
 def test_g0_r6_event_vector_pins_codepoint_order_control_escape_frame_and_mac():

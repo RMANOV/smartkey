@@ -332,17 +332,19 @@ CANONICAL_REF_SET_SHA256 = (
     "81168506c76776f060aaf9cd71bb4ed0e2fbde31b286ac30b69823bc8a54a5ee"
 )
 SEMANTIC_COMMITMENT_ALGORITHM = "sha256-canonical-json-v1"
+SEMANTIC_AUTHORITY_PROJECTION_VERSION = "smartkey-g0-semantic-authority-projection-v2"
 HMAC_SCHEME = "smartkey-g0-hmac-sha256-v1"
 HMAC_DOMAINS = ("value", "event", "metadata", "source_record")
 HMAC_MIN_KEY_BYTES = 32
-HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v2"
+HMAC_CONTRACT_VERSION = "smartkey-g0-hmac-byte-contract-v3"
 HMAC_SCALAR_PAYLOAD_ENCODING = "exact-utf8-scalar-no-normalization-v1"
 HMAC_STRUCTURED_PAYLOAD_ENCODING = "smartkey-g0-canonical-json-v1"
+SOURCE_RECORD_HMAC_PROFILE = "smartkey-g0-source-record-semantic-v1"
 HMAC_DOMAIN_PAYLOAD_PROFILES = {
     "value": "scalar_utf8",
     "event": "project_canonical_json_v1",
     "metadata": "project_canonical_json_v1",
-    "source_record": "project_canonical_json_v1",
+    "source_record": SOURCE_RECORD_HMAC_PROFILE,
 }
 HMAC_DOMAIN_ROOT_TYPES = {
     "value": "exact_str",
@@ -372,7 +374,7 @@ HMAC_RECEIPT_COVERAGE = (
 )
 HMAC_RECEIPT_STATE = "externally_verified"
 HMAC_VECTOR_SET_SHA256 = (
-    "7a1f3543ff11c1060149b72f9abad4a0bb603a06463f9229edb775078f005ecb"
+    "0672508a1525bb5d606a79b30940dfe9ff8dca032532cd29f15d110ed5185d0f"
 )
 CANONICAL_JSON_SAFE_INTEGER_MAX = 9_007_199_254_740_991
 BASELINE_RECEIPT_STATE = "externally_verified"
@@ -1079,6 +1081,223 @@ def parse_project_canonical_json(text: str):
     return parsed
 
 
+HMAC_CONTRACT_ERROR = "E_HMAC_CONTRACT"
+_SOURCE_RECORD_INPUT_FIELDS = (
+    "merged_id",
+    "source_schema_version",
+    "platform",
+    "authorship_confidence",
+    "excluded_segments",
+    "raw_sha256",
+)
+_SOURCE_RECORD_ENVELOPE_FIELDS = ("profile", *_SOURCE_RECORD_INPUT_FIELDS)
+_SOURCE_RECORD_SEGMENT_FIELDS = (
+    "authorship_confidence",
+    "start_char",
+    "end_char",
+    "reason",
+)
+_SOURCE_RECORD_INPUT_FIELD_SET = frozenset(_SOURCE_RECORD_INPUT_FIELDS)
+_SOURCE_RECORD_ENVELOPE_FIELD_SET = frozenset(_SOURCE_RECORD_ENVELOPE_FIELDS)
+_SOURCE_RECORD_SEGMENT_FIELD_SET = frozenset(_SOURCE_RECORD_SEGMENT_FIELDS)
+
+
+def _raise_hmac_contract_error() -> None:
+    """Raise a fixed error from a frame that has never received private input."""
+    raise ValueError(HMAC_CONTRACT_ERROR)
+
+
+def _source_record_text_bytes(value) -> bytes | None:
+    """Return bounded UTF-8 for one exact, non-empty source-contract string."""
+    if type(value) is not str or not value:
+        return None
+    maximum = HMAC_RESOURCE_LIMITS["max_string_utf8_bytes"]
+    if len(value) > maximum:
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        value = None
+        return None
+    value = None
+    if len(encoded) > maximum:
+        encoded = None
+        return None
+    return encoded
+
+
+def _source_record_exact_keys(value: dict, expected: frozenset[str]) -> bool:
+    """Check a closed exact-builtin dictionary without calling key overrides."""
+    if len(value) != len(expected):
+        return False
+    keys: list[str] = []
+    for key in dict.__iter__(value):
+        if type(key) is not str:
+            return False
+        keys.append(key)
+    return frozenset(keys) == expected
+
+
+def _source_record_has_input_fields(value: dict) -> bool:
+    """Find only exact public input keys; all other source metadata is ignored."""
+    found: set[str] = set()
+    for key in dict.__iter__(value):
+        if type(key) is str and key in _SOURCE_RECORD_INPUT_FIELD_SET:
+            found.add(key)
+            if len(found) == len(_SOURCE_RECORD_INPUT_FIELDS):
+                return True
+    return False
+
+
+def _private_source_record_segments(
+    value, *, require_canonical_order: bool
+) -> list[dict] | None:
+    if type(value) is not list:
+        return None
+    if len(value) > HMAC_RESOURCE_LIMITS["max_array_members"]:
+        return None
+    captured: list[tuple[tuple[int, int, bytes, bytes], dict]] = []
+    seen: set[tuple[int, int, bytes, bytes]] = set()
+    previous: tuple[int, int, bytes, bytes] | None = None
+    for segment in list.__iter__(value):
+        if type(segment) is not dict or not _source_record_exact_keys(
+            segment, _SOURCE_RECORD_SEGMENT_FIELD_SET
+        ):
+            return None
+        authorship = dict.__getitem__(segment, "authorship_confidence")
+        start = dict.__getitem__(segment, "start_char")
+        end = dict.__getitem__(segment, "end_char")
+        reason = dict.__getitem__(segment, "reason")
+        authorship_bytes = _source_record_text_bytes(authorship)
+        reason_bytes = _source_record_text_bytes(reason)
+        if (
+            authorship_bytes is None
+            or reason_bytes is None
+            or type(start) is not int
+            or type(end) is not int
+            or start < 0
+            or start >= end
+            or end > CANONICAL_JSON_SAFE_INTEGER_MAX
+        ):
+            return None
+        order_key = (start, end, authorship_bytes, reason_bytes)
+        if order_key in seen:
+            return None
+        if require_canonical_order and previous is not None and order_key < previous:
+            return None
+        seen.add(order_key)
+        previous = order_key
+        captured.append(
+            (
+                order_key,
+                {
+                    "authorship_confidence": authorship,
+                    "start_char": start,
+                    "end_char": end,
+                    "reason": reason,
+                },
+            )
+        )
+    if not require_canonical_order:
+        captured.sort(key=lambda item: item[0])
+    return [segment for _order_key, segment in captured]
+
+
+def _private_source_record_identity_envelope(
+    source_record, *, require_closed_root: bool, require_canonical_order: bool
+) -> tuple[bool, dict | None]:
+    """Build a bounded fresh snapshot, returning no input-derived diagnostics."""
+    try:
+        if type(source_record) is not dict:
+            return False, None
+        if require_closed_root:
+            if not _source_record_exact_keys(
+                source_record, _SOURCE_RECORD_ENVELOPE_FIELD_SET
+            ):
+                return False, None
+            profile = dict.__getitem__(source_record, "profile")
+            if type(profile) is not str or profile != SOURCE_RECORD_HMAC_PROFILE:
+                return False, None
+        elif not _source_record_has_input_fields(source_record):
+            return False, None
+
+        merged_id = dict.__getitem__(source_record, "merged_id")
+        source_schema_version = dict.__getitem__(source_record, "source_schema_version")
+        platform = dict.__getitem__(source_record, "platform")
+        authorship_confidence = dict.__getitem__(source_record, "authorship_confidence")
+        excluded_segments = _private_source_record_segments(
+            dict.__getitem__(source_record, "excluded_segments"),
+            require_canonical_order=require_canonical_order,
+        )
+        raw_sha256 = dict.__getitem__(source_record, "raw_sha256")
+        if (
+            type(merged_id) is not str
+            or SHA256_RE.fullmatch(merged_id) is None
+            or _source_record_text_bytes(source_schema_version) is None
+            or _source_record_text_bytes(platform) is None
+            or _source_record_text_bytes(authorship_confidence) is None
+            or excluded_segments is None
+            or type(raw_sha256) is not str
+            or SHA256_RE.fullmatch(raw_sha256) is None
+        ):
+            return False, None
+        envelope = {
+            "profile": SOURCE_RECORD_HMAC_PROFILE,
+            "merged_id": merged_id,
+            "source_schema_version": source_schema_version,
+            "platform": platform,
+            "authorship_confidence": authorship_confidence,
+            "excluded_segments": excluded_segments,
+            "raw_sha256": raw_sha256,
+        }
+        return True, envelope
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        source_record = None
+        return False, None
+
+
+def _private_source_record_payload(envelope: dict) -> bytes | None:
+    """Encode a validated snapshot without exposing an unexpected internal."""
+    try:
+        encoded_result = _private_encode(envelope)
+    except Exception as internal:
+        _discard_internal_exception(internal)
+        internal = None
+        envelope = None
+        return None
+    envelope = None
+    code, payload = encoded_result
+    encoded_result = None
+    if code is not None:
+        code = None
+        payload = None
+        return None
+    return payload
+
+
+def source_record_identity_envelope(source_record) -> dict:
+    """Project one whole merged source into its fixed public HMAC envelope."""
+    valid, envelope = _private_source_record_identity_envelope(
+        source_record,
+        require_closed_root=False,
+        require_canonical_order=False,
+    )
+    source_record = None
+    if valid:
+        payload = _private_source_record_payload(envelope)
+        if payload is None:
+            valid = False
+        payload = None
+    if not valid:
+        envelope = None
+        _raise_hmac_contract_error()
+    return envelope
+
+
 def _private_hmac_payload(domain: str, value) -> tuple[str | None, bytes | None]:
     if type(domain) is not str:
         domain = None
@@ -1089,6 +1308,22 @@ def _private_hmac_payload(domain: str, value) -> tuple[str | None, bytes | None]
         domain = None
         value = None
         return CANONICAL_ERROR_ROOT, None
+    if domain == "source_record":
+        valid, envelope = _private_source_record_identity_envelope(
+            value,
+            require_closed_root=True,
+            require_canonical_order=True,
+        )
+        domain = None
+        value = None
+        if not valid:
+            envelope = None
+            return HMAC_CONTRACT_ERROR, None
+        payload = _private_source_record_payload(envelope)
+        envelope = None
+        if payload is None:
+            return HMAC_CONTRACT_ERROR, None
+        return None, payload
     if profile == "scalar_utf8":
         if type(value) is not str:
             domain = None
@@ -1145,6 +1380,9 @@ def hmac_payload_bytes(domain: str, value) -> bytes:
         public_code = code
         code = None
         payload = None
+        if public_code == HMAC_CONTRACT_ERROR:
+            public_code = None
+            _raise_hmac_contract_error()
         _raise_canonical_error(public_code)
     return payload
 
@@ -1185,6 +1423,9 @@ def hmac_frame_bytes(domain: str, value) -> bytes:
         public_code = code
         code = None
         frame = None
+        if public_code == HMAC_CONTRACT_ERROR:
+            public_code = None
+            _raise_hmac_contract_error()
         _raise_canonical_error(public_code)
     return frame
 
@@ -1542,10 +1783,14 @@ def _check_sides(rec: dict, path: str, errors: list[str]) -> None:
         rec["last_seen_utc"],
         rec["recorded_utc"],
     )
-    if first and last and _pad_utc(first) > _pad_utc(last):
+    if first is not None and last is not None and _pad_utc(first) > _pad_utc(last):
         errors.append(f"E_TIME: {path}: first_seen_utc after last_seen_utc")
     for name, stamp in (("first_seen_utc", first), ("last_seen_utc", last)):
-        if stamp and _pad_utc(stamp) > _pad_utc(recorded):
+        if (
+            stamp is not None
+            and recorded is not None
+            and _pad_utc(stamp) > _pad_utc(recorded)
+        ):
             errors.append(f"E_TIME: {path}: {name} after recorded_utc")
 
 
