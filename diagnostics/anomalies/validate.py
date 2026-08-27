@@ -1276,9 +1276,19 @@ def _private_authoritative_scope(adjudication) -> tuple[bool, str | None]:
     try:
         if type(adjudication) is not dict:
             return False, None
-        keys = frozenset(dict.__iter__(adjudication))
+        key_count = dict.__len__(adjudication)
+        if key_count not in (11, 12):
+            return False, None
+        bounded_keys: list[str] = []
+        for key in dict.__iter__(adjudication):
+            if type(key) is not str:
+                return False, None
+            bounded_keys.append(key)
+        keys = frozenset(bounded_keys)
+        bounded_keys = None
         if keys not in _ADJUDICATION_SCOPE_ALLOWED_FIELD_SETS:
             return False, None
+        keys = None
         grain = dict.__getitem__(adjudication, "grain")
         ref = dict.__getitem__(adjudication, "ref")
         if (
@@ -3108,25 +3118,37 @@ def _private_source_scope_placements(doc) -> list[dict] | None:
         exclusions = dict.get(doc, "source_exclusions")
         if type(records) is not list or type(exclusions) is not list:
             return None
-        if len(records) > PROJECTED_RECORD_COUNT or len(exclusions) > 2:
+        if (
+            list.__len__(records) > PROJECTED_RECORD_COUNT
+            or list.__len__(exclusions) > 2
+        ):
             return None
 
         items: list[dict] = []
+        remaining = HMAC_SOURCE_SCOPE_BINDING_COUNT
         for record in list.__iter__(records):
             if type(record) is not dict:
                 return None
             adjudications = dict.get(record, "adjudications", [])
             if type(adjudications) is not list:
                 return None
+            adjudication_count = list.__len__(adjudications)
+            if adjudication_count > remaining:
+                return None
+            remaining -= adjudication_count
             for item in list.__iter__(adjudications):
                 if type(item) is not dict:
                     return None
                 items.append(item)
+        exclusion_count = list.__len__(exclusions)
+        if exclusion_count > remaining:
+            return None
+        remaining -= exclusion_count
         for item in list.__iter__(exclusions):
             if type(item) is not dict:
                 return None
             items.append(item)
-        if len(items) != HMAC_SOURCE_SCOPE_BINDING_COUNT:
+        if remaining != 0:
             return None
 
         placements: list[dict] = []
@@ -3468,24 +3490,24 @@ def _check_adjudication_contract(
 
 def _adjudication_locations(doc: dict) -> list[tuple[str, dict]]:
     locations: list[tuple[str, dict]] = []
-    records = doc.get("records")
+    records = dict.get(doc, "records")
     if not isinstance(records, list):
         records = []
-    for index, rec in enumerate(records):
+    for index, rec in enumerate(list.__iter__(records)):
         if not isinstance(rec, dict):
             continue
-        adjudications = rec.get("adjudications")
+        adjudications = dict.get(rec, "adjudications")
         if not isinstance(adjudications, list):
             continue
-        for adj_index, adjudication in enumerate(adjudications):
+        for adj_index, adjudication in enumerate(list.__iter__(adjudications)):
             if isinstance(adjudication, dict):
                 locations.append(
                     (f"$.records[{index}].adjudications[{adj_index}]", adjudication)
                 )
-    source_exclusions = doc.get("source_exclusions")
+    source_exclusions = dict.get(doc, "source_exclusions")
     if not isinstance(source_exclusions, list):
         source_exclusions = []
-    for index, adjudication in enumerate(source_exclusions):
+    for index, adjudication in enumerate(list.__iter__(source_exclusions)):
         if isinstance(adjudication, dict):
             locations.append((f"$.source_exclusions[{index}]", adjudication))
     return locations
@@ -3704,17 +3726,18 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
     """Emit fail-closed domain codes even when structural validation fails."""
     if not isinstance(doc, dict):
         return
-    records = doc.get("records")
-    has_enhanced_record = isinstance(records, list) and any(
-        isinstance(record, dict)
-        and isinstance(record.get("adjudications"), list)
-        and bool(record["adjudications"])
-        for record in records
-    )
-    has_enhanced_exclusion = isinstance(doc.get("source_exclusions"), list) and bool(
-        doc["source_exclusions"]
-    )
-    if has_enhanced_record or has_enhanced_exclusion or "adjudication_contract" in doc:
+    records = dict.get(doc, "records")
+    has_enhanced_marker = dict.__contains__(
+        doc, "adjudication_contract"
+    ) or dict.__contains__(doc, "source_exclusions")
+    if isinstance(records, list):
+        for record in list.__iter__(records):
+            if not isinstance(record, dict):
+                continue
+            for key in _ENHANCED_RECORD_FIELDS:
+                if dict.__contains__(record, key):
+                    has_enhanced_marker = True
+    if has_enhanced_marker:
         # R11a is deliberately preparatory: its self-derived algorithm digest
         # is not the final private authority pin.  R11b alone may hard-pin the
         # synthesized digest and remove this code-owned, unconditional HOLD.
@@ -3723,14 +3746,16 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
             "until the separately audited R11b authority seal"
         )
     if isinstance(records, list):
-        for index, record in enumerate(records):
+        for index, record in enumerate(list.__iter__(records)):
             if not isinstance(record, dict):
                 continue
             path = f"$.records[{index}]"
-            adjudications = record.get("adjudications")
-            enhanced = isinstance(adjudications, list) and bool(adjudications)
+            adjudications = dict.get(record, "adjudications")
+            enhanced = isinstance(adjudications, list) and (
+                list.__len__(adjudications) > 0
+            )
             for key in ("record_origin", "baseline_record_sha256"):
-                present = key in record
+                present = dict.__contains__(record, key)
                 if enhanced and not present:
                     errors.append(
                         f"E_ADJ_KEYS: {path}.{key}: enhanced record requires this key"
@@ -3739,10 +3764,10 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
                     errors.append(
                         f"E_ADJ_KEYS: {path}.{key}: legacy record forbids this key"
                     )
-            if not enhanced or "baseline_record_sha256" not in record:
+            if not enhanced or not dict.__contains__(record, "baseline_record_sha256"):
                 continue
-            origin = record.get("record_origin")
-            baseline_digest = record["baseline_record_sha256"]
+            origin = dict.get(record, "record_origin")
+            baseline_digest = dict.__getitem__(record, "baseline_record_sha256")
             if origin == "new" and baseline_digest is not None:
                 errors.append(
                     f"E_BASELINE_AUTHORITY: {path}.baseline_record_sha256: new "
@@ -3757,7 +3782,7 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
                     "baseline record requires a nonzero lowercase sha256"
                 )
     locations = _adjudication_locations(doc)
-    contract = doc.get("adjudication_contract")
+    contract = dict.get(doc, "adjudication_contract")
     _check_hmac_contract_preflight(doc, contract, locations, errors)
     if locations and (
         not isinstance(contract, dict) or contract.get("state") != "sealed"
@@ -3765,7 +3790,13 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
         errors.append(
             "E_ADJ_CONTRACT: $: enhanced mappings require state='sealed' contract"
         )
-    if doc.get("source_exclusions") and not locations:
+    source_exclusions = dict.get(doc, "source_exclusions")
+    has_source_exclusions = (
+        list.__len__(source_exclusions) > 0
+        if isinstance(source_exclusions, list)
+        else bool(source_exclusions)
+    )
+    if has_source_exclusions and not locations:
         errors.append(
             "E_ADJ_CONTRACT: $.source_exclusions: exclusions require enhanced mappings"
         )
@@ -3804,8 +3835,9 @@ def _check_enhanced_preflight(doc, errors: list[str]) -> None:
                 "$.adjudication_contract.baseline_external_receipt: external "
                 "baseline approval declaration is required"
             )
-        exclusions = doc.get("source_exclusions")
-        if not isinstance(exclusions, list) or len(exclusions) != 2:
+        if not isinstance(source_exclusions, list) or (
+            list.__len__(source_exclusions) != 2
+        ):
             errors.append(
                 "E_ADJ_COUNT: $.source_exclusions: sealed contract requires "
                 "exactly two top-level exclusions"
