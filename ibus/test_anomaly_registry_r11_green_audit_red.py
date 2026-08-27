@@ -42,6 +42,21 @@ def _capture_fixed_error(call) -> tuple[ValueError, int]:
     return error, peak_bytes
 
 
+def _capture_exact_error(call, code: str) -> ValueError:
+    """Require one exact public error without retaining inputs between calls."""
+    error = None
+    try:
+        call()
+    except Exception as caught:
+        error = caught
+    assert type(error) is ValueError
+    assert error.args == (code,)
+    assert vars(error) == {}
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    return error
+
+
 def _assert_fixed_nonreflective_error(
     error: ValueError,
     code: str,
@@ -109,7 +124,7 @@ def test_r11a_a_valid_exact_11_and_12_key_authority_shapes_remain_green(
 def test_r11a_a_exact_allowed_authority_field_set_is_required_at_valid_sizes(
     include_optional_key,
 ):
-    required_fields = (
+    allowed_fields_11 = (
         "grain",
         "ref",
         "classification",
@@ -122,44 +137,92 @@ def test_r11a_a_exact_allowed_authority_field_set_is_required_at_valid_sizes(
         "source_refs",
         "source_event_refs",
     )
-    assert len(required_fields) == len(set(required_fields)) == 11
+    allowed_fields_12 = (
+        "grain",
+        "ref",
+        "classification",
+        "disposition",
+        "normalized_class",
+        "expected",
+        "causal_confidence",
+        "owner_lane",
+        "privacy_class",
+        "source_refs",
+        "source_event_refs",
+        "expected_form_status",
+    )
+    assert len(allowed_fields_11) == len(set(allowed_fields_11)) == 11
+    assert len(allowed_fields_12) == len(set(allowed_fields_12)) == 12
+    assert allowed_fields_12[:-1] == allowed_fields_11
 
-    for index, missing_field in enumerate(required_fields):
-        marker = f"synthetic_unexpected_authority_field_{index:02d}"
-        adjudication = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
-        if include_optional_key:
-            adjudication["expected_form_status"] = "synthetic-ignored-status"
-            expected_size = 12
-        else:
-            adjudication.pop("expected_form_status", None)
-            expected_size = 11
-        replaced_value = adjudication.pop(missing_field)
-        adjudication[marker] = replaced_value
-        assert len(adjudication) == expected_size
-        assert all(type(key) is str for key in dict.__iter__(adjudication))
-        assert missing_field not in adjudication
-
-        error, _peak_bytes = _capture_fixed_error(
-            lambda: V.source_record_identity_envelope(R11._source_input(), adjudication)
-        )
-
-        _assert_fixed_nonreflective_error(error, _HMAC_ERROR, marker)
-
+    allowed_fields = allowed_fields_12 if include_optional_key else allowed_fields_11
+    expected_case_count = (1 << len(allowed_fields)) - 1
+    assert expected_case_count == (4095 if include_optional_key else 2047)
+    representative_masks = {1, 3, expected_case_count}
+    base_adjudication = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
     if include_optional_key:
-        marker = "synthetic_unexpected_authority_field_11"
-        adjudication = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
-        adjudication.pop("expected_form_status", None)
-        assert (
-            tuple(field for field in required_fields if field not in adjudication) == ()
-        )
-        adjudication[marker] = "synthetic-unknown-twelfth-slot"
-        assert len(adjudication) == 12
+        base_adjudication["expected_form_status"] = "synthetic-ignored-status"
+    else:
+        base_adjudication.pop("expected_form_status", None)
+    assert frozenset(dict.__iter__(base_adjudication)) == frozenset(allowed_fields)
+    source_input = R11._source_input()
+    source_input_before = copy.deepcopy(source_input)
+    executed_case_count = 0
 
-        error, _peak_bytes = _capture_fixed_error(
-            lambda: V.source_record_identity_envelope(R11._source_input(), adjudication)
+    for subset_mask in range(1, expected_case_count + 1):
+        adjudication = dict(base_adjudication)
+        replacement_markers = []
+        for field_index, field in enumerate(allowed_fields):
+            if not subset_mask & (1 << field_index):
+                continue
+            marker = (
+                "synthetic_unknown_authority_field_"
+                f"{len(allowed_fields):02d}_{subset_mask:04x}_{field_index:02d}"
+            )
+            replaced_value = adjudication.pop(field)
+            adjudication[marker] = replaced_value
+            replacement_markers.append(marker)
+
+        assert len(adjudication) == len(allowed_fields)
+        assert len(replacement_markers) == subset_mask.bit_count()
+        assert len(replacement_markers) == len(set(replacement_markers))
+        assert all(type(key) is str for key in dict.__iter__(adjudication))
+        assert all(
+            field not in adjudication
+            for field_index, field in enumerate(allowed_fields)
+            if subset_mask & (1 << field_index)
+        )
+
+        error = _capture_exact_error(
+            lambda: V.source_record_identity_envelope(source_input, adjudication),
+            _HMAC_ERROR,
+        )
+
+        if subset_mask in representative_masks:
+            for marker in replacement_markers:
+                _assert_fixed_nonreflective_error(error, _HMAC_ERROR, marker)
+        error.__traceback__ = None
+        executed_case_count += 1
+
+    assert executed_case_count == (4095 if include_optional_key else 2047)
+    assert source_input == source_input_before
+    if include_optional_key:
+        marker = "synthetic_unknown_authority_field_moderate_13th"
+        adjudication = dict(base_adjudication)
+        assert (
+            tuple(field for field in allowed_fields_12 if field not in adjudication)
+            == ()
+        )
+        adjudication[marker] = "synthetic-moderate-thirteenth-slot"
+        assert len(adjudication) == 13
+
+        error = _capture_exact_error(
+            lambda: V.source_record_identity_envelope(source_input, adjudication),
+            _HMAC_ERROR,
         )
 
         _assert_fixed_nonreflective_error(error, _HMAC_ERROR, marker)
+        error.__traceback__ = None
 
 
 def test_r11a_a_oversized_exact_authority_keyset_fails_with_bounded_peak():
@@ -436,37 +499,66 @@ def test_r11a_c_nested_only_markers_in_final_record_emit_one_hold():
         "baseline_record_sha256",
     )
     assert len(markers) == len(set(markers)) == 4
-    individual_hold_counts = []
-    for marker in markers:
+    marker_values = (None, {}, [], "")
+    expected_record_count = 20
+
+    def fresh_nested_doc():
         doc = _legacy_doc()
         assert "adjudication_contract" not in doc
         assert "source_exclusions" not in doc
-        assert len(doc["records"]) > 1
+        assert len(doc["records"]) == expected_record_count
         assert all(
-            enhanced_marker not in record
-            for record in doc["records"]
-            for enhanced_marker in markers
+            marker not in record for record in doc["records"] for marker in markers
         )
-        doc["records"][-1][marker] = None
+        return doc
 
+    subset_executed_count = 0
+    subset_exact_hold_count = 0
+    for subset_mask in range(1, 1 << len(markers)):
+        doc = fresh_nested_doc()
+        for marker_index, marker in enumerate(markers):
+            if subset_mask & (1 << marker_index):
+                doc["records"][-1][marker] = None
         errors = V.validate_document(doc, R10._schema())
+        subset_exact_hold_count += len(_hold_errors(errors)) == 1
+        subset_executed_count += 1
 
-        individual_hold_counts.append(len(_hold_errors(errors)))
+    position_executed_count = 0
+    position_exact_hold_count = 0
+    for marker in markers:
+        for marker_value in marker_values:
+            for record_index in range(expected_record_count):
+                doc = fresh_nested_doc()
+                doc["records"][record_index][marker] = copy.deepcopy(marker_value)
+                errors = V.validate_document(doc, R10._schema())
+                position_exact_hold_count += len(_hold_errors(errors)) == 1
+                position_executed_count += 1
 
-    combined_doc = _legacy_doc()
-    assert "adjudication_contract" not in combined_doc
-    assert "source_exclusions" not in combined_doc
-    assert len(combined_doc["records"]) > 1
-    assert all(
-        marker not in record for record in combined_doc["records"] for marker in markers
-    )
+    combined_doc = fresh_nested_doc()
     for marker in markers:
         combined_doc["records"][-1][marker] = None
-
     combined_errors = V.validate_document(combined_doc, R10._schema())
 
-    assert individual_hold_counts == [1, 1, 1, 1]
-    assert len(_hold_errors(combined_errors)) == 1
+    distributed_doc = fresh_nested_doc()
+    distributed_indices = (0, 6, 13, 19)
+    assert len(distributed_indices) == len(set(distributed_indices)) == len(markers)
+    for record_index, marker in zip(distributed_indices, markers, strict=True):
+        distributed_doc["records"][record_index][marker] = None
+    distributed_errors = V.validate_document(distributed_doc, R10._schema())
+
+    assert subset_executed_count == 15
+    assert position_executed_count == 320
+    assert {
+        "subset_cases_with_exactly_one_hold": subset_exact_hold_count,
+        "position_cases_with_exactly_one_hold": position_exact_hold_count,
+        "combined_hold_count": len(_hold_errors(combined_errors)),
+        "distributed_hold_count": len(_hold_errors(distributed_errors)),
+    } == {
+        "subset_cases_with_exactly_one_hold": 15,
+        "position_cases_with_exactly_one_hold": 320,
+        "combined_hold_count": 1,
+        "distributed_hold_count": 1,
+    }
 
 
 def test_r11a_c_hostile_mapping_overrides_cannot_hide_present_marker():
@@ -517,6 +609,55 @@ def test_r11a_c_hostile_mapping_overrides_cannot_hide_present_marker():
             self._trip()
             return dict.values(self)
 
+    class ArmedRecords(list):
+        def __init__(self, values, present_key):
+            self.armed = False
+            self.touched = False
+            list.__init__(self, values)
+            self.middle_index = list.__len__(self) // 2
+            middle_record = list.__getitem__(self, self.middle_index)
+            dict.__setitem__(middle_record, present_key, None)
+            self.armed = True
+
+        def _trip(self):
+            if self.armed:
+                self.touched = True
+                raise AssertionError(marker)
+
+        def __iter__(self):
+            self._trip()
+            return list.__iter__(self)
+
+        def __len__(self):
+            self._trip()
+            return list.__len__(self)
+
+        def __getitem__(self, key):
+            self._trip()
+            return list.__getitem__(self, key)
+
+        def __contains__(self, value):
+            self._trip()
+            return list.__contains__(self, value)
+
+        def __reversed__(self):
+            self._trip()
+            return list.__reversed__(self)
+
+        def copy(self):
+            self._trip()
+            return list.copy(self)
+
+        def count(self, value):
+            self._trip()
+            return list.count(self, value)
+
+        def index(self, value, start=0, stop=None):
+            self._trip()
+            if stop is None:
+                return list.index(self, value, start)
+            return list.index(self, value, start, stop)
+
     hostile_top_level = ArmedMapping(_legacy_doc(), "adjudication_contract")
     assert dict.__contains__(hostile_top_level, "adjudication_contract")
 
@@ -525,10 +666,17 @@ def test_r11a_c_hostile_mapping_overrides_cannot_hide_present_marker():
     assert dict.__contains__(hostile_record, "record_origin")
     nested_doc["records"][0] = hostile_record
 
+    hostile_records_doc = _legacy_doc()
+    hostile_records = ArmedRecords(hostile_records_doc["records"], "record_origin")
+    middle_record = list.__getitem__(hostile_records, hostile_records.middle_index)
+    assert dict.__contains__(middle_record, "record_origin")
+    hostile_records_doc["records"] = hostile_records
+
     outcomes = []
     for doc, hostile_mapping in (
         (hostile_top_level, hostile_top_level),
         (nested_doc, hostile_record),
+        (hostile_records_doc, hostile_records),
     ):
         errors = []
         escaped = None
@@ -538,9 +686,18 @@ def test_r11a_c_hostile_mapping_overrides_cannot_hide_present_marker():
             escaped = caught
         outcomes.append((escaped, hostile_mapping.touched, errors))
 
-    assert [escaped is None for escaped, _touched, _errors in outcomes] == [True, True]
-    assert [touched for _escaped, touched, _errors in outcomes] == [False, False]
+    assert [escaped is None for escaped, _touched, _errors in outcomes] == [
+        True,
+        True,
+        True,
+    ]
+    assert [touched for _escaped, touched, _errors in outcomes] == [
+        False,
+        False,
+        False,
+    ]
     assert [len(_hold_errors(errors)) for _escaped, _touched, errors in outcomes] == [
+        1,
         1,
         1,
     ]
