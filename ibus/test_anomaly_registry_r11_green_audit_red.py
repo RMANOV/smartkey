@@ -106,13 +106,18 @@ def _legacy_doc() -> dict:
 def test_r11a_a_valid_exact_11_and_12_key_authority_shapes_remain_green(
     include_optional_key,
 ):
-    adjudication = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
-    if include_optional_key:
-        adjudication["expected_form_status"] = "synthetic-ignored-status"
-        expected_size = 12
-    else:
-        adjudication.pop("expected_form_status", None)
-        expected_size = 11
+    valid_12 = R11._authoritative_adjudication(R11._ORIGINAL_SCOPE)
+    valid_12["expected_form_status"] = "synthetic-ignored-status"
+    valid_11 = dict(valid_12)
+    assert valid_11.pop("expected_form_status") == "synthetic-ignored-status"
+    assert {
+        key: value
+        for key, value in dict.items(valid_12)
+        if key != "expected_form_status"
+    } == valid_11
+
+    adjudication = valid_12 if include_optional_key else valid_11
+    expected_size = 12 if include_optional_key else 11
     assert type(adjudication) is dict
     assert len(adjudication) == expected_size
     assert V.source_record_identity_envelope(
@@ -167,6 +172,53 @@ def test_r11a_a_exact_allowed_authority_field_set_is_required_at_valid_sizes(
     assert frozenset(dict.__iter__(base_adjudication)) == frozenset(allowed_fields)
     source_input = R11._source_input()
     source_input_before = copy.deepcopy(source_input)
+
+    allowed_union = frozenset(allowed_fields_12)
+    missing_required_expected_counts = {False: 11, True: 11}
+    assert sum(missing_required_expected_counts.values()) == 22
+    representative_missing_indices = {0, len(allowed_fields_11) - 1}
+    missing_required_executed_count = 0
+    for field_index, missing_field in enumerate(allowed_fields_11):
+        allowed_only_adjudication = dict(base_adjudication)
+        allowed_only_adjudication.pop(missing_field)
+        actual_keys = tuple(dict.__iter__(allowed_only_adjudication))
+
+        assert len(allowed_only_adjudication) == (11 if include_optional_key else 10)
+        assert frozenset(actual_keys) < allowed_union
+        assert tuple(key for key in actual_keys if key not in allowed_union) == ()
+        assert missing_field not in actual_keys
+        assert (
+            dict.__contains__(allowed_only_adjudication, "expected_form_status")
+            is include_optional_key
+        )
+
+        trace_marker = None
+        if field_index in representative_missing_indices:
+            trace_marker = (
+                "synthetic-allowed-value-missing-required-"
+                f"{int(include_optional_key)}-{field_index:02d}"
+            )
+            carrier_field = "classification"
+            if missing_field == carrier_field:
+                carrier_field = "disposition"
+            allowed_only_adjudication[carrier_field] = trace_marker
+
+        error = _capture_exact_error(
+            lambda: V.source_record_identity_envelope(
+                source_input, allowed_only_adjudication
+            ),
+            _HMAC_ERROR,
+        )
+
+        if trace_marker is not None:
+            _assert_fixed_nonreflective_error(error, _HMAC_ERROR, trace_marker)
+        error.__traceback__ = None
+        missing_required_executed_count += 1
+
+    assert (
+        missing_required_executed_count
+        == missing_required_expected_counts[include_optional_key]
+    )
     executed_case_count = 0
 
     for subset_mask in range(1, expected_case_count + 1):
