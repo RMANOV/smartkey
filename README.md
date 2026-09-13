@@ -14,6 +14,10 @@ All prediction happens in pure Rust. Zero network. Zero cloud. Sub-millisecond p
 | Windows | TSF (Text Services Framework) | In Development | `smartkey-win` |
 | macOS | Input Method Kit | In Development | `smartkey-mac` |
 
+### Windows pilot status
+
+The Windows package is an **experimental pre-release pilot**, not a daily-ready input method. A future pilot must use a disposable, non-elevated Windows account and pass the separately gated registration, clean-uninstall, and native-app checks; packaging alone does not establish those results or fix the known ReplaceWord/composing defects. Its runtime payload is limited to the helper, DLL, reviewed public corpora, and starter configuration; the archive also carries the pilot safety form and repository license notices. Copying data to `%APPDATA%\smartkey` and any later registration are manual, separately authorized actions: the package creates no autostart, sends no network traffic, and excludes `personal.json` and private corpora.
+
 The Rust core (`smartkey-core`) is platform-agnostic — all prediction logic and key event state machine are shared. Each platform crate is a thin adapter (~200-400 LoC) that bridges OS input events to the shared `InputMethodCore`.
 
 ---

@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "package_name": "smartkey-windows-pilot",
+  "status": "experimental_pre_release",
+  "native_artifact_layout": "smartkey-register.exe and smartkey_win.dll remain side by side in the extracted artifact directory.",
+  "runtime_data_destination_directory": "%APPDATA%\\smartkey",
+  "native_files": [
+    {
+      "name": "smartkey-register.exe",
+      "repository_source": "target/release/smartkey-register.exe",
+      "purpose": "Manual registration helper; locates smartkey_win.dll beside itself."
+    },
+    {
+      "name": "smartkey_win.dll",
+      "repository_source": "target/release/smartkey_win.dll",
+      "purpose": "Windows TSF COM server."
+    }
+  ],
+  "runtime_data_files": [
+    {
+      "name": "smartkey.json",
+      "repository_source": "config/smartkey.json",
+      "destination": "%APPDATA%\\smartkey\\smartkey.json",
+      "optional": true,
+      "provenance": "Tracked, reviewed non-personal starter configuration; GPL-3.0 under repository LICENSE."
+    },
+    {
+      "name": "corpus_en.json",
+      "repository_source": "corpus/corpus_en.json",
+      "destination": "%APPDATA%\\smartkey\\corpus_en.json",
+      "optional": false,
+      "provenance": "Tracked public repository corpus; GPL-3.0 under repository LICENSE."
+    },
+    {
+      "name": "corpus_bg.json",
+      "repository_source": "corpus/corpus_bg.json",
+      "destination": "%APPDATA%\\smartkey\\corpus_bg.json",
+      "optional": false,
+      "provenance": "Tracked public repository corpus; GPL-3.0 under repository LICENSE."
+    },
+    {
+      "name": "corpus_tech.json",
+      "repository_source": "corpus/corpus_tech.json",
+      "destination": "%APPDATA%\\smartkey\\corpus_tech.json",
+      "optional": false,
+      "provenance": "Tracked public repository corpus; GPL-3.0 under repository LICENSE."
+    }
+  ],
+  "artifact_ancillary_files": [
+    {
+      "name": "PILOT_README.md",
+      "repository_source": "crates/smartkey-win/tests/windows_pilot_manual.md",
+      "purpose": "Safety boundary and future disposable-account evidence form."
+    },
+    {
+      "name": "LICENSE",
+      "repository_source": "LICENSE",
+      "purpose": "Repository dual-license notice."
+    },
+    {
+      "name": "LICENSE-GPL",
+      "repository_source": "LICENSE-GPL",
+      "purpose": "GPL-3.0 license text for application and corpus payload."
+    },
+    {
+      "name": "LICENSE-APACHE",
+      "repository_source": "LICENSE-APACHE",
+      "purpose": "Apache-2.0 license text for smartkey-core."
+    },
+    {
+      "name": "artifact-source-manifest.json",
+      "repository_source": null,
+      "purpose": "CI-generated source SHA, source URL, and per-file SHA-256 receipt for every other archive file."
+    }
+  ],
+  "excluded_files": [
+    {
+      "name": "personal.json",
+      "reason": "Optional user-specific profile; never packaged."
+    },
+    {
+      "pattern": "corpus_*.bin",
+      "reason": "Runtime-generated caches are not source payload."
+    }
+  ],
+  "runtime_contract": {
+    "network_required": false,
+    "autostart_created": false,
+    "automatic_registration": false,
+    "automatic_appdata_mutation": false,
+    "missing_public_corpus_is_package_failure": true,
+    "warning": "Current activation sets corpus_loaded=true after attempted loads even when a corpus load fails; this flag is not proof of a useful package."
+  },
+  "uninstall_boundary": "Remove only SmartKey identities through a separately approved nonce-scoped cleanup, then manually remove the extracted pilot directory and only this pilot's staged files from %APPDATA%\\smartkey. No broad registry, account, service, scheduled-task, or other-IME cleanup is authorized.",
+  "dependency_evidence": {
+    "build_assumption": "Rust Windows cdylib and helper built by cargo for windows-latest.",
+    "runtime_dll_completeness": "UNVERIFIED_PENDING_WINDOWS_ARTIFACT_INSPECTION"
+  }
+}

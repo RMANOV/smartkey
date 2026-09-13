@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, integration/smartkey-exec.ZUDHA2Ey]
   pull_request:
     branches: [main, master]
 
@@ -42,6 +42,51 @@ jobs:
             PYTHONDONTWRITEBYTECODE=1 \
             python -m pytest -q -p no:cacheprovider
 
+  s02-offline:
+    name: S02 offline import safety (expected RED checkpoint)
+    runs-on: ubuntu-latest
+    env:
+      P2A_PYALLOW: ${{ runner.temp }}/p2a-pyallow
+      P2A_BASETEMP: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-basetemp
+      SMARTKEY_PHASEA_DATA: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-phase
+      SMARTKEY_DEBUG_DIR: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-trace
+      XDG_CONFIG_HOME: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-config
+      XDG_DATA_HOME: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-data
+      XDG_STATE_HOME: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-state
+      SMARTKEY_DEBUG: "off"
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Require fresh isolated paths
+        shell: bash
+        run: |
+          for path in \
+            "$P2A_PYALLOW" \
+            "$P2A_BASETEMP" \
+            "$SMARTKEY_PHASEA_DATA" \
+            "$SMARTKEY_DEBUG_DIR" \
+            "$XDG_CONFIG_HOME" \
+            "$XDG_DATA_HOME" \
+            "$XDG_STATE_HOME"
+          do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              echo "Refusing pre-existing S02 path: $path" >&2
+              exit 1
+            fi
+          done
+      - name: Install exact pytest allowlist
+        run: |
+          umask 077
+          python3.14 -m pip install --disable-pip-version-check --no-compile --target "$P2A_PYALLOW" 'pytest==9.0.2'
+      - name: Run focused S02 offline import safety
+        run: |
+          umask 077
+          timeout 30s nice -n 19 python3.14 -I -S -B -c 'import os,sys; sys.path.insert(0, os.environ["P2A_PYALLOW"]); import pytest; raise SystemExit(pytest.main(["-q", "-p", "no:cacheprovider", "--basetemp", os.environ["P2A_BASETEMP"], "ibus/test_p2a_import_safety.py"]))'
+
   build-windows:
     name: Build (Windows)
     runs-on: windows-latest
@@ -56,6 +101,65 @@ jobs:
       - run: cargo check -p smartkey-win
       - run: cargo check -p smartkey-playground
       - run: cargo clippy -p smartkey-win -- -D warnings
+      - name: Build Windows pilot payload
+        run: cargo build --locked -p smartkey-win --release
+      - name: Stage complete Windows pilot payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP "smartkey-windows-pilot-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $stage) {
+            throw "Refusing to reuse staging directory: $stage"
+          }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+
+          $payload = @(
+            @{ Source = 'target/release/smartkey-register.exe'; Name = 'smartkey-register.exe' },
+            @{ Source = 'target/release/smartkey_win.dll'; Name = 'smartkey_win.dll' },
+            @{ Source = 'crates/smartkey-win/pilot-runtime-manifest.json'; Name = 'pilot-runtime-manifest.json' },
+            @{ Source = 'config/smartkey.json'; Name = 'smartkey.json' },
+            @{ Source = 'corpus/corpus_en.json'; Name = 'corpus_en.json' },
+            @{ Source = 'corpus/corpus_bg.json'; Name = 'corpus_bg.json' },
+            @{ Source = 'corpus/corpus_tech.json'; Name = 'corpus_tech.json' },
+            @{ Source = 'crates/smartkey-win/tests/windows_pilot_manual.md'; Name = 'PILOT_README.md' },
+            @{ Source = 'LICENSE'; Name = 'LICENSE' },
+            @{ Source = 'LICENSE-GPL'; Name = 'LICENSE-GPL' },
+            @{ Source = 'LICENSE-APACHE'; Name = 'LICENSE-APACHE' }
+          )
+          foreach ($item in $payload) {
+            if (-not (Test-Path -LiteralPath $item.Source -PathType Leaf)) {
+              throw "Required payload file is missing: $($item.Source)"
+            }
+            Copy-Item -LiteralPath $item.Source -Destination (Join-Path $stage $item.Name)
+          }
+
+          $files = foreach ($item in $payload) {
+            $staged = Join-Path $stage $item.Name
+            [ordered]@{
+              name = $item.Name
+              repository_source = $item.Source
+              sha256 = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          [ordered]@{
+            schema_version = 1
+            source_sha = $env:GITHUB_SHA
+            source_url = "https://github.com/RMANOV/smartkey/tree/$env:GITHUB_SHA"
+            files = @($files)
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'artifact-source-manifest.json') -Encoding utf8NoBOM
+
+          $expected = @($payload.Name + 'artifact-source-manifest.json' | Sort-Object)
+          $actual = @(Get-ChildItem -LiteralPath $stage -File | ForEach-Object Name | Sort-Object)
+          if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
+            throw 'Staged payload differs from the exact allowlist.'
+          }
+      - name: Upload Windows pilot payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartkey-windows-pilot
+          path: ${{ runner.temp }}/smartkey-windows-pilot-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
 
   build-macos:
     name: Build (macOS)
