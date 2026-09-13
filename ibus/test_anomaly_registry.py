@@ -922,7 +922,7 @@ def test_open_is_the_default_and_every_record_has_a_source():
 
 def test_cli_exit_zero_on_real_registry():
     proc = subprocess.run(
-        [sys.executable, str(_VALIDATOR), str(_REGISTRY)],
+        [sys.executable, "-I", "-S", "-B", str(_VALIDATOR), str(_REGISTRY)],
         capture_output=True,
         text=True,
         check=False,
@@ -937,7 +937,16 @@ def test_cli_exit_nonzero_on_bad_file(tmp_path):
     bad = tmp_path / "registry.json"
     bad.write_text(V.canonical_text(doc), encoding="utf-8")
     proc = subprocess.run(
-        [sys.executable, str(_VALIDATOR), str(bad), "--schema", str(_SCHEMA)],
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            str(_VALIDATOR),
+            str(bad),
+            "--schema",
+            str(_SCHEMA),
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -948,12 +957,45 @@ def test_cli_exit_nonzero_on_bad_file(tmp_path):
 
 def test_cli_exit_two_on_unreadable_input(tmp_path):
     proc = subprocess.run(
-        [sys.executable, str(_VALIDATOR), str(tmp_path / "missing.json")],
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            str(_VALIDATOR),
+            str(tmp_path / "missing.json"),
+        ],
         capture_output=True,
         text=True,
         check=False,
     )
     assert proc.returncode == 2
+
+
+def test_cli_children_are_isolated_before_external_execution(monkeypatch, tmp_path):
+    """Fail closed if any validator child loses the audited interpreter flags."""
+    calls = []
+
+    def deny_unisolated_child(argv, **kwargs):
+        assert argv[1:4] == ["-I", "-S", "-B"], argv
+        calls.append((argv, kwargs))
+        if "--schema" in argv:
+            return subprocess.CompletedProcess(argv, 1, "E_DUP\n", "")
+        if argv[-1].endswith("missing.json"):
+            return subprocess.CompletedProcess(argv, 2, "", "E_READ\n")
+        return subprocess.CompletedProcess(argv, 0, "OK: 29 record(s)\n", "")
+
+    monkeypatch.setattr(subprocess, "run", deny_unisolated_child)
+    test_cli_exit_zero_on_real_registry()
+    test_cli_exit_nonzero_on_bad_file(tmp_path)
+    test_cli_exit_two_on_unreadable_input(tmp_path)
+
+    assert len(calls) == 3
+    assert all(call[1] == {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+    } for call in calls)
 
 
 def test_non_canonical_format_is_rejected(tmp_path):
