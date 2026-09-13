@@ -5017,4 +5017,100 @@ mod lang_prior_tests {
         assert_eq!(replaces, 0);
         assert_eq!(core.current_word(), "");
     }
+
+    // ── Deferred flush task: Tab/Right characterizations on the same fixture ──
+
+    /// One-sided fixture with ghost text disabled, so Tab/Right exercise the
+    /// flush paths and never an accept.
+    fn one_sided_exact_core_without_ghost() -> InputMethodCore {
+        let mut core = one_sided_exact_core();
+        core.config.ghost_text = false;
+        core
+    }
+
+    /// Tab without a ghost flushes the displayed reading (no boundary
+    /// resolution on this path).  Characterization of the later flush task.
+    #[test]
+    fn tab_flush_keeps_the_displayed_reading() {
+        let mut core = one_sided_exact_core_without_ghost();
+        type_word(&mut core, &STATIQ);
+        assert!(core.ghost.is_empty(), "precondition: no ghost to accept");
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_key(Key::Tab)));
+        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// Right without a ghost is a cursor move: flush the displayed reading,
+    /// then reset the word, context and detector.  Characterization.
+    #[test]
+    fn right_without_ghost_flushes_and_resets_context() {
+        let mut core = one_sided_exact_core_without_ghost();
+        type_word(&mut core, &STATIQ);
+        assert!(core.ghost.is_empty(), "precondition: no ghost to accept");
+        let (commits, forwards, replaces) =
+            delimiter_shape(&core.handle_key(press_key(Key::Right)));
+        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+        assert!(core.context.is_empty());
+        let detected = core.lang_detector.detected();
+        assert_eq!(detected.lang, LangId::En);
+        assert_eq!(detected.confidence, 0.0);
+    }
+
+    // ── S03-EXACT-FREQ-SHADOW (RED): post-commit correction, public path ──
+
+    /// EN "stat" (7) is shadowed by "status" (900_000) in the completion
+    /// search; BG "стат" (20) and "ви" (20) are exact.  Post-commit
+    /// auto-correction is switched on for this fixture only.
+    fn shadowed_exact_core() -> InputMethodCore {
+        let config = InputConfig {
+            ghost_text: false,
+            space_accept: false,
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
+        assert!(core.config.dual_buffer.enabled);
+        core.load_word_lang("stat", 7, LangId::En);
+        core.load_word_lang("status", 900_000, LangId::En);
+        core.load_word_lang("стат", 20, LangId::Bg);
+        core.load_word_lang("ви", 20, LangId::Bg);
+        core
+    }
+
+    /// Desired: a typed word that exists (7) is not auto-corrected to a
+    /// transliteration that is merely 20/7 ≈ 2.9× more frequent (below the
+    /// 5× rule).  RED today: `word_frequency("stat")` is shadowed to 0.0, so
+    /// the correction fires and a ReplaceWord("стат") follows the commit.
+    #[test]
+    fn shadowed_typed_word_is_not_auto_corrected_on_the_public_path() {
+        let mut core = shadowed_exact_core();
+        type_word(&mut core, &STATIQ[..4]);
+        assert_eq!(core.current_word(), "stat");
+        assert_eq!(core.engine.score_exact_both("stat", "стат"), (7.0, 20.0));
+
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        assert_eq!(commits, vec!["stat".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// Guard (expected PASS): a typed word that is genuinely absent from its
+    /// own model is still corrected when the other side is supported.
+    #[test]
+    fn genuinely_absent_typed_word_is_still_corrected() {
+        let core = shadowed_exact_core();
+        assert_eq!(
+            core.try_language_correction("wi"),
+            Some(Action::ReplaceWord {
+                replace_len: 2,
+                text: "ви".to_string(),
+            })
+        );
+    }
 }

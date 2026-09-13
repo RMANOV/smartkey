@@ -1294,6 +1294,21 @@ mod tests {
         assert_eq!(engine.score_exact_both("статия", "status"), (0.0, 0.0));
     }
 
+    /// S03-EXACT-FREQ-SHADOW (RED): the exact lookup must not be shadowed by
+    /// a more frequent longer completion.
+    #[test]
+    fn word_frequency_reports_a_terminal_shadowed_by_a_frequent_child() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word_lang("stat", 7, LangId::En);
+        engine.load_word_lang("status", 900_000, LangId::En);
+
+        assert_eq!(engine.word_frequency("status", LangId::En), 900_000.0);
+        assert_eq!(engine.word_frequency("stat", LangId::Bg), 0.0);
+        // RED today: prefix_search("stat", 1) ranks "status" first, so the
+        // stored terminal frequency of "stat" is reported as 0.0.
+        assert_eq!(engine.word_frequency("stat", LangId::En), 7.0);
+    }
+
     /// Helper: build a small engine with a handful of words and bigrams.
     fn test_engine() -> SmartKeyEngine {
         let mut engine = SmartKeyEngine::new();
