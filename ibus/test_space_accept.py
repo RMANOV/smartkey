@@ -319,3 +319,416 @@ def test_space_in_sensitive_field_never_reaches_the_core():
     assert consumed is False, "sensitive field: the key goes straight back to IBus"
     assert rec.commits == []
     assert eng._core._scripts, "the core must not have been consulted"
+
+
+# --- S02/P2a Cycle 2: ordered synthetic client buffer + literal-key oracles ---
+#
+# Independent client model.  Nothing below asks a production symbol what the
+# CLIENT types: key values and modifier bits are the literal IBus numbers and
+# ``_literal_char`` is a bounded, test-local decoder.  The adapter itself is
+# still driven through its real ``do_process_key_event`` seam via
+# ``build_engine``; the core stays the scripted fake on every route, so every
+# test here is a scripted-core characterization of the adapter, not a proof
+# of the real core's policy.
+
+_KEY_SPACE = 0x0020
+_KEY_RETURN = 0xFF0D
+_KEY_BACKSPACE = 0xFF08
+_KEY_HOME = 0xFF50
+_KEY_LEFT = 0xFF51
+_KEY_RIGHT = 0xFF53
+_KEY_END = 0xFF57
+_KEY_TAB = 0xFF09
+_KEY_ESCAPE = 0xFF1B
+_CLIENT_CONTROL = 1 << 2
+_CLIENT_ALT = 1 << 3
+_CLIENT_RELEASE = 1 << 30
+
+
+def _literal_char(keyval: int) -> str | None:
+    """Bounded, test-local decoding of a literal key into client text."""
+    if keyval == _KEY_SPACE:
+        return " "
+    if keyval == _KEY_RETURN:
+        return "\n"
+    if 0x21 <= keyval <= 0x7E or 0x0400 <= keyval <= 0x04FF:
+        return chr(keyval)
+    if 0x01000000 <= keyval <= 0x0110FFFF:
+        return chr(keyval & 0x00FFFFFF)
+    return None
+
+
+class ClientBuffer:
+    """Ordered synthetic client: exact text, cursor and an event log."""
+
+    def __init__(self, text: str = "", cursor: int | None = None) -> None:
+        self.text = text
+        self.cursor = len(text) if cursor is None else cursor
+        self.log: list[tuple] = []
+
+    def _insert(self, s: str) -> None:
+        self.text = self.text[: self.cursor] + s + self.text[self.cursor :]
+        self.cursor += len(s)
+
+    def commit(self, s: str) -> None:
+        self._insert(s)
+        self.log.append(("commit", s))
+
+    def delete_surrounding(self, offset: int, n: int) -> None:
+        start = max(0, self.cursor + offset)
+        end = min(len(self.text), start + n)
+        self.text = self.text[:start] + self.text[end:]
+        if offset < 0:
+            self.cursor = start
+        self.log.append(("delete", offset, n))
+
+    def apply_key(self, keyval: int, state: int, source: str) -> None:
+        """Apply one physical key exactly once; chords and releases never type."""
+        if state & _CLIENT_RELEASE:
+            self.log.append((source, "release", keyval))
+            return
+        if state & (_CLIENT_CONTROL | _CLIENT_ALT):
+            self.log.append((source, "chord", keyval))
+            return
+        if keyval == _KEY_BACKSPACE:
+            if self.cursor > 0:
+                self.text = self.text[: self.cursor - 1] + self.text[self.cursor :]
+                self.cursor -= 1
+        elif keyval == _KEY_HOME:
+            self.cursor = 0
+        elif keyval == _KEY_END:
+            self.cursor = len(self.text)
+        elif keyval == _KEY_LEFT:
+            self.cursor = max(0, self.cursor - 1)
+        elif keyval == _KEY_RIGHT:
+            self.cursor = min(len(self.text), self.cursor + 1)
+        else:
+            ch = _literal_char(keyval)
+            if ch is None:
+                self.log.append((source, "ignored", keyval))
+                return
+            self._insert(ch)
+        self.log.append((source, keyval))
+
+    def defaults(self) -> list[tuple]:
+        return [event for event in self.log if event[0] == "default"]
+
+
+class RecordingCore(FakeCore):
+    """Scripted core that also records every key call the adapter makes."""
+
+    def __init__(self, scripts: list[list[tuple[str, str]]]) -> None:
+        super().__init__(scripts)
+        self.calls: list[tuple] = []
+
+    def process_keycode(self, evdev: int, state: int) -> list[tuple[str, str]]:
+        self.calls.append(("process_keycode", evdev, state))
+        return self._next()
+
+    def handle_key(self, keyval: int, state: int) -> list[tuple[str, str]]:
+        self.calls.append(("handle_key", keyval, state))
+        return self._next()
+
+    def key_calls(self) -> list[tuple]:
+        return [call for call in self.calls if call[0] in ("process_keycode", "handle_key")]
+
+
+def build_client_engine(scripts, *, text: str = "", caps: int = 0):
+    """Real adapter + scripted recording core + synthetic client buffer."""
+    eng, rec = build_engine(scripts)
+    eng._core = RecordingCore(scripts)
+    eng._caps = caps
+    buf = ClientBuffer(text)
+    rec.deleted = []
+
+    def _commit(text_obj) -> None:
+        rec.commits.append(text_obj.s)
+        buf.commit(text_obj.s)
+
+    def _delete(offset: int, n: int) -> None:
+        rec.deleted.append((offset, n))
+        buf.delete_surrounding(offset, n)
+
+    def _forward(kv: int, kc: int, st: int) -> None:
+        rec.forwarded_keys.append((kv, kc, st))
+        buf.apply_key(kv, st, "forward")
+
+    eng.commit_text = _commit
+    eng.delete_surrounding_text = _delete
+    eng.forward_key_event = _forward
+    return eng, rec, buf
+
+
+def offer(eng, buf: ClientBuffer, keyval: int, keycode: int, state: int = 0) -> bool:
+    """Offer one physical key; the client applies it once iff not consumed."""
+    consumed = eng.do_process_key_event(keyval, keycode, state)
+    if consumed is False:
+        buf.apply_key(keyval, state, "default")
+    return consumed
+
+
+def test_client_buffer_replace_and_wrong_buffer_mismatch():
+    buf = ClientBuffer("dog")
+    buf.delete_surrounding(-3, 3)
+    buf.commit("cat")
+    assert (buf.text, buf.cursor) == ("cat", 3)
+    assert buf.log == [("delete", -3, 3), ("commit", "cat")]
+    # Wrong-buffer shapes that real adapter bugs would produce stay distinct.
+    appended = ClientBuffer("dog")
+    appended.commit("cat")  # forgot to delete the old word
+    assert (appended.text, appended.cursor) == ("dogcat", 6)
+    short = ClientBuffer("dog")
+    short.delete_surrounding(-2, 2)  # off-by-one deletion
+    short.commit("cat")
+    assert (short.text, short.cursor) == ("dcat", 4)
+    assert appended.text != buf.text and short.text != buf.text
+
+
+def test_client_accept_then_literal_space_exact_text():
+    eng, rec, buf = build_client_engine(
+        [
+            [("composing", "hel\x00lo")],
+            [("hide", ""), ("commit", "hello ")],
+            [("hide", ""), ("forward", "")],
+        ]
+    )
+    assert offer(eng, buf, ord("l"), 38) is True
+    assert buf.text == ""  # the preedit is display-only
+    assert offer(eng, buf, _KEY_SPACE, 57) is True
+    assert buf.text == "hello "
+    assert offer(eng, buf, _KEY_SPACE, 57) is False
+    assert (buf.text, buf.cursor) == ("hello  ", 7)
+    assert rec.commits == ["hello "]
+    assert rec.forwarded_keys == []
+    assert buf.log == [("commit", "hello "), ("default", _KEY_SPACE)]
+
+
+def test_client_scripted_default_off_space_lands_typed_word_then_literal_space():
+    # Scripted-core characterization of the default-off action shape
+    # [hide, commit(typed), forward]; not a proof of the real flag policy.
+    eng, rec, buf = build_client_engine(
+        [
+            [("composing", "hel\x00lo")],
+            [("hide", ""), ("commit", "hel"), ("forward", "")],
+        ]
+    )
+    assert offer(eng, buf, ord("l"), 38) is True
+    assert offer(eng, buf, _KEY_SPACE, 57) is False
+    assert (buf.text, buf.cursor) == ("hel ", 4)
+    assert buf.log == [("commit", "hel"), ("default", _KEY_SPACE)]
+
+
+def test_client_escape_then_space_exact_text():
+    eng, rec, buf = build_client_engine(
+        [
+            [("composing", "hel\x00lo")],
+            [("composing", "hel\x00")],
+            [("hide", ""), ("commit", "hel"), ("forward", "")],
+        ]
+    )
+    assert offer(eng, buf, ord("l"), 38) is True
+    assert offer(eng, buf, _KEY_ESCAPE, 1) is True
+    assert buf.text == ""
+    assert offer(eng, buf, _KEY_SPACE, 57) is False
+    assert (buf.text, buf.cursor) == ("hel ", 4)
+
+
+def test_client_literal_cyrillic_keyvals_type_exact_text():
+    eng, rec, buf = build_client_engine([[("forward", "")], [("forward", "")]])
+    assert offer(eng, buf, 0x0431, 56) is False
+    assert offer(eng, buf, 0x01000431, 56) is False
+    assert (buf.text, buf.cursor) == ("бб", 2)
+    # Both keysym forms reach the keyval route normalised to the code point.
+    assert eng._core.key_calls() == [("handle_key", 0x0431, 0), ("handle_key", 0x0431, 0)]
+
+
+def test_client_return_lands_typed_word_then_newline():
+    eng, rec, buf = build_client_engine(
+        [
+            [("composing", "hel\x00lo")],
+            [("hide", ""), ("commit", "hel"), ("forward", "")],
+        ]
+    )
+    assert offer(eng, buf, ord("l"), 38) is True
+    assert offer(eng, buf, _KEY_RETURN, 28) is False
+    assert (buf.text, buf.cursor) == ("hel\n", 4)
+    assert buf.log == [("commit", "hel"), ("default", _KEY_RETURN)]
+
+
+def test_client_forwarded_backspace_deletes_committed_text_once():
+    eng, rec, buf = build_client_engine(
+        [[("ghost", "lo")], [("hide", ""), ("forward", "")]], text="hello "
+    )
+    assert offer(eng, buf, ord("l"), 38) is True
+    assert buf.text == "hello "
+    assert offer(eng, buf, _KEY_BACKSPACE, 22) is False
+    assert (buf.text, buf.cursor) == ("hello", 5)
+    assert buf.defaults() == [("default", _KEY_BACKSPACE)]
+    assert rec.forwarded_keys == []
+
+
+def test_client_forwarded_navigation_keys_move_cursor_sequentially():
+    eng, rec, buf = build_client_engine([[("forward", "")]] * 4, text="ab")
+    assert buf.cursor == 2
+    expected = [(_KEY_HOME, 0), (_KEY_LEFT, 0), (_KEY_RIGHT, 1), (_KEY_END, 2)]
+    for keyval, cursor in expected:
+        assert offer(eng, buf, keyval, 100) is False
+        assert (buf.text, buf.cursor) == ("ab", cursor), hex(keyval)
+    assert buf.log == [("default", keyval) for keyval, _ in expected]
+
+
+def test_client_forwarded_navigation_keys_from_explicit_initial_states():
+    rows = [
+        (2, _KEY_HOME, 0),
+        (2, _KEY_LEFT, 1),
+        (2, _KEY_RIGHT, 2),
+        (2, _KEY_END, 2),
+        (1, _KEY_LEFT, 0),
+        (1, _KEY_RIGHT, 2),
+        (1, _KEY_HOME, 0),
+        (1, _KEY_END, 2),
+        (0, _KEY_LEFT, 0),
+        (0, _KEY_HOME, 0),
+    ]
+    for start, keyval, cursor in rows:
+        eng, rec, buf = build_client_engine([[("forward", "")]], text="ab")
+        buf.cursor = start
+        assert offer(eng, buf, keyval, 100) is False
+        assert (buf.text, buf.cursor) == ("ab", cursor), (start, hex(keyval))
+        assert buf.log == [("default", keyval)]
+
+
+def test_client_ctrl_chord_reaches_core_once_and_types_nothing():
+    # No pre-core chord short-circuit: the core sees the key with its state
+    # bits exactly once; the client never turns a chord into literal text.
+    eng, rec, buf = build_client_engine([[("forward", "")]], text="x")
+    assert offer(eng, buf, ord("c"), 46, _CLIENT_CONTROL) is False
+    assert eng._core.key_calls() == [("handle_key", ord("c"), _CLIENT_CONTROL)]
+    assert buf.text == "x"
+    assert buf.log == [("default", "chord", ord("c"))]
+
+    eng2, rec2, buf2 = build_client_engine([[("hide", "")]], text="x")
+    assert offer(eng2, buf2, ord("c"), 46, _CLIENT_ALT) is True
+    assert eng2._core.key_calls() == [("handle_key", ord("c"), _CLIENT_ALT)]
+    assert buf2.text == "x" and buf2.log == []
+
+
+def test_client_release_reaches_core_once_and_types_nothing():
+    eng, rec, buf = build_client_engine([[("forward", "")], [("forward", "")]], text="x")
+    eng._keys_since_content_type = 0
+    assert offer(eng, buf, ord("c"), 46, _CLIENT_RELEASE) is False
+    assert eng._core.key_calls() == [("handle_key", ord("c"), _CLIENT_RELEASE)]
+    assert buf.text == "x"
+    assert buf.log == [("default", "release", ord("c"))]
+    assert eng._keys_since_content_type == 0  # releases are not counted
+    assert offer(eng, buf, ord("c"), 46) is False  # a press is
+    assert eng._keys_since_content_type == 1
+    assert (buf.text, buf.cursor) == ("xc", 2)
+
+
+def test_client_release_never_logs_prediction_rejection():
+    eng, rec, buf = build_client_engine([[("composing", "hel\x00lo")], [("forward", "")]])
+    events = capture_replay(eng)
+    assert offer(eng, buf, ord("l"), 38) is True
+    assert eng._active_prediction is not None
+    assert offer(eng, buf, ord("l"), 38, _CLIENT_RELEASE) is False
+    kinds = [event for event, _ in events]
+    assert "rejected" not in kinds and "accepted" not in kinds
+    assert eng._active_prediction is not None
+    assert buf.text == ""
+
+
+def test_client_spurious_zero_key_is_consumed_without_core_but_chord_reaches_core():
+    eng, rec, buf = build_client_engine([[("forward", "")]], text="x")
+    assert offer(eng, buf, 0, 240, 16) is True
+    assert eng._core.key_calls() == []
+    assert buf.text == "x" and buf.log == []
+    assert offer(eng, buf, 0, 240, _CLIENT_CONTROL) is False
+    assert eng._core.key_calls() == [("handle_key", 0, _CLIENT_CONTROL)]
+    assert buf.text == "x" and buf.log == [("default", "chord", 0)]
+
+
+def test_client_replace_uses_surrounding_delete_when_capability_present():
+    eng, rec, buf = build_client_engine(
+        [[("replace", "3\x1fcat")]], text="dog", caps=0x20
+    )
+    assert offer(eng, buf, _KEY_SPACE, 57) is True
+    assert rec.deleted == [(-3, 3)]
+    assert rec.forwarded_keys == []
+    assert (buf.text, buf.cursor) == ("cat", 3)
+    assert buf.log == [("delete", -3, 3), ("commit", "cat")]
+
+
+def test_client_replace_falls_back_to_forwarded_backspaces_without_capability():
+    eng, rec, buf = build_client_engine([[("replace", "3\x1fcat")]], text="dog", caps=0)
+    assert offer(eng, buf, _KEY_SPACE, 57) is True
+    assert rec.deleted == []
+    assert rec.forwarded_keys == [(_KEY_BACKSPACE, 14, 0)] * 3
+    assert (buf.text, buf.cursor) == ("cat", 3)
+    assert buf.log == [("forward", _KEY_BACKSPACE)] * 3 + [("commit", "cat")]
+
+
+def test_client_replace_during_composing_commits_without_deleting():
+    eng, rec, buf = build_client_engine(
+        [[("composing", "do\x00g")], [("replace", "2\x1fcat")]], caps=0x20
+    )
+    assert offer(eng, buf, ord("o"), 32) is True
+    assert buf.text == ""
+    assert offer(eng, buf, _KEY_SPACE, 57) is True
+    assert rec.deleted == [] and rec.forwarded_keys == []
+    assert (buf.text, buf.cursor) == ("cat", 3)
+
+
+def test_client_route_epochs_are_synthetic_and_normalised(monkeypatch):
+    # Default harness: the fence leaves _HAS_CORE False, so every event takes
+    # the keyval route whatever the keycode.
+    eng, rec, buf = build_client_engine([[("forward", "")]] * 4)
+    assert offer(eng, buf, ord("l"), 38) is False
+    assert eng._core.key_calls() == [("handle_key", ord("l"), 0)]
+    # Fixture-only route pins (restored by monkeypatch): the raw-scancode
+    # route with the SAME scripted core -- no native module is imported.
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    monkeypatch.setattr(ske, "_IS_WAYLAND", False)
+    assert offer(eng, buf, ord("l"), 38) is False
+    assert eng._core.key_calls()[-1] == ("process_keycode", 30, 0)
+    monkeypatch.setattr(ske, "_IS_WAYLAND", True)
+    assert offer(eng, buf, ord("l"), 38) is False
+    assert eng._core.key_calls()[-1] == ("process_keycode", 38, 0)
+    assert offer(eng, buf, ord("l"), 0) is False  # keycode 0 -> keyval route
+    assert eng._core.key_calls()[-1] == ("handle_key", ord("l"), 0)
+    assert len(eng._core.key_calls()) == 4
+    assert (buf.text, buf.cursor) == ("llll", 4)
+    assert len(buf.defaults()) == 4
+
+
+def test_client_tab_and_right_variants_exact_text():
+    eng, rec, buf = build_client_engine(
+        [[("composing", "hel\x00lo")], [("hide", ""), ("commit", "hello")]]
+    )
+    assert offer(eng, buf, ord("l"), 38) is True
+    assert offer(eng, buf, _KEY_TAB, 23) is True
+    assert (buf.text, buf.cursor) == ("hello", 5)
+    assert ("", False) in rec.preedits and buf.defaults() == []
+
+    # Right as a one-character composing step is display-only.
+    eng2, rec2, buf2 = build_client_engine(
+        [[("composing", "hel\x00lo")], [("composing", "hell\x00o")]]
+    )
+    assert offer(eng2, buf2, ord("l"), 38) is True
+    assert offer(eng2, buf2, _KEY_RIGHT, 106) is True
+    assert buf2.text == "" and rec2.preedits[-1] == ("hello", True)
+
+    # A final Right commits the full word without a delimiter.
+    eng3, rec3, buf3 = build_client_engine(
+        [[("composing", "hel\x00lo")], [("hide", ""), ("commit", "hello")]]
+    )
+    assert offer(eng3, buf3, ord("l"), 38) is True
+    assert offer(eng3, buf3, _KEY_RIGHT, 106) is True
+    assert (buf3.text, buf3.cursor) == ("hello", 5)
+
+    # A forwarded Right with no composition moves the client cursor once.
+    eng4, rec4, buf4 = build_client_engine([[("forward", "")]], text="ab")
+    buf4.cursor = 1
+    assert offer(eng4, buf4, _KEY_RIGHT, 106) is False
+    assert (buf4.text, buf4.cursor) == ("ab", 2)
+    assert buf4.log == [("default", _KEY_RIGHT)]
