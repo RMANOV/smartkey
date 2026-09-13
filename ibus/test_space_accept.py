@@ -19,6 +19,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 import types
 
 if "SMARTKEY_PHASEA_DATA" not in os.environ:
@@ -732,3 +733,179 @@ def test_client_tab_and_right_variants_exact_text():
     assert offer(eng4, buf4, _KEY_RIGHT, 106) is False
     assert (buf4.text, buf4.cursor) == ("ab", 2)
     assert buf4.log == [("default", _KEY_RIGHT)]
+
+
+# --- S02/P2a Cycle 3: lifecycle characterizations (scripted core) ------------
+#
+# ``do_set_content_type`` / ``do_focus_in`` / ``do_focus_out`` / ``do_reset`` /
+# ``do_disable`` against the real adapter, a scripted recording core and the
+# synthetic client of Cycle 2.  Expected-PASS characterizations of the current
+# behaviour; no production change.
+
+
+class LifecycleCore(RecordingCore):
+    """Recording core that also answers the adapter's lifecycle callbacks."""
+
+    def __init__(self, scripts, reset_actions=None) -> None:
+        super().__init__(scripts)
+        self.reset_actions = list(reset_actions or [])
+
+    def focus_lost(self) -> list[tuple[str, str]]:
+        self.calls.append(("focus_lost",))
+        return []
+
+    def focus_gained(self) -> None:
+        self.calls.append(("focus_gained",))
+
+    def reset(self) -> list[tuple[str, str]]:
+        self.calls.append(("reset",))
+        return list(self.reset_actions)
+
+    def save_personal(self) -> None:
+        self.calls.append(("save_personal",))
+
+    def set_surrounding_text(self, text, cursor_pos) -> None:
+        self.calls.append(("set_surrounding_text", text, cursor_pos))
+
+    def lifecycle_calls(self) -> list[tuple]:
+        return [c for c in self.calls if c[0] not in ("process_keycode", "handle_key")]
+
+
+class _ScriptedClock:
+    """``time`` stand-in for the adapter: scripted ``monotonic``, rest real."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+def build_lifecycle_engine(scripts, *, reset_actions=None, text: str = "", caps: int = 0):
+    """Cycle-2 client engine whose core also records lifecycle callbacks."""
+    eng, rec, buf = build_client_engine(scripts, text=text, caps=caps)
+    eng._core = LifecycleCore(scripts, reset_actions)
+    eng._last_save = time.monotonic()  # "just saved": focus-out must not save now
+    eng._keys_since_content_type = 0
+    eng._o1 = None
+    rec.hides = 0
+
+    def _hide() -> None:
+        rec.hides += 1
+
+    eng.hide_preedit_text = _hide
+    return eng, rec, buf
+
+
+# Text-producing actions a core must never emit on a cancel path; the adapter's
+# second lock (``_cancel_safe``) has to drop them.
+_CANCEL_ACTIONS = [("commit", "x"), ("replace", "1\x1fy"), ("hide", "")]
+
+
+def test_lifecycle_password_declaration_is_sticky_across_focus():
+    eng, _rec, buf = build_lifecycle_engine([[("forward", "")]] * 3)
+    core = eng._core
+    eng.do_set_content_type(ske._PURPOSE_PASSWORD, 0)
+    assert eng._sensitive is True
+    assert core.lifecycle_calls() == [("reset",), ("set_surrounding_text", None, None)]
+
+    # Sensitive: the key never reaches the core; the client gets it by default.
+    assert offer(eng, buf, ord("a"), 38) is False
+    assert core.key_calls() == []
+    assert buf.text == "a"
+
+    # The declaration survives a focus round-trip (IBus deduplicates it).
+    core.calls.clear()
+    eng.do_focus_out()
+    assert ("focus_lost",) in core.calls
+    assert ("save_personal",) not in core.calls
+    eng.do_focus_in()
+    assert ("focus_gained",) in core.calls
+    assert eng._sensitive is True
+    assert offer(eng, buf, ord("b"), 56) is False
+    assert core.key_calls() == []
+    assert buf.text == "ab"
+
+    # Only an explicit ordinary declaration un-sticks it.
+    core.calls.clear()
+    eng.do_set_content_type(0, 0)
+    assert eng._sensitive is False
+    assert core.calls.count(("reset",)) == 1
+    assert offer(eng, buf, ord("c"), 54) is False
+    assert core.key_calls() == [("handle_key", ord("c"), 0)]
+    assert buf.text == "abc"
+
+
+def test_lifecycle_unknown_and_bool_purposes_fail_closed_on_fresh_engines():
+    for purpose in (99, True):
+        eng, _rec, buf = build_lifecycle_engine([[("forward", "")]])
+        eng.do_set_content_type(purpose, 0)
+        assert eng._sensitive is True, purpose
+        assert offer(eng, buf, ord("a"), 38) is False
+        assert eng._core.key_calls() == [], purpose
+        assert buf.text == "a"
+
+    # An ordinary declaration on a fresh engine changes nothing: no reset,
+    # and the key reaches the core.
+    eng, _rec, buf = build_lifecycle_engine([[("forward", "")]])
+    eng.do_set_content_type(0, 0)
+    assert getattr(eng, "_sensitive", False) is False
+    assert eng._core.calls.count(("reset",)) == 0
+    assert offer(eng, buf, ord("a"), 38) is False
+    assert eng._core.key_calls() == [("handle_key", ord("a"), 0)]
+    assert buf.text == "a"
+
+
+def test_lifecycle_focus_out_debounces_save_personal_at_sixty_seconds(monkeypatch):
+    eng, _rec, _buf = build_lifecycle_engine([])
+    core = eng._core
+    clock = _ScriptedClock(1000.0)
+    monkeypatch.setattr(ske, "time", clock)
+
+    eng._last_save = 0.0  # the adapter's initial value: first focus-out saves
+    eng.do_focus_out()
+    assert core.calls.count(("save_personal",)) == 1
+    assert eng._last_save == 1000.0
+
+    clock.now = 1059.999
+    eng.do_focus_out()
+    assert core.calls.count(("save_personal",)) == 1
+    assert eng._last_save == 1000.0
+
+    clock.now = 1060.0
+    eng.do_focus_out()
+    assert core.calls.count(("save_personal",)) == 2
+    assert eng._last_save == 1060.0
+
+
+def test_lifecycle_reset_is_cancel_safe_with_prefilled_client():
+    eng, rec, buf = build_lifecycle_engine(
+        [], reset_actions=_CANCEL_ACTIONS, text="abc", caps=0x20
+    )
+    eng.do_reset()
+    assert ("reset",) in eng._core.calls
+    assert buf.text == "abc"
+    assert buf.log == []
+    assert rec.commits == []
+    assert rec.deleted == []
+    assert rec.forwarded_keys == []
+    assert rec.hides == 1
+    assert eng._active_prediction is None
+
+
+def test_lifecycle_disable_resets_then_saves_without_client_text():
+    eng, rec, buf = build_lifecycle_engine(
+        [], reset_actions=_CANCEL_ACTIONS, text="abc", caps=0x20
+    )
+    eng.do_disable()
+    calls = eng._core.calls
+    assert calls.count(("save_personal",)) == 1
+    assert calls.index(("reset",)) < calls.index(("save_personal",))
+    assert buf.text == "abc"
+    assert buf.log == []
+    assert rec.commits == []
+    assert rec.deleted == []
+    assert rec.hides == 1
