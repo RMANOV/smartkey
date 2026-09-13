@@ -743,6 +743,24 @@ impl SmartKeyEngine {
         (en, bg)
     }
 
+    /// Exact-word evidence for the two dual-buffer interpretations: the stored
+    /// frequency of `en_word` in the EN model and of `bg_word` in the BG model,
+    /// `0.0` where the whole word is not stored.  Case is folded like
+    /// [`score_both`](Self::score_both); the input strings are not modified.
+    /// This is a terminal read, never a completion: a rare exact word is
+    /// reported even when a frequent longer word outranks it in the trie.
+    pub fn score_exact_both(&self, en_word: &str, bg_word: &str) -> (f64, f64) {
+        let en_word = fold_case(en_word);
+        let bg_word = fold_case(bg_word);
+        let exact = |lang: LangId, word: &str| -> f64 {
+            self.lang_models
+                .get(lang)
+                .and_then(|m| m.trie.exact_frequency(word))
+                .map_or(0.0, f64::from)
+        };
+        (exact(LangId::En, &en_word), exact(LangId::Bg, &bg_word))
+    }
+
     /// Produce up to `limit` predictions for the given prefix and context.
     ///
     /// * `prefix` — the characters typed so far for the current word.
@@ -1253,6 +1271,28 @@ impl Default for SmartKeyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn score_exact_both_is_case_folded_and_language_separated() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word_lang("status", 900_000, LangId::En);
+        engine.load_word_lang("статия", 50_000, LangId::Bg);
+
+        assert_eq!(
+            engine.score_exact_both("status", "статия"),
+            (900_000.0, 50_000.0)
+        );
+        // Case folding on both sides.
+        assert_eq!(
+            engine.score_exact_both("Status", "Статия"),
+            (900_000.0, 50_000.0)
+        );
+        // Prefixes and unknown words are not exact evidence.
+        assert_eq!(engine.score_exact_both("stat", "стат"), (0.0, 0.0));
+        assert_eq!(engine.score_exact_both("statiq", "статии"), (0.0, 0.0));
+        // Strict per-language separation: a word is evidence only in its own model.
+        assert_eq!(engine.score_exact_both("статия", "status"), (0.0, 0.0));
+    }
 
     /// Helper: build a small engine with a handful of words and bigrams.
     fn test_engine() -> SmartKeyEngine {

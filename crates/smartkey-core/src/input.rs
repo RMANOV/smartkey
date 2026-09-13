@@ -855,8 +855,9 @@ impl InputMethodCore {
                 if self.dual_buffer.is_some() && !self.current_word.is_empty() {
                     // Full-word composing: commit entire preedit word at once.
                     // The word has been in composing mode the whole time — the
-                    // user sees the correct script; now we finalize it.
-                    let word = self.current_word.clone();
+                    // user sees the displayed script; the boundary resolves
+                    // exact one-sided evidence before anything is learned.
+                    let word = self.resolve_word_boundary();
                     self.commit_word_internal(&word, true);
                     self.reset_word();
                     let mut actions = vec![
@@ -942,7 +943,7 @@ impl InputMethodCore {
                     && !self.current_word.is_empty()
                     && !ch.is_alphabetic()
                 {
-                    let word = self.current_word.clone();
+                    let word = self.resolve_word_boundary();
                     self.commit_word_internal(&word, true);
                     self.reset_word();
                     let mut actions = vec![Action::HideGhost, Action::CommitText(word.clone())];
@@ -1740,6 +1741,39 @@ impl InputMethodCore {
         }
 
         actions
+    }
+
+    /// Choose the word to commit at a boundary of a dual-buffer composition.
+    ///
+    /// The display lock is a scoring signal on the PREFIX; it must not decide
+    /// the committed word when the full physical word has exact corpus
+    /// support on exactly one side.  Only that one-sided case switches the
+    /// reading (S03/P3a): both-supported words keep the existing evidence
+    /// decision, unsupported words keep the displayed reading, and a `Tech`
+    /// winner is left alone.  When the reading switches, the language
+    /// detector is realigned BEFORE `commit_word_internal` so learning,
+    /// momentum and the regime observation all see the selected script.
+    fn resolve_word_boundary(&mut self) -> String {
+        let Some(db) = self.dual_buffer.as_ref() else {
+            return self.current_word.clone();
+        };
+        let (en_exact, bg_exact) = self.engine.score_exact_both(db.en_text(), db.bg_text());
+        let selected = match (en_exact > 0.0, bg_exact > 0.0, db.winner_lang()) {
+            (true, false, LangId::Bg) => LangId::En,
+            (false, true, LangId::En) => LangId::Bg,
+            _ => return self.current_word.clone(),
+        };
+        let word = match selected {
+            LangId::En => db.en_text().to_string(),
+            LangId::Bg | LangId::Tech => db.bg_text().to_string(),
+        };
+        self.current_word = word.clone();
+        self.current_word_had_flip = true;
+        if self.config.lang_detection {
+            // Normalised one-sided exact evidence, not a calibrated probability.
+            self.lang_detector.feed_dual_result(selected, 1.0);
+        }
+        word
     }
 
     /// Commit action for the in-flight composing preedit, if there is one.
@@ -4912,5 +4946,75 @@ mod lang_prior_tests {
         assert_eq!(commits, vec!["to".to_string()]);
         assert_eq!(forwards, 1);
         assert_eq!(replaces, 0);
+    }
+
+    // ── GREEN state guards: what the boundary selection must carry along ──
+
+    fn press_key(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    /// The selected script drives the detector, momentum and context that
+    /// `commit_word_internal` learns from — not the display lock.
+    #[test]
+    fn detector_and_momentum_follow_the_selected_word() {
+        let mut core = one_sided_exact_core();
+        core.config.lang_detection = true;
+        type_word(&mut core, &STATIQ);
+        core.handle_key(press_raw(57));
+        assert_eq!(core.lang_detector.detected().lang, LangId::Bg);
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::Bg));
+        assert_eq!(core.context.back().map(String::as_str), Some("статия"));
+
+        let mut core = one_sided_exact_core();
+        core.config.lang_detection = true;
+        type_word(&mut core, &STATUS);
+        core.handle_key(press_raw(57));
+        assert_eq!(core.lang_detector.detected().lang, LangId::En);
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::En));
+        assert_eq!(core.context.back().map(String::as_str), Some("status"));
+    }
+
+    /// Return is a literal delimiter like Space: same selection, same shape.
+    #[test]
+    fn return_boundary_uses_the_same_selection() {
+        let mut core = one_sided_exact_core();
+        type_word(&mut core, &STATIQ);
+        let (commits, forwards, replaces) =
+            delimiter_shape(&core.handle_key(press_key(Key::Return)));
+        assert_eq!(commits, vec!["статия".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// The non-alphabetic boundary (punctuation) uses the same selection.
+    #[test]
+    fn punctuation_boundary_uses_the_same_selection() {
+        let mut core = one_sided_exact_core();
+        type_word(&mut core, &STATIQ);
+        let (commits, forwards, replaces) =
+            delimiter_shape(&core.handle_key(press_key(Key::Char(','))));
+        assert_eq!(commits, vec!["статия".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// Flush paths are outside this cycle: focus loss still delivers the
+    /// displayed reading.  Characterization of an explicit later task, not a
+    /// desired-output assertion.
+    #[test]
+    fn focus_lost_flush_keeps_the_displayed_reading() {
+        let mut core = one_sided_exact_core();
+        type_word(&mut core, &STATIQ);
+        let (commits, forwards, replaces) = delimiter_shape(&core.focus_lost());
+        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(forwards, 0);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
     }
 }
