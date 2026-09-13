@@ -46,13 +46,6 @@ jobs:
     name: S02 offline import safety (expected RED checkpoint)
     runs-on: ubuntu-latest
     env:
-      P2A_PYALLOW: ${{ runner.temp }}/p2a-pyallow
-      P2A_BASETEMP: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-basetemp
-      SMARTKEY_PHASEA_DATA: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-phase
-      SMARTKEY_DEBUG_DIR: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-trace
-      XDG_CONFIG_HOME: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-config
-      XDG_DATA_HOME: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-data
-      XDG_STATE_HOME: ${{ runner.temp }}/p2a-${{ github.run_id }}-${{ github.run_attempt }}-state
       SMARTKEY_DEBUG: "off"
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
       PYTHONDONTWRITEBYTECODE: "1"
@@ -61,6 +54,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
+      - name: Define runner-scoped isolated paths
+        shell: bash
+        run: |
+          {
+            printf '%s\n' "P2A_PYALLOW=$RUNNER_TEMP/p2a-pyallow"
+            printf '%s\n' "P2A_BASETEMP=$RUNNER_TEMP/p2a-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-basetemp"
+            printf '%s\n' "SMARTKEY_PHASEA_DATA=$RUNNER_TEMP/p2a-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-phase"
+            printf '%s\n' "SMARTKEY_DEBUG_DIR=$RUNNER_TEMP/p2a-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-trace"
+            printf '%s\n' "XDG_CONFIG_HOME=$RUNNER_TEMP/p2a-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-config"
+            printf '%s\n' "XDG_DATA_HOME=$RUNNER_TEMP/p2a-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-data"
+            printf '%s\n' "XDG_STATE_HOME=$RUNNER_TEMP/p2a-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-state"
+          } >> "$GITHUB_ENV"
       - name: Require fresh isolated paths
         shell: bash
         run: |
