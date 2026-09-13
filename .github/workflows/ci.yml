@@ -43,7 +43,7 @@ jobs:
             python -m pytest -q -p no:cacheprovider
 
   s02-offline:
-    name: S02 offline import safety (expected RED checkpoint)
+    name: S02 offline import safety
     runs-on: ubuntu-latest
     env:
       SMARTKEY_DEBUG: "off"

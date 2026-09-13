@@ -21,9 +21,10 @@ import sys
 import tempfile
 import types
 
-os.environ.setdefault(
-    "SMARTKEY_PHASEA_DATA", tempfile.mkdtemp(prefix="smartkey-test-phasea-")
-)
+if "SMARTKEY_PHASEA_DATA" not in os.environ:
+    os.environ["SMARTKEY_PHASEA_DATA"] = tempfile.mkdtemp(
+        prefix="smartkey-test-phasea-"
+    )
 
 _fake_gi = types.ModuleType("gi")
 

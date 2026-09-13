@@ -28,9 +28,10 @@ import tempfile
 import types
 
 # Belt-and-suspenders: never let any transitive code touch live Phase-A data.
-os.environ.setdefault(
-    "SMARTKEY_PHASEA_DATA", tempfile.mkdtemp(prefix="smartkey-test-phasea-")
-)
+if "SMARTKEY_PHASEA_DATA" not in os.environ:
+    os.environ["SMARTKEY_PHASEA_DATA"] = tempfile.mkdtemp(
+        prefix="smartkey-test-phasea-"
+    )
 
 # Force the module's ``_FakeIBus`` fallback: make ``gi.require_version`` raise so
 # the ``except (ValueError, ImportError)`` branch selects the stub IBus.
