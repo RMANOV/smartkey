@@ -4794,4 +4794,123 @@ mod lang_prior_tests {
         core.handle_key(press_raw(57));
         assert_eq!(type_word(&mut core, &IS), "is");
     }
+
+    // ── S03/P3a RED: exact one-sided evidence must win at the boundary ─────
+    //
+    // An early EN display lock on the prefix ("stat") must not decide the
+    // committed word when the full physical word has exact support on
+    // exactly ONE side (BG "статия"; no EN word starts with "statiq").
+    // Desired: one CommitText("статия"), one forwarded delimiter, no
+    // ReplaceWord, empty composition.  The guards below pin the readings
+    // that must NOT change with that fix.
+
+    /// s t a t i q → EN "statiq" / BG phonetic "статия".
+    const STATIQ: [u16; 6] = [31, 20, 30, 20, 23, 16];
+    /// s t a t u s / s t a t i c / s t a t i o n.
+    const STATUS: [u16; 6] = [31, 20, 30, 20, 22, 31];
+    const STATIC: [u16; 6] = [31, 20, 30, 20, 23, 46];
+    const STATION: [u16; 7] = [31, 20, 30, 20, 23, 24, 49];
+    /// s t a t i x: no exact support on either side.
+    const STATIX: [u16; 6] = [31, 20, 30, 20, 23, 45];
+
+    /// Controlled one-sided corpus: EN has strong prefix support for "stat"
+    /// through longer words only (EN-exact for "statiq" = 0); BG has exact
+    /// support for the full word only, weaker than the EN prefix, so the
+    /// display locks EN at char 4.
+    fn one_sided_exact_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        assert!(core.config.dual_buffer.enabled);
+        for (w, f) in [
+            ("status", 900_000u32),
+            ("static", 600_000),
+            ("station", 500_000),
+        ] {
+            core.load_word_lang(w, f, LangId::En);
+        }
+        core.load_word_lang("статия", 50_000, LangId::Bg);
+        core
+    }
+
+    /// (committed texts, forwarded delimiters, replacements) of one action list.
+    fn delimiter_shape(actions: &[Action]) -> (Vec<String>, usize, usize) {
+        let commits = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::CommitText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let forwards = actions
+            .iter()
+            .filter(|a| matches!(a, Action::ForwardKey))
+            .count();
+        let replaces = actions
+            .iter()
+            .filter(|a| matches!(a, Action::ReplaceWord { .. }))
+            .count();
+        (commits, forwards, replaces)
+    }
+
+    #[test]
+    fn exact_statia_boundary_reaches_one_committed_word() {
+        let mut core = one_sided_exact_core();
+        // "stat": EN 900_000 vs BG 50_000 → 0.947 ≥ 0.85 at four chars.
+        type_word(&mut core, &STATIQ[..4]);
+        let (dual, locked, _) = core.debug_state();
+        assert!(
+            dual && locked,
+            "precondition: early EN display lock on the prefix"
+        );
+        // "iq": no EN word continues "statiq"; BG "статия" is exact.
+        type_word(&mut core, &STATIQ[4..]);
+
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        assert_eq!(commits, vec!["статия".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    // ── Guards (expected PASS): readings a boundary fix must not change ────
+
+    /// EN-exact > 0, BG-exact = 0: the English word stays English.
+    #[test]
+    fn english_status_static_station_commit_english() {
+        for (codes, expected) in [
+            (&STATUS[..], "status"),
+            (&STATIC[..], "static"),
+            (&STATION[..], "station"),
+        ] {
+            let mut core = one_sided_exact_core();
+            type_word(&mut core, codes);
+            let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+            assert_eq!(commits, vec![expected.to_string()]);
+            assert_eq!(forwards, 1);
+            assert_eq!(replaces, 0);
+        }
+    }
+
+    /// EN-exact = 0 and BG-exact = 0: no crossover, the displayed reading is
+    /// committed as typed (unsupported input acquires no new policy).
+    #[test]
+    fn unsupported_both_keeps_displayed_reading() {
+        let mut core = one_sided_exact_core();
+        type_word(&mut core, &STATIX);
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        assert_eq!(commits, vec!["statix".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+    }
+
+    /// Both sides have exact support ("to" 5_000_000 / "то" 700_000): the
+    /// existing evidence decides, the two-supported policy is untouched.
+    #[test]
+    fn both_supported_short_word_keeps_current_reading() {
+        let mut core = bilingual_core();
+        type_word(&mut core, &TO);
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        assert_eq!(commits, vec!["to".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+    }
 }
