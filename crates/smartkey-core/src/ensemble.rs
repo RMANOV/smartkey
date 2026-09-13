@@ -696,18 +696,15 @@ impl SmartKeyEngine {
 
     /// Exact word frequency in a specific language model (for auto-correction).
     ///
-    /// Returns 0.0 if the word is not found.
+    /// Returns 0.0 if the word is not found.  This is a terminal read of the
+    /// stored word, never a completion search: a rare exact word is reported
+    /// even when a more frequent longer word outranks it in the trie.  The
+    /// input is matched as given (callers lowercase it themselves).
     pub fn word_frequency(&self, word: &str, lang: LangId) -> f64 {
         self.lang_models
             .get(lang)
-            .and_then(|m| {
-                m.trie
-                    .prefix_search(word, 1)
-                    .first()
-                    .filter(|e| e.word == word)
-                    .map(|e| e.frequency as f64)
-            })
-            .unwrap_or(0.0)
+            .and_then(|m| m.trie.exact_frequency(word))
+            .map_or(0.0, f64::from)
     }
 
     /// Score two prefixes (EN and BG interpretations) for dual-buffer comparison.
