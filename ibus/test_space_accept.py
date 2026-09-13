@@ -41,8 +41,29 @@ _ENGINE_PATH = pathlib.Path(__file__).resolve().parent / "smartkey_engine.py"
 _spec = importlib.util.spec_from_file_location("smartkey_engine_space_accept", _ENGINE_PATH)
 assert _spec and _spec.loader
 ske = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ske)
+# Harness-native self-fence: the adapter module executes right here.  For
+# exactly that window the native extension and the content-level debug sinks
+# must be unreachable whatever is installed, cached or exported in this
+# process; afterwards the exact previous ``sys.modules`` entry and
+# ``SMARTKEY_DEBUG`` value are restored, also on an exceptional exit.
+_MISSING = object()
+_prev_native = sys.modules.get("smartkey_py", _MISSING)
+_prev_debug = os.environ.get("SMARTKEY_DEBUG", _MISSING)
+sys.modules["smartkey_py"] = None
+os.environ["SMARTKEY_DEBUG"] = "off"
+try:
+    _spec.loader.exec_module(ske)
+finally:
+    if _prev_native is _MISSING:
+        sys.modules.pop("smartkey_py", None)
+    else:
+        sys.modules["smartkey_py"] = _prev_native
+    if _prev_debug is _MISSING:
+        os.environ.pop("SMARTKEY_DEBUG", None)
+    else:
+        os.environ["SMARTKEY_DEBUG"] = _prev_debug
 assert ske._HAS_IBUS is False
+assert ske._HAS_CORE is False and ske._DEBUG is False
 
 
 def _mk_text(s: str):
