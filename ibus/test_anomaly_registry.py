@@ -21,6 +21,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,7 @@ _DIR = _REPO / "diagnostics" / "anomalies"
 _REGISTRY = _DIR / "registry.json"
 _SCHEMA = _DIR / "schema.json"
 _VALIDATOR = _DIR / "validate.py"
+_WRITER = _DIR / "write_candidate.py"
 _R4_SYNTHETIC_KEY_ID = "0123456789abcdef0123456789abcdef"
 
 # The eight pairs the gate names as the minimum first baseline.
@@ -96,6 +98,72 @@ def _find(doc: dict, observed: str, expected: str) -> dict:
 def _refresh_identity(rec: dict) -> None:
     rec["dedup_key"] = V.compute_dedup_key(rec)
     rec["id"] = V.compute_id(rec)
+
+
+def _legacy_append(label: str) -> dict:
+    cyrillic_labels = {
+        "alpha": "алфа",
+        "beta": "бета",
+        "gamma": "гама",
+    }
+    rec = copy.deepcopy(_doc()["records"][0])
+    rec["observed"] = {"token": f"writer{label}", "script": "latin", "descriptor": None}
+    rec["expected"] = {
+        "token": f"писател{cyrillic_labels[label]}",
+        "script": "cyrillic",
+        "descriptor": None,
+    }
+    rec["minimal_context"] = {"before": None, "after": None}
+    rec["recorded_utc"] = "2026-09-13T00:00Z"
+    rec["first_seen_utc"] = None
+    rec["last_seen_utc"] = None
+    rec["repeat"] = False
+    rec["occurrence_count"] = 1
+    rec["source_refs"] = [{
+        "kind": "other",
+        "ref": hashlib.sha256(f"writer:{label}".encode()).hexdigest()[:12],
+        "observed_utc": None,
+        "build_sha": None,
+        "surface": "synthetic writer fixture",
+        "note": None,
+    }]
+    rec["status"] = "open_suspected_smartkey"
+    for field in ("reproducer", "red_test", "red_test_waiver", "fix_commit", "verification", "closure_reason", "notes"):
+        rec[field] = None
+    _refresh_identity(rec)
+    return rec
+
+
+def _run_writer_cli(source: Path, additions, output: Path, expected_sha: str):
+    additions_path = output.parent / f"{output.name}.append.json"
+    additions_path.write_text(json.dumps(additions, ensure_ascii=False), encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            str(_WRITER),
+            str(source),
+            str(additions_path),
+            str(output),
+            "--schema",
+            str(_SCHEMA),
+            "--expected-input-sha256",
+            expected_sha,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _load_writer():
+    spec = importlib.util.spec_from_file_location("smartkey_anomaly_writer", _WRITER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def _synthetic_opaque_ref(label: str) -> str:
@@ -1262,6 +1330,484 @@ def test_schema_enum_drift_is_detected():
     schema = _schema()
     schema["$defs"]["record"]["properties"]["status"]["enum"].append("maybe")
     assert "E_SCHEMA_DRIFT" in _codes(V.validate_document(_doc(), schema))
+
+
+# ------------------------------------------- append-only legacy writer contract
+def test_writer_appends_one_record_without_changing_source_or_prior_records(tmp_path):
+    before = _REGISTRY.read_bytes()
+    before_stat = _REGISTRY.stat()
+    output = tmp_path / "candidate.json"
+    proc = _run_writer_cli(
+        _REGISTRY,
+        [_legacy_append("alpha")],
+        output,
+        hashlib.sha256(before).hexdigest(),
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    result = json.loads(proc.stdout)
+    candidate = json.loads(output.read_text(encoding="utf-8"))
+    source = json.loads(before)
+    assert candidate["records"][: len(source["records"])] == source["records"]
+    assert candidate["records"][-1] == _legacy_append("alpha")
+    assert result["original_count"] == len(source["records"])
+    assert result["appended_count"] == 1
+    assert _REGISTRY.read_bytes() == before
+    assert (_REGISTRY.stat().st_ino, _REGISTRY.stat().st_mtime_ns) == (
+        before_stat.st_ino,
+        before_stat.st_mtime_ns,
+    )
+
+
+def test_writer_reuses_prior_candidate_as_next_digest_pinned_source(tmp_path):
+    first = tmp_path / "first.json"
+    first_proc = _run_writer_cli(
+        _REGISTRY,
+        [_legacy_append("alpha")],
+        first,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+    assert first_proc.returncode == 0, first_proc.stdout + first_proc.stderr
+    second = tmp_path / "second.json"
+    second_proc = _run_writer_cli(
+        first,
+        [_legacy_append("beta")],
+        second,
+        hashlib.sha256(first.read_bytes()).hexdigest(),
+    )
+
+    assert second_proc.returncode == 0, second_proc.stdout + second_proc.stderr
+    result = json.loads(second_proc.stdout)
+    assert result["original_count"] == 30
+    assert result["appended_count"] == 1
+    assert len(json.loads(second.read_text(encoding="utf-8"))["records"]) == 31
+
+
+def test_writer_exact_existing_duplicate_is_idempotent_even_when_fixed(tmp_path):
+    fixed = copy.deepcopy(next(r for r in _doc()["records"] if r["status"] == "fixed"))
+    output = tmp_path / "candidate.json"
+    proc = _run_writer_cli(
+        _REGISTRY,
+        [fixed],
+        output,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["appended_count"] == 0
+    assert result["duplicate_identical_ids"] == [fixed["id"]]
+    assert output.read_bytes() == _REGISTRY.read_bytes()
+
+
+def test_writer_exact_duplicate_inside_append_batch_is_added_once(tmp_path):
+    addition = _legacy_append("alpha")
+    output = tmp_path / "candidate.json"
+    proc = _run_writer_cli(
+        _REGISTRY,
+        [addition, copy.deepcopy(addition)],
+        output,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["appended_count"] == 1
+    assert result["duplicate_identical_ids"] == [addition["id"]]
+
+
+def test_writer_rejects_changed_payload_with_existing_identity(tmp_path):
+    collision = copy.deepcopy(_doc()["records"][0])
+    collision["notes"] = "synthetic collision"
+    output = tmp_path / "candidate.json"
+    proc = _run_writer_cli(
+        _REGISTRY,
+        [collision],
+        output,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+
+    assert proc.returncode == 1
+    assert json.loads(proc.stderr)["code"] == "E_IDENTITY_COLLISION"
+    assert not output.exists()
+
+
+def test_writer_rejects_distinct_record_that_does_not_start_open(tmp_path):
+    addition = _legacy_append("alpha")
+    addition["status"] = "fixed"
+    output = tmp_path / "candidate.json"
+    proc = _run_writer_cli(
+        _REGISTRY,
+        [addition],
+        output,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+
+    assert proc.returncode == 1
+    assert json.loads(proc.stderr)["code"] == "E_NEW_STATUS"
+    assert not output.exists()
+
+
+def test_writer_rejects_malformed_operation_shape_and_wrong_digest(tmp_path):
+    malformed_output = tmp_path / "malformed.json"
+    malformed = _run_writer_cli(
+        _REGISTRY,
+        {"append_records": [_legacy_append("alpha")]},
+        malformed_output,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+    stale_output = tmp_path / "stale.json"
+    stale = _run_writer_cli(_REGISTRY, [], stale_output, "0" * 64)
+
+    assert json.loads(malformed.stderr)["code"] == "E_OPERATION_SHAPE"
+    assert json.loads(stale.stderr)["code"] == "E_INPUT_DIGEST"
+    assert not malformed_output.exists()
+    assert not stale_output.exists()
+
+
+def test_writer_retry_is_noop_and_different_existing_output_is_not_clobbered(tmp_path):
+    addition = _legacy_append("alpha")
+    expected = hashlib.sha256(_REGISTRY.read_bytes()).hexdigest()
+    output = tmp_path / "candidate.json"
+    first = _run_writer_cli(_REGISTRY, [addition], output, expected)
+    assert first.returncode == 0, first.stdout + first.stderr
+    before = output.stat()
+    retry = _run_writer_cli(_REGISTRY, [addition], output, expected)
+    after = output.stat()
+
+    assert json.loads(retry.stdout)["outcome"] == "NOOP_IDENTICAL_OUTPUT"
+    assert (before.st_ino, before.st_mtime_ns) == (after.st_ino, after.st_mtime_ns)
+
+    occupied = tmp_path / "occupied.json"
+    occupied.write_text("different\n", encoding="utf-8")
+    rejected = _run_writer_cli(_REGISTRY, [addition], occupied, expected)
+    assert json.loads(rejected.stderr)["code"] == "E_OUTPUT_EXISTS"
+    assert occupied.read_text(encoding="utf-8") == "different\n"
+
+
+def test_writer_reports_directory_fsync_failure_after_output_is_linked(monkeypatch, tmp_path):
+    writer = _load_writer()
+    append_path = tmp_path / "append.json"
+    append_path.write_text(json.dumps([_legacy_append("alpha")]), encoding="utf-8")
+    output = tmp_path / "candidate.json"
+    real_fsync = writer.os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("synthetic directory fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(writer.os, "fsync", fail_directory_fsync)
+    with pytest.raises(writer.WriterError) as caught:
+        writer.prepare_candidate(
+            _REGISTRY,
+            append_path,
+            _SCHEMA,
+            output,
+            hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+        )
+
+    assert caught.value.code == "E_DIR_FSYNC_AFTER_PUBLISH"
+    assert caught.value.output_published is True
+    assert output.exists()
+
+
+def test_writer_rejects_enhanced_append_fields(tmp_path):
+    addition = _legacy_append("alpha")
+    addition["adjudications"] = []
+    output = tmp_path / "candidate.json"
+    proc = _run_writer_cli(
+        _REGISTRY,
+        [addition],
+        output,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+
+    assert proc.returncode == 1
+    assert json.loads(proc.stderr)["code"] == "E_R3_IMPORT_HOLD"
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("id", []), ("dedup_key", {}), ("observed", [])],
+)
+def test_writer_rejects_malformed_record_shapes_without_traceback(
+    tmp_path, field, value
+):
+    addition = _legacy_append("alpha")
+    addition[field] = value
+    output = tmp_path / "candidate.json"
+    proc = _run_writer_cli(
+        _REGISTRY,
+        [addition],
+        output,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+
+    assert proc.returncode == 1
+    assert json.loads(proc.stderr)["code"] == "E_APPEND_INVALID"
+    assert "Traceback" not in proc.stderr
+    assert not output.exists()
+
+
+def test_writer_supports_valid_empty_source_then_reuses_one_record_candidate(tmp_path):
+    empty_doc = _doc()
+    empty_doc["records"] = []
+    assert V.validate_document(empty_doc, _schema()) == []
+    source = tmp_path / "empty.json"
+    source.write_text(V.canonical_text(empty_doc), encoding="utf-8")
+    first = tmp_path / "one.json"
+    first_proc = _run_writer_cli(
+        source,
+        [_legacy_append("alpha")],
+        first,
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    second = tmp_path / "two.json"
+    second_proc = _run_writer_cli(
+        first,
+        [_legacy_append("beta")],
+        second,
+        hashlib.sha256(first.read_bytes()).hexdigest(),
+    )
+
+    assert first_proc.returncode == 0, first_proc.stdout + first_proc.stderr
+    assert json.loads(first_proc.stdout)["original_count"] == 0
+    assert second_proc.returncode == 0, second_proc.stdout + second_proc.stderr
+    assert json.loads(second_proc.stdout)["original_count"] == 1
+    assert len(json.loads(second.read_text(encoding="utf-8"))["records"]) == 2
+
+
+def test_writer_rejects_nonobject_schema_without_traceback(tmp_path):
+    writer = _load_writer()
+    additions = tmp_path / "append.json"
+    additions.write_text(json.dumps([_legacy_append("alpha")]), encoding="utf-8")
+    schema = tmp_path / "schema.json"
+    schema.write_text("[]\n", encoding="utf-8")
+
+    with pytest.raises(writer.WriterError) as caught:
+        writer.prepare_candidate(
+            _REGISTRY,
+            additions,
+            schema,
+            tmp_path / "candidate.json",
+            hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+        )
+
+    assert caught.value.code == "E_SCHEMA_SHAPE"
+    assert caught.value.output_published is False
+
+
+def test_writer_rejects_symlink_ancestor_and_special_inputs(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir(mode=0o700)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    additions = tmp_path / "append.json"
+    additions.write_text(json.dumps([_legacy_append("alpha")]), encoding="utf-8")
+    writer = _load_writer()
+    with pytest.raises(writer.WriterError) as caught:
+        writer.prepare_candidate(
+            _REGISTRY,
+            additions,
+            _SCHEMA,
+            linked_parent / "candidate.json",
+            hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+        )
+    assert caught.value.code == "E_OUTPUT_PARENT"
+    assert not (real_parent / "candidate.json").exists()
+
+    source_link = tmp_path / "source-link.json"
+    source_link.symlink_to(_REGISTRY)
+    linked_source = _run_writer_cli(
+        source_link,
+        [_legacy_append("alpha")],
+        tmp_path / "linked-source-output.json",
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+    assert json.loads(linked_source.stderr)["code"] == "E_SOURCE_READ"
+
+    fifo = tmp_path / "append.fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(writer.WriterError) as caught:
+        writer.prepare_candidate(
+            _REGISTRY,
+            fifo,
+            _SCHEMA,
+            tmp_path / "fifo-output.json",
+            hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+        )
+    assert caught.value.code == "E_APPEND_READ"
+
+    output_target = tmp_path / "output-target.json"
+    output_target.write_text("untouched\n", encoding="utf-8")
+    output_link = tmp_path / "output-link.json"
+    output_link.symlink_to(output_target)
+    linked_output = _run_writer_cli(
+        _REGISTRY,
+        [_legacy_append("alpha")],
+        output_link,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+    assert json.loads(linked_output.stderr)["code"] == "E_OUTPUT_EXISTS"
+    assert output_target.read_text(encoding="utf-8") == "untouched\n"
+
+    output_fifo = tmp_path / "output.fifo"
+    os.mkfifo(output_fifo)
+    special_output = _run_writer_cli(
+        _REGISTRY,
+        [_legacy_append("alpha")],
+        output_fifo,
+        hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+    )
+    assert json.loads(special_output.stderr)["code"] == "E_OUTPUT_EXISTS"
+
+
+def test_writer_detects_real_parent_replacement_while_using_pinned_dirfd(
+    monkeypatch, tmp_path
+):
+    writer = _load_writer()
+    additions = tmp_path / "append.json"
+    additions.write_text(json.dumps([_legacy_append("alpha")]), encoding="utf-8")
+    parent = tmp_path / "publish"
+    parent.mkdir(mode=0o700)
+    moved = tmp_path / "publish-moved"
+    output = parent / "candidate.json"
+    real_link = writer.os.link
+
+    def replace_parent_then_link(src, dst, **kwargs):
+        parent.rename(moved)
+        parent.mkdir(mode=0o700)
+        return real_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(writer.os, "link", replace_parent_then_link)
+    with pytest.raises(writer.WriterError) as caught:
+        writer.prepare_candidate(
+            _REGISTRY,
+            additions,
+            _SCHEMA,
+            output,
+            hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+        )
+
+    assert caught.value.code == "E_OUTPUT_PARENT_DRIFT"
+    assert caught.value.output_published is True
+    assert not output.exists()
+    assert (moved / "candidate.json").exists()
+
+
+def test_writer_reports_post_link_temp_unlink_failure(monkeypatch, tmp_path):
+    writer = _load_writer()
+    additions = tmp_path / "append.json"
+    additions.write_text(json.dumps([_legacy_append("alpha")]), encoding="utf-8")
+    output = tmp_path / "candidate.json"
+
+    def fail_unlink(_name, **_kwargs):
+        raise OSError("synthetic temp unlink failure")
+
+    monkeypatch.setattr(writer.os, "unlink", fail_unlink)
+    with pytest.raises(writer.WriterError) as caught:
+        writer.prepare_candidate(
+            _REGISTRY,
+            additions,
+            _SCHEMA,
+            output,
+            hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+        )
+
+    assert caught.value.code == "E_TEMP_UNLINK_AFTER_PUBLISH"
+    assert caught.value.output_published is True
+    assert output.exists()
+
+
+def test_writer_reports_pre_link_failure_without_output_and_retains_temp(
+    monkeypatch, tmp_path
+):
+    writer = _load_writer()
+    additions = tmp_path / "append.json"
+    additions.write_text(json.dumps([_legacy_append("alpha")]), encoding="utf-8")
+    output = tmp_path / "candidate.json"
+
+    def fail_link(*_args, **_kwargs):
+        raise OSError("synthetic pre-link failure")
+
+    monkeypatch.setattr(writer.os, "link", fail_link)
+    with pytest.raises(writer.WriterError) as caught:
+        writer.prepare_candidate(
+            _REGISTRY,
+            additions,
+            _SCHEMA,
+            output,
+            hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+        )
+
+    assert caught.value.code == "E_OUTPUT_PUBLISH"
+    assert caught.value.output_published is False
+    assert not output.exists()
+    assert caught.value.temp_path is not None
+    assert caught.value.temp_path.is_file()
+
+
+def test_writer_rejects_identical_noop_after_output_parent_replacement(
+    monkeypatch, tmp_path
+):
+    writer = _load_writer()
+    additions = tmp_path / "append.json"
+    additions.write_text(json.dumps([_legacy_append("alpha")]), encoding="utf-8")
+    parent = tmp_path / "publish"
+    parent.mkdir(mode=0o700)
+    moved = tmp_path / "publish-moved"
+    output = parent / "candidate.json"
+    expected = hashlib.sha256(_REGISTRY.read_bytes()).hexdigest()
+    first = writer.prepare_candidate(_REGISTRY, additions, _SCHEMA, output, expected)
+    assert first["outcome"] == "CREATED"
+    real_link = writer.os.link
+
+    def replace_parent_then_link(src, dst, **kwargs):
+        parent.rename(moved)
+        parent.mkdir(mode=0o700)
+        return real_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(writer.os, "link", replace_parent_then_link)
+    with pytest.raises(writer.WriterError) as caught:
+        writer.prepare_candidate(_REGISTRY, additions, _SCHEMA, output, expected)
+
+    assert caught.value.code == "E_OUTPUT_PARENT_DRIFT"
+    assert caught.value.output_published is False
+    assert not output.exists()
+    assert (moved / "candidate.json").is_file()
+
+
+def test_writer_reports_regular_file_fsync_failure_as_unpublished_with_temp(
+    monkeypatch, tmp_path
+):
+    writer = _load_writer()
+    additions = tmp_path / "append.json"
+    additions.write_text(json.dumps([_legacy_append("alpha")]), encoding="utf-8")
+    output = tmp_path / "candidate.json"
+    real_fsync = writer.os.fsync
+
+    def fail_regular_file_fsync(fd):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("synthetic regular-file fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(writer.os, "fsync", fail_regular_file_fsync)
+    with pytest.raises(writer.WriterError) as caught:
+        writer.prepare_candidate(
+            _REGISTRY,
+            additions,
+            _SCHEMA,
+            output,
+            hashlib.sha256(_REGISTRY.read_bytes()).hexdigest(),
+        )
+
+    assert caught.value.code == "E_OUTPUT_STAGE"
+    assert caught.value.output_published is False
+    assert not output.exists()
+    assert caught.value.temp_path is not None
+    assert caught.value.temp_path.is_file()
 
 
 # -------------------------------------------- G0 adjudication contract (RED)
