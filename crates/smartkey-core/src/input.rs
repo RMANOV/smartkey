@@ -5105,8 +5105,12 @@ mod lang_prior_tests {
     #[test]
     fn genuinely_absent_typed_word_is_still_corrected() {
         let core = shadowed_exact_core();
+        // Fixture assumption made explicit: the phonetic map sends v → в
+        // (w → ш), so "vi" is the Latin spelling that transliterates to the
+        // loaded BG word "ви".
+        assert_eq!(crate::lang_detect::transliterate("vi"), "ви");
         assert_eq!(
-            core.try_language_correction("wi"),
+            core.try_language_correction("vi"),
             Some(Action::ReplaceWord {
                 replace_len: 2,
                 text: "ви".to_string(),
