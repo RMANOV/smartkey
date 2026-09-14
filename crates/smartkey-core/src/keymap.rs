@@ -34,6 +34,27 @@ pub fn scancode_to_both(code: u16, shift: bool) -> Option<(char, char)> {
     Some((en, bg))
 }
 
+/// Map a scancode to both interpretations with the Caps Lock latch applied
+/// **per layout**: Caps Lock inverts Shift only where that layout's unshifted
+/// character is a letter.  The bracket keys carry Bulgarian letters (ш щ ч ю)
+/// but English punctuation, so one shared shift decision is wrong for one of
+/// the two sides; `is_alpha_scancode` (shared alphabetic set) is left as it is.
+///
+/// Returns `None` exactly when [`scancode_to_both`] would.
+pub(crate) fn scancode_to_both_with_caps(
+    code: u16,
+    shift_held: bool,
+    caps_lock: bool,
+) -> Option<(char, char)> {
+    let en_unshifted = en_qwerty(code, false)?;
+    let bg_unshifted = bg_phonetic(code, false)?;
+    let en_shift = shift_held ^ (caps_lock && en_unshifted.is_alphabetic());
+    let bg_shift = shift_held ^ (caps_lock && bg_unshifted.is_alphabetic());
+    let en = en_qwerty(code, en_shift)?;
+    let bg = bg_phonetic(code, bg_shift)?;
+    Some((en, bg))
+}
+
 /// Find the physical EN/BG pair whose character on `layout` is `ch`.
 ///
 /// This reverse lookup deliberately reuses the hardware tables above.  The
@@ -422,5 +443,128 @@ mod tests {
         assert_eq!(scancode_to_char(44, true, Layout::Bg), Some('З'));
         assert_eq!(scancode_to_char(17, true, Layout::Bg), Some('В'));
         assert_eq!(scancode_to_char(41, true, Layout::Bg), Some('Ч'));
+    }
+
+    // ── Per-layout Caps Lock (S03/P3b) ───────────────────────────────────
+    //
+    // Expected outputs are written out explicitly; nothing below derives an
+    // expectation from the helper under test.
+
+    /// The four bracket keys: English punctuation, Bulgarian letters.
+    /// Columns: (shift_held, caps_lock) → (en, bg).
+    #[test]
+    fn test_with_caps_bg_only_letters_follow_the_latch_en_symbols_do_not() {
+        let cases: [(u16, [(bool, bool, (char, char)); 4]); 4] = [
+            (
+                26,
+                [
+                    (false, false, ('[', 'ш')),
+                    (true, false, ('{', 'Ш')),
+                    (false, true, ('[', 'Ш')),
+                    (true, true, ('{', 'ш')),
+                ],
+            ),
+            (
+                27,
+                [
+                    (false, false, (']', 'щ')),
+                    (true, false, ('}', 'Щ')),
+                    (false, true, (']', 'Щ')),
+                    (true, true, ('}', 'щ')),
+                ],
+            ),
+            (
+                41,
+                [
+                    (false, false, ('`', 'ч')),
+                    (true, false, ('~', 'Ч')),
+                    (false, true, ('`', 'Ч')),
+                    (true, true, ('~', 'ч')),
+                ],
+            ),
+            (
+                43,
+                [
+                    (false, false, ('\\', 'ю')),
+                    (true, false, ('|', 'Ю')),
+                    (false, true, ('\\', 'Ю')),
+                    (true, true, ('|', 'ю')),
+                ],
+            ),
+        ];
+        for (code, table) in cases {
+            for (shift_held, caps_lock, expected) in table {
+                assert_eq!(
+                    scancode_to_both_with_caps(code, shift_held, caps_lock),
+                    Some(expected),
+                    "code {code} shift_held {shift_held} caps_lock {caps_lock}"
+                );
+            }
+        }
+    }
+
+    /// An ordinary key that is a letter on both layouts: Caps Lock inverts
+    /// Shift on both sides, exactly like the shared decision did.
+    #[test]
+    fn test_with_caps_ordinary_dual_letter_inverts_on_both_layouts() {
+        assert_eq!(
+            scancode_to_both_with_caps(35, false, false),
+            Some(('h', 'х'))
+        );
+        assert_eq!(
+            scancode_to_both_with_caps(35, true, false),
+            Some(('H', 'Х'))
+        );
+        assert_eq!(
+            scancode_to_both_with_caps(35, false, true),
+            Some(('H', 'Х'))
+        );
+        assert_eq!(scancode_to_both_with_caps(35, true, true), Some(('h', 'х')));
+    }
+
+    /// Digits and punctuation shared by both layouts ignore the latch and
+    /// still follow a held Shift.
+    #[test]
+    fn test_with_caps_digits_and_shared_punctuation_ignore_the_latch() {
+        for (code, plain, shifted) in [(2u16, '1', '!'), (12, '-', '_'), (51, ',', '<')] {
+            assert_eq!(
+                scancode_to_both_with_caps(code, false, false),
+                Some((plain, plain))
+            );
+            assert_eq!(
+                scancode_to_both_with_caps(code, false, true),
+                Some((plain, plain))
+            );
+            assert_eq!(
+                scancode_to_both_with_caps(code, true, false),
+                Some((shifted, shifted))
+            );
+            assert_eq!(
+                scancode_to_both_with_caps(code, true, true),
+                Some((shifted, shifted))
+            );
+        }
+    }
+
+    /// Special keys and unknown scancodes stay `None`, as with the shared
+    /// mapping, whatever the modifiers.
+    #[test]
+    fn test_with_caps_special_and_unknown_scancodes_are_none() {
+        for code in [57u16, 15, 999] {
+            for (shift_held, caps_lock) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                assert_eq!(
+                    scancode_to_both(code, shift_held),
+                    None,
+                    "baseline code {code}"
+                );
+                assert_eq!(
+                    scancode_to_both_with_caps(code, shift_held, caps_lock),
+                    None,
+                    "code {code} shift_held {shift_held} caps_lock {caps_lock}"
+                );
+            }
+        }
     }
 }
