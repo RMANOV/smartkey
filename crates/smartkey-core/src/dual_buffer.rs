@@ -30,6 +30,33 @@ impl Default for DualBufferConfig {
     }
 }
 
+/// Where the current winner's evidence comes from (U2 evidence-origin API).
+///
+/// The numbers alone cannot tell these apart: a both-zero scoring and a
+/// genuine 50/50 corpus tie both read confidence 0.5, and a first-character
+/// prior bias reads a constant 0.65.  Commit 1 of the API ships the surface
+/// only: the field is initialised to `Initial` and never transitioned, so
+/// `evidence_origin()` is a placeholder until commit 2 adds the transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceOrigin {
+    /// Fresh or cleared buffer: nothing has been scored yet.
+    Initial,
+    /// The last scoring found no corpus support for either reading
+    /// (`total < MIN_CORPUS_SUPPORT`); the winner is inherited, not derived.
+    UnsupportedBoth,
+    /// A surrounding/momentum prior biased the winner on the first
+    /// character; no word-level evidence exists yet.
+    PriorOnly,
+    /// At least one reading has prefix-corpus support; scores are normalised.
+    Corpus,
+}
+
+/// Prefix support is an integer count; `total < MIN_CORPUS_SUPPORT`
+/// (strict-less, 1.0) therefore means BOTH readings have zero support, not a
+/// tolerance.  A future `>=` or fractional scorer must revisit the R8 and R9b
+/// evidence-origin tests before changing this.
+pub const MIN_CORPUS_SUPPORT: f64 = 1.0;
+
 /// Dual-interpretation buffer that tracks both EN and BG readings
 /// of the same physical keypress sequence.
 pub struct DualBuffer {
@@ -53,6 +80,8 @@ pub struct DualBuffer {
     lock_threshold: f64,
     /// Minimum chars before lock from config.
     min_lock_chars: usize,
+    /// Provenance of the current winner (see `EvidenceOrigin`).
+    origin: EvidenceOrigin,
 }
 
 impl DualBuffer {
@@ -70,6 +99,7 @@ impl DualBuffer {
             flip_detected: false,
             lock_threshold,
             min_lock_chars,
+            origin: EvidenceOrigin::Initial,
         }
     }
 
@@ -132,7 +162,7 @@ impl DualBuffer {
     /// `SmartKeyEngine::score_both()`).
     pub fn update_scores(&mut self, en_freq: f64, bg_freq: f64) {
         let total = en_freq + bg_freq;
-        if total < 1.0 {
+        if total < MIN_CORPUS_SUPPORT {
             // No corpus support for either — keep previous winner, low confidence.
             self.en_score = 0.5;
             self.bg_score = 0.5;
@@ -243,6 +273,15 @@ impl DualBuffer {
         self.locked
     }
 
+    /// Provenance of the current winner (see `EvidenceOrigin`).
+    ///
+    /// Commit 1 placeholder: the field is only ever `Initial` here; commit 2
+    /// adds the transitions in `update_scores`, `apply_prior_lock_hint` and
+    /// `pop`.  No consumer reads this before commit 2 lands.
+    pub fn evidence_origin(&self) -> EvidenceOrigin {
+        self.origin
+    }
+
     /// Whether a confidence flip was detected after lock.
     ///
     /// When true, the caller should emit a `ReplaceWord` action to fix
@@ -290,6 +329,7 @@ impl DualBuffer {
         self.locked = false;
         self.locked_lang = None;
         self.flip_detected = false;
+        self.origin = EvidenceOrigin::Initial;
     }
 }
 
@@ -694,5 +734,135 @@ mod tests {
             "prior should NOT override after char 1"
         );
         assert!(!b.is_locked());
+    }
+
+    // ── U2 evidence-origin API — unit matrix (commit 1: API surface) ────────
+    //
+    // R1 passes against the placeholder; R2–R6 and R8 fail on the origin
+    // assert, R7b on its lock-clear assert, until commit 2 adds the
+    // transitions.  R7 (test_pop_keeps_lock_sticky) is unchanged.
+
+    /// R1: a fresh buffer carries no evidence; clear() returns to that state.
+    #[test]
+    fn origin_is_initial_when_fresh_and_after_clear() {
+        let mut b = DualBuffer::new(0.85, 4);
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::Initial);
+        b.push('h', 'х');
+        b.update_scores(4_897_788.0, 43_651.0);
+        b.clear();
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::Initial);
+    }
+
+    /// R2: both readings unsupported → UnsupportedBoth; the winner and the
+    /// literal EN reading are kept (D2), confidence 0.5.
+    #[test]
+    fn origin_is_unsupported_both_when_neither_reading_has_support() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('q', 'я');
+        b.push('x', 'ь');
+        b.update_scores(0.0, 0.0);
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+        assert_eq!(b.winner_lang(), LangId::En);
+        assert_eq!(b.winner_text(), "qx");
+        assert_eq!(b.confidence(), 0.5);
+    }
+
+    /// R3: a genuine 50/50 corpus tie has the same numbers as R2 but is
+    /// evidence — only the origin tells them apart.
+    #[test]
+    fn origin_is_corpus_on_an_exact_corpus_tie() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('a', 'а');
+        b.push('b', 'б');
+        b.update_scores(10.0, 10.0);
+        assert_eq!(b.confidence(), 0.5, "premise: same number as R2");
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::Corpus);
+    }
+
+    /// R4: support, then none — the winner is inherited and the origin says
+    /// so; the lock state is untouched.
+    #[test]
+    fn origin_becomes_unsupported_both_while_the_winner_is_inherited() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('h', 'х');
+        b.update_scores(100.0, 1.0);
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::Corpus);
+        assert_eq!(b.winner_lang(), LangId::En, "premise");
+        b.push('q', 'я');
+        b.update_scores(0.0, 0.0);
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+        assert_eq!(
+            b.winner_lang(),
+            LangId::En,
+            "winner inherited, not re-derived"
+        );
+        assert!(!b.is_locked());
+    }
+
+    /// R5: a char-1 prior override is PriorOnly; corpus evidence on char 2
+    /// rescores it to Corpus.  R5 is also the guard for the SCORE → HINT
+    /// order in input.rs `handle_dual_buffer_key` (`update_scores` before
+    /// `apply_prior_lock_hint`): swapping them makes this node RED.
+    #[test]
+    fn origin_is_prior_only_on_char_1_then_corpus_on_char_2() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('i', 'и');
+        b.update_scores(1.0, 100.0);
+        b.apply_prior_lock_hint(Some(LangId::En));
+        assert_eq!(b.winner_lang(), LangId::En, "premise: char-1 bias applied");
+        assert!((b.confidence() - 0.65).abs() < 1e-9, "premise");
+        assert!(!b.is_locked(), "premise");
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::PriorOnly);
+        b.push('m', 'м');
+        b.update_scores(1.0, 10_000.0);
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::Corpus);
+        assert_eq!(b.winner_lang(), LangId::Bg);
+    }
+
+    /// R6: a matching prior that early-locks is evidence-backed — Corpus.
+    #[test]
+    fn origin_stays_corpus_when_a_matching_prior_early_locks() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('h', 'х');
+        b.push('e', 'е');
+        b.push('l', 'л');
+        b.update_scores(850.0, 150.0);
+        b.apply_prior_lock_hint(Some(LangId::En));
+        assert!(b.is_locked(), "premise: relaxed early lock");
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::Corpus);
+    }
+
+    /// R7b: a pop() that empties the buffer performs the full clear() —
+    /// origin Initial AND lock/locked_lang/flip cleared.  Unreachable from the
+    /// core (the input.rs Backspace arm drops an emptied buffer, see the
+    /// core-level R7c); defence in depth.  Pop above len 0 keeps the lock
+    /// sticky (R7, test_pop_keeps_lock_sticky).
+    #[test]
+    fn pop_to_empty_clears_origin_and_lock() {
+        let mut b = DualBuffer::new(0.85, 2);
+        b.push('h', 'х');
+        b.push('e', 'е');
+        b.update_scores(4_897_788.0, 43_651.0);
+        assert!(b.is_locked(), "premise");
+        b.pop();
+        assert!(b.is_locked(), "pop above len 0 keeps the lock sticky");
+        b.pop();
+        assert!(b.is_empty(), "premise");
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::Initial);
+        assert!(!b.is_locked(), "pop to empty clears the lock");
+        assert!(!b.flip_detected());
+        assert_eq!(b.confidence(), 0.5);
+    }
+
+    /// R8: the threshold is a zero-support test on integer counts, not a
+    /// tolerance — fractional inputs below MIN_CORPUS_SUPPORT are unsupported.
+    #[test]
+    fn origin_is_unsupported_both_below_min_corpus_support() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('q', 'я');
+        b.update_scores(0.4, 0.5);
+        assert!(0.4 + 0.5 < MIN_CORPUS_SUPPORT, "premise");
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+        assert_eq!(b.confidence(), 0.5);
     }
 }

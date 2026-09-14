@@ -5350,4 +5350,150 @@ mod lang_prior_tests {
             }
         }
     }
+
+    // ── U2 evidence-origin API, core-level nodes (commit 1) ─────────────────
+    //
+    // The push path scores BEFORE it applies the prior (input.rs
+    // handle_dual_buffer_key: `update_scores` then `apply_prior_lock_hint`),
+    // so the hint is the last writer at len == 1 and only when the prior
+    // differs from the scored winner.  The Backspace arm rescoring never
+    // re-applies the hint.  A fresh core with no loaded words scores (0, 0)
+    // for every reading, and `with_prior` stands in for Bg momentum.
+
+    use crate::dual_buffer::EvidenceOrigin;
+
+    fn press_backspace() -> KeyEvent {
+        KeyEvent {
+            key: Key::Backspace,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    /// R7c (characterization, expected PASS): a Backspace that empties the
+    /// dual buffer drops it, so no reader can see a live buffer at len 0;
+    /// the next dual key starts a fresh, unlocked buffer.
+    #[test]
+    fn backspace_to_empty_drops_the_dual_buffer_and_the_next_key_starts_fresh() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        core.handle_key(press_raw(16)); // q / я
+        assert!(core.dual_buffer.is_some(), "premise: dual buffer alive");
+        let actions = core.handle_key(press_backspace());
+        assert_eq!(actions, vec![Action::HideGhost]);
+        assert!(core.dual_buffer.is_none(), "buffer dropped at len 0");
+        assert_eq!(core.current_word(), "");
+        core.handle_key(press_raw(16));
+        let db = core
+            .dual_buffer
+            .as_ref()
+            .expect("premise: fresh dual buffer");
+        assert_eq!(db.len(), 1);
+        assert!(!db.is_locked());
+    }
+
+    /// R9: a both-zero word on a fresh core keeps the literal EN reading (D2)
+    /// and the buffer reports UnsupportedBoth — unsupported is not "force BG".
+    #[test]
+    fn unsupported_word_on_a_fresh_core_keeps_the_literal_reading() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        core.handle_key(press_raw(16)); // q / я
+        core.handle_key(press_raw(45)); // x / ь
+        assert_eq!(core.current_word(), "qx", "premise: literal EN reading");
+        let db = core
+            .dual_buffer
+            .as_ref()
+            .expect("premise: dual buffer alive");
+        assert_eq!(db.winner_lang(), LangId::En, "premise: En tie-break winner");
+        assert_eq!(db.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+    }
+
+    /// R9b (reading-only characterization of CURRENT behaviour while ROOT Q4
+    /// is open): after a Bg prior the first character is rendered Cyrillic by
+    /// the prior override, and a both-zero continuation inherits that winner,
+    /// so the code token "qx" composes as "яь".  A Q4 reversal REQUIRES this
+    /// node to be changed; a green run is not an endorsement of the policy.
+    /// Asserts nothing about `evidence_origin()`.
+    #[test]
+    fn unsupported_word_after_a_bg_prior_composes_in_cyrillic_today() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        with_prior(&mut core, LangId::Bg);
+        core.handle_key(press_raw(16)); // q / я
+        assert_eq!(
+            core.current_word(),
+            "я",
+            "char 1: the prior override renders Cyrillic"
+        );
+        core.handle_key(press_raw(45)); // x / ь
+        assert_eq!(core.current_word(), "яь");
+    }
+
+    /// R9b-origin: the same sequence reports PriorOnly at char 1 (the hint
+    /// overrode the En tie-break winner) and UnsupportedBoth at char 2 — the
+    /// winner is inherited from the prior, which is what Q4 is about.
+    #[test]
+    fn unsupported_word_after_a_bg_prior_reports_unsupported_both_inherited_from_prior_only() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        with_prior(&mut core, LangId::Bg);
+        core.handle_key(press_raw(16)); // q / я
+        assert!(core.dual_buffer.is_some(), "premise: dual buffer alive");
+        {
+            let db = core.dual_buffer.as_ref().unwrap();
+            assert_eq!(
+                db.winner_lang(),
+                LangId::Bg,
+                "premise: the Bg prior overrode the En tie-break winner"
+            );
+            assert_eq!(db.evidence_origin(), EvidenceOrigin::PriorOnly);
+        }
+        core.handle_key(press_raw(45)); // x / ь
+        let db = core
+            .dual_buffer
+            .as_ref()
+            .expect("premise: dual buffer alive");
+        assert_eq!(db.winner_lang(), LangId::Bg, "premise: winner inherited");
+        assert_eq!(db.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+    }
+
+    /// R9c (characterization of an asymmetry, pinned deliberately): Backspace
+    /// back to one character rescores through the Backspace arm, which never
+    /// re-applies the prior — push-to-1 reports PriorOnly, backspace-to-1
+    /// reports UnsupportedBoth for the same buffer.  A later phase changes
+    /// this on purpose or not at all.
+    #[test]
+    fn backspace_to_one_char_rescores_without_reapplying_the_prior() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        with_prior(&mut core, LangId::Bg);
+        core.handle_key(press_raw(16)); // q / я
+        core.handle_key(press_raw(45)); // x / ь
+        core.handle_key(press_backspace());
+        assert_eq!(
+            core.current_word(),
+            "я",
+            "premise: one char left, Cyrillic reading kept"
+        );
+        let db = core
+            .dual_buffer
+            .as_ref()
+            .expect("premise: dual buffer alive");
+        assert_eq!(db.len(), 1, "premise");
+        assert_eq!(db.winner_lang(), LangId::Bg, "premise: winner inherited");
+        assert_eq!(db.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+    }
+
+    /// R11 (test_gap, expected PASS today — U2 F6): the detector is fed the
+    /// inherited winner with confidence 0.5 as if it were corpus evidence
+    /// (`feed_dual_result` on every unlocked character).  Flips when D5
+    /// (skip Initial/UnsupportedBoth/PriorOnly) lands as its own phase.
+    #[test]
+    fn test_gap_detector_reads_an_unsupported_winner_as_half_confidence_evidence() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        assert!(core.config.lang_detection, "premise: detection on");
+        core.handle_key(press_raw(16)); // q / я
+        core.handle_key(press_raw(45)); // x / ь
+        let det = core.lang_detector.detected();
+        assert_eq!(det.lang, LangId::En);
+        assert!(
+            (det.confidence - 0.5).abs() < 1e-9,
+            "today: feed_dual_result(En, 0.5) reports the inherited winner as evidence"
+        );
+    }
 }
