@@ -5121,15 +5121,16 @@ mod lang_prior_tests {
         );
     }
 
-    // ── S03/P3b Caps RED: BG-only letters on the bracket keys ─────────────
+    // ── S03/P3b Caps: BG-only letters on the bracket keys ─────────────────
     //
-    // The RawCode arm resolves ONE shift state for both layouts and treats
-    // evdev 26/27/41/43 as non-letters (is_alpha_scancode), so Caps Lock
-    // never uppercases ш/щ/ч/ю and Shift+Caps never lowercases them, even
-    // inside a locked Bulgarian word.  Eight independent RED cases below;
-    // the guards pin the English bracket symbols that must NOT change with
-    // the fix.  Fixtures are one-sided synthetic corpora, ghost text off,
-    // post-commit flags at their defaults.
+    // Before `keymap::scancode_to_both_with_caps` the RawCode arm resolved
+    // ONE shift state for both layouts and treated evdev 26/27/41/43 as
+    // non-letters (is_alpha_scancode), so Caps Lock never uppercased
+    // ш/щ/ч/ю and Shift+Caps never lowercased them, even inside a locked
+    // Bulgarian word.  The eight cases below were the RED for that defect
+    // and now pin the per-layout latch; the guards pin the English bracket
+    // symbols that must not change.  Fixtures are one-sided synthetic
+    // corpora, ghost text off, post-commit flags at their defaults.
 
     fn press_raw_with(code: u16, modifiers: Modifiers) -> KeyEvent {
         KeyEvent {

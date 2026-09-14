@@ -567,4 +567,27 @@ mod tests {
             }
         }
     }
+
+    /// Exhaustive invariant over every scancode: without the latch the new
+    /// helper is exactly the shared mapping, and with the latch it is defined
+    /// for exactly the same codes (both tables are symmetric between their
+    /// unshifted and shifted rows, so the `?` chains cannot diverge).
+    #[test]
+    fn test_with_caps_matches_shared_mapping_for_every_scancode() {
+        for code in 0..=255u16 {
+            for shift_held in [false, true] {
+                let baseline = scancode_to_both(code, shift_held);
+                assert_eq!(
+                    scancode_to_both_with_caps(code, shift_held, false),
+                    baseline,
+                    "caps off must equal the shared mapping: code {code} shift {shift_held}"
+                );
+                assert_eq!(
+                    scancode_to_both_with_caps(code, shift_held, true).is_some(),
+                    baseline.is_some(),
+                    "caps on must be defined for the same codes: code {code} shift {shift_held}"
+                );
+            }
+        }
+    }
 }
