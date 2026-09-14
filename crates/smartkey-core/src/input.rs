@@ -5117,4 +5117,233 @@ mod lang_prior_tests {
             })
         );
     }
+
+    // ── S03/P3b Caps RED: BG-only letters on the bracket keys ─────────────
+    //
+    // The RawCode arm resolves ONE shift state for both layouts and treats
+    // evdev 26/27/41/43 as non-letters (is_alpha_scancode), so Caps Lock
+    // never uppercases ш/щ/ч/ю and Shift+Caps never lowercases them, even
+    // inside a locked Bulgarian word.  Eight independent RED cases below;
+    // the guards pin the English bracket symbols that must NOT change with
+    // the fix.  Fixtures are one-sided synthetic corpora, ghost text off,
+    // post-commit flags at their defaults.
+
+    fn press_raw_with(code: u16, modifiers: Modifiers) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers,
+        }
+    }
+
+    /// m a m a on the raw route (evdev 50, 30, 50, 30) → EN "mama" / BG "мама".
+    const MAMA: [u16; 4] = [50, 30, 50, 30];
+    /// t e s t on the raw route (evdev 20, 18, 31, 20) → EN "test" / BG "тест".
+    const TEST: [u16; 4] = [20, 18, 31, 20];
+    /// (evdev code, BG lower, BG upper, EN unshifted, EN shifted).
+    const BRACKET_KEYS: [(u16, char, char, char, char); 4] = [
+        (26, 'ш', 'Ш', '[', '{'),
+        (27, 'щ', 'Щ', ']', '}'),
+        (41, 'ч', 'Ч', '`', '~'),
+        (43, 'ю', 'Ю', '\\', '|'),
+    ];
+
+    fn no_ghost_config() -> InputConfig {
+        InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        }
+    }
+
+    /// One-sided BG fixture: only "мама" is known, no English support at all.
+    fn bg_only_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        assert!(core.config.dual_buffer.enabled);
+        core.load_word_lang("мама", 100_000, LangId::Bg);
+        core
+    }
+
+    /// One-sided EN fixture: only "test" is known, no Bulgarian support at all.
+    fn en_only_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        assert!(core.config.dual_buffer.enabled);
+        core.load_word_lang("test", 100_000, LangId::En);
+        core
+    }
+
+    /// Types МАМА with Caps Lock on the public raw route and asserts the BG
+    /// winner + lock precondition independently of the target key.
+    fn locked_bg_mama_with_caps() -> InputMethodCore {
+        let mut core = bg_only_core();
+        for code in MAMA {
+            core.handle_key(press_raw_with(code, Modifiers::CAPS_LOCK));
+        }
+        let (dual, locked, _) = core.debug_state();
+        assert!(dual && locked, "precondition: BG lock on МАМА");
+        let db = core.dual_buffer.as_ref().expect("dual buffer");
+        assert_eq!(db.winner_lang(), LangId::Bg);
+        assert_eq!(db.bg_text(), "МАМА");
+        assert_eq!(db.en_text(), "MAMA");
+        assert_eq!(core.current_word(), "МАМА");
+        core
+    }
+
+    /// Types TEST with Caps Lock on the public raw route and asserts the EN
+    /// winner + lock precondition.
+    fn locked_en_test_with_caps() -> InputMethodCore {
+        let mut core = en_only_core();
+        for code in TEST {
+            core.handle_key(press_raw_with(code, Modifiers::CAPS_LOCK));
+        }
+        let (dual, locked, _) = core.debug_state();
+        assert!(dual && locked, "precondition: EN lock on TEST");
+        let db = core.dual_buffer.as_ref().expect("dual buffer");
+        assert_eq!(db.winner_lang(), LangId::En);
+        assert_eq!(db.en_text(), "TEST");
+        assert_eq!(db.bg_text(), "ТЕСТ");
+        assert_eq!(core.current_word(), "TEST");
+        core
+    }
+
+    /// Presses one bracket key on a locked composition and returns
+    /// (BG buffer, EN buffer, visible ShowComposing text, current_word).
+    fn press_bracket(
+        core: &mut InputMethodCore,
+        code: u16,
+        mods: Modifiers,
+    ) -> (String, String, String, String) {
+        let actions = core.handle_key(press_raw_with(code, mods));
+        let typed = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::ShowComposing { typed, .. } => Some(typed.clone()),
+                _ => None,
+            })
+            .expect("composing preedit after a bracket key");
+        let db = core.dual_buffer.as_ref().expect("dual buffer");
+        (
+            db.bg_text().to_string(),
+            db.en_text().to_string(),
+            typed,
+            core.current_word().to_string(),
+        )
+    }
+
+    /// RED: Caps Lock must uppercase the BG-only letter inside a locked
+    /// Bulgarian word; the English shadow keeps the unshifted symbol.
+    fn assert_caps_uppercases(idx: usize) {
+        let (code, _lower, upper, en_plain, _en_shift) = BRACKET_KEYS[idx];
+        let mut core = locked_bg_mama_with_caps();
+        let (bg, en, typed, word) = press_bracket(&mut core, code, Modifiers::CAPS_LOCK);
+        let expected = format!("МАМА{upper}");
+        assert_eq!(bg, expected, "BG buffer under Caps Lock, code {code}");
+        assert_eq!(
+            en,
+            format!("MAMA{en_plain}"),
+            "EN shadow under Caps Lock, code {code}"
+        );
+        assert_eq!(typed, expected, "visible composing text, code {code}");
+        assert_eq!(word, expected, "current_word, code {code}");
+    }
+
+    /// RED: Shift + Caps Lock cancel out on a letter, so the BG-only letter
+    /// must be lowercase; the English shadow keeps the shifted symbol.
+    fn assert_shift_caps_lowercases(idx: usize) {
+        let (code, lower, _upper, _en_plain, en_shift) = BRACKET_KEYS[idx];
+        let mut core = locked_bg_mama_with_caps();
+        let mods = Modifiers::CAPS_LOCK | Modifiers::SHIFT;
+        let (bg, en, typed, word) = press_bracket(&mut core, code, mods);
+        let expected = format!("МАМА{lower}");
+        assert_eq!(bg, expected, "BG buffer under Shift+Caps, code {code}");
+        assert_eq!(
+            en,
+            format!("MAMA{en_shift}"),
+            "EN shadow under Shift+Caps, code {code}"
+        );
+        assert_eq!(typed, expected, "visible composing text, code {code}");
+        assert_eq!(word, expected, "current_word, code {code}");
+    }
+
+    #[test]
+    fn caps_lock_uppercases_bg_letter_on_code_26_sh() {
+        assert_caps_uppercases(0);
+    }
+
+    #[test]
+    fn caps_lock_uppercases_bg_letter_on_code_27_sht() {
+        assert_caps_uppercases(1);
+    }
+
+    #[test]
+    fn caps_lock_uppercases_bg_letter_on_code_41_ch() {
+        assert_caps_uppercases(2);
+    }
+
+    #[test]
+    fn caps_lock_uppercases_bg_letter_on_code_43_yu() {
+        assert_caps_uppercases(3);
+    }
+
+    #[test]
+    fn shift_plus_caps_lowercases_bg_letter_on_code_26_sh() {
+        assert_shift_caps_lowercases(0);
+    }
+
+    #[test]
+    fn shift_plus_caps_lowercases_bg_letter_on_code_27_sht() {
+        assert_shift_caps_lowercases(1);
+    }
+
+    #[test]
+    fn shift_plus_caps_lowercases_bg_letter_on_code_41_ch() {
+        assert_shift_caps_lowercases(2);
+    }
+
+    #[test]
+    fn shift_plus_caps_lowercases_bg_letter_on_code_43_yu() {
+        assert_shift_caps_lowercases(3);
+    }
+
+    /// Guard (expected PASS): on a locked English word the bracket keys keep
+    /// their English semantics under Caps, Shift and Shift+Caps.
+    #[test]
+    fn english_bracket_symbols_are_unchanged_by_caps_lock() {
+        for (code, _lower, _upper, en_plain, en_shift) in BRACKET_KEYS {
+            for (mods, symbol) in [
+                (Modifiers::CAPS_LOCK, en_plain),
+                (Modifiers::SHIFT, en_shift),
+                (Modifiers::CAPS_LOCK | Modifiers::SHIFT, en_shift),
+            ] {
+                let mut core = locked_en_test_with_caps();
+                let (_bg, en, typed, word) = press_bracket(&mut core, code, mods);
+                let expected = format!("TEST{symbol}");
+                assert_eq!(en, expected, "EN buffer, code {code} mods {mods:?}");
+                assert_eq!(typed, expected, "visible text, code {code} mods {mods:?}");
+                assert_eq!(word, expected, "current_word, code {code} mods {mods:?}");
+            }
+        }
+    }
+
+    /// Guard (expected PASS): without the dual buffer the bracket keys are
+    /// plain English punctuation, unaffected by Caps Lock; a fresh core per
+    /// code and modifier set.
+    #[test]
+    fn bracket_symbols_without_dual_buffer_ignore_caps_lock() {
+        for (code, _lower, _upper, en_plain, en_shift) in BRACKET_KEYS {
+            for (mods, symbol) in [
+                (Modifiers::CAPS_LOCK, en_plain),
+                (Modifiers::SHIFT, en_shift),
+                (Modifiers::CAPS_LOCK | Modifiers::SHIFT, en_shift),
+            ] {
+                let mut config = no_ghost_config();
+                config.dual_buffer.enabled = false;
+                let mut core = InputMethodCore::new(config);
+                core.handle_key(press_raw_with(code, mods));
+                assert_eq!(
+                    core.current_word(),
+                    symbol.to_string(),
+                    "code {code} mods {mods:?}"
+                );
+            }
+        }
+    }
 }
