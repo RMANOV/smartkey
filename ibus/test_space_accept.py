@@ -970,7 +970,12 @@ def test_client_focus_out_flushes_the_composed_word_exactly_once():
     assert rec.commits == ["statiq"]
     assert buf.text == "statiq"
     assert rec.forwarded_keys == []
-    assert rec.hides == 1
+    # The "hide" that precedes the commit is deferred while a composing
+    # preedit is pending (browser-doubling guard); ``_safe_commit`` then
+    # replaces the composing preedit with an EMPTY invisible preedit before
+    # ``commit_text`` -- so ``hide_preedit_text`` is never called here.
+    assert rec.hides == 0
+    assert rec.preedits[-1] == ("", False)
     assert eng._active_prediction is None
     assert eng._core.calls.count(("focus_lost",)) == 1
     assert getattr(eng, "_sensitive", False) is False
@@ -1040,7 +1045,10 @@ def test_client_partial_right_updates_preedit_then_completes_once_then_forwards(
     assert len(accepted) == 1 and accepted[0]["reason"] == "right"
 
     assert offer(eng, buf, _KEY_RIGHT, 106) is False  # no ghost: cursor move
-    assert len(rec.forwarded_keys) == 1
+    # A "forward" action is a pass-through: the adapter returns False and the
+    # client applies the key itself; no forward_key_event is issued.
+    assert rec.forwarded_keys == []
+    assert buf.log[-1] == ("default", _KEY_RIGHT)
     assert rec.commits == ["hello"]
     assert (buf.text, buf.cursor) == ("helloab", 6)
 
