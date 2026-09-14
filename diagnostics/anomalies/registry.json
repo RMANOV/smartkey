@@ -1129,8 +1129,8 @@
       "recorded_utc": "2026-08-25T16:11Z",
       "first_seen_utc": null,
       "last_seen_utc": null,
-      "repeat": false,
-      "occurrence_count": 1,
+      "repeat": true,
+      "occurrence_count": 2,
       "environment": {
         "app_surface": "unknown",
         "os": "linux",
@@ -1146,6 +1146,14 @@
           "build_sha": "unknown",
           "surface": null,
           "note": "operator text seen by ADVOCATE; app, build and time not recorded"
+        },
+        {
+          "kind": "ledger",
+          "ref": "8b7993d42742",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "second sighting relayed in the P0 dispatch (occurrence of the existing root record, not a duplicate row)"
         }
       ],
       "status": "open_suspected_smartkey",
@@ -1229,6 +1237,488 @@
       "closure_reason": null,
       "privacy_classification": "unknown",
       "notes": "Fix is opt-in and the flag is OFF on the live build (7b9901a), so the reported surface is NOT verified. Verification needs an operator-enabled flag-ON live run."
+    },
+    {
+      "id": "anom-23d88f31f224",
+      "dedup_key": "tudu|todo",
+      "category": "unknown",
+      "observed": {
+        "token": "tudu",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "todo",
+        "script": "latin",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-26T04:29Z",
+      "first_seen_utc": null,
+      "last_seen_utc": "2026-08-26T04:12Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "unknown (not observable from the dispatch message)",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "8b7993d42742",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator-identified sighting relayed by ADVOCATE in the P0 dispatch; raw spelling preserved; app, build and time not recorded"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Operator sentence context: 'tudu list' = 'todo list' (ruling 1ad31b15a4aa); raw 'tudu' preserved; 'to-do' is an English spelling guard, not the canonical expected token."
+    },
+    {
+      "id": "anom-e3c721fe871f",
+      "dedup_key": "всичki|всички",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "всичki",
+        "script": "mixed",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "всички",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-26T04:29Z",
+      "first_seen_utc": null,
+      "last_seen_utc": "2026-08-26T04:12Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "unknown (not observable from the dispatch message)",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "8b7993d42742",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator-identified sighting relayed by ADVOCATE in the P0 dispatch; raw spelling preserved; app, build and time not recorded"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Mixed-script token: the final two letters rendered in the Latin reading mid-word; expected form unambiguous from the word itself."
+    },
+    {
+      "id": "anom-34186e4ebaa0",
+      "dedup_key": "anoмалии|аномалии",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "anoмалии",
+        "script": "mixed",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "аномалии",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-26T04:29Z",
+      "first_seen_utc": null,
+      "last_seen_utc": "2026-08-26T04:12Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "unknown (not observable from the dispatch message)",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "8b7993d42742",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator-identified sighting relayed by ADVOCATE in the P0 dispatch; raw spelling preserved; app, build and time not recorded"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Mixed-script token: the first three letters rendered in the Latin reading, the rest Cyrillic; expected form unambiguous from the word itself."
+    },
+    {
+      "id": "anom-16b91f4614a5",
+      "dedup_key": "smarkey|smartkey",
+      "category": "unknown",
+      "observed": {
+        "token": "smarkey",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "smartkey",
+        "script": "latin",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-26T04:29Z",
+      "first_seen_utc": null,
+      "last_seen_utc": "2026-08-26T04:12Z",
+      "repeat": true,
+      "occurrence_count": 2,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "unknown (not observable from the dispatch message)",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "8b7993d42742",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator-identified sighting relayed by ADVOCATE in the P0 dispatch; raw spelling preserved; app, build and time not recorded"
+        },
+        {
+          "kind": "ledger",
+          "ref": "1b367b9c9d16",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "second sighting (corpus addendum); occurrence of the existing smartkey group record"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Operator context (ruling 1ad31b15a4aa): expected normalized token 'smartkey' (display-case guard may include SmartKey); raw lowercase occurrence preserved; mechanism (lost character) unknown."
+    },
+    {
+      "id": "anom-18f9dd4bb2d1",
+      "dedup_key": "//къмит|къмит",
+      "category": "unknown",
+      "observed": {
+        "token": "//къмит",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "къмит",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-26T04:29Z",
+      "first_seen_utc": null,
+      "last_seen_utc": "2026-08-26T04:12Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "unknown (not observable from the dispatch message)",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "8b7993d42742",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator-identified sighting relayed by ADVOCATE in the P0 dispatch; raw spelling preserved; app, build and time not recorded"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Ruling 1ad31b15a4aa: expected 'къмит'; exact double-slash raw occurrence preserved; slash-prefix artifact hypothesis kept separate from Lane A until raw-event/transport evidence."
+    },
+    {
+      "id": "anom-2daaf76ff1c4",
+      "dedup_key": "/пуш|пуш",
+      "category": "unknown",
+      "observed": {
+        "token": "/пуш",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "пуш",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-26T04:29Z",
+      "first_seen_utc": null,
+      "last_seen_utc": "2026-08-26T04:12Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "unknown",
+        "build_label": "unknown (not observable from the dispatch message)",
+        "flags": null
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "8b7993d42742",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator-identified sighting relayed by ADVOCATE in the P0 dispatch; raw spelling preserved; app, build and time not recorded"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Ruling 1ad31b15a4aa: expected 'пуш'; exact single-slash raw occurrence preserved; slash-prefix artifact hypothesis kept separate from Lane A until raw-event/transport evidence."
+    },
+    {
+      "id": "anom-07be717ec836",
+      "dedup_key": "hahodki|находки",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "hahodki",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "находки",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-26T05:05Z",
+      "first_seen_utc": null,
+      "last_seen_utc": "2026-08-26T04:55Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live test installation since 2026-08-23 (anchor)",
+        "flags": {
+          "accept.space_accept": "absent"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "1b367b9c9d16",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator-authored message after the 2026-08-23 anchor, relayed by ADVOCATE in the corpus addendum; raw sentence kept in the private corpus only"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Whole-word Latin rendering of a Bulgarian word (physical keys of находки); expected per ruling 1b367b9c9d16."
+    },
+    {
+      "id": "anom-463c05d2bbbb",
+      "dedup_key": "startiraneto|стартирането",
+      "category": "script_flip_bg_to_en",
+      "observed": {
+        "token": "startiraneto",
+        "script": "latin",
+        "descriptor": null
+      },
+      "expected": {
+        "token": "стартирането",
+        "script": "cyrillic",
+        "descriptor": null
+      },
+      "needs_operator_confirmation": false,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-26T05:05Z",
+      "first_seen_utc": null,
+      "last_seen_utc": "2026-08-26T04:55Z",
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live test installation since 2026-08-23 (anchor)",
+        "flags": {
+          "accept.space_accept": "absent"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "1b367b9c9d16",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator-authored message after the 2026-08-23 anchor, relayed by ADVOCATE in the corpus addendum; raw sentence kept in the private corpus only"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "public_token",
+      "notes": "Whole-word Latin rendering of a Bulgarian word; expected per ruling 1b367b9c9d16."
+    },
+    {
+      "id": "anom-f7a74db3de77",
+      "dedup_key": "desc:punctuation/grammar anomaly candidate (token-less; see private corpus record)|desc:expected form not established; operator/cross-audit to resolve",
+      "category": "unknown",
+      "observed": {
+        "token": null,
+        "script": "unknown",
+        "descriptor": "punctuation/grammar anomaly candidate (token-less; see private corpus record)"
+      },
+      "expected": {
+        "token": null,
+        "script": "unknown",
+        "descriptor": "expected form not established; operator/cross-audit to resolve"
+      },
+      "needs_operator_confirmation": true,
+      "minimal_context": {
+        "before": null,
+        "after": null
+      },
+      "recorded_utc": "2026-08-26T05:05Z",
+      "first_seen_utc": null,
+      "last_seen_utc": null,
+      "repeat": false,
+      "occurrence_count": 1,
+      "environment": {
+        "app_surface": "unknown",
+        "os": "linux",
+        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "build_label": "live test installation since 2026-08-23 (anchor)",
+        "flags": {
+          "accept.space_accept": "absent"
+        }
+      },
+      "source_refs": [
+        {
+          "kind": "ledger",
+          "ref": "1b367b9c9d16",
+          "observed_utc": null,
+          "build_sha": "unknown",
+          "surface": null,
+          "note": "operator-authored message after the 2026-08-23 anchor, relayed by ADVOCATE in the corpus addendum; raw sentence kept in the private corpus only"
+        }
+      ],
+      "status": "open_suspected_smartkey",
+      "suspected_layer": "unknown",
+      "reproducer": null,
+      "red_test": null,
+      "red_test_waiver": null,
+      "fix_commit": null,
+      "verification": null,
+      "closure_reason": null,
+      "privacy_classification": "unknown",
+      "notes": "Punctuation/grammar candidate in an operator sentence (around the words for sessions/from and audit/of-the-analysis); exact raw sentence lives only in the private corpus; mechanism unknown."
     }
   ]
 }
