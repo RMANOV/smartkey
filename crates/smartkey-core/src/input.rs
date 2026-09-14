@@ -5442,7 +5442,11 @@ mod lang_prior_tests {
                 LangId::Bg,
                 "premise: the Bg prior overrode the En tie-break winner"
             );
-            assert_eq!(db.evidence_origin(), EvidenceOrigin::PriorOnly);
+            assert_eq!(
+                db.evidence_origin(),
+                EvidenceOrigin::PriorOnly,
+                "char 1: prior override → PriorOnly (origin table)"
+            );
         }
         core.handle_key(press_raw(45)); // x / ь
         let db = core
@@ -5457,7 +5461,10 @@ mod lang_prior_tests {
     /// back to one character rescores through the Backspace arm, which never
     /// re-applies the prior — push-to-1 reports PriorOnly, backspace-to-1
     /// reports UnsupportedBoth for the same buffer.  A later phase changes
-    /// this on purpose or not at all.
+    /// this on purpose or not at all.  If the asymmetry is ever ruled a bug,
+    /// the Backspace arm (`Key::Backspace` in `handle_key`: rescoring only) is
+    /// the odd one out — it drops the prior entirely, not just the origin;
+    /// the push path (`handle_dual_buffer_key`) is the reference behaviour.
     #[test]
     fn backspace_to_one_char_rescores_without_reapplying_the_prior() {
         let mut core = InputMethodCore::new(no_ghost_config());

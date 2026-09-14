@@ -34,9 +34,18 @@ impl Default for DualBufferConfig {
 ///
 /// The numbers alone cannot tell these apart: a both-zero scoring and a
 /// genuine 50/50 corpus tie both read confidence 0.5, and a first-character
-/// prior bias reads a constant 0.65.  Commit 1 of the API ships the surface
-/// only: the field is initialised to `Initial` and never transitioned, so
-/// `evidence_origin()` is a placeholder until commit 2 adds the transitions.
+/// prior bias reads a constant 0.65.
+///
+/// Transition table (the only writers): `new()`/`clear()` → `Initial`;
+/// `update_scores` → `UnsupportedBoth` when `total < MIN_CORPUS_SUPPORT`,
+/// else `Corpus`; `apply_prior_lock_hint` → `PriorOnly` only in the
+/// len == 1 branch where the prior DIFFERS from the scored winner (a
+/// matching prior leaves the scored origin as it is — with zero support it
+/// cannot lock either, because confidence is 0.5 and the relaxed threshold
+/// is at least 0.55; a repeated hint at len 1 after an override is excluded
+/// by the caller's score-then-hint order, not by that threshold);
+/// `pop()` to empty → `Initial` via `clear()`.  The caller scores BEFORE it
+/// applies the hint, so on the first character the hint is the last writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceOrigin {
     /// Fresh or cleared buffer: nothing has been scored yet.
@@ -148,12 +157,18 @@ impl DualBuffer {
     }
 
     /// Remove the last character from both buffers (backspace).
+    ///
+    /// Empty buffer ⇒ full `clear()`; invariant, unreachable from the key
+    /// path (the input Backspace arm drops an emptied buffer — see R7c).
     pub fn pop(&mut self) {
         self.en_buf.pop();
         self.bg_buf.pop();
-        // Lock is sticky — once locked, stays locked until clear().
-        // This prevents re-entering hypothesis phase after chars were
-        // committed to the application during the lock transition.
+        if self.is_empty() {
+            self.clear();
+        }
+        // Above len 0 the lock is sticky — once locked, stays locked until
+        // clear().  This prevents re-entering hypothesis phase after chars
+        // were committed to the application during the lock transition.
     }
 
     /// Update scores from corpus frequency data and determine the winner.
@@ -167,11 +182,13 @@ impl DualBuffer {
             self.en_score = 0.5;
             self.bg_score = 0.5;
             self.confidence = 0.5;
+            self.origin = EvidenceOrigin::UnsupportedBoth;
             return;
         }
 
         self.en_score = en_freq / total;
         self.bg_score = bg_freq / total;
+        self.origin = EvidenceOrigin::Corpus;
 
         let new_winner = if self.en_score >= self.bg_score {
             LangId::En
@@ -228,6 +245,7 @@ impl DualBuffer {
         if self.en_buf.len() == 1 && prior_lang != self.winner {
             self.winner = prior_lang;
             self.confidence = 0.65;
+            self.origin = EvidenceOrigin::PriorOnly;
             return;
         }
 
@@ -273,11 +291,9 @@ impl DualBuffer {
         self.locked
     }
 
-    /// Provenance of the current winner (see `EvidenceOrigin`).
-    ///
-    /// Commit 1 placeholder: the field is only ever `Initial` here; commit 2
-    /// adds the transitions in `update_scores`, `apply_prior_lock_hint` and
-    /// `pop`.  No consumer reads this before commit 2 lands.
+    /// Provenance of the current winner (see the transition table on
+    /// `EvidenceOrigin`).  No production consumer reads this yet; the
+    /// detector-side policy (D5) is a separate, separately gated change.
     pub fn evidence_origin(&self) -> EvidenceOrigin {
         self.origin
     }
@@ -736,11 +752,11 @@ mod tests {
         assert!(!b.is_locked());
     }
 
-    // ── U2 evidence-origin API — unit matrix (commit 1: API surface) ────────
+    // ── U2 evidence-origin API — unit matrix ────────────────────────────────
     //
-    // R1 passes against the placeholder; R2–R6 and R8 fail on the origin
-    // assert, R7b on its lock-clear assert, until commit 2 adds the
-    // transitions.  R7 (test_pop_keeps_lock_sticky) is unchanged.
+    // Commit 1 shipped the surface with a constant `Initial` (R2–R6, R8 RED
+    // on the origin assert, R7b on its lock-clear assert); commit 2 adds the
+    // transitions and R6b.  R7 (test_pop_keeps_lock_sticky) is unchanged.
 
     /// R1: a fresh buffer carries no evidence; clear() returns to that state.
     #[test]
@@ -850,7 +866,32 @@ mod tests {
         assert!(b.is_empty(), "premise");
         assert_eq!(b.evidence_origin(), EvidenceOrigin::Initial);
         assert!(!b.is_locked(), "pop to empty clears the lock");
+        assert_eq!(b.locked_lang, None, "pop to empty clears locked_lang");
         assert!(!b.flip_detected());
+        assert_eq!(b.confidence(), 0.5);
+        assert_eq!(
+            (b.en_score, b.bg_score),
+            (0.5, 0.5),
+            "pop to empty resets the scores"
+        );
+    }
+
+    /// R6b: a MATCHING prior on a both-zero first character neither locks
+    /// nor changes the origin — confidence is 0.5 and the relaxed threshold
+    /// is at least 0.55.  Precondition: the confidence came from
+    /// `update_scores` in the same step; a len==1 prior OVERRIDE raises
+    /// confidence to 0.65, so a repeated hint at len 1 is excluded by the
+    /// caller's score-then-hint order (R5), not by this threshold.
+    #[test]
+    fn origin_stays_unsupported_and_unlocked_when_a_matching_prior_meets_zero_support() {
+        let mut b = DualBuffer::new(0.85, 4);
+        b.push('q', 'я');
+        b.update_scores(0.0, 0.0);
+        assert_eq!(b.winner_lang(), LangId::En, "premise: En tie-break winner");
+        b.apply_prior_lock_hint(Some(LangId::En));
+        assert!(!b.is_locked());
+        assert_eq!(b.winner_lang(), LangId::En);
+        assert_eq!(b.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
         assert_eq!(b.confidence(), 0.5);
     }
 
