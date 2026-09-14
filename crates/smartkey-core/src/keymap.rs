@@ -590,4 +590,81 @@ mod tests {
             }
         }
     }
+
+    // ── LEGACY-PHONETIC-MAP-DIVERGENCE (test-only RED characterization) ─────
+    //
+    // `lang_detect::phonetic_map` / `transliterate` / `reverse_transliterate`
+    // are a legacy ASCII table used by the opt-in post-commit auto-correction
+    // and by the keyval wrong-layout path.  The physical Bulgarian layout is
+    // the traditional phonetic table in this file.  They disagree on the keys
+    // for `w` (physical в, legacy ш) and `v` (physical ж, legacy в), and the
+    // legacy table has no Latin key for ш/щ/ч/ю at all.  The RED cases state
+    // the desired agreement with the physical layout; the gap case pins the
+    // exact divergence as it stands today.  No production change here.
+
+    const ALPHA_SCANCODES: [u16; 26] = [
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36, 37, 38, 44, 45, 46, 47,
+        48, 49, 50,
+    ];
+
+    /// RED: the legacy map must agree with the physical layout on every
+    /// letter key (fails today at evdev 17: `w` → legacy ш, physical в).
+    #[test]
+    fn test_legacy_phonetic_map_matches_physical_layout_on_letter_keys() {
+        for code in ALPHA_SCANCODES {
+            let (en, bg) = scancode_to_both(code, false).expect("letter key");
+            assert_eq!(
+                crate::lang_detect::phonetic_map(en),
+                Some(bg),
+                "code {code}: legacy map for {en} vs physical layout"
+            );
+        }
+    }
+
+    /// RED: a transliterated Latin spelling must equal what the physical keys
+    /// compose (the caps test types z d r a w e j and gets ЗДРАВЕЙ).
+    #[test]
+    fn test_legacy_transliterate_matches_physical_composition() {
+        assert_eq!(crate::lang_detect::transliterate("zdrawej"), "здравей");
+        assert_eq!(crate::lang_detect::transliterate("v"), "ж");
+        assert_eq!(crate::lang_detect::reverse_transliterate("вж"), "wv");
+    }
+
+    /// RED: the four BG-only letters live on the bracket keys; the legacy map
+    /// must reach them from those keys in both directions.
+    #[test]
+    fn test_legacy_transliterate_reaches_bg_only_letters() {
+        assert_eq!(crate::lang_detect::transliterate("[]`\\"), "шщчю");
+        assert_eq!(crate::lang_detect::reverse_transliterate("шщчю"), "[]`\\");
+    }
+
+    /// GAP (pinned; expected to flip when the legacy map is realigned): today
+    /// exactly `w` and `v` diverge, and the bracket-key letters are unmapped.
+    #[test]
+    fn test_gap_legacy_phonetic_map_divergence_is_exactly_w_v_and_bracket_keys() {
+        let divergent: Vec<(u16, char, char, Option<char>)> = ALPHA_SCANCODES
+            .iter()
+            .filter_map(|&code| {
+                let (en, bg) = scancode_to_both(code, false).expect("letter key");
+                let legacy = crate::lang_detect::phonetic_map(en);
+                (legacy != Some(bg)).then_some((code, en, bg, legacy))
+            })
+            .collect();
+        assert_eq!(
+            divergent,
+            vec![(17, 'w', 'в', Some('ш')), (47, 'v', 'ж', Some('в'))]
+        );
+        for (code, bg) in [(26u16, 'ш'), (27, 'щ'), (41, 'ч'), (43, 'ю')] {
+            let (en, physical) = scancode_to_both(code, false).expect("bracket key");
+            assert_eq!(physical, bg, "code {code}");
+            assert_eq!(
+                crate::lang_detect::phonetic_map(en),
+                None,
+                "code {code} ({en})"
+            );
+        }
+        for bg in ['ж', 'щ', 'ч', 'ю'] {
+            assert_eq!(crate::lang_detect::reverse_phonetic_map(bg), None, "{bg}");
+        }
+    }
 }
