@@ -746,13 +746,17 @@ def test_client_tab_and_right_variants_exact_text():
 class LifecycleCore(RecordingCore):
     """Recording core that also answers the adapter's lifecycle callbacks."""
 
-    def __init__(self, scripts, reset_actions=None) -> None:
+    def __init__(self, scripts, reset_actions=None, focus_actions=None) -> None:
         super().__init__(scripts)
         self.reset_actions = list(reset_actions or [])
+        # One-shot, like the real core: the first focus loss flushes the
+        # in-flight word, a second call finds nothing left to flush.
+        self.focus_actions = list(focus_actions or [])
 
     def focus_lost(self) -> list[tuple[str, str]]:
         self.calls.append(("focus_lost",))
-        return []
+        actions, self.focus_actions = self.focus_actions, []
+        return actions
 
     def focus_gained(self) -> None:
         self.calls.append(("focus_gained",))
@@ -784,10 +788,12 @@ class _ScriptedClock:
         return getattr(time, name)
 
 
-def build_lifecycle_engine(scripts, *, reset_actions=None, text: str = "", caps: int = 0):
+def build_lifecycle_engine(
+    scripts, *, reset_actions=None, focus_actions=None, text: str = "", caps: int = 0
+):
     """Cycle-2 client engine whose core also records lifecycle callbacks."""
     eng, rec, buf = build_client_engine(scripts, text=text, caps=caps)
-    eng._core = LifecycleCore(scripts, reset_actions)
+    eng._core = LifecycleCore(scripts, reset_actions, focus_actions)
     eng._last_save = time.monotonic()  # "just saved": focus-out must not save now
     eng._keys_since_content_type = 0
     eng._o1 = None
@@ -909,3 +915,155 @@ def test_lifecycle_disable_resets_then_saves_without_client_text():
     assert rec.commits == []
     assert rec.deleted == []
     assert rec.hides == 1
+
+
+# --- S04/P4 accounting characterizations (scripted core, client sink) --------
+#
+# Expected-PASS characterizations of the adapter's acceptance accounting on
+# the Tab/Right/focus paths, driven through the real adapter dispatch with the
+# Cycle-2 client buffer.  Tests named ``test_gap_*`` pin behaviour that is a
+# documented GAP (decision item D1 / review item R2 of the S04 packet): they are
+# expected to flip once that decision lands and are NOT part of the coverage
+# claim.
+
+
+def _accepted_events(events) -> list[dict]:
+    return [payload for event, payload in events if event == "accepted"]
+
+
+def test_gap_tab_accept_logs_tracked_word_even_when_core_commits_a_different_word():
+    """GAP (S04 packet C1, operator decision D1): the adapter classifies an
+    acceptance from the key and the action SHAPE only and logs the TRACKED
+    prediction word; the committed payload is never compared with it.  Today a
+    core that commits "hellx" on Tab while "hello" is tracked is still logged
+    as ``accepted`` with word "hello".  Expected to flip when D1 is decided."""
+    eng, _rec, buf = build_client_engine(
+        [[("composing", "hel\x00lo")], [("hide", ""), ("commit", "hellx")]]
+    )
+    events = capture_replay(eng)
+    assert offer(eng, buf, ord("l"), 38) is True
+    assert eng._active_prediction is not None
+    assert eng._active_prediction["word"] == "hello"
+
+    assert offer(eng, buf, _KEY_TAB, 15) is True
+    assert buf.text == "hellx"
+    accepted = _accepted_events(events)
+    assert len(accepted) == 1
+    assert accepted[0]["reason"] == "tab"
+    assert accepted[0]["word"] == "hello"  # tracked word, not the committed one
+    assert {event for event, _ in events}.isdisjoint({"rejected", "completed"})
+    assert eng._active_prediction is None
+
+
+def test_client_focus_out_flushes_the_composed_word_exactly_once():
+    """Focus loss delivers the core's flush commit to the client exactly once:
+    one commit, no forwarded key, the preedit hidden, the prediction cleared,
+    the sensitive state untouched (S04 packet C-S04-2)."""
+    eng, rec, buf = build_lifecycle_engine(
+        [[("composing", "stat\x00iq")]],
+        focus_actions=[("hide", ""), ("commit", "statiq")],
+    )
+    assert offer(eng, buf, ord("s"), 31) is True
+    assert eng._active_prediction is not None
+
+    eng.do_focus_out()
+    assert rec.commits == ["statiq"]
+    assert buf.text == "statiq"
+    assert rec.forwarded_keys == []
+    assert rec.hides == 1
+    assert eng._active_prediction is None
+    assert eng._core.calls.count(("focus_lost",)) == 1
+    assert getattr(eng, "_sensitive", False) is False
+
+
+def test_gap_focus_out_reentered_from_the_commit_callback_still_commits_once():
+    """Re-entrancy (PA review R2): a client whose commit callback synchronously
+    re-enters ``do_focus_out`` still yields exactly one commit and no forward,
+    because the core has nothing left to flush on the second call.  GAP pinned
+    here: the re-entered handler observes the adapter's prediction still set,
+    since ``do_focus_out`` clears it only after executing the flush actions."""
+    eng, rec, buf = build_lifecycle_engine(
+        [[("composing", "stat\x00iq")]],
+        focus_actions=[("hide", ""), ("commit", "statiq")],
+    )
+    assert offer(eng, buf, ord("s"), 31) is True
+    original_commit = eng.commit_text
+    reentered: list[bool] = []
+    seen_prediction_on_reentry: list[bool] = []
+
+    def _reentrant_commit(text_obj) -> None:
+        if not reentered:
+            reentered.append(True)
+            seen_prediction_on_reentry.append(eng._active_prediction is not None)
+            eng.do_focus_out()  # synchronous client callback during the commit
+        original_commit(text_obj)
+
+    eng.commit_text = _reentrant_commit
+    eng.do_focus_out()
+    assert rec.commits == ["statiq"]
+    assert buf.text == "statiq"
+    assert rec.forwarded_keys == []
+    assert eng._core.calls.count(("focus_lost",)) == 2
+    assert eng._active_prediction is None
+    assert seen_prediction_on_reentry == [True]  # GAP: not yet cleared then
+
+
+def test_client_partial_right_updates_preedit_then_completes_once_then_forwards():
+    """Right on a dual-buffer composition: each partial Right updates the
+    preedit only (no client text), the completing Right lands the whole word
+    exactly once as an acceptance, and a further Right with no ghost is
+    forwarded to the client as a cursor move (S04 packet C-S04-3)."""
+    eng, rec, buf = build_client_engine(
+        [
+            [("composing", "hel\x00lo")],
+            [("composing", "hell\x00o")],
+            [("hide", ""), ("commit", "hello")],
+            [("forward", "")],
+        ],
+        text="ab",
+    )
+    buf.cursor = 0
+    events = capture_replay(eng)
+    assert offer(eng, buf, ord("l"), 38) is True
+    preedits_before = len(rec.preedits)
+
+    assert offer(eng, buf, _KEY_RIGHT, 106) is True  # partial accept
+    assert len(rec.preedits) == preedits_before + 1
+    assert rec.commits == []
+    assert (buf.text, buf.cursor) == ("ab", 0)
+
+    assert offer(eng, buf, _KEY_RIGHT, 106) is True  # completing Right
+    assert rec.commits == ["hello"]
+    assert (buf.text, buf.cursor) == ("helloab", 5)
+    assert rec.forwarded_keys == []
+    accepted = _accepted_events(events)
+    assert len(accepted) == 1 and accepted[0]["reason"] == "right"
+
+    assert offer(eng, buf, _KEY_RIGHT, 106) is False  # no ghost: cursor move
+    assert len(rec.forwarded_keys) == 1
+    assert rec.commits == ["hello"]
+    assert (buf.text, buf.cursor) == ("helloab", 6)
+
+
+def test_client_right_whole_word_fallback_is_a_single_acceptance():
+    """Whole-word Right fallback (S04 packet C-S04-4): when the core cannot
+    accept the next ghost character one at a time it emits the full word as a
+    commit with no continuing ghost/composing/forward.  The adapter classifies
+    exactly that batch shape on Right as a whole-word acceptance (see
+    ``_prediction_accept_reason``: Right + commit, none of ghost/composing/
+    forward -> reason "right"); the client receives the word once."""
+    eng, rec, buf = build_client_engine(
+        [[("composing", "hel\x00lo")], [("hide", ""), ("commit", "hello")]]
+    )
+    events = capture_replay(eng)
+    assert offer(eng, buf, ord("l"), 38) is True
+
+    assert offer(eng, buf, _KEY_RIGHT, 106) is True
+    assert rec.commits == ["hello"]
+    assert buf.text == "hello"
+    assert rec.forwarded_keys == []
+    accepted = _accepted_events(events)
+    assert len(accepted) == 1
+    assert accepted[0]["reason"] == "right"
+    assert accepted[0]["word"] == "hello"
+    assert eng._active_prediction is None
