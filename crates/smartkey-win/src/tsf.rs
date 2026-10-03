@@ -15,7 +15,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
 
 use smartkey_core::input::{Action, InputConfig, Key, KeyEvent, Modifiers};
 use smartkey_core::MasterLoop;
