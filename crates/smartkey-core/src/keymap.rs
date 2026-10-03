@@ -58,8 +58,8 @@ pub(crate) fn scancode_to_both_with_caps(
 /// Find the physical EN/BG pair whose character on `layout` is `ch`.
 ///
 /// This reverse lookup deliberately reuses the hardware tables above.  The
-/// legacy text-transliteration map is not equivalent to xkeyboard-config's
-/// traditional phonetic layout for keys such as в/ш/щ/ч/ю.
+/// text-conversion helpers reuse these physical tables so в/ш/щ/ч/ю cannot
+/// acquire a second, inconsistent phonetic spelling.
 pub(crate) fn physical_pair_for_char(layout: Layout, ch: char) -> Option<(char, char)> {
     for code in 2..=53 {
         for shift in [false, true] {
@@ -196,8 +196,8 @@ fn en_qwerty(code: u16, shift: bool) -> Option<char> {
 // ======================================================================
 //
 // Letter keys follow xkeyboard-config's `bg(phonetic)` variant. This is a
-// physical keyboard map, intentionally separate from the legacy text
-// transliteration helper in `lang_detect`.
+// physical keyboard map, also reused by the text-conversion helpers in
+// `lang_detect`.
 
 fn bg_phonetic(code: u16, shift: bool) -> Option<char> {
     let (lower, upper) = match code {
@@ -593,14 +593,10 @@ mod tests {
 
     // ── LEGACY-PHONETIC-MAP-DIVERGENCE (test-only RED characterization) ─────
     //
-    // `lang_detect::phonetic_map` / `transliterate` / `reverse_transliterate`
-    // are a legacy ASCII table used by the opt-in post-commit auto-correction
-    // and by the keyval wrong-layout path.  The physical Bulgarian layout is
-    // the traditional phonetic table in this file.  They disagree on the keys
-    // for `w` (physical в, legacy ш) and `v` (physical ж, legacy в), and the
-    // legacy table has no Latin key for ш/щ/ч/ю at all.  The RED cases state
-    // the desired agreement with the physical layout; the gap case pins the
-    // exact divergence as it stands today.  No production change here.
+    // The former ASCII table disagreed on `w`/`v` and omitted the bracket-key
+    // letters. These three genuine RED requirements retain their desired
+    // physical-layout assertions; the consistency guard replaces the former
+    // known-gap characterization after realignment.
 
     const ALPHA_SCANCODES: [u16; 26] = [
         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36, 37, 38, 44, 45, 46, 47,
@@ -638,10 +634,10 @@ mod tests {
         assert_eq!(crate::lang_detect::reverse_transliterate("шщчю"), "[]`\\");
     }
 
-    /// GAP (pinned; expected to flip when the legacy map is realigned): today
-    /// exactly `w` and `v` diverge, and the bracket-key letters are unmapped.
+    /// After realignment, every letter and letter-bearing symbol agrees with
+    /// the physical table; shifted partners preserve uppercase composition.
     #[test]
-    fn test_gap_legacy_phonetic_map_divergence_is_exactly_w_v_and_bracket_keys() {
+    fn test_phonetic_map_agrees_with_physical_letters_and_bracket_keys() {
         let divergent: Vec<(u16, char, char, Option<char>)> = ALPHA_SCANCODES
             .iter()
             .filter_map(|&code| {
@@ -650,21 +646,25 @@ mod tests {
                 (legacy != Some(bg)).then_some((code, en, bg, legacy))
             })
             .collect();
-        assert_eq!(
-            divergent,
-            vec![(17, 'w', 'в', Some('ш')), (47, 'v', 'ж', Some('в'))]
+        assert!(
+            divergent.is_empty(),
+            "physical map divergence: {divergent:?}"
         );
         for (code, bg) in [(26u16, 'ш'), (27, 'щ'), (41, 'ч'), (43, 'ю')] {
             let (en, physical) = scancode_to_both(code, false).expect("bracket key");
             assert_eq!(physical, bg, "code {code}");
             assert_eq!(
                 crate::lang_detect::phonetic_map(en),
-                None,
+                Some(bg),
                 "code {code} ({en})"
             );
         }
-        for bg in ['ж', 'щ', 'ч', 'ю'] {
-            assert_eq!(crate::lang_detect::reverse_phonetic_map(bg), None, "{bg}");
+        for code in ALPHA_SCANCODES.into_iter().chain([26, 27, 41, 43]) {
+            for shift in [false, true] {
+                let (en, bg) = scancode_to_both(code, shift).expect("letter-bearing key");
+                assert_eq!(crate::lang_detect::phonetic_map(en), Some(bg));
+                assert_eq!(crate::lang_detect::reverse_phonetic_map(bg), Some(en));
+            }
         }
     }
 }

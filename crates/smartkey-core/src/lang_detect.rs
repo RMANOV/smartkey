@@ -317,130 +317,30 @@ impl LanguageDetector {
 // Phonetic transliteration (v0.4.1)
 // ======================================================================
 
-/// Map a Latin character to its BG Phonetic keyboard Cyrillic equivalent.
+/// Convert an EN physical-key character to its BG Phonetic letter.
+/// Letter-bearing symbols ([ ] ` \\ and their shifted partners) are included;
+/// digits, ordinary punctuation and characters absent from the table are not.
 pub fn phonetic_map(ch: char) -> Option<char> {
-    Some(match ch {
-        'a' => 'а',
-        'A' => 'А',
-        'b' => 'б',
-        'B' => 'Б',
-        'c' => 'ц',
-        'C' => 'Ц',
-        'd' => 'д',
-        'D' => 'Д',
-        'e' => 'е',
-        'E' => 'Е',
-        'f' => 'ф',
-        'F' => 'Ф',
-        'g' => 'г',
-        'G' => 'Г',
-        'h' => 'х',
-        'H' => 'Х',
-        'i' => 'и',
-        'I' => 'И',
-        'j' => 'й',
-        'J' => 'Й',
-        'k' => 'к',
-        'K' => 'К',
-        'l' => 'л',
-        'L' => 'Л',
-        'm' => 'м',
-        'M' => 'М',
-        'n' => 'н',
-        'N' => 'Н',
-        'o' => 'о',
-        'O' => 'О',
-        'p' => 'п',
-        'P' => 'П',
-        'q' => 'я',
-        'Q' => 'Я',
-        'r' => 'р',
-        'R' => 'Р',
-        's' => 'с',
-        'S' => 'С',
-        't' => 'т',
-        'T' => 'Т',
-        'u' => 'у',
-        'U' => 'У',
-        'v' => 'в',
-        'V' => 'В',
-        'w' => 'ш',
-        'W' => 'Ш',
-        'x' => 'ь',
-        'X' => 'Ь',
-        'y' => 'ъ',
-        'Y' => 'Ъ',
-        'z' => 'з',
-        'Z' => 'З',
-        _ => return None,
-    })
+    crate::keymap::physical_pair_for_char(crate::keymap::Layout::En, ch)
+        .filter(|(_, bg)| bg.is_alphabetic())
+        .map(|(_, bg)| bg)
 }
 
 /// Transliterate a Latin string to Cyrillic using BG Phonetic layout.
 ///
-/// Non-alphabetic characters (digits, spaces, punctuation) are dropped.
-/// Callers should pre-filter to ensure input contains only ASCII letters.
+/// Unmapped characters are dropped. Letter-bearing physical-key symbols are
+/// converted; this is keyboard composition, not general Roman transliteration.
 pub fn transliterate(input: &str) -> String {
     input.chars().filter_map(phonetic_map).collect()
 }
 
-/// Map a Cyrillic character back to its BG Phonetic Latin equivalent.
+/// Convert a BG Phonetic letter to its EN physical-key character.
+/// Uppercase bracket-key letters use shifted symbols ({ } ~ |); a character
+/// alone cannot reconstruct whether Caps Lock or Shift produced that letter.
 pub fn reverse_phonetic_map(ch: char) -> Option<char> {
-    Some(match ch {
-        'а' => 'a',
-        'А' => 'A',
-        'б' => 'b',
-        'Б' => 'B',
-        'ц' => 'c',
-        'Ц' => 'C',
-        'д' => 'd',
-        'Д' => 'D',
-        'е' => 'e',
-        'Е' => 'E',
-        'ф' => 'f',
-        'Ф' => 'F',
-        'г' => 'g',
-        'Г' => 'G',
-        'х' => 'h',
-        'Х' => 'H',
-        'и' => 'i',
-        'И' => 'I',
-        'й' => 'j',
-        'Й' => 'J',
-        'к' => 'k',
-        'К' => 'K',
-        'л' => 'l',
-        'Л' => 'L',
-        'м' => 'm',
-        'М' => 'M',
-        'н' => 'n',
-        'Н' => 'N',
-        'о' => 'o',
-        'О' => 'O',
-        'п' => 'p',
-        'П' => 'P',
-        'я' => 'q',
-        'Я' => 'Q',
-        'р' => 'r',
-        'Р' => 'R',
-        'с' => 's',
-        'С' => 'S',
-        'т' => 't',
-        'Т' => 'T',
-        'у' => 'u',
-        'У' => 'U',
-        'в' => 'v',
-        'В' => 'V',
-        'ш' => 'w',
-        'Ш' => 'W',
-        'ь' => 'x',
-        'Ь' => 'X',
-        'ъ' => 'y',
-        'Ъ' => 'Y',
-        'з' => 'z',
-        'З' => 'Z',
-        _ => return None,
-    })
+    crate::keymap::physical_pair_for_char(crate::keymap::Layout::Bg, ch)
+        .filter(|(_, bg)| bg.is_alphabetic())
+        .map(|(en, _)| en)
 }
 
 /// Reverse-transliterate a Cyrillic string to Latin using BG Phonetic layout.
@@ -637,8 +537,44 @@ mod tests {
 
     #[test]
     fn test_transliterate() {
-        assert_eq!(transliterate("zdrave"), "здраве");
+        assert_eq!(transliterate("zdrawe"), "здраве");
         assert_eq!(transliterate("Hello"), "Хелло");
+    }
+
+    #[test]
+    fn physical_phonetic_symbols_and_shifted_letters_round_trip() {
+        for (en, bg) in [
+            ('w', 'в'),
+            ('W', 'В'),
+            ('v', 'ж'),
+            ('V', 'Ж'),
+            ('[', 'ш'),
+            ('{', 'Ш'),
+            (']', 'щ'),
+            ('}', 'Щ'),
+            ('`', 'ч'),
+            ('~', 'Ч'),
+            ('\\', 'ю'),
+            ('|', 'Ю'),
+        ] {
+            assert_eq!(phonetic_map(en), Some(bg));
+            assert_eq!(reverse_phonetic_map(bg), Some(en));
+        }
+        assert_eq!(transliterate("[]`\\{}~|"), "шщчюШЩЧЮ");
+        assert_eq!(reverse_transliterate("шщчюШЩЧЮ"), "[]`\\{}~|");
+    }
+
+    #[test]
+    fn physical_phonetic_conversion_drops_only_unmapped_characters() {
+        for ch in ['1', ' ', '-', '.', ':', 'é', '🙂'] {
+            assert_eq!(phonetic_map(ch), None);
+            assert_eq!(reverse_phonetic_map(ch), None);
+        }
+        assert_eq!(phonetic_map('в'), None);
+        assert_eq!(reverse_phonetic_map('w'), None);
+        assert_eq!(reverse_phonetic_map('Ё'), None);
+        assert_eq!(transliterate("w1 v."), "вж");
+        assert_eq!(reverse_transliterate("в1 ж."), "wv");
     }
 
     #[test]

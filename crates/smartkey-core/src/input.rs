@@ -1595,8 +1595,8 @@ impl InputMethodCore {
         let typed_freq = self.engine.word_frequency(&word.to_lowercase(), typed_lang);
 
         // Transliterate to the other language.  A partial transliteration is
-        // never a valid replacement: BG-only letters such as ч/щ/ю are not in
-        // the legacy ASCII phonetic table, and dropping them produced live
+        // never a valid replacement: BG-only letters such as ч/щ/ю were absent
+        // from the former ASCII phonetic table, and dropping them produced live
         // corruptions such as "чака" -> "aka" and "защо" -> "zao".
         let other_word = if typed_lang == LangId::En {
             transliterate(word)
@@ -2730,6 +2730,87 @@ mod tests {
             )),
             "opt-in must re-enable language correction: {actions:?}"
         );
+    }
+
+    #[test]
+    fn post_commit_autocorrect_physical_brackets_stay_raw_by_default() {
+        for (typed, target) in [("шщчю", "[]`\\"), ("ШЩЧЮ", "{}~|")] {
+            let mut core = InputMethodCore::new(InputConfig::default());
+            core.load_word(target, 20);
+            assert_eq!(core.engine.word_frequency(target, LangId::En), 20.0);
+            core.current_word = typed.to_string();
+            let actions = core.handle_key(press(Key::Space));
+            // This keyval path already forwarded the typed characters: Space
+            // must forward only the delimiter, without recommitting/replacing.
+            assert_eq!(actions, vec![Action::HideGhost, Action::ForwardKey]);
+        }
+    }
+
+    #[test]
+    fn post_commit_autocorrect_physical_brackets_replace_full_word_when_opted_in() {
+        for (typed, target) in [("шщчю", "[]`\\"), ("ШЩЧЮ", "{}~|")] {
+            let mut core = InputMethodCore::new(InputConfig {
+                post_commit_autocorrect: true,
+                ..InputConfig::default()
+            });
+            core.load_word(target, 20);
+            assert_eq!(core.engine.word_frequency(target, LangId::En), 20.0);
+            assert_eq!(
+                core.engine
+                    .word_frequency(&typed.to_lowercase(), LangId::Bg),
+                0.0
+            );
+            core.current_word = typed.to_string();
+            let actions = core.handle_key(press(Key::Space));
+            let replacements: Vec<_> = actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::ReplaceWord { replace_len, text } => {
+                        Some((*replace_len, text.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replacements, vec![(4, target)]);
+        }
+    }
+
+    #[test]
+    fn post_commit_autocorrect_physical_brackets_require_supported_target() {
+        for typed in ["шщчю", "ШЩЧЮ"] {
+            let mut core = InputMethodCore::new(InputConfig {
+                post_commit_autocorrect: true,
+                ..InputConfig::default()
+            });
+            core.current_word = typed.to_string();
+            let actions = core.handle_key(press(Key::Space));
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        }
+    }
+
+    #[test]
+    fn post_commit_autocorrect_physical_brackets_preserve_below_ratio_word() {
+        for (typed, target) in [("шщчю", "[]`\\"), ("ШЩЧЮ", "{}~|")] {
+            let mut core = InputMethodCore::new(InputConfig {
+                post_commit_autocorrect: true,
+                ..InputConfig::default()
+            });
+            core.load_word(target, 20);
+            core.load_word(&typed.to_lowercase(), 7);
+            assert_eq!(core.engine.word_frequency(target, LangId::En), 20.0);
+            assert_eq!(
+                core.engine
+                    .word_frequency(&typed.to_lowercase(), LangId::Bg),
+                7.0
+            );
+            core.current_word = typed.to_string();
+            let actions = core.handle_key(press(Key::Space));
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        }
     }
 
     /// Anti-desync + anti-double: Tab commits EXACTLY the last displayed
@@ -5108,12 +5189,10 @@ mod lang_prior_tests {
     #[test]
     fn genuinely_absent_typed_word_is_still_corrected() {
         let core = shadowed_exact_core();
-        // Fixture assumption made explicit: the phonetic map sends v → в
-        // (w → ш), so "vi" is the Latin spelling that transliterates to the
-        // loaded BG word "ви".
-        assert_eq!(crate::lang_detect::transliterate("vi"), "ви");
+        // Physical phonetic spelling of the same supported BG word "ви".
+        assert_eq!(crate::lang_detect::transliterate("wi"), "ви");
         assert_eq!(
-            core.try_language_correction("vi"),
+            core.try_language_correction("wi"),
             Some(Action::ReplaceWord {
                 replace_len: 2,
                 text: "ви".to_string(),
