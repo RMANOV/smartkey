@@ -255,11 +255,7 @@ impl ITfTextInputProcessor_Impl for SmartKeyTextService_Impl {
         *self.thread_mgr.borrow_mut() = None;
 
         // Track live object count for DllCanUnloadNow.
-        OBJECT_COUNT
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                Some(n.saturating_sub(1))
-            })
-            .ok();
+        crate::counter::saturating_decrement(&OBJECT_COUNT);
 
         Ok(())
     }

@@ -66,11 +66,7 @@ impl IClassFactory_Impl for SmartKeyClassFactory_Impl {
         if flock.as_bool() {
             LOCK_COUNT.fetch_add(1, Ordering::SeqCst);
         } else {
-            LOCK_COUNT
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    Some(n.saturating_sub(1))
-                })
-                .ok();
+            crate::counter::saturating_decrement(&LOCK_COUNT);
         }
         Ok(())
     }

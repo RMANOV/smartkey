@@ -9,6 +9,8 @@
 #[cfg(windows)]
 mod class_factory;
 pub mod config;
+#[cfg(any(windows, test))]
+mod counter;
 #[cfg(windows)]
 mod display;
 #[cfg(windows)]
