@@ -71,6 +71,8 @@ CREATE INDEX IF NOT EXISTS idx_events_run ON events (run_id);
 
 CREATE TABLE IF NOT EXISTS sweeps (
     id              INTEGER PRIMARY KEY,
+    run_id          TEXT NOT NULL,
+    synthetic       INTEGER NOT NULL CHECK (synthetic IN (0, 1)),
     sweep_date      TEXT NOT NULL,
     ran_ts          REAL NOT NULL,
     events          INTEGER NOT NULL,
@@ -82,6 +84,39 @@ CREATE TABLE IF NOT EXISTS sweeps (
 );
 CREATE INDEX IF NOT EXISTS idx_sweeps_date ON sweeps (sweep_date);
 """
+
+
+def _migrate_sweeps_schema(conn: sqlite3.Connection) -> None:
+    """Add campaign provenance to pre-provenance databases, idempotently.
+
+    SQLite cannot add a ``NOT NULL`` column to a populated table without a
+    default.  A default would incorrectly attribute legacy sweeps, so migrated
+    rows deliberately retain ``NULL`` provenance and are never eligible for a
+    campaign.  The trigger makes provenance mandatory for every subsequent
+    insert while preserving those legacy rows for audit.
+    """
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sweeps)")}
+    if "run_id" not in columns:
+        conn.execute("ALTER TABLE sweeps ADD COLUMN run_id TEXT")
+    if "synthetic" not in columns:
+        conn.execute(
+            "ALTER TABLE sweeps ADD COLUMN synthetic INTEGER "
+            "CHECK (synthetic IN (0, 1))"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sweeps_campaign "
+        "ON sweeps (run_id, synthetic, ran_ts)"
+    )
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS sweeps_provenance_required_insert
+        BEFORE INSERT ON sweeps
+        WHEN NEW.run_id IS NULL OR trim(NEW.run_id) = '' OR NEW.synthetic IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'sweeps provenance required');
+        END;
+        """
+    )
 
 
 def context_hash(context: str, salt: bytes) -> str:
@@ -112,6 +147,7 @@ def connect(db_path: str | Path, *, readonly: bool = False) -> sqlite3.Connectio
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.executescript(SCHEMA)
+    _migrate_sweeps_schema(conn)
     conn.commit()
     return conn
 

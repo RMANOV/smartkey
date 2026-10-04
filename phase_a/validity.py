@@ -1,9 +1,10 @@
-"""Canonical row selection for real calibration campaigns.
+"""Canonical row selection for calibration campaigns.
 
 Both reconciliation and calibration consume this module so foreign runs,
-malformed rows, empty candidate sets, and operational exclusion windows cannot
-silently enter one path but not the other. Unresolved eligible rows remain in
-the analysis population so the unresolved-rate gate stays meaningful.
+real/synthetic scope mismatches, malformed rows, empty candidate sets, and
+operational exclusion windows cannot silently enter one path but not the
+other. Unresolved eligible rows remain in the analysis population so the
+unresolved-rate gate stays meaningful.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ DEGRADED_WINDOW_S = 60.0
 
 REASON_CODES = (
     "EXCL_SYNTHETIC",
+    "EXCL_REAL",
     "EXCL_FOREIGN_RUN",
     "EXCL_CORRUPT_ROW",
     "EXCL_OUT_OF_WINDOW",
@@ -32,6 +34,7 @@ _DEGRADED_KINDS = ("queue_overflow", "drop_counter", "writer_error")
 class CampaignSelection:
     campaign_run_id: str | None
     window: tuple[float, float] | None
+    synthetic: bool = False
     raw_rows: list[sqlite3.Row] = field(default_factory=list)
     valid_rows: list[sqlite3.Row] = field(default_factory=list)
     analysis_rows: list[sqlite3.Row] = field(default_factory=list)
@@ -83,15 +86,16 @@ def classify_row(
     window: tuple[float, float] | None,
     kill_windows: list[tuple[float, float | None]],
     degraded_windows: list[tuple[float, float | None]],
+    expected_synthetic: int = 0,
 ) -> str | None:
     """Return the first exclusion code, or ``None`` for a valid resolution."""
     ts = row["ts"]
     outcome = row["outcome"]
     resolved_ts = row["resolved_ts"]
 
-    if row["synthetic"] != 0:
-        return "EXCL_SYNTHETIC"
-    if campaign_run_id is not None and row["run_id"] != campaign_run_id:
+    if row["synthetic"] != expected_synthetic:
+        return "EXCL_SYNTHETIC" if expected_synthetic == 0 else "EXCL_REAL"
+    if campaign_run_id is None or row["run_id"] != campaign_run_id:
         return "EXCL_FOREIGN_RUN"
     corrupt = (
         not _finite_number(ts)
@@ -134,15 +138,26 @@ def select_campaign_rows(
     conn: sqlite3.Connection,
     campaign_run_id: str | None = None,
     window: tuple[float, float] | None = None,
+    *,
+    synthetic: bool = False,
 ) -> CampaignSelection:
-    """Select one real campaign and classify every row in the database."""
+    """Select one exact campaign/synthetic scope and classify every event."""
     conn.row_factory = sqlite3.Row
+    expected_synthetic = 1 if synthetic else 0
     if campaign_run_id is None:
         latest = conn.execute(
-            "SELECT run_id FROM run_metadata WHERE synthetic=0 "
-            "ORDER BY created_ts DESC, id DESC LIMIT 1"
+            "SELECT run_id FROM run_metadata WHERE synthetic=? "
+            "ORDER BY created_ts DESC, id DESC LIMIT 1",
+            (expected_synthetic,),
         ).fetchone()
         campaign_run_id = latest["run_id"] if latest else None
+    else:
+        matching_metadata = conn.execute(
+            "SELECT run_id FROM run_metadata WHERE run_id=? AND synthetic=? "
+            "ORDER BY created_ts DESC, id DESC LIMIT 1",
+            (campaign_run_id, expected_synthetic),
+        ).fetchone()
+        campaign_run_id = matching_metadata["run_id"] if matching_metadata else None
 
     try:
         log_rows = [
@@ -165,6 +180,7 @@ def select_campaign_rows(
     selection = CampaignSelection(
         campaign_run_id=campaign_run_id,
         window=window,
+        synthetic=synthetic,
         drop_total=drop_total,
         kill_windows=_kill_windows(log_rows),
         degraded_marks=len(degraded_times),
@@ -186,6 +202,7 @@ def select_campaign_rows(
             window,
             selection.kill_windows,
             degraded_windows,
+            expected_synthetic,
         )
         if code is None:
             selection.valid_rows.append(row)
@@ -195,3 +212,30 @@ def select_campaign_rows(
             if code == "EXCL_UNRESOLVED":
                 selection.analysis_rows.append(row)
     return selection
+
+
+def select_campaign_sweep_rows(
+    conn: sqlite3.Connection,
+    campaign_run_id: str | None,
+    *,
+    synthetic: bool = False,
+) -> list[sqlite3.Row]:
+    """Return only sweeps attributed to one exact campaign and data scope.
+
+    Databases whose legacy ``sweeps`` table has not yet been migrated, and
+    migrated legacy rows whose provenance remains ``NULL``, deliberately
+    produce no credit.
+    """
+    if campaign_run_id is None:
+        return []
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sweeps)")}
+    if not {"run_id", "synthetic"}.issubset(columns):
+        return []
+    conn.row_factory = sqlite3.Row
+    return list(
+        conn.execute(
+            "SELECT run_id, synthetic, sweep_date, ran_ts, watchdog_status "
+            "FROM sweeps WHERE run_id=? AND synthetic=? ORDER BY ran_ts, id",
+            (campaign_run_id, 1 if synthetic else 0),
+        )
+    )

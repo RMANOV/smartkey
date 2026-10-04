@@ -57,7 +57,13 @@ def _fresh(path: Path) -> Path:
     return path
 
 
-def _sim_daily_sweeps(db_path: Path, first_ts: float, last_ts: float) -> int:
+def _sim_daily_sweeps(
+    db_path: Path,
+    first_ts: float,
+    last_ts: float,
+    *,
+    run_id: str,
+) -> int:
     """Insert one 'OK' sweep row per date in the event window (watchdog cover).
     Returns the number of sweep-days written."""
     conn = connect(db_path)
@@ -67,10 +73,21 @@ def _sim_daily_sweeps(db_path: Path, first_ts: float, last_ts: float) -> int:
     while d <= d1:
         noon = time.mktime(d.timetuple()) + 43200
         conn.execute(
-            "INSERT INTO sweeps (sweep_date, ran_ts, events, resolutions, "
-            "latency_p99_us, over_budget_pct, watchdog_status, receipt) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (d.isoformat(), noon, 0, 0, 0, 0.0, "OK", "simulated daily sweep (lab)"),
+            "INSERT INTO sweeps (run_id, synthetic, sweep_date, ran_ts, events, "
+            "resolutions, latency_p99_us, over_budget_pct, watchdog_status, receipt) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                run_id,
+                1,
+                d.isoformat(),
+                noon,
+                0,
+                0,
+                0,
+                0.0,
+                "OK",
+                "simulated daily sweep (lab)",
+            ),
         )
         d += _dt.timedelta(days=1)
         n += 1
@@ -127,8 +144,11 @@ def run_replay(
     """Replay *n_events* corpus-driven resolution events into *db_path*.
 
     Returns a small summary dict (counts, hashes, sweep-days). ``synthetic``
-    defaults to True: all lab-replay data is marked synthetic=1 and lives in the
-    scratch data dir — it is never real-typing evidence."""
+    is retained as an explicit guard and must be True: all lab-replay data is
+    marked synthetic=1 and lives in the scratch data dir — it is never
+    real-typing evidence."""
+    if not synthetic:
+        raise ValueError("corpus replay is synthetic-only and cannot emit real evidence")
     rng = random.Random(seed)
     model = FreqModel.load(corpus_files)
     sampler = _Sampler(model, rng)
@@ -162,18 +182,25 @@ def run_replay(
         pend = logger.log_prediction(ctx, top3, ts=ts, p_top3=p)
         logger.resolve_bit(pend, outcome, ts=ts)
         hits += outcome
+    run_id = logger.run_id
     logger.close()
 
     conn = connect(db_path, readonly=True)
     lo, hi = conn.execute(
-        "SELECT MIN(ts), MAX(ts) FROM events WHERE synthetic=?",
-        (1 if synthetic else 0,),
+        "SELECT MIN(ts), MAX(ts) FROM events WHERE run_id=? AND synthetic=?",
+        (run_id, 1 if synthetic else 0),
     ).fetchone()
     conn.close()
-    sweep_days = _sim_daily_sweeps(db_path, lo, hi)
+    sweep_days = _sim_daily_sweeps(
+        db_path,
+        lo,
+        hi,
+        run_id=run_id,
+    )
 
     return {
         "db_path": str(db_path),
+        "run_id": run_id,
         "n_events": n_events,
         "resolutions": n_events,
         "raw_hit_rate": hits / max(n_events, 1),
