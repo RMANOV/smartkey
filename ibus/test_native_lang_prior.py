@@ -20,7 +20,7 @@ import tempfile
 
 import pytest
 
-from test_native_space_accept import _native
+from .test_native_space_accept import _native
 
 if "SMARTKEY_PHASEA_DATA" not in os.environ:
     os.environ["SMARTKEY_PHASEA_DATA"] = tempfile.mkdtemp(prefix="smartkey-test-phasea-")

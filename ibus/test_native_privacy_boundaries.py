@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from test_native_space_accept import ZDRA, _compose, _native
+from .test_native_space_accept import ZDRA, _compose, _native
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("SMARTKEY_NATIVE_MODULE_DIR")
