@@ -6,32 +6,29 @@ committed Bulgarian physical-key words as the EN keymap text
 („имаш" → "ima[", „след" → "sled", „превключване" → "prewkl`wane").
 
 Which module: ``SMARTKEY_NATIVE_MODULE_DIR`` (directory containing the
-``smartkey_py`` package, e.g. an unzipped worktree wheel).  Corpora: the
-machine's ``~/.config/smartkey/corpus_*.bin`` (read-only).  Without either
-the tests are SKIPPED — this file is an audit artifact, never a blind
-assumption about the installed module.  Temp Phase-A dir; no live data.
+``smartkey_py`` package, e.g. an unzipped audited wheel). Fixed synthetic
+load_word fixtures replace any user corpus dependency. Missing explicit
+artifact skips ordinary optional collection, but required audit mode fails
+closed. No claim about actual user-frequency corpus accuracy or live input.
 """
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
-import sys
 import tempfile
 
 import pytest
 
-os.environ.setdefault(
-    "SMARTKEY_PHASEA_DATA", tempfile.mkdtemp(prefix="smartkey-test-phasea-")
-)
+from test_native_space_accept import _native
+
+if "SMARTKEY_PHASEA_DATA" not in os.environ:
+    os.environ["SMARTKEY_PHASEA_DATA"] = tempfile.mkdtemp(prefix="smartkey-test-phasea-")
 
 _MODULE_DIR = os.environ.get("SMARTKEY_NATIVE_MODULE_DIR")
-_CORPUS_DIR = os.path.expanduser("~/.config/smartkey")
-_CORPORA = [os.path.join(_CORPUS_DIR, f) for f in ("corpus_en.bin", "corpus_bg.bin")]
 pytestmark = pytest.mark.skipif(
-    not _MODULE_DIR or not all(os.path.exists(p) for p in _CORPORA),
-    reason="needs SMARTKEY_NATIVE_MODULE_DIR and the local corpora (audit artifact)",
+    not _MODULE_DIR and os.environ.get("SMARTKEY_NATIVE_AUDIT_REQUIRED") != "1",
+    reason="needs explicit native audit artifact",
 )
 
 SPACE = 57
@@ -43,24 +40,15 @@ WORDS = {
 }
 ENGLISH = {"the": [20, 35, 18], "is": [23, 31], "git": [34, 23, 20]}
 LATIN_CONTEXT = "cd ~/smartkey && cargo test -p smartkey-core "
-_NATIVE = None
-
-
-def _native():
-    global _NATIVE  # noqa: PLW0603
-    if _NATIVE is None:
-        sys.path.insert(0, _MODULE_DIR)
-        assert "smartkey_py" not in sys.modules
-        _NATIVE = importlib.import_module("smartkey_py")
-        assert _NATIVE.__file__.startswith(_MODULE_DIR), _NATIVE.__file__
-    return _NATIVE
+# Fixed synthetic fixtures, not a claim about real-user corpus accuracy.
+FIXTURE_FREQUENCIES = {word: 1_000_000 for word in (*WORDS, *ENGLISH)}
 
 
 def _core(surrounding=None):
     smartkey_py = _native()
     core = smartkey_py.PyInputMethodCore(json.dumps({}))
-    for path in _CORPORA:
-        core.load_corpus_file(path)
+    for word, frequency in FIXTURE_FREQUENCIES.items():
+        core.load_word(word, frequency)
     if surrounding is not None:
         core.set_surrounding_text(surrounding, len(surrounding))
     return core

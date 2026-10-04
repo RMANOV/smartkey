@@ -18,20 +18,23 @@ assumed to be the artifact under audit.  Temp Phase-A dir; no live data.
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
-os.environ.setdefault(
-    "SMARTKEY_PHASEA_DATA", tempfile.mkdtemp(prefix="smartkey-test-phasea-")
-)
+if "SMARTKEY_PHASEA_DATA" not in os.environ:
+    os.environ["SMARTKEY_PHASEA_DATA"] = tempfile.mkdtemp(prefix="smartkey-test-phasea-")
 
 _MODULE_DIR = os.environ.get("SMARTKEY_NATIVE_MODULE_DIR")
+_REQUIRED = os.environ.get("SMARTKEY_NATIVE_AUDIT_REQUIRED") == "1"
 pytestmark = pytest.mark.skipif(
-    not _MODULE_DIR, reason="SMARTKEY_NATIVE_MODULE_DIR not set (audit artifact only)"
+    not _MODULE_DIR and not _REQUIRED,
+    reason="SMARTKEY_NATIVE_MODULE_DIR not set (audit artifact only)",
 )
 
 SPACE = 57
@@ -47,10 +50,27 @@ def _native():
     # exactly once from the audited directory and reuse it.
     global _NATIVE  # noqa: PLW0603
     if _NATIVE is None:
-        sys.path.insert(0, _MODULE_DIR)
-        assert "smartkey_py" not in sys.modules, "another smartkey_py already loaded"
-        _NATIVE = importlib.import_module("smartkey_py")
-        assert _NATIVE.__file__.startswith(_MODULE_DIR), _NATIVE.__file__
+        assert _MODULE_DIR, "required native artifact directory missing"
+        root = Path(_MODULE_DIR).resolve(strict=True)
+        assert not any(name == "smartkey_py" or name.startswith("smartkey_py.")
+                       for name in sys.modules), "another smartkey_py already loaded"
+        sys.path.insert(0, str(root))
+        native = importlib.import_module("smartkey_py")
+        Path(native.__file__).resolve(strict=True).relative_to(root)
+        extensions = []
+        for name, module in tuple(sys.modules.items()):
+            if name == "smartkey_py" or name.startswith("smartkey_py."):
+                origin = Path(module.__file__).resolve(strict=True)
+                origin.relative_to(root)
+                if origin.suffix in {".so", ".pyd"}:
+                    extensions.append(origin)
+        assert len(set(extensions)) == 1, extensions
+        extension = extensions[0]
+        assert extension == Path(os.environ["SMARTKEY_NATIVE_EXTENSION"]).resolve(strict=True)
+        assert hashlib.sha256(extension.read_bytes()).hexdigest() == os.environ["SMARTKEY_NATIVE_EXTENSION_SHA256"]
+        assert native.__build_git_sha__ == os.environ["SMARTKEY_EXPECT_BUILD_GIT_SHA"]
+        assert native.__build_dirty__ is (os.environ["SMARTKEY_EXPECT_BUILD_GIT_DIRTY"] == "1")
+        _NATIVE = native
     return _NATIVE
 
 
