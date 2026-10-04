@@ -680,7 +680,7 @@ def test_client_replace_during_composing_commits_without_deleting():
     assert (buf.text, buf.cursor) == ("cat", 3)
 
 
-def test_client_route_epochs_are_synthetic_and_normalised(monkeypatch):
+def test_client_route_preserves_ibus_normalized_keycodes(monkeypatch):
     # Default harness: the fence leaves _HAS_CORE False, so every event takes
     # the keyval route whatever the keycode.
     eng, rec, buf = build_client_engine([[("forward", "")]] * 4)
@@ -689,10 +689,8 @@ def test_client_route_epochs_are_synthetic_and_normalised(monkeypatch):
     # Fixture-only route pins (restored by monkeypatch): the raw-scancode
     # route with the SAME scripted core -- no native module is imported.
     monkeypatch.setattr(ske, "_HAS_CORE", True)
-    monkeypatch.setattr(ske, "_IS_WAYLAND", False)
     assert offer(eng, buf, ord("l"), 38) is False
-    assert eng._core.key_calls()[-1] == ("process_keycode", 30, 0)
-    monkeypatch.setattr(ske, "_IS_WAYLAND", True)
+    assert eng._core.key_calls()[-1] == ("process_keycode", 38, 0)
     assert offer(eng, buf, ord("l"), 38) is False
     assert eng._core.key_calls()[-1] == ("process_keycode", 38, 0)
     assert offer(eng, buf, ord("l"), 0) is False  # keycode 0 -> keyval route
