@@ -852,6 +852,18 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             {"ghost", "composing", "forward"}
         ):
             return "right"
+        # Opt-in Space-accept (2026-08-22): the core signals an eligible
+        # acceptance with ONE commit that already carries the delimiter and no
+        # forwarded key.  A literal Space always forwards, so it never matches.
+        if (
+            keyval == IBus.KEY_space
+            and "forward" not in action_types
+            and any(
+                action_type == "commit" and payload.endswith(" ")
+                for action_type, payload in actions
+            )
+        ):
+            return "space"
         return None
 
     def _finalize_prediction_outcome(
@@ -939,6 +951,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         accept_reason = self._prediction_accept_reason(keyval, key_release, actions)
         if accept_reason is not None:
             word = str((pending_prediction or {}).get("word") or "")
+            if not word and accept_reason == "space":
+                # No tracked prediction (e.g. shown-tracking missed the ghost):
+                # the accepted word is the commit payload minus its delimiter.
+                word = "".join(
+                    payload for action_type, payload in actions if action_type == "commit"
+                ).rstrip(" ")
         else:
             word = pre_key_word
         if word:

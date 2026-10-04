@@ -351,3 +351,75 @@ def test_lang_class_basics():
     assert lang_class("привet") == "mixed"
     assert lang_class("") == "empty"
     assert lang_class(None) == "empty"
+
+
+# --- S02/P2a Cycle 4: trace isolation (directory separation/preservation) ------
+#
+# Scope: a new invocation-owned trace directory is the only place a new trace
+# writes and purges; pre-existing bytes in that directory and in a sibling
+# directory are preserved.  This proves directory separation/preservation for
+# the tested layout only -- not general trace confidentiality and not
+# cross-instance filename uniqueness.
+
+
+def _age(path: Path, hours: float) -> None:
+    old = time.time() - hours * 3600
+    os.utime(path, (old, old))
+
+
+def test_new_structural_trace_is_isolated_from_sibling_and_existing_files(tmp_path):
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    sentinel = previous / "kept.jsonl"
+    sentinel.write_bytes(b'{"synthetic":"older evidence"}\n')
+    _age(sentinel, smartkey_debug.PURGE_AFTER_HOURS + 1)
+    sentinel_bytes = sentinel.read_bytes()
+
+    current = tmp_path / "current"
+    current.mkdir()
+    fresh = current / "trace-fresh.jsonl"
+    fresh.write_bytes(b'{"synthetic":"fresh"}\n')
+    fresh_bytes = fresh.read_bytes()
+
+    eng, _rec = build_engine(scripts=[[("composing", "SECRETSENTINEL\x00TAIL")]])
+    trace = _attach_trace(eng, current, LEVEL_STRUCTURAL)
+    assert trace.enabled and trace._file is not None  # noqa: SLF001
+    assert eng.do_process_key_event(ord("l"), 38, 0) is True
+    events = _read_events(trace)
+
+    key_ins = [e for e in events if e["event"] == "key_in"]
+    assert len(key_ins) == 1, events  # the privacy check below is not vacuous
+    assert not {"keyname", "keyval", "keycode"} & set(key_ins[0])
+    assert key_ins[0]["key_class"] == "char"
+    text = trace._file.read_text(encoding="utf-8")  # noqa: SLF001
+    assert "SECRETSENTINEL" not in text and "TAIL" not in text
+
+    assert trace._file.parent == current  # noqa: SLF001
+    assert trace._file.name.startswith("trace-")  # noqa: SLF001
+    assert trace._file != fresh  # noqa: SLF001
+    assert set(current.glob("*.jsonl")) == {fresh, trace._file}  # noqa: SLF001
+    assert fresh.read_bytes() == fresh_bytes
+    assert sentinel.exists() and sentinel.read_bytes() == sentinel_bytes
+    assert list(previous.iterdir()) == [sentinel]
+
+
+def test_structural_trace_constructor_purges_only_its_own_stale_file(tmp_path):
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    sibling_old = previous / "trace-old.jsonl"
+    sibling_old.write_bytes(b'{"synthetic":"older sibling"}\n')
+    _age(sibling_old, smartkey_debug.PURGE_AFTER_HOURS + 1)
+    sibling_bytes = sibling_old.read_bytes()
+
+    current = tmp_path / "current"
+    current.mkdir()
+    stale = current / "trace-old.jsonl"  # fixture-owned, the only purge target
+    stale.write_bytes(b'{"synthetic":"stale"}\n')
+    _age(stale, smartkey_debug.PURGE_AFTER_HOURS + 1)
+
+    trace = KeystrokeTrace(level=LEVEL_STRUCTURAL, directory=current)
+    assert trace.enabled and trace._file is not None  # noqa: SLF001
+    assert not stale.exists(), "the stale file inside the trace's own directory is purged"
+    assert set(current.glob("*.jsonl")) == {trace._file}  # noqa: SLF001
+    assert sibling_old.exists() and sibling_old.read_bytes() == sibling_bytes
+    assert list(previous.iterdir()) == [sibling_old]

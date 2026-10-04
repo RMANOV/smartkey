@@ -1,0 +1,567 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smartkey://diagnostics/anomalies/schema.json",
+  "title": "SmartKey anomaly registry",
+  "description": "Canonical, Git-tracked registry of typed-text anomalies. Every anomaly is an OPEN SmartKey defect until evidence closes it (ANOMALY GATE af4d6969b2ad). Each record carries at most one token per side and never full text, credentials, organization data or keystreams. Semantic rules (deterministic id, dedup uniqueness, adjudication accounting, closure gates and privacy walks) live in validate.py; this document is the structural contract and the single source of truth for enums.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "registry", "gate_ref", "records"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "registry": { "const": "smartkey-anomaly-registry" },
+    "gate_ref": { "type": "string", "pattern": "^[0-9a-f]{12}$" },
+    "adjudication_contract": { "$ref": "#/$defs/adjudication_contract" },
+    "source_exclusions": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/adjudication" }
+    },
+    "records": { "type": "array", "items": { "$ref": "#/$defs/record" } }
+  },
+  "$defs": {
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256_nonzero": {
+      "type": "string",
+      "pattern": "^(?!0000000000000000000000000000000000000000000000000000000000000000$)[0-9a-f]{64}$"
+    },
+    "sha_or_unknown": { "type": "string", "pattern": "^([0-9a-f]{40}|unknown)$" },
+    "hmac_key_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "typed_hmac_ref": {
+      "type": "string",
+      "description": "Domain-separated smartkey-g0-hmac-sha256-v1 opaque reference with a public rotation key_id. Syntax validation here does not prove private-key derivation.",
+      "pattern": "^smartkey-g0-hmac-sha256-v1:(?:value|event|metadata|source_record):[0-9a-f]{32}:[0-9a-f]{64}$"
+    },
+    "canonical_adjudication_ref": {
+      "type": "string",
+      "pattern": "^(orig:[0-9a-f]{16}|supp:G[0-9]{3}:H[0-9]{3})$"
+    },
+    "source_event_ref": {
+      "type": "string",
+      "pattern": "^smartkey-g0-hmac-sha256-v1:event:[0-9a-f]{32}:[0-9a-f]{64}$"
+    },
+    "expected_value_ref_or_null": {
+      "type": ["string", "null"],
+      "pattern": "^smartkey-g0-hmac-sha256-v1:value:[0-9a-f]{32}:[0-9a-f]{64}$"
+    },
+    "hmac_external_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state", "scheme", "key_id", "contract_version",
+        "resource_contract_version", "resource_contract_sha256",
+        "vector_set_sha256", "coverage", "receipt_sha256",
+        "source_scope_policy_version", "crosswalk_projection_profile",
+        "source_scope_placement_profile", "audit_contract",
+        "registry_schema_version", "source_scope_binding_count",
+        "mapping_crosswalk_sha256", "source_scope_placement_sha256",
+        "semantic_commitment_sha256"
+      ],
+      "properties": {
+        "state": { "const": "externally_verified" },
+        "scheme": { "const": "smartkey-g0-hmac-sha256-v1" },
+        "key_id": { "$ref": "#/$defs/hmac_key_id" },
+        "contract_version": { "const": "smartkey-g0-hmac-byte-contract-v4" },
+        "resource_contract_version": { "const": "smartkey-g0-hmac-resource-contract-v1" },
+        "resource_contract_sha256": { "const": "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab" },
+        "vector_set_sha256": { "const": "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c" },
+        "coverage": { "const": "all-refs-domain-serialization-resource-key-id-adjudication-scope-uniqueness-whole-source-private-recomputation-v3" },
+        "receipt_sha256": { "$ref": "#/$defs/sha256_nonzero" },
+        "source_scope_policy_version": { "const": "smartkey-g0-source-ref-scoped-cap-v1" },
+        "crosswalk_projection_profile": { "const": "smartkey-g0-crosswalk-target-binding-v2" },
+        "source_scope_placement_profile": { "const": "smartkey-g0-source-scope-placement-v1" },
+        "audit_contract": { "const": "g0-r11a-preseal-crosswalk" },
+        "registry_schema_version": { "const": 1 },
+        "source_scope_binding_count": { "const": 159 },
+        "mapping_crosswalk_sha256": { "const": "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6" },
+        "source_scope_placement_sha256": { "const": "c4f2a3a642a15c0a62ce9bb5904adfdec43721e88af65be1577f68d7e122f119" },
+        "semantic_commitment_sha256": { "$ref": "#/$defs/sha256_nonzero" }
+      }
+    },
+    "baseline_external_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "record_count", "approved_record_set_sha256", "receipt_sha256"],
+      "properties": {
+        "state": { "const": "externally_verified" },
+        "record_count": { "const": 20 },
+        "approved_record_set_sha256": { "$ref": "#/$defs/sha256_nonzero" },
+        "receipt_sha256": { "$ref": "#/$defs/sha256_nonzero" }
+      }
+    },
+    "original_presence_external_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state", "policy_version", "ruling_ref", "original_count",
+        "derived_presence", "original_ref_set_sha256",
+        "crosswalk_projection_profile", "target_binding_crosswalk_sha256",
+        "audit_contract", "receipt_sha256"
+      ],
+      "properties": {
+        "state": { "const": "externally_verified" },
+        "policy_version": { "const": "smartkey-g0-original-retained-exactly-once-presence-v1" },
+        "ruling_ref": { "const": "4e0198426714" },
+        "original_count": { "const": 106 },
+        "derived_presence": { "const": "high" },
+        "original_ref_set_sha256": { "const": "6a2d167b00ece704a369772c76b231821513b0da5602ab960c16ac9bed78a3f2" },
+        "crosswalk_projection_profile": { "const": "smartkey-g0-crosswalk-target-binding-v2" },
+        "target_binding_crosswalk_sha256": { "const": "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6" },
+        "audit_contract": { "const": "g0-r11a-preseal-crosswalk" },
+        "receipt_sha256": { "const": "6e9d2931631a284fb25e0f60e354eb42e42f026a5032d5f58db3a1a7e07b96ee" }
+      }
+    },
+    "utc_or_null": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}(:[0-9]{2})?Z)?$"
+    },
+    "short_text_or_null": { "type": ["string", "null"], "maxLength": 500 },
+    "token_or_null": { "type": ["string", "null"], "minLength": 1, "maxLength": 40 },
+    "script": { "enum": ["latin", "cyrillic", "mixed", "other", "unknown"] },
+    "adjudication_classification": {
+      "enum": [
+        "guard_not_bug_unless_intent_changes",
+        "instrumentation_first_candidate",
+        "intent_confirmation_needed",
+        "language_quality_feature_candidate",
+        "mechanical_red_candidate",
+        "source_authorship_exclusion"
+      ]
+    },
+    "adjudication_disposition": {
+      "enum": ["bug_candidate", "guard", "source_exclusion"]
+    },
+    "expected_form_status": {
+      "enum": [
+        "null_non_unique",
+        "null_pending_operator_intent",
+        "unique_operator_confirmed",
+        "unique_authoritative_spelling",
+        "not_applicable"
+      ]
+    },
+    "expected_authority": {
+      "enum": [
+        "final", "null", "operator", "authoritative",
+        "legacy_bridge", "not_applicable"
+      ]
+    },
+    "adjudication_expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "authority", "value_ref"],
+      "properties": {
+        "status": { "$ref": "#/$defs/expected_form_status" },
+        "authority": { "$ref": "#/$defs/expected_authority" },
+        "value_ref": { "$ref": "#/$defs/expected_value_ref_or_null" }
+      }
+    },
+    "causal_confidence": {
+      "enum": ["none", "low", "medium", "high", "not_applicable"]
+    },
+    "owner_lane": {
+      "enum": [
+        "adapter_event_integrity",
+        "composite_boundary_and_provenance",
+        "f4_core",
+        "f4_core_both_supported_contextual",
+        "f4_core_early_lock_full_word",
+        "f4_core_one_sided_exact",
+        "future_language_quality_layer",
+        "future_language_quality_or_intent",
+        "intended_english_quoted_guard",
+        "output_neutral_provenance",
+        "outside_product_source_authorship",
+        "punctuation_boundary",
+        "same_script_loss"
+      ]
+    },
+    "normalized_class": {
+      "enum": [
+        "not_applicable",
+        "boundary_extra_hyphen",
+        "boundary_extra_space",
+        "boundary_space_before_terminal_punctuation",
+        "brand_or_intentional_transliteration_ambiguity",
+        "brand_or_native_word_layout_ambiguity",
+        "duplicated_character",
+        "f4_early_lock_full_word_crossover",
+        "grammar_adjective_or_ellipsis",
+        "grammar_definite_article",
+        "grammar_missing_comma",
+        "grammar_verb_or_mood",
+        "intentional_transliteration_guard",
+        "loanword_vowel_orthography",
+        "orthographic_missing_hyphen",
+        "orthographic_word_boundary_space",
+        "phrase_level_omission",
+        "same_script_character_omission",
+        "same_script_character_substitution",
+        "semantic_word_form_ambiguity",
+        "source_harness_framing",
+        "style_punctuation_guard",
+        "style_sensitive_extra_comma"
+      ]
+    },
+    "adjudication_privacy_class": {
+      "enum": ["public_token", "redacted", "metadata_only"]
+    },
+    "adjudication_source_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref"],
+      "properties": {
+        "kind": { "enum": ["source_record", "source_span", "ruling", "receipt", "other"] },
+        "ref": { "$ref": "#/$defs/typed_hmac_ref" }
+      }
+    },
+    "adjudication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "grain", "ref", "classification", "disposition",
+        "normalized_class", "expected", "causal_confidence", "owner_lane",
+        "privacy_class", "source_refs", "source_event_refs"
+      ],
+      "properties": {
+        "grain": { "enum": ["original_candidate", "supplemental_hypothesis"] },
+        "ref": { "$ref": "#/$defs/canonical_adjudication_ref" },
+        "classification": { "$ref": "#/$defs/adjudication_classification" },
+        "disposition": { "$ref": "#/$defs/adjudication_disposition" },
+        "normalized_class": { "$ref": "#/$defs/normalized_class" },
+        "expected_form_status": { "$ref": "#/$defs/expected_form_status" },
+        "expected": { "$ref": "#/$defs/adjudication_expected" },
+        "causal_confidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "expected_form", "runtime_mechanism", "smartkey_attribution"
+          ],
+          "properties": {
+            "anomaly_or_guard_presence": { "$ref": "#/$defs/causal_confidence" },
+            "expected_form": { "$ref": "#/$defs/causal_confidence" },
+            "runtime_mechanism": { "$ref": "#/$defs/causal_confidence" },
+            "smartkey_attribution": { "$ref": "#/$defs/causal_confidence" }
+          }
+        },
+        "owner_lane": { "$ref": "#/$defs/owner_lane" },
+        "privacy_class": { "$ref": "#/$defs/adjudication_privacy_class" },
+        "source_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/adjudication_source_ref" }
+        },
+        "source_event_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/source_event_ref" }
+        }
+      }
+    },
+    "adjudication_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state", "ruling_ref", "artifact_sha256",
+        "mapping_crosswalk_sha256", "audit_contract",
+        "original_count",
+        "supplemental_count", "bug_candidate_count", "guard_count",
+        "source_exclusion_count", "projected_record_count",
+        "bug_record_count", "guard_record_count", "legacy_record_count",
+        "baseline_update_record_count", "new_record_count",
+        "canonical_ref_set_sha256", "normalized_tuple_matrix_sha256",
+        "reconstruction_fragment_policy_version",
+        "crosswalk_projection_profile", "source_scope_placement_profile",
+        "source_scope_placement_sha256",
+        "original_presence_derivation_version",
+        "original_presence_derivation_ruling_ref", "original_ref_set_sha256",
+        "original_presence_external_receipt", "semantic_commitment_algorithm",
+        "semantic_commitment_sha256", "legacy_projection_sha256",
+        "registry_projection_sha256", "baseline_commitment_algorithm",
+        "baseline_record_set_sha256", "baseline_external_receipt",
+        "hmac_scheme", "hmac_min_key_bytes", "hmac_contract_version",
+        "hmac_domains", "hmac_domain_payload_profiles", "hmac_domain_root_types",
+        "hmac_resource_contract_version", "hmac_resource_limits",
+        "hmac_resource_contract_sha256",
+        "hmac_scalar_payload_encoding", "hmac_structured_payload_encoding",
+        "hmac_input_frame", "hmac_vector_set_sha256",
+        "hmac_key_id", "hmac_external_receipt"
+      ],
+      "properties": {
+        "state": { "const": "sealed" },
+        "ruling_ref": { "const": "6e0704632fef" },
+        "artifact_sha256": { "const": "92c6dd612be8095d54dc385044c60e9d33e91d0ed9e9f62f6701c87722edbb72" },
+        "mapping_crosswalk_sha256": { "const": "dff41e032dab140ed77b3d0339787e354a5772354f60093b0c6b8153bbe384d6" },
+        "audit_contract": { "const": "g0-r11a-preseal-crosswalk" },
+        "original_count": { "const": 106 },
+        "supplemental_count": { "const": 53 },
+        "bug_candidate_count": { "const": 125 },
+        "guard_count": { "const": 32 },
+        "source_exclusion_count": { "const": 2 },
+        "projected_record_count": { "const": 111 },
+        "bug_record_count": { "const": 76 },
+        "guard_record_count": { "const": 26 },
+        "legacy_record_count": { "const": 9 },
+        "baseline_update_record_count": { "const": 20 },
+        "new_record_count": { "const": 82 },
+        "canonical_ref_set_sha256": { "const": "81168506c76776f060aaf9cd71bb4ed0e2fbde31b286ac30b69823bc8a54a5ee" },
+        "normalized_tuple_matrix_sha256": { "const": "4c32653fa93b8dbe2ca48b5ee42cb4d733aec6ebc374c2ca712f558203237a04" },
+        "reconstruction_fragment_policy_version": { "const": "smartkey-g0-source-ref-scoped-cap-v1" },
+        "crosswalk_projection_profile": { "const": "smartkey-g0-crosswalk-target-binding-v2" },
+        "source_scope_placement_profile": { "const": "smartkey-g0-source-scope-placement-v1" },
+        "source_scope_placement_sha256": { "const": "c4f2a3a642a15c0a62ce9bb5904adfdec43721e88af65be1577f68d7e122f119" },
+        "original_presence_derivation_version": { "const": "smartkey-g0-original-retained-exactly-once-presence-v1" },
+        "original_presence_derivation_ruling_ref": { "const": "4e0198426714" },
+        "original_ref_set_sha256": { "const": "6a2d167b00ece704a369772c76b231821513b0da5602ab960c16ac9bed78a3f2" },
+        "original_presence_external_receipt": { "$ref": "#/$defs/original_presence_external_receipt" },
+        "semantic_commitment_algorithm": { "const": "sha256-canonical-json-v1" },
+        "semantic_commitment_sha256": { "$ref": "#/$defs/sha256_nonzero" },
+        "legacy_projection_sha256": {
+          "description": "Canonical complete projection of the nine retained unadjudicated records; authority requires an external import receipt.",
+          "$ref": "#/$defs/sha256_nonzero"
+        },
+        "registry_projection_sha256": {
+          "description": "Canonical complete sealed document projection excluding only this self-referential field; authority requires an external import receipt.",
+          "$ref": "#/$defs/sha256_nonzero"
+        },
+        "baseline_commitment_algorithm": { "const": "sha256-canonical-json-v1" },
+        "baseline_record_set_sha256": {
+          "description": "Canonical set of the 20 reviewed baseline record identities and per-record legacy projections. The external receipt is the authority boundary.",
+          "$ref": "#/$defs/sha256_nonzero"
+        },
+        "baseline_external_receipt": { "$ref": "#/$defs/baseline_external_receipt" },
+        "hmac_scheme": { "const": "smartkey-g0-hmac-sha256-v1" },
+        "hmac_min_key_bytes": { "const": 32 },
+        "hmac_contract_version": { "const": "smartkey-g0-hmac-byte-contract-v4" },
+        "hmac_domains": { "const": ["value", "event", "metadata", "source_record"] },
+        "hmac_domain_payload_profiles": {
+          "const": {
+            "value": "scalar_utf8",
+            "event": "project_canonical_json_v1",
+            "metadata": "project_canonical_json_v1",
+            "source_record": "smartkey-g0-source-record-adjudication-scoped-semantic-v2"
+          }
+        },
+        "hmac_domain_root_types": {
+          "const": {
+            "value": "exact_str",
+            "event": "exact_dict",
+            "metadata": "exact_dict",
+            "source_record": "exact_dict"
+          }
+        },
+        "hmac_resource_contract_version": { "const": "smartkey-g0-hmac-resource-contract-v1" },
+        "hmac_resource_limits": {
+          "const": {
+            "max_raw_utf8_bytes": 262144,
+            "max_canonical_payload_bytes": 65536,
+            "max_lexical_nesting_depth": 32,
+            "max_typed_nesting_depth": 32,
+            "max_total_nodes": 4096,
+            "max_array_members": 1024,
+            "max_object_members": 512,
+            "max_string_utf8_bytes": 65528,
+            "max_key_utf8_bytes": 1024,
+            "max_integer_token_digits": 16
+          }
+        },
+        "hmac_resource_contract_sha256": { "const": "50c430ef4de54c935e9bbbc4e6929dc7fbd28ba0f549da843526dcaf0f271bab" },
+        "hmac_scalar_payload_encoding": { "const": "exact-utf8-scalar-no-normalization-v1" },
+        "hmac_structured_payload_encoding": { "const": "smartkey-g0-canonical-json-v1" },
+        "hmac_input_frame": { "const": "ascii-scheme-nul-domain-nul-u64be-length-payload-v1" },
+        "hmac_vector_set_sha256": { "const": "8f6644ed05a898bd650f4e42dca4bc278e19db601523ed5442fcc20dd5ab0b3c" },
+        "hmac_key_id": { "$ref": "#/$defs/hmac_key_id" },
+        "hmac_external_receipt": { "$ref": "#/$defs/hmac_external_receipt" }
+      }
+    },
+    "side": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["token", "script", "descriptor"],
+      "properties": {
+        "token": { "$ref": "#/$defs/token_or_null" },
+        "script": { "$ref": "#/$defs/script" },
+        "descriptor": { "$ref": "#/$defs/short_text_or_null" }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "dedup_key", "category", "observed", "expected",
+        "needs_operator_confirmation", "minimal_context", "recorded_utc",
+        "first_seen_utc", "last_seen_utc", "repeat", "occurrence_count",
+        "environment", "source_refs", "status", "suspected_layer",
+        "reproducer", "red_test", "red_test_waiver", "fix_commit",
+        "verification", "closure_reason", "privacy_classification", "notes"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^anom-[0-9a-f]{12}$" },
+        "dedup_key": { "type": "string", "minLength": 3, "maxLength": 600 },
+        "category": {
+          "enum": ["script_flip_bg_to_en", "script_flip_en_to_bg", "inconsistent_acceptance", "unknown"]
+        },
+        "observed": { "$ref": "#/$defs/side" },
+        "expected": { "$ref": "#/$defs/side" },
+        "needs_operator_confirmation": { "type": "boolean" },
+        "minimal_context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["before", "after"],
+          "properties": {
+            "before": { "$ref": "#/$defs/token_or_null" },
+            "after": { "$ref": "#/$defs/token_or_null" }
+          }
+        },
+        "recorded_utc": { "$ref": "#/$defs/utc_or_null" },
+        "first_seen_utc": { "$ref": "#/$defs/utc_or_null" },
+        "last_seen_utc": { "$ref": "#/$defs/utc_or_null" },
+        "repeat": { "type": "boolean" },
+        "occurrence_count": { "type": "integer", "minimum": 1 },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["app_surface", "os", "build_sha", "build_label", "flags"],
+          "properties": {
+            "app_surface": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "os": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "build_sha": { "$ref": "#/$defs/sha_or_unknown" },
+            "build_label": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "flags": {
+              "type": ["object", "null"],
+              "additionalProperties": { "enum": ["on", "off", "absent", "unknown"] }
+            }
+          }
+        },
+        "source_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "ref", "observed_utc", "build_sha", "surface", "note"],
+            "properties": {
+              "kind": { "enum": ["ledger", "ruling", "plan", "trace", "probe", "operator_report", "commit", "other"] },
+              "ref": { "type": "string", "minLength": 4, "maxLength": 200 },
+              "observed_utc": { "$ref": "#/$defs/utc_or_null" },
+              "build_sha": { "type": ["string", "null"], "pattern": "^([0-9a-f]{40}|unknown)$" },
+              "surface": { "type": ["string", "null"], "maxLength": 200 },
+              "note": { "$ref": "#/$defs/short_text_or_null" }
+            }
+          }
+        },
+        "status": {
+          "enum": ["open_suspected_smartkey", "reproduced", "red_tested", "fixed", "verified", "closed", "not_smartkey"]
+        },
+        "suspected_layer": {
+          "enum": [
+            "dual_buffer_short_word", "dual_buffer_prefix_lock",
+            "dual_buffer_unsupported_inheritance", "lang_prior_lock",
+            "accept_gesture", "unknown"
+          ]
+        },
+        "reproducer": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["kind", "ref", "build_sha", "summary"],
+          "properties": {
+            "kind": { "enum": ["offline_probe", "structural_trace", "full_trace", "unit_test", "operator_report"] },
+            "ref": { "type": "string", "minLength": 4, "maxLength": 200 },
+            "build_sha": { "$ref": "#/$defs/sha_or_unknown" },
+            "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "covered_adjudication_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/canonical_adjudication_ref" }
+            },
+            "covered_source_event_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/source_event_ref" }
+            }
+          }
+        },
+        "red_test": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["path", "name", "commit"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "commit": { "$ref": "#/$defs/sha" },
+            "covered_adjudication_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/canonical_adjudication_ref" }
+            },
+            "covered_source_event_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/source_event_ref" }
+            }
+          }
+        },
+        "red_test_waiver": {
+          "description": "Legacy-only compatibility field. Enhanced adjudicated records forbid waivers and require covered RED evidence.",
+          "$ref": "#/$defs/short_text_or_null"
+        },
+        "fix_commit": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "fix_evidence": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["covered_adjudication_refs", "covered_source_event_refs"],
+          "properties": {
+            "covered_adjudication_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/canonical_adjudication_ref" }
+            },
+            "covered_source_event_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/source_event_ref" }
+            }
+          }
+        },
+        "verification": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["build_sha", "evidence_refs", "surface", "summary"],
+          "properties": {
+            "build_sha": { "$ref": "#/$defs/sha" },
+            "evidence_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 4, "maxLength": 200 }
+            },
+            "surface": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "covered_adjudication_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/canonical_adjudication_ref" }
+            },
+            "covered_source_event_refs": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/source_event_ref" }
+            }
+          }
+        },
+        "closure_reason": { "$ref": "#/$defs/short_text_or_null" },
+        "privacy_classification": { "enum": ["public_token", "redacted", "unknown"] },
+        "notes": { "$ref": "#/$defs/short_text_or_null" },
+        "record_origin": { "enum": ["new", "preexisting_public_baseline"] },
+        "baseline_record_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^(?!0000000000000000000000000000000000000000000000000000000000000000$)[0-9a-f]{64}$"
+        },
+        "adjudications": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/adjudication" }
+        }
+      }
+    }
+  }
+}

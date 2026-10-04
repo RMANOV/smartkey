@@ -147,6 +147,11 @@ pub struct InputConfig {
     /// user already typed.  Off by default: raw input is authoritative, and
     /// predictions may be accepted only through the explicit accept path.
     pub post_commit_autocorrect: bool,
+    /// Opt-in (2026-08-22, debate 4e02928c0537): Space accepts a visible,
+    /// eligible word-completion ghost as one atomic `typed+ghost+" "` commit.
+    /// Default OFF — Space stays exactly literal unless the operator enables
+    /// `accept.space_accept` in the config.
+    pub space_accept: bool,
     // ── Dual buffer (v0.5.0) ─────────────────────────────────────
     /// Enable layout-agnostic dual-buffer input.
     pub dual_buffer: DualBufferConfig,
@@ -177,6 +182,7 @@ impl Default for InputConfig {
             use_hedge: true,
             use_reranker: true,
             post_commit_autocorrect: false,
+            space_accept: false,
             dual_buffer: DualBufferConfig::default(),
         }
     }
@@ -197,6 +203,13 @@ impl InputConfig {
             }
             if let Some(b) = v.get("post_commit_autocorrect").and_then(|v| v.as_bool()) {
                 config.post_commit_autocorrect = b;
+            }
+            if let Some(b) = v
+                .get("accept")
+                .and_then(|v| v.get("space_accept"))
+                .and_then(|v| v.as_bool())
+            {
+                config.space_accept = b;
             }
             if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
                 config.max_candidates = (n as usize).max(1);
@@ -303,6 +316,13 @@ impl InputConfig {
         }
         if let Some(b) = v.get("post_commit_autocorrect").and_then(|v| v.as_bool()) {
             config.post_commit_autocorrect = b;
+        }
+        if let Some(b) = v
+            .get("accept")
+            .and_then(|v| v.get("space_accept"))
+            .and_then(|v| v.as_bool())
+        {
+            config.space_accept = b;
         }
         if let Some(n) = v.get("max_candidates").and_then(|v| v.as_u64()) {
             if n < 1 {
@@ -446,6 +466,9 @@ pub struct InputMethodCore {
     /// True when an anticipatory (next-word) ghost is showing, not a prefix ghost.
     /// Used to distinguish Tab-accept behavior.
     anticipatory_ghost_active: bool,
+    /// One-shot display attestation from the master loop (GREEN v4); see
+    /// `attest_space_accept_display`.  Consumed by every `handle_key`.
+    space_accept_display_attested: bool,
 }
 
 impl InputMethodCore {
@@ -468,6 +491,7 @@ impl InputMethodCore {
             caps_engine: CapsEngine::new(),
             active_hints: None,
             anticipatory_ghost_active: false,
+            space_accept_display_attested: false,
         }
     }
 
@@ -600,6 +624,8 @@ impl InputMethodCore {
     /// Process a key event and return actions for the platform to execute.
     pub fn handle_key(&mut self, event: KeyEvent) -> Vec<Action> {
         let is_kill = event.key == Key::Escape && event.modifiers.contains(Modifiers::SUPER);
+        // The display attestation covers exactly this key event (one-shot).
+        let display_attested = std::mem::take(&mut self.space_accept_display_attested);
 
         // Disabled state — only the kill switch can re-enable.
         if !self.enabled {
@@ -632,10 +658,11 @@ impl InputMethodCore {
         // a regular Key before entering the main match.
         let event = if let Key::RawCode(code) = event.key {
             // Caps Lock inverts Shift, but only on letter keys — the lock latch
-            // must never uppercase digits or punctuation.
-            let shift = event.modifiers.contains(Modifiers::SHIFT)
-                ^ (event.modifiers.contains(Modifiers::CAPS_LOCK)
-                    && keymap::is_alpha_scancode(code));
+            // must never uppercase digits or punctuation.  Which keys are
+            // letters differs per layout (the bracket keys are ш щ ч ю in
+            // Bulgarian), so the latch is applied per layout by the keymap.
+            let shift_held = event.modifiers.contains(Modifiers::SHIFT);
+            let caps_lock = event.modifiers.contains(Modifiers::CAPS_LOCK);
             // Special keys (Tab, Space, etc.) → rewrite to their Key variant.
             if let Some(special) = keymap::scancode_to_special(code) {
                 let key = match special {
@@ -657,7 +684,9 @@ impl InputMethodCore {
                     key,
                     modifiers: event.modifiers,
                 }
-            } else if let Some((en_ch, bg_ch)) = keymap::scancode_to_both(code, shift) {
+            } else if let Some((en_ch, bg_ch)) =
+                keymap::scancode_to_both_with_caps(code, shift_held, caps_lock)
+            {
                 if en_ch != bg_ch && self.config.dual_buffer.enabled {
                     // Dual-interpretable character → handle via dual buffer.
                     return self.handle_dual_buffer_key(en_ch, bg_ch);
@@ -814,11 +843,24 @@ impl InputMethodCore {
             // Space/Return commit exactly the TYPED word; Tab remains the
             // only accept key.
             Key::Space | Key::Return => {
+                // Opt-in Space-accept (2026-08-22, debate 4e02928c0537): Space —
+                // never Return — accepts an eligible visible completion as ONE
+                // atomic `typed+ghost+" "` commit with the key consumed.  With
+                // the flag off, or without an eligible ghost, both keys stay
+                // exactly literal (the unchanged paths below).
+                if matches!(event.key, Key::Space)
+                    && self.config.space_accept
+                    && display_attested
+                    && self.space_accept_eligible()
+                {
+                    return self.accept_ghost_with_delimiter();
+                }
                 if self.dual_buffer.is_some() && !self.current_word.is_empty() {
                     // Full-word composing: commit entire preedit word at once.
                     // The word has been in composing mode the whole time — the
-                    // user sees the correct script; now we finalize it.
-                    let word = self.current_word.clone();
+                    // user sees the displayed script; the boundary resolves
+                    // exact one-sided evidence before anything is learned.
+                    let word = self.resolve_word_boundary();
                     self.commit_word_internal(&word, true);
                     self.reset_word();
                     let mut actions = vec![
@@ -904,7 +946,7 @@ impl InputMethodCore {
                     && !self.current_word.is_empty()
                     && !ch.is_alphabetic()
                 {
-                    let word = self.current_word.clone();
+                    let word = self.resolve_word_boundary();
                     self.commit_word_internal(&word, true);
                     self.reset_word();
                     let mut actions = vec![Action::HideGhost, Action::CommitText(word.clone())];
@@ -979,6 +1021,171 @@ impl InputMethodCore {
     /// Whether the dual buffer is active but not yet locked (hypothesis phase).
     fn in_hypothesis_phase(&self) -> bool {
         self.dual_buffer.as_ref().is_some_and(|db| !db.is_locked())
+    }
+
+    /// Script class for the Space-accept gate: `Some('c')` all-Cyrillic,
+    /// `Some('l')` all-Latin, `None` for empty, mixed-script or any other
+    /// character (digits, punctuation).  A completion is alphabetic by
+    /// construction, so anything else is ineligible — fail closed.
+    fn script_class(text: &str) -> Option<char> {
+        let mut class = None;
+        for ch in text.chars() {
+            let c = if ('\u{0400}'..='\u{04FF}').contains(&ch) {
+                'c'
+            } else if ch.is_ascii_alphabetic() {
+                'l'
+            } else {
+                return None;
+            };
+            match class {
+                None => class = Some(c),
+                Some(prev) if prev == c => {}
+                _ => return None,
+            }
+        }
+        class
+    }
+
+    /// Opt-in Space-accept eligibility (spec 2026-08-22 §2).  Every clause is a
+    /// known injection or staleness class: the prefix must live in the
+    /// composing preedit (dual buffer), the ghost must be the visible
+    /// word-completion (not an anticipatory next-word ghost, not a
+    /// transliteration suggestion), and typed + ghost must share one script —
+    /// the 12.07 incident committed an English candidate onto Bulgarian typing.
+    /// Sensitive fields and focus/cursor transitions never reach this point:
+    /// the adapter bypasses the core, and `reset_word()` clears the ghost.
+    fn space_accept_eligible(&self) -> bool {
+        if self.dual_buffer.is_none()
+            || self.current_word.is_empty()
+            || self.ghost.is_empty()
+            || self.anticipatory_ghost_active
+            || self.transliteration_active
+        {
+            return false;
+        }
+        // Identity with the DISPLAYED prediction: the composition the user
+        // sees (typed + ghost) must be exactly the tracked top prediction the
+        // ghost was derived from — normalised like the adapter's "accept ==
+        // last shown prediction" check.  No tracked prediction, or a ghost
+        // that drifted from it (e.g. injected), is never accepted.
+        let shown = format!("{}{}", self.current_word, self.ghost);
+        let identity_ok = self
+            .last_predictions
+            .first()
+            .is_some_and(|top| Self::same_normalized(&top.word, &shown));
+        if !identity_ok {
+            return false;
+        }
+        matches!(
+            (
+                Self::script_class(&self.current_word),
+                Self::script_class(&self.ghost)
+            ),
+            (Some(typed), Some(ghost)) if typed == ghost
+        )
+    }
+
+    fn same_normalized(left: &str, right: &str) -> bool {
+        left.trim().to_lowercase() == right.trim().to_lowercase()
+    }
+
+    /// Whether the NEXT Space would be an acceptance (flag on + core-local
+    /// eligibility).  Read by the master loop before delegation; the master
+    /// loop then ATTESTS the display identity (`attest_space_accept_display`)
+    /// — the core never accepts on its own predicate alone.
+    pub fn space_accept_armed(&self) -> bool {
+        self.config.space_accept && self.space_accept_eligible()
+    }
+
+    /// Whether this event is a Space press, on either entry path: the keyval
+    /// path (`Key::Space`) or the raw-scancode path the live adapter uses for
+    /// every key (`Key::RawCode` that the keymap resolves to Space).  The
+    /// master loop must not match `Key::Space` alone — raw codes are resolved
+    /// only inside `handle_key`, so a raw Space would never be attested.
+    pub fn is_space_event(event: &KeyEvent) -> bool {
+        match event.key {
+            Key::Space => true,
+            Key::RawCode(code) => matches!(
+                keymap::scancode_to_special(code),
+                Some(keymap::SpecialKey::Space)
+            ),
+            _ => false,
+        }
+    }
+
+    /// One-shot attestation from the display owner (the master loop) that the
+    /// composition the core holds is exactly what is currently shown and
+    /// tracked for the user.  Consumed by the next key event; absent → Space
+    /// stays literal.  (GREEN v4: the adapter's public rejection feedback can
+    /// clear the display attribution while core ghost/top remain; the core
+    /// alone cannot know that.)
+    pub fn attest_space_accept_display(&mut self, ok: bool) {
+        self.space_accept_display_attested = ok;
+    }
+
+    /// Fold one delimiter into the accept batch.
+    ///
+    /// The accept path commits the full composition and may follow it with
+    /// post-commit `ReplaceWord`s (language correction, casing) sized for that
+    /// commit.  Lengthening the commit would break the adapter's same-batch
+    /// coalescing and turn the later delete into text corruption
+    /// (`hello` + Space + `ReplaceWord(5, Hello)` → `hHello`).  So every
+    /// replacement that exactly covers the current commit is absorbed INTO
+    /// the commit first, and the delimiter is appended last: the client sees
+    /// one commit = final word + one space.  Anything else — no full commit,
+    /// a replacement of another length — is refused (`None`).
+    fn fold_delimiter(actions: Vec<Action>, full_text: &str) -> Option<Vec<Action>> {
+        let commit_idx = actions
+            .iter()
+            .position(|a| matches!(a, Action::CommitText(t) if t == full_text))?;
+        let mut out: Vec<Action> = Vec::with_capacity(actions.len());
+        let mut committed = full_text.to_string();
+        for (idx, action) in actions.into_iter().enumerate() {
+            if idx <= commit_idx {
+                out.push(action);
+                continue;
+            }
+            match action {
+                Action::ReplaceWord { replace_len, text }
+                    if replace_len == committed.chars().count() =>
+                {
+                    committed = text;
+                }
+                Action::ReplaceWord { .. } => return None,
+                other => out.push(other),
+            }
+        }
+        committed.push(' ');
+        out[commit_idx] = Action::CommitText(committed);
+        Some(out)
+    }
+
+    /// Fold the delimiter, or fall back to the CANONICAL accepted batch.
+    ///
+    /// By the time this runs the core has already accepted and learned the
+    /// completion, so the layers above must see exactly one acceptance: the
+    /// safest fallback drops the unfoldable post-commit rewrites and emits
+    /// `HideGhost + CommitText(accepted word + one space)` with no
+    /// `ForwardKey`.  (Forwarding the key here would make the adapter record a
+    /// word-boundary rejection of a word the core just accepted — blocker 3.)
+    fn fold_or_canonical(actions: Vec<Action>, full_text: &str) -> Vec<Action> {
+        match Self::fold_delimiter(actions, full_text) {
+            Some(folded) => folded,
+            None => vec![
+                Action::HideGhost,
+                Action::CommitText(format!("{full_text} ")),
+            ],
+        }
+    }
+
+    /// One-press Space-accept: the shared Tab accept path (learning, metrics,
+    /// reset, no ghost re-arm) with the delimiter folded INTO its single
+    /// full-composition commit.  No `ForwardKey` is emitted, so the client
+    /// cannot receive the space a second time — one press, one delimiter.
+    fn accept_ghost_with_delimiter(&mut self) -> Vec<Action> {
+        let full_text = format!("{}{}", self.current_word, self.ghost);
+        let actions = self.accept_ghost_completion();
+        Self::fold_or_canonical(actions, &full_text)
     }
 
     /// Accept the visible ghost completion when the user presses Tab.
@@ -1388,8 +1595,8 @@ impl InputMethodCore {
         let typed_freq = self.engine.word_frequency(&word.to_lowercase(), typed_lang);
 
         // Transliterate to the other language.  A partial transliteration is
-        // never a valid replacement: BG-only letters such as ч/щ/ю are not in
-        // the legacy ASCII phonetic table, and dropping them produced live
+        // never a valid replacement: BG-only letters such as ч/щ/ю were absent
+        // from the former ASCII phonetic table, and dropping them produced live
         // corruptions such as "чака" -> "aka" and "защо" -> "zao".
         let other_word = if typed_lang == LangId::En {
             transliterate(word)
@@ -1537,6 +1744,39 @@ impl InputMethodCore {
         }
 
         actions
+    }
+
+    /// Choose the word to commit at a boundary of a dual-buffer composition.
+    ///
+    /// The display lock is a scoring signal on the PREFIX; it must not decide
+    /// the committed word when the full physical word has exact corpus
+    /// support on exactly one side.  Only that one-sided case switches the
+    /// reading (S03/P3a): both-supported words keep the existing evidence
+    /// decision, unsupported words keep the displayed reading, and a `Tech`
+    /// winner is left alone.  When the reading switches, the language
+    /// detector is realigned BEFORE `commit_word_internal` so learning,
+    /// momentum and the regime observation all see the selected script.
+    fn resolve_word_boundary(&mut self) -> String {
+        let Some(db) = self.dual_buffer.as_ref() else {
+            return self.current_word.clone();
+        };
+        let (en_exact, bg_exact) = self.engine.score_exact_both(db.en_text(), db.bg_text());
+        let selected = match (en_exact > 0.0, bg_exact > 0.0, db.winner_lang()) {
+            (true, false, LangId::Bg) => LangId::En,
+            (false, true, LangId::En) => LangId::Bg,
+            _ => return self.current_word.clone(),
+        };
+        let word = match selected {
+            LangId::En => db.en_text().to_string(),
+            LangId::Bg | LangId::Tech => db.bg_text().to_string(),
+        };
+        self.current_word = word.clone();
+        self.current_word_had_flip = true;
+        if self.config.lang_detection {
+            // Normalised one-sided exact evidence, not a calibrated probability.
+            self.lang_detector.feed_dual_result(selected, 1.0);
+        }
+        word
     }
 
     /// Commit action for the in-flight composing preedit, if there is one.
@@ -2490,6 +2730,87 @@ mod tests {
             )),
             "opt-in must re-enable language correction: {actions:?}"
         );
+    }
+
+    #[test]
+    fn post_commit_autocorrect_physical_brackets_stay_raw_by_default() {
+        for (typed, target) in [("шщчю", "[]`\\"), ("ШЩЧЮ", "{}~|")] {
+            let mut core = InputMethodCore::new(InputConfig::default());
+            core.load_word(target, 20);
+            assert_eq!(core.engine.word_frequency(target, LangId::En), 20.0);
+            core.current_word = typed.to_string();
+            let actions = core.handle_key(press(Key::Space));
+            // This keyval path already forwarded the typed characters: Space
+            // must forward only the delimiter, without recommitting/replacing.
+            assert_eq!(actions, vec![Action::HideGhost, Action::ForwardKey]);
+        }
+    }
+
+    #[test]
+    fn post_commit_autocorrect_physical_brackets_replace_full_word_when_opted_in() {
+        for (typed, target) in [("шщчю", "[]`\\"), ("ШЩЧЮ", "{}~|")] {
+            let mut core = InputMethodCore::new(InputConfig {
+                post_commit_autocorrect: true,
+                ..InputConfig::default()
+            });
+            core.load_word(target, 20);
+            assert_eq!(core.engine.word_frequency(target, LangId::En), 20.0);
+            assert_eq!(
+                core.engine
+                    .word_frequency(&typed.to_lowercase(), LangId::Bg),
+                0.0
+            );
+            core.current_word = typed.to_string();
+            let actions = core.handle_key(press(Key::Space));
+            let replacements: Vec<_> = actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::ReplaceWord { replace_len, text } => {
+                        Some((*replace_len, text.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replacements, vec![(4, target)]);
+        }
+    }
+
+    #[test]
+    fn post_commit_autocorrect_physical_brackets_require_supported_target() {
+        for typed in ["шщчю", "ШЩЧЮ"] {
+            let mut core = InputMethodCore::new(InputConfig {
+                post_commit_autocorrect: true,
+                ..InputConfig::default()
+            });
+            core.current_word = typed.to_string();
+            let actions = core.handle_key(press(Key::Space));
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        }
+    }
+
+    #[test]
+    fn post_commit_autocorrect_physical_brackets_preserve_below_ratio_word() {
+        for (typed, target) in [("шщчю", "[]`\\"), ("ШЩЧЮ", "{}~|")] {
+            let mut core = InputMethodCore::new(InputConfig {
+                post_commit_autocorrect: true,
+                ..InputConfig::default()
+            });
+            core.load_word(target, 20);
+            core.load_word(&typed.to_lowercase(), 7);
+            assert_eq!(core.engine.word_frequency(target, LangId::En), 20.0);
+            assert_eq!(
+                core.engine
+                    .word_frequency(&typed.to_lowercase(), LangId::Bg),
+                7.0
+            );
+            core.current_word = typed.to_string();
+            let actions = core.handle_key(press(Key::Space));
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        }
     }
 
     /// Anti-desync + anti-double: Tab commits EXACTLY the last displayed
@@ -3898,5 +4219,1367 @@ mod tests {
         let config = result.unwrap();
         assert_eq!(config.max_candidates, 3);
         assert_eq!(config.min_prefix_length, 2);
+    }
+}
+
+/// Step-1 contract for the OPT-IN Space-accept mode (debate 843f34443fd7 →
+/// 9c7b7dd85ca6 / 4e02928c0537; spec: smartkey_space_accept_spec_2026-08-22).
+///
+/// Written RED-first: the `space_accept_on_*` tests below fail on d8b01c0
+/// because the flag does not exist yet and Space commits the typed word only.
+/// The `*_literal` / `*_unchanged` tests are the guards the ADVOCATE gate
+/// requires — they must stay green before, during and after the change.
+#[cfg(test)]
+mod space_accept_tests {
+    use super::*;
+
+    const FLAG_ON: &str = r#"{"accept": {"space_accept": true}}"#;
+    const FLAG_ABSENT: &str = "{}";
+
+    // ── Delimiter folding vs post-commit replacement (bd9219aa448c B) ────
+
+    /// `hello` + Space with a post-commit `ReplaceWord(5, "Hello")` must reach
+    /// the client as exactly `Hello ` — one commit, correct casing, one
+    /// delimiter, no delete-length mismatch (never `hHello`).
+    #[test]
+    fn fold_delimiter_absorbs_same_length_post_commit_replace() {
+        let actions = vec![
+            Action::HideGhost,
+            Action::CommitText("hello".to_string()),
+            Action::ReplaceWord {
+                replace_len: 5,
+                text: "Hello".to_string(),
+            },
+        ];
+
+        let folded = InputMethodCore::fold_delimiter(actions, "hello");
+
+        assert_eq!(
+            folded,
+            Some(vec![
+                Action::HideGhost,
+                Action::CommitText("Hello ".to_string())
+            ])
+        );
+    }
+
+    /// Two chained replacements (correction, then casing) fold in order.
+    #[test]
+    fn fold_delimiter_absorbs_chained_replacements() {
+        let actions = vec![
+            Action::HideGhost,
+            Action::CommitText("hello".to_string()),
+            Action::ReplaceWord {
+                replace_len: 5,
+                text: "hullo".to_string(),
+            },
+            Action::ReplaceWord {
+                replace_len: 5,
+                text: "Hullo".to_string(),
+            },
+        ];
+
+        let folded = InputMethodCore::fold_delimiter(actions, "hello");
+
+        assert_eq!(
+            folded,
+            Some(vec![
+                Action::HideGhost,
+                Action::CommitText("Hullo ".to_string())
+            ])
+        );
+    }
+
+    /// A replacement that is NOT sized for the committed word cannot be folded
+    /// safely: refuse (caller falls back to a literal, forwarded delimiter).
+    #[test]
+    fn fold_delimiter_refuses_mismatched_replace() {
+        let actions = vec![
+            Action::HideGhost,
+            Action::CommitText("hello".to_string()),
+            Action::ReplaceWord {
+                replace_len: 3,
+                text: "x".to_string(),
+            },
+        ];
+
+        assert_eq!(InputMethodCore::fold_delimiter(actions, "hello"), None);
+    }
+
+    /// No full-composition commit in the batch: nothing to fold, refuse.
+    #[test]
+    fn fold_delimiter_refuses_when_full_commit_is_absent() {
+        let actions = vec![Action::HideGhost, Action::CommitText("hel".to_string())];
+
+        assert_eq!(InputMethodCore::fold_delimiter(actions, "hello"), None);
+    }
+
+    /// Blocker 3 (4f9970749edd): refusal must not contradict the layers. The
+    /// core has already accepted/learned, so the safest fallback DROPS the
+    /// unfoldable post-commit rewrites and emits the canonical accepted batch —
+    /// HideGhost + CommitText(accepted word + exactly one space), no
+    /// ForwardKey — so the adapter still sees one acceptance, never a
+    /// word_boundary rejection, and O1 gets the accepted word.
+    #[test]
+    fn space_accept_on_refusal_emits_canonical_commit_without_forward() {
+        let actions = vec![
+            Action::HideGhost,
+            Action::CommitText("hello".to_string()),
+            Action::ReplaceWord {
+                replace_len: 3,
+                text: "x".to_string(),
+            },
+        ];
+
+        let out = InputMethodCore::fold_or_canonical(actions, "hello");
+
+        assert_eq!(
+            out,
+            vec![Action::HideGhost, Action::CommitText("hello ".to_string())]
+        );
+    }
+
+    /// Even a batch without the full-composition commit degrades to the
+    /// canonical shape (synthesised), never to a forwarded key.
+    #[test]
+    fn space_accept_on_refusal_without_full_commit_synthesises_canonical() {
+        let actions = vec![Action::HideGhost, Action::CommitText("hel".to_string())];
+
+        let out = InputMethodCore::fold_or_canonical(actions, "hello");
+
+        assert_eq!(
+            out,
+            vec![Action::HideGhost, Action::CommitText("hello ".to_string())]
+        );
+    }
+
+    // ── Blocker 1 (4f9970749edd): displayed-prediction identity ─────────────
+
+    fn with_top_prediction(core: &mut InputMethodCore, word: &str) {
+        core.last_predictions = vec![Prediction {
+            word: word.to_string(),
+            score: 1.0,
+            confidence: 1.0,
+        }];
+    }
+
+    /// A ghost that is not exactly the tracked top prediction (what the user
+    /// was shown) is never accepted — e.g. a synthetically injected ghost.
+    #[test]
+    fn space_accept_on_requires_tracked_top_prediction() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+        core.last_predictions.clear();
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    #[test]
+    fn space_accept_on_rejects_ghost_mismatching_top_prediction() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+        with_top_prediction(&mut core, "help");
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    /// Identity is normalized (case/whitespace) exactly like the adapter's
+    /// "accept == last shown prediction" comparison.
+    #[test]
+    fn space_accept_on_accepts_exact_normalized_identity() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "Hel", "lo", true);
+        with_top_prediction(&mut core, "hello");
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["Hello ".to_string()]);
+        assert!(!has(&actions, &Action::ForwardKey));
+    }
+
+    fn core_with(json: &str) -> InputMethodCore {
+        let mut config = InputConfig::from_json(json);
+        config.ghost_text_separation_margin = 0.0;
+        let mut core = InputMethodCore::new(config);
+        core.load_word("hello", 100);
+        core.load_word("world", 90);
+        core
+    }
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn has(actions: &[Action], target: &Action) -> bool {
+        actions.iter().any(|a| a == target)
+    }
+
+    fn commits(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::CommitText(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Locked buffer = steady state after `min_lock_chars`.
+    fn locked_db(core: &InputMethodCore) -> DualBuffer {
+        let mut db = DualBuffer::from_config(&core.config.dual_buffer);
+        for _ in 0..4 {
+            db.push('h', 'h');
+        }
+        db.update_scores(100.0, 1.0);
+        assert!(db.is_locked(), "precondition: locked");
+        db
+    }
+
+    /// Unlocked buffer = the hypothesis phase the operator reports the bug in
+    /// („на 2–3 букви": fewer than `min_lock_chars` = 4).
+    fn unlocked_db(core: &InputMethodCore) -> DualBuffer {
+        let mut db = DualBuffer::from_config(&core.config.dual_buffer);
+        db.push('h', 'х');
+        db.push('e', 'е');
+        db.update_scores(100.0, 1.0);
+        assert!(!db.is_locked(), "precondition: hypothesis phase");
+        db
+    }
+
+    /// Put the core into full-word composing: typed prefix in the preedit plus
+    /// a visible word-completion ghost — exactly what the structural trace shows
+    /// right before the operator's Space (seq 47 / 205, 2026-08-22).
+    fn composing(core: &mut InputMethodCore, typed: &str, ghost: &str, locked: bool) {
+        let db = if locked {
+            locked_db(core)
+        } else {
+            unlocked_db(core)
+        };
+        core.dual_buffer = Some(db);
+        core.current_word = typed.to_string();
+        core.ghost = ghost.to_string();
+        // Direct core tests stand in for the MasterLoop: attest that the
+        // composition is the currently displayed one (one-shot, next key).
+        core.attest_space_accept_display(!ghost.is_empty());
+        // The displayed completion IS the tracked top prediction (what the
+        // user was shown) — the identity the accept gate must verify.
+        core.last_predictions = if ghost.is_empty() {
+            Vec::new()
+        } else {
+            vec![Prediction {
+                word: format!("{typed}{ghost}"),
+                score: 1.0,
+                confidence: 1.0,
+            }]
+        };
+    }
+
+    // ── RED: the new behaviour ────────────────────────────────────────────
+
+    /// One press, one atomic payload: `typed + ghost + one delimiter`, and the
+    /// key is CONSUMED (no ForwardKey) so IBus cannot deliver a second space.
+    #[test]
+    fn space_accept_on_commits_typed_plus_ghost_plus_one_delimiter() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(
+            commits(&actions),
+            vec!["hello ".to_string()],
+            "exactly one commit carrying the word and ONE literal space, got {actions:?}"
+        );
+        assert!(has(&actions, &Action::HideGhost));
+        assert!(
+            !has(&actions, &Action::ForwardKey),
+            "the Space must be consumed — forwarding it would double the delimiter"
+        );
+        assert_eq!(core.current_word(), "");
+        assert!(!core.has_ghost());
+    }
+
+    /// The reported case lives in the hypothesis phase (2–3 letters, unlocked).
+    #[test]
+    fn space_accept_on_works_in_hypothesis_phase() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "he", "llo", false);
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["hello ".to_string()]);
+        assert!(!has(&actions, &Action::ForwardKey));
+    }
+
+    /// Acceptance must feed learning with the ACCEPTED word, not the prefix.
+    #[test]
+    fn space_accept_on_learns_the_accepted_word() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+
+        core.handle_key(press(Key::Space));
+
+        assert_eq!(core.context_words(), (Some("hello"), None));
+    }
+
+    /// One-shot: the acceptance consumes the ghost; a rapid second Space is an
+    /// ordinary literal space (forwarded, nothing committed).
+    #[test]
+    fn space_accept_on_second_space_is_literal() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+        let first = core.handle_key(press(Key::Space));
+        assert_eq!(commits(&first), vec!["hello ".to_string()]);
+
+        let second = core.handle_key(press(Key::Space));
+
+        assert!(
+            commits(&second).is_empty(),
+            "second Space must not commit, got {second:?}"
+        );
+        assert!(has(&second, &Action::ForwardKey));
+    }
+
+    // ── GUARDS: literal Space everywhere else; Tab/Return unchanged ────────
+
+    #[test]
+    fn space_accept_default_off_keeps_literal_space() {
+        let mut core = core_with(FLAG_ABSENT);
+        composing(&mut core, "hel", "lo", true);
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    #[test]
+    fn space_accept_on_no_ghost_is_literal() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "", true);
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    #[test]
+    fn space_accept_on_ignores_anticipatory_ghost() {
+        let mut core = core_with(FLAG_ON);
+        core.ghost = "world".to_string();
+        core.anticipatory_ghost_active = true;
+        assert!(core.current_word.is_empty());
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert!(
+            commits(&actions).iter().all(|c| !c.contains("world")),
+            "anticipatory ghost must never be committed by Space, got {actions:?}"
+        );
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    #[test]
+    fn space_accept_on_ignores_transliteration() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+        core.transliteration_active = true;
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    /// Cross-script completion = the 12.07 injection class. Never accepted.
+    #[test]
+    fn space_accept_on_rejects_script_mismatch() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "зд", "rav", false);
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["зд".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    /// A ghost that was visible before a focus transition is stale: the word
+    /// was flushed on focus-out, the following Space is literal.
+    #[test]
+    fn space_accept_on_stale_ghost_after_focus_lost_is_literal() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+        let flushed = core.focus_lost();
+        assert_eq!(commits(&flushed), vec!["hel".to_string()]);
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert!(
+            commits(&actions).is_empty(),
+            "stale ghost must not be accepted, got {actions:?}"
+        );
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    #[test]
+    fn space_accept_on_return_unchanged() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+
+        let actions = core.handle_key(press(Key::Return));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    /// GREEN v4: without the MasterLoop's one-shot display attestation the
+    /// core never accepts on Space, however eligible its own state looks.
+    #[test]
+    fn space_accept_on_requires_display_attestation() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+        core.attest_space_accept_display(false);
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    /// The attestation is one-shot: it covers exactly the next key.
+    #[test]
+    fn space_accept_display_attestation_is_consumed_by_the_next_key() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true); // helper attests for the next key
+        core.handle_key(press(Key::Escape)); // consumes the attestation, keeps the prefix
+                                             // Restore an eligible composition WITHOUT a fresh attestation.
+        core.ghost = "lo".to_string();
+        with_top_prediction(&mut core, "hello");
+
+        let actions = core.handle_key(press(Key::Space));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    #[test]
+    fn space_accept_on_tab_unchanged() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+
+        let actions = core.handle_key(press(Key::Tab));
+
+        assert_eq!(
+            commits(&actions),
+            vec!["hello".to_string()],
+            "Tab never adds a delimiter"
+        );
+        assert!(!has(&actions, &Action::ForwardKey));
+    }
+
+    // ── Config parser coverage (ADVOCATE_CODEX 3037035ecb52) ───────────────
+
+    #[test]
+    fn config_space_accept_defaults_off() {
+        assert!(!InputConfig::default().space_accept);
+        assert!(!InputConfig::from_json(FLAG_ABSENT).space_accept);
+        assert!(
+            !InputConfig::try_from_json(FLAG_ABSENT)
+                .unwrap()
+                .space_accept
+        );
+    }
+
+    #[test]
+    fn config_space_accept_parses_true_and_false() {
+        assert!(InputConfig::from_json(FLAG_ON).space_accept);
+        assert!(InputConfig::try_from_json(FLAG_ON).unwrap().space_accept);
+        let off = r#"{"accept": {"space_accept": false}}"#;
+        assert!(!InputConfig::from_json(off).space_accept);
+        assert!(!InputConfig::try_from_json(off).unwrap().space_accept);
+    }
+
+    /// Fail-closed: a non-boolean value never switches the feature on.
+    #[test]
+    fn config_space_accept_invalid_type_is_off() {
+        for bad in [
+            r#"{"accept": {"space_accept": "yes"}}"#,
+            r#"{"accept": {"space_accept": 1}}"#,
+            r#"{"accept": "space_accept"}"#,
+            r#"{"accept": null}"#,
+        ] {
+            assert!(!InputConfig::from_json(bad).space_accept, "{bad}");
+            assert!(
+                !InputConfig::try_from_json(bad).unwrap().space_accept,
+                "{bad}"
+            );
+        }
+    }
+
+    // ── Boundary / multilingual guards (ADVOCATE_CODEX 3037035ecb52) ──────
+
+    /// Punctuation never goes through the Space arm: the typed word is
+    /// committed verbatim and the key is forwarded, flag or no flag.
+    #[test]
+    fn space_accept_on_punctuation_boundary_stays_literal() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+
+        let actions = core.handle_key(press(Key::Char('!')));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    #[test]
+    fn space_accept_on_digit_boundary_stays_literal() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "lo", true);
+
+        let actions = core.handle_key(press(Key::Char('1')));
+
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+
+    /// Latin prefix with a Cyrillic completion, and a prefix that already
+    /// mixes scripts — both are the mid-word flip the 12.07 incident was made
+    /// of. Never accepted.
+    #[test]
+    fn space_accept_on_multilingual_mid_word_rejected() {
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hel", "ло", true);
+        let actions = core.handle_key(press(Key::Space));
+        assert_eq!(commits(&actions), vec!["hel".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+
+        let mut core = core_with(FLAG_ON);
+        composing(&mut core, "hе", "llo", false); // 'h' Latin + 'е' Cyrillic
+        let actions = core.handle_key(press(Key::Space));
+        assert_eq!(commits(&actions), vec!["hе".to_string()]);
+        assert!(has(&actions, &Action::ForwardKey));
+    }
+}
+
+/// B9 / F1 (2026-08-23, ADVOCATE_CODEX ruling 487688994026): a contextual
+/// language prior (surrounding text / typing momentum) may bias the first
+/// character of a dual-buffer word but must never lock it — corpus evidence
+/// on char 2+ decides. Live defect: after an xkb→SmartKey switch inside a
+/// Latin-surrounded terminal, Bulgarian words were committed as the EN keymap
+/// text („имаш" → "ima[", „след" → "sled", „превключване" → "prewkl`wane").
+#[cfg(test)]
+mod lang_prior_tests {
+    use super::*;
+    use crate::lang_detect::LangId;
+
+    fn press_raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    /// Bilingual corpus shaped like the live one: the Bulgarian words of the
+    /// operator's report plus ordinary English words that share physical keys.
+    fn bilingual_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        assert!(core.config.dual_buffer.enabled);
+        for (w, f) in [
+            ("имаш", 120_000u32),
+            ("има", 900_000),
+            ("след", 400_000),
+            ("превключване", 30_000),
+            ("отговор", 250_000),
+            ("то", 700_000),
+        ] {
+            core.load_word(w, f);
+        }
+        for (w, f) in [
+            ("is", 4_000_000u32),
+            ("image", 600_000),
+            ("sled", 20_000),
+            ("the", 9_000_000),
+            ("hello", 4_800_000),
+            ("to", 5_000_000),
+        ] {
+            core.load_word(w, f);
+        }
+        core
+    }
+
+    fn with_prior(core: &mut InputMethodCore, prior: LangId) {
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(prior),
+            ..Default::default()
+        });
+    }
+
+    /// Physical keys (evdev) for the reported words.
+    const IMASH: [u16; 4] = [23, 50, 30, 26]; // i m a [  → имаш
+    const SLED: [u16; 4] = [31, 38, 18, 32]; // s l e d  → след
+    const OTGOWOR: [u16; 7] = [24, 20, 34, 24, 17, 24, 19]; // o t g o w o r → отговор
+    const PREWKL: [u16; 6] = [25, 19, 18, 17, 37, 38]; // p r e w k l → превкл(ючване)
+    const IS: [u16; 2] = [23, 31];
+    const HELLO: [u16; 5] = [35, 18, 38, 38, 24];
+    const TO: [u16; 2] = [20, 24];
+
+    fn type_word(core: &mut InputMethodCore, codes: &[u16]) -> String {
+        for &c in codes {
+            core.handle_key(press_raw(c));
+        }
+        core.current_word().to_string()
+    }
+
+    // ── RED: the reported alternating pattern must come out Cyrillic ───────
+
+    #[test]
+    fn bulgarian_words_after_english_context_are_cyrillic() {
+        let mut core = bilingual_core();
+        for (codes, expected) in [
+            (&IMASH[..], "имаш"),
+            (&SLED[..], "след"),
+            (&OTGOWOR[..], "отговор"),
+            (&PREWKL[..], "превкл"),
+        ] {
+            with_prior(&mut core, LangId::En); // Latin surrounding / EN momentum
+            let got = type_word(&mut core, codes);
+            assert_eq!(got, expected, "EN prior must not lock a Bulgarian word");
+            core.handle_key(press_raw(57)); // Space
+        }
+    }
+
+    #[test]
+    fn first_char_prior_is_a_bias_not_a_lock() {
+        let mut core = bilingual_core();
+        with_prior(&mut core, LangId::En);
+        core.handle_key(press_raw(23)); // i / и
+
+        let (dual, locked, hypothesis) = core.debug_state();
+        assert!(dual);
+        assert!(!locked, "char-1 prior must leave the buffer unlocked");
+        assert!(hypothesis);
+    }
+
+    // ── GUARDS: the prior still helps genuine English; invariants hold ─────
+
+    #[test]
+    fn genuine_english_after_english_context_stays_english() {
+        let mut core = bilingual_core();
+        with_prior(&mut core, LangId::En);
+        assert_eq!(type_word(&mut core, &IS), "is");
+        core.handle_key(press_raw(57));
+        with_prior(&mut core, LangId::En);
+        assert_eq!(type_word(&mut core, &HELLO), "hello");
+    }
+
+    /// Short, corpus-ambiguous word ("to" vs „то"): the English context must
+    /// still decide it — the bias is kept when the corpus cannot separate.
+    #[test]
+    fn short_ambiguous_english_word_keeps_the_english_context() {
+        let mut core = bilingual_core();
+        with_prior(&mut core, LangId::En);
+
+        assert_eq!(type_word(&mut core, &TO), "to");
+    }
+
+    /// Symmetry: a Bulgarian context must not trap a genuine English word.
+    #[test]
+    fn english_word_after_bulgarian_context_is_rescored_to_english() {
+        let mut core = bilingual_core();
+        with_prior(&mut core, LangId::Bg);
+
+        assert_eq!(type_word(&mut core, &HELLO), "hello");
+    }
+
+    /// Typing momentum is the other prior source: after a committed
+    /// Bulgarian word the momentum says BG, yet a clearly English word typed
+    /// next must still be re-scored to English (on the old code it locked to
+    /// „ис").
+    #[test]
+    fn momentum_prior_after_bulgarian_word_does_not_lock_english() {
+        let mut core = bilingual_core();
+        assert_eq!(type_word(&mut core, &IMASH), "имаш");
+        core.handle_key(press_raw(57));
+        assert_eq!(type_word(&mut core, &IS), "is");
+    }
+
+    // ── S03/P3a RED: exact one-sided evidence must win at the boundary ─────
+    //
+    // An early EN display lock on the prefix ("stat") must not decide the
+    // committed word when the full physical word has exact support on
+    // exactly ONE side (BG "статия"; no EN word starts with "statiq").
+    // Desired: one CommitText("статия"), one forwarded delimiter, no
+    // ReplaceWord, empty composition.  The guards below pin the readings
+    // that must NOT change with that fix.
+
+    /// s t a t i q → EN "statiq" / BG phonetic "статия".
+    const STATIQ: [u16; 6] = [31, 20, 30, 20, 23, 16];
+    /// s t a t u s / s t a t i c / s t a t i o n.
+    const STATUS: [u16; 6] = [31, 20, 30, 20, 22, 31];
+    const STATIC: [u16; 6] = [31, 20, 30, 20, 23, 46];
+    const STATION: [u16; 7] = [31, 20, 30, 20, 23, 24, 49];
+    /// s t a t i x: no exact support on either side.
+    const STATIX: [u16; 6] = [31, 20, 30, 20, 23, 45];
+
+    /// Controlled one-sided corpus: EN has strong prefix support for "stat"
+    /// through longer words only (EN-exact for "statiq" = 0); BG has exact
+    /// support for the full word only, weaker than the EN prefix, so the
+    /// display locks EN at char 4.
+    fn one_sided_exact_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        assert!(core.config.dual_buffer.enabled);
+        for (w, f) in [
+            ("status", 900_000u32),
+            ("static", 600_000),
+            ("station", 500_000),
+        ] {
+            core.load_word_lang(w, f, LangId::En);
+        }
+        core.load_word_lang("статия", 50_000, LangId::Bg);
+        core
+    }
+
+    /// (committed texts, forwarded delimiters, replacements) of one action list.
+    fn delimiter_shape(actions: &[Action]) -> (Vec<String>, usize, usize) {
+        let commits = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::CommitText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let forwards = actions
+            .iter()
+            .filter(|a| matches!(a, Action::ForwardKey))
+            .count();
+        let replaces = actions
+            .iter()
+            .filter(|a| matches!(a, Action::ReplaceWord { .. }))
+            .count();
+        (commits, forwards, replaces)
+    }
+
+    #[test]
+    fn exact_statia_boundary_reaches_one_committed_word() {
+        let mut core = one_sided_exact_core();
+        // "stat": EN 900_000 vs BG 50_000 → 0.947 ≥ 0.85 at four chars.
+        type_word(&mut core, &STATIQ[..4]);
+        let (dual, locked, _) = core.debug_state();
+        assert!(
+            dual && locked,
+            "precondition: early EN display lock on the prefix"
+        );
+        // "iq": no EN word continues "statiq"; BG "статия" is exact.
+        type_word(&mut core, &STATIQ[4..]);
+
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        assert_eq!(commits, vec!["статия".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    // ── Guards (expected PASS): readings a boundary fix must not change ────
+
+    /// EN-exact > 0, BG-exact = 0: the English word stays English.
+    #[test]
+    fn english_status_static_station_commit_english() {
+        for (codes, expected) in [
+            (&STATUS[..], "status"),
+            (&STATIC[..], "static"),
+            (&STATION[..], "station"),
+        ] {
+            let mut core = one_sided_exact_core();
+            type_word(&mut core, codes);
+            let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+            assert_eq!(commits, vec![expected.to_string()]);
+            assert_eq!(forwards, 1);
+            assert_eq!(replaces, 0);
+        }
+    }
+
+    /// EN-exact = 0 and BG-exact = 0: no crossover, the displayed reading is
+    /// committed as typed (unsupported input acquires no new policy).
+    #[test]
+    fn unsupported_both_keeps_displayed_reading() {
+        let mut core = one_sided_exact_core();
+        type_word(&mut core, &STATIX);
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        assert_eq!(commits, vec!["statix".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+    }
+
+    /// Both sides have exact support ("to" 5_000_000 / "то" 700_000): the
+    /// existing evidence decides, the two-supported policy is untouched.
+    #[test]
+    fn both_supported_short_word_keeps_current_reading() {
+        let mut core = bilingual_core();
+        type_word(&mut core, &TO);
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        assert_eq!(commits, vec!["to".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+    }
+
+    // ── GREEN state guards: what the boundary selection must carry along ──
+
+    fn press_key(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    /// The selected script drives the detector, momentum and context that
+    /// `commit_word_internal` learns from — not the display lock.
+    #[test]
+    fn detector_and_momentum_follow_the_selected_word() {
+        let mut core = one_sided_exact_core();
+        core.config.lang_detection = true;
+        type_word(&mut core, &STATIQ);
+        core.handle_key(press_raw(57));
+        assert_eq!(core.lang_detector.detected().lang, LangId::Bg);
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::Bg));
+        assert_eq!(core.context.back().map(String::as_str), Some("статия"));
+
+        let mut core = one_sided_exact_core();
+        core.config.lang_detection = true;
+        type_word(&mut core, &STATUS);
+        core.handle_key(press_raw(57));
+        assert_eq!(core.lang_detector.detected().lang, LangId::En);
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::En));
+        assert_eq!(core.context.back().map(String::as_str), Some("status"));
+    }
+
+    /// Return is a literal delimiter like Space: same selection, same shape.
+    #[test]
+    fn return_boundary_uses_the_same_selection() {
+        let mut core = one_sided_exact_core();
+        type_word(&mut core, &STATIQ);
+        let (commits, forwards, replaces) =
+            delimiter_shape(&core.handle_key(press_key(Key::Return)));
+        assert_eq!(commits, vec!["статия".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// The non-alphabetic boundary (punctuation) uses the same selection.
+    #[test]
+    fn punctuation_boundary_uses_the_same_selection() {
+        let mut core = one_sided_exact_core();
+        type_word(&mut core, &STATIQ);
+        let (commits, forwards, replaces) =
+            delimiter_shape(&core.handle_key(press_key(Key::Char(','))));
+        assert_eq!(commits, vec!["статия".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// Flush paths are outside this cycle: focus loss still delivers the
+    /// displayed reading.  Characterization of an explicit later task, not a
+    /// desired-output assertion.
+    #[test]
+    fn focus_lost_flush_keeps_the_displayed_reading() {
+        let mut core = one_sided_exact_core();
+        type_word(&mut core, &STATIQ);
+        let (commits, forwards, replaces) = delimiter_shape(&core.focus_lost());
+        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(forwards, 0);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    // ── Deferred flush task: Tab/Right characterizations on the same fixture ──
+
+    /// One-sided fixture with ghost text disabled, so Tab/Right exercise the
+    /// flush paths and never an accept.
+    fn one_sided_exact_core_without_ghost() -> InputMethodCore {
+        let mut core = one_sided_exact_core();
+        core.config.ghost_text = false;
+        core
+    }
+
+    /// Tab without a ghost flushes the displayed reading (no boundary
+    /// resolution on this path).  Characterization of the later flush task.
+    #[test]
+    fn tab_flush_keeps_the_displayed_reading() {
+        let mut core = one_sided_exact_core_without_ghost();
+        type_word(&mut core, &STATIQ);
+        assert!(core.ghost.is_empty(), "precondition: no ghost to accept");
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_key(Key::Tab)));
+        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// Right without a ghost is a cursor move: flush the displayed reading,
+    /// then reset the word, context and detector.  Characterization.
+    #[test]
+    fn right_without_ghost_flushes_and_resets_context() {
+        let mut core = one_sided_exact_core_without_ghost();
+        type_word(&mut core, &STATIQ);
+        assert!(core.ghost.is_empty(), "precondition: no ghost to accept");
+        let (commits, forwards, replaces) =
+            delimiter_shape(&core.handle_key(press_key(Key::Right)));
+        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+        assert!(core.context.is_empty());
+        let detected = core.lang_detector.detected();
+        assert_eq!(detected.lang, LangId::En);
+        assert_eq!(detected.confidence, 0.0);
+    }
+
+    // ── S03-EXACT-FREQ-SHADOW (RED): post-commit correction, public path ──
+
+    /// EN "stat" (7) is shadowed by "status" (900_000) in the completion
+    /// search; BG "стат" (20) and "ви" (20) are exact.  Post-commit
+    /// auto-correction is switched on for this fixture only.
+    fn shadowed_exact_core() -> InputMethodCore {
+        let config = InputConfig {
+            ghost_text: false,
+            space_accept: false,
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        };
+        let mut core = InputMethodCore::new(config);
+        assert!(core.config.dual_buffer.enabled);
+        core.load_word_lang("stat", 7, LangId::En);
+        core.load_word_lang("status", 900_000, LangId::En);
+        core.load_word_lang("стат", 20, LangId::Bg);
+        core.load_word_lang("ви", 20, LangId::Bg);
+        core
+    }
+
+    /// Desired: a typed word that exists (7) is not auto-corrected to a
+    /// transliteration that is merely 20/7 ≈ 2.9× more frequent (below the
+    /// 5× rule).  RED today: `word_frequency("stat")` is shadowed to 0.0, so
+    /// the correction fires and a ReplaceWord("стат") follows the commit.
+    #[test]
+    fn shadowed_typed_word_is_not_auto_corrected_on_the_public_path() {
+        let mut core = shadowed_exact_core();
+        type_word(&mut core, &STATIQ[..4]);
+        assert_eq!(core.current_word(), "stat");
+        assert_eq!(core.engine.score_exact_both("stat", "стат"), (7.0, 20.0));
+
+        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        assert_eq!(commits, vec!["stat".to_string()]);
+        assert_eq!(forwards, 1);
+        assert_eq!(replaces, 0);
+        assert_eq!(core.current_word(), "");
+    }
+
+    /// Guard (expected PASS): a typed word that is genuinely absent from its
+    /// own model is still corrected when the other side is supported.
+    #[test]
+    fn genuinely_absent_typed_word_is_still_corrected() {
+        let core = shadowed_exact_core();
+        // Physical phonetic spelling of the same supported BG word "ви".
+        assert_eq!(crate::lang_detect::transliterate("wi"), "ви");
+        assert_eq!(
+            core.try_language_correction("wi"),
+            Some(Action::ReplaceWord {
+                replace_len: 2,
+                text: "ви".to_string(),
+            })
+        );
+    }
+
+    // ── S03/P3b Caps: BG-only letters on the bracket keys ─────────────────
+    //
+    // Before `keymap::scancode_to_both_with_caps` the RawCode arm resolved
+    // ONE shift state for both layouts and treated evdev 26/27/41/43 as
+    // non-letters (is_alpha_scancode), so Caps Lock never uppercased
+    // ш/щ/ч/ю and Shift+Caps never lowercased them, even inside a locked
+    // Bulgarian word.  The eight cases below were the RED for that defect
+    // and now pin the per-layout latch; the guards pin the English bracket
+    // symbols that must not change.  Fixtures are one-sided synthetic
+    // corpora, ghost text off, post-commit flags at their defaults.
+
+    fn press_raw_with(code: u16, modifiers: Modifiers) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers,
+        }
+    }
+
+    /// m a m a on the raw route (evdev 50, 30, 50, 30) → EN "mama" / BG "мама".
+    const MAMA: [u16; 4] = [50, 30, 50, 30];
+    /// t e s t on the raw route (evdev 20, 18, 31, 20) → EN "test" / BG "тест".
+    const TEST: [u16; 4] = [20, 18, 31, 20];
+    /// (evdev code, BG lower, BG upper, EN unshifted, EN shifted).
+    const BRACKET_KEYS: [(u16, char, char, char, char); 4] = [
+        (26, 'ш', 'Ш', '[', '{'),
+        (27, 'щ', 'Щ', ']', '}'),
+        (41, 'ч', 'Ч', '`', '~'),
+        (43, 'ю', 'Ю', '\\', '|'),
+    ];
+
+    fn no_ghost_config() -> InputConfig {
+        InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        }
+    }
+
+    /// One-sided BG fixture: only "мама" is known, no English support at all.
+    fn bg_only_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        assert!(core.config.dual_buffer.enabled);
+        core.load_word_lang("мама", 100_000, LangId::Bg);
+        core
+    }
+
+    /// One-sided EN fixture: only "test" is known, no Bulgarian support at all.
+    fn en_only_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        assert!(core.config.dual_buffer.enabled);
+        core.load_word_lang("test", 100_000, LangId::En);
+        core
+    }
+
+    /// Types МАМА with Caps Lock on the public raw route and asserts the BG
+    /// winner + lock precondition independently of the target key.
+    fn locked_bg_mama_with_caps() -> InputMethodCore {
+        let mut core = bg_only_core();
+        for code in MAMA {
+            core.handle_key(press_raw_with(code, Modifiers::CAPS_LOCK));
+        }
+        let (dual, locked, _) = core.debug_state();
+        assert!(dual && locked, "precondition: BG lock on МАМА");
+        let db = core.dual_buffer.as_ref().expect("dual buffer");
+        assert_eq!(db.winner_lang(), LangId::Bg);
+        assert_eq!(db.bg_text(), "МАМА");
+        assert_eq!(db.en_text(), "MAMA");
+        assert_eq!(core.current_word(), "МАМА");
+        core
+    }
+
+    /// Types TEST with Caps Lock on the public raw route and asserts the EN
+    /// winner + lock precondition.
+    fn locked_en_test_with_caps() -> InputMethodCore {
+        let mut core = en_only_core();
+        for code in TEST {
+            core.handle_key(press_raw_with(code, Modifiers::CAPS_LOCK));
+        }
+        let (dual, locked, _) = core.debug_state();
+        assert!(dual && locked, "precondition: EN lock on TEST");
+        let db = core.dual_buffer.as_ref().expect("dual buffer");
+        assert_eq!(db.winner_lang(), LangId::En);
+        assert_eq!(db.en_text(), "TEST");
+        assert_eq!(db.bg_text(), "ТЕСТ");
+        assert_eq!(core.current_word(), "TEST");
+        core
+    }
+
+    /// Presses one bracket key on a locked composition and returns
+    /// (BG buffer, EN buffer, visible ShowComposing text, current_word).
+    fn press_bracket(
+        core: &mut InputMethodCore,
+        code: u16,
+        mods: Modifiers,
+    ) -> (String, String, String, String) {
+        let actions = core.handle_key(press_raw_with(code, mods));
+        let typed = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::ShowComposing { typed, .. } => Some(typed.clone()),
+                _ => None,
+            })
+            .expect("composing preedit after a bracket key");
+        let db = core.dual_buffer.as_ref().expect("dual buffer");
+        (
+            db.bg_text().to_string(),
+            db.en_text().to_string(),
+            typed,
+            core.current_word().to_string(),
+        )
+    }
+
+    /// RED: Caps Lock must uppercase the BG-only letter inside a locked
+    /// Bulgarian word; the English shadow keeps the unshifted symbol.
+    fn assert_caps_uppercases(idx: usize) {
+        let (code, _lower, upper, en_plain, _en_shift) = BRACKET_KEYS[idx];
+        let mut core = locked_bg_mama_with_caps();
+        let (bg, en, typed, word) = press_bracket(&mut core, code, Modifiers::CAPS_LOCK);
+        let expected = format!("МАМА{upper}");
+        assert_eq!(bg, expected, "BG buffer under Caps Lock, code {code}");
+        assert_eq!(
+            en,
+            format!("MAMA{en_plain}"),
+            "EN shadow under Caps Lock, code {code}"
+        );
+        assert_eq!(typed, expected, "visible composing text, code {code}");
+        assert_eq!(word, expected, "current_word, code {code}");
+    }
+
+    /// RED: Shift + Caps Lock cancel out on a letter, so the BG-only letter
+    /// must be lowercase; the English shadow keeps the shifted symbol.
+    fn assert_shift_caps_lowercases(idx: usize) {
+        let (code, lower, _upper, _en_plain, en_shift) = BRACKET_KEYS[idx];
+        let mut core = locked_bg_mama_with_caps();
+        let mods = Modifiers::CAPS_LOCK | Modifiers::SHIFT;
+        let (bg, en, typed, word) = press_bracket(&mut core, code, mods);
+        let expected = format!("МАМА{lower}");
+        assert_eq!(bg, expected, "BG buffer under Shift+Caps, code {code}");
+        assert_eq!(
+            en,
+            format!("MAMA{en_shift}"),
+            "EN shadow under Shift+Caps, code {code}"
+        );
+        assert_eq!(typed, expected, "visible composing text, code {code}");
+        assert_eq!(word, expected, "current_word, code {code}");
+    }
+
+    #[test]
+    fn caps_lock_uppercases_bg_letter_on_code_26_sh() {
+        assert_caps_uppercases(0);
+    }
+
+    #[test]
+    fn caps_lock_uppercases_bg_letter_on_code_27_sht() {
+        assert_caps_uppercases(1);
+    }
+
+    #[test]
+    fn caps_lock_uppercases_bg_letter_on_code_41_ch() {
+        assert_caps_uppercases(2);
+    }
+
+    #[test]
+    fn caps_lock_uppercases_bg_letter_on_code_43_yu() {
+        assert_caps_uppercases(3);
+    }
+
+    #[test]
+    fn shift_plus_caps_lowercases_bg_letter_on_code_26_sh() {
+        assert_shift_caps_lowercases(0);
+    }
+
+    #[test]
+    fn shift_plus_caps_lowercases_bg_letter_on_code_27_sht() {
+        assert_shift_caps_lowercases(1);
+    }
+
+    #[test]
+    fn shift_plus_caps_lowercases_bg_letter_on_code_41_ch() {
+        assert_shift_caps_lowercases(2);
+    }
+
+    #[test]
+    fn shift_plus_caps_lowercases_bg_letter_on_code_43_yu() {
+        assert_shift_caps_lowercases(3);
+    }
+
+    /// Guard (expected PASS): on a locked English word the bracket keys keep
+    /// their English semantics under Caps, Shift and Shift+Caps.
+    #[test]
+    fn english_bracket_symbols_are_unchanged_by_caps_lock() {
+        for (code, _lower, _upper, en_plain, en_shift) in BRACKET_KEYS {
+            for (mods, symbol) in [
+                (Modifiers::CAPS_LOCK, en_plain),
+                (Modifiers::SHIFT, en_shift),
+                (Modifiers::CAPS_LOCK | Modifiers::SHIFT, en_shift),
+            ] {
+                let mut core = locked_en_test_with_caps();
+                let (_bg, en, typed, word) = press_bracket(&mut core, code, mods);
+                let expected = format!("TEST{symbol}");
+                assert_eq!(en, expected, "EN buffer, code {code} mods {mods:?}");
+                assert_eq!(typed, expected, "visible text, code {code} mods {mods:?}");
+                assert_eq!(word, expected, "current_word, code {code} mods {mods:?}");
+            }
+        }
+    }
+
+    /// Guard (expected PASS): without the dual buffer the bracket keys are
+    /// plain English punctuation, unaffected by Caps Lock; a fresh core per
+    /// code and modifier set.
+    #[test]
+    fn bracket_symbols_without_dual_buffer_ignore_caps_lock() {
+        for (code, _lower, _upper, en_plain, en_shift) in BRACKET_KEYS {
+            for (mods, symbol) in [
+                (Modifiers::CAPS_LOCK, en_plain),
+                (Modifiers::SHIFT, en_shift),
+                (Modifiers::CAPS_LOCK | Modifiers::SHIFT, en_shift),
+            ] {
+                let mut config = no_ghost_config();
+                config.dual_buffer.enabled = false;
+                let mut core = InputMethodCore::new(config);
+                core.handle_key(press_raw_with(code, mods));
+                assert_eq!(
+                    core.current_word(),
+                    symbol.to_string(),
+                    "code {code} mods {mods:?}"
+                );
+            }
+        }
+    }
+
+    // ── U2 evidence-origin API, core-level nodes (commit 1) ─────────────────
+    //
+    // The push path scores BEFORE it applies the prior (input.rs
+    // handle_dual_buffer_key: `update_scores` then `apply_prior_lock_hint`),
+    // so the hint is the last writer at len == 1 and only when the prior
+    // differs from the scored winner.  The Backspace arm rescoring never
+    // re-applies the hint.  A fresh core with no loaded words scores (0, 0)
+    // for every reading, and `with_prior` stands in for Bg momentum.
+
+    use crate::dual_buffer::EvidenceOrigin;
+
+    fn press_backspace() -> KeyEvent {
+        KeyEvent {
+            key: Key::Backspace,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    /// R7c (characterization, expected PASS): a Backspace that empties the
+    /// dual buffer drops it, so no reader can see a live buffer at len 0;
+    /// the next dual key starts a fresh, unlocked buffer.
+    #[test]
+    fn backspace_to_empty_drops_the_dual_buffer_and_the_next_key_starts_fresh() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        core.handle_key(press_raw(16)); // q / я
+        assert!(core.dual_buffer.is_some(), "premise: dual buffer alive");
+        let actions = core.handle_key(press_backspace());
+        assert_eq!(actions, vec![Action::HideGhost]);
+        assert!(core.dual_buffer.is_none(), "buffer dropped at len 0");
+        assert_eq!(core.current_word(), "");
+        core.handle_key(press_raw(16));
+        let db = core
+            .dual_buffer
+            .as_ref()
+            .expect("premise: fresh dual buffer");
+        assert_eq!(db.len(), 1);
+        assert!(!db.is_locked());
+    }
+
+    /// R9: a both-zero word on a fresh core keeps the literal EN reading (D2)
+    /// and the buffer reports UnsupportedBoth — unsupported is not "force BG".
+    #[test]
+    fn unsupported_word_on_a_fresh_core_keeps_the_literal_reading() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        core.handle_key(press_raw(16)); // q / я
+        core.handle_key(press_raw(45)); // x / ь
+        assert_eq!(core.current_word(), "qx", "premise: literal EN reading");
+        let db = core
+            .dual_buffer
+            .as_ref()
+            .expect("premise: dual buffer alive");
+        assert_eq!(db.winner_lang(), LangId::En, "premise: En tie-break winner");
+        assert_eq!(db.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+    }
+
+    /// R9b (reading-only characterization of CURRENT behaviour while ROOT Q4
+    /// is open): after a Bg prior the first character is rendered Cyrillic by
+    /// the prior override, and a both-zero continuation inherits that winner,
+    /// so the code token "qx" composes as "яь".  A Q4 reversal REQUIRES this
+    /// node to be changed; a green run is not an endorsement of the policy.
+    /// Asserts nothing about `evidence_origin()`.
+    #[test]
+    fn unsupported_word_after_a_bg_prior_composes_in_cyrillic_today() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        with_prior(&mut core, LangId::Bg);
+        core.handle_key(press_raw(16)); // q / я
+        assert_eq!(
+            core.current_word(),
+            "я",
+            "char 1: the prior override renders Cyrillic"
+        );
+        core.handle_key(press_raw(45)); // x / ь
+        assert_eq!(core.current_word(), "яь");
+    }
+
+    /// R9b-origin: the same sequence reports PriorOnly at char 1 (the hint
+    /// overrode the En tie-break winner) and UnsupportedBoth at char 2 — the
+    /// winner is inherited from the prior, which is what Q4 is about.
+    #[test]
+    fn unsupported_word_after_a_bg_prior_reports_unsupported_both_inherited_from_prior_only() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        with_prior(&mut core, LangId::Bg);
+        core.handle_key(press_raw(16)); // q / я
+        assert!(core.dual_buffer.is_some(), "premise: dual buffer alive");
+        {
+            let db = core.dual_buffer.as_ref().unwrap();
+            assert_eq!(
+                db.winner_lang(),
+                LangId::Bg,
+                "premise: the Bg prior overrode the En tie-break winner"
+            );
+            assert_eq!(
+                db.evidence_origin(),
+                EvidenceOrigin::PriorOnly,
+                "char 1: prior override → PriorOnly (origin table)"
+            );
+        }
+        core.handle_key(press_raw(45)); // x / ь
+        let db = core
+            .dual_buffer
+            .as_ref()
+            .expect("premise: dual buffer alive");
+        assert_eq!(db.winner_lang(), LangId::Bg, "premise: winner inherited");
+        assert_eq!(db.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+    }
+
+    /// R9c (characterization of an asymmetry, pinned deliberately): Backspace
+    /// back to one character rescores through the Backspace arm, which never
+    /// re-applies the prior — push-to-1 reports PriorOnly, backspace-to-1
+    /// reports UnsupportedBoth for the same buffer.  A later phase changes
+    /// this on purpose or not at all.  If the asymmetry is ever ruled a bug,
+    /// the Backspace arm (`Key::Backspace` in `handle_key`: rescoring only) is
+    /// the odd one out — it drops the prior entirely, not just the origin;
+    /// the push path (`handle_dual_buffer_key`) is the reference behaviour.
+    #[test]
+    fn backspace_to_one_char_rescores_without_reapplying_the_prior() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        with_prior(&mut core, LangId::Bg);
+        core.handle_key(press_raw(16)); // q / я
+        core.handle_key(press_raw(45)); // x / ь
+        core.handle_key(press_backspace());
+        assert_eq!(
+            core.current_word(),
+            "я",
+            "premise: one char left, Cyrillic reading kept"
+        );
+        let db = core
+            .dual_buffer
+            .as_ref()
+            .expect("premise: dual buffer alive");
+        assert_eq!(db.len(), 1, "premise");
+        assert_eq!(db.winner_lang(), LangId::Bg, "premise: winner inherited");
+        assert_eq!(db.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+    }
+
+    /// R11 (test_gap, expected PASS today — U2 F6): the detector is fed the
+    /// inherited winner with confidence 0.5 as if it were corpus evidence
+    /// (`feed_dual_result` on every unlocked character).  Flips when D5
+    /// (skip Initial/UnsupportedBoth/PriorOnly) lands as its own phase.
+    #[test]
+    fn test_gap_detector_reads_an_unsupported_winner_as_half_confidence_evidence() {
+        let mut core = InputMethodCore::new(no_ghost_config());
+        assert!(core.config.lang_detection, "premise: detection on");
+        core.handle_key(press_raw(16)); // q / я
+        core.handle_key(press_raw(45)); // x / ь
+        let det = core.lang_detector.detected();
+        assert_eq!(det.lang, LangId::En);
+        assert!(
+            (det.confidence - 0.5).abs() < 1e-9,
+            "today: feed_dual_result(En, 0.5) reports the inherited winner as evidence"
+        );
     }
 }

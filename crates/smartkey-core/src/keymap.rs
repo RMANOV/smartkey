@@ -34,11 +34,32 @@ pub fn scancode_to_both(code: u16, shift: bool) -> Option<(char, char)> {
     Some((en, bg))
 }
 
+/// Map a scancode to both interpretations with the Caps Lock latch applied
+/// **per layout**: Caps Lock inverts Shift only where that layout's unshifted
+/// character is a letter.  The bracket keys carry Bulgarian letters (ш щ ч ю)
+/// but English punctuation, so one shared shift decision is wrong for one of
+/// the two sides; `is_alpha_scancode` (shared alphabetic set) is left as it is.
+///
+/// Returns `None` exactly when [`scancode_to_both`] would.
+pub(crate) fn scancode_to_both_with_caps(
+    code: u16,
+    shift_held: bool,
+    caps_lock: bool,
+) -> Option<(char, char)> {
+    let en_unshifted = en_qwerty(code, false)?;
+    let bg_unshifted = bg_phonetic(code, false)?;
+    let en_shift = shift_held ^ (caps_lock && en_unshifted.is_alphabetic());
+    let bg_shift = shift_held ^ (caps_lock && bg_unshifted.is_alphabetic());
+    let en = en_qwerty(code, en_shift)?;
+    let bg = bg_phonetic(code, bg_shift)?;
+    Some((en, bg))
+}
+
 /// Find the physical EN/BG pair whose character on `layout` is `ch`.
 ///
 /// This reverse lookup deliberately reuses the hardware tables above.  The
-/// legacy text-transliteration map is not equivalent to xkeyboard-config's
-/// traditional phonetic layout for keys such as в/ш/щ/ч/ю.
+/// text-conversion helpers reuse these physical tables so в/ш/щ/ч/ю cannot
+/// acquire a second, inconsistent phonetic spelling.
 pub(crate) fn physical_pair_for_char(layout: Layout, ch: char) -> Option<(char, char)> {
     for code in 2..=53 {
         for shift in [false, true] {
@@ -175,8 +196,8 @@ fn en_qwerty(code: u16, shift: bool) -> Option<char> {
 // ======================================================================
 //
 // Letter keys follow xkeyboard-config's `bg(phonetic)` variant. This is a
-// physical keyboard map, intentionally separate from the legacy text
-// transliteration helper in `lang_detect`.
+// physical keyboard map, also reused by the text-conversion helpers in
+// `lang_detect`.
 
 fn bg_phonetic(code: u16, shift: bool) -> Option<char> {
     let (lower, upper) = match code {
@@ -422,5 +443,228 @@ mod tests {
         assert_eq!(scancode_to_char(44, true, Layout::Bg), Some('З'));
         assert_eq!(scancode_to_char(17, true, Layout::Bg), Some('В'));
         assert_eq!(scancode_to_char(41, true, Layout::Bg), Some('Ч'));
+    }
+
+    // ── Per-layout Caps Lock (S03/P3b) ───────────────────────────────────
+    //
+    // Expected outputs are written out explicitly; nothing below derives an
+    // expectation from the helper under test.
+
+    /// The four bracket keys: English punctuation, Bulgarian letters.
+    /// Columns: (shift_held, caps_lock) → (en, bg).
+    #[test]
+    fn test_with_caps_bg_only_letters_follow_the_latch_en_symbols_do_not() {
+        let cases: [(u16, [(bool, bool, (char, char)); 4]); 4] = [
+            (
+                26,
+                [
+                    (false, false, ('[', 'ш')),
+                    (true, false, ('{', 'Ш')),
+                    (false, true, ('[', 'Ш')),
+                    (true, true, ('{', 'ш')),
+                ],
+            ),
+            (
+                27,
+                [
+                    (false, false, (']', 'щ')),
+                    (true, false, ('}', 'Щ')),
+                    (false, true, (']', 'Щ')),
+                    (true, true, ('}', 'щ')),
+                ],
+            ),
+            (
+                41,
+                [
+                    (false, false, ('`', 'ч')),
+                    (true, false, ('~', 'Ч')),
+                    (false, true, ('`', 'Ч')),
+                    (true, true, ('~', 'ч')),
+                ],
+            ),
+            (
+                43,
+                [
+                    (false, false, ('\\', 'ю')),
+                    (true, false, ('|', 'Ю')),
+                    (false, true, ('\\', 'Ю')),
+                    (true, true, ('|', 'ю')),
+                ],
+            ),
+        ];
+        for (code, table) in cases {
+            for (shift_held, caps_lock, expected) in table {
+                assert_eq!(
+                    scancode_to_both_with_caps(code, shift_held, caps_lock),
+                    Some(expected),
+                    "code {code} shift_held {shift_held} caps_lock {caps_lock}"
+                );
+            }
+        }
+    }
+
+    /// An ordinary key that is a letter on both layouts: Caps Lock inverts
+    /// Shift on both sides, exactly like the shared decision did.
+    #[test]
+    fn test_with_caps_ordinary_dual_letter_inverts_on_both_layouts() {
+        assert_eq!(
+            scancode_to_both_with_caps(35, false, false),
+            Some(('h', 'х'))
+        );
+        assert_eq!(
+            scancode_to_both_with_caps(35, true, false),
+            Some(('H', 'Х'))
+        );
+        assert_eq!(
+            scancode_to_both_with_caps(35, false, true),
+            Some(('H', 'Х'))
+        );
+        assert_eq!(scancode_to_both_with_caps(35, true, true), Some(('h', 'х')));
+    }
+
+    /// Digits and punctuation shared by both layouts ignore the latch and
+    /// still follow a held Shift.
+    #[test]
+    fn test_with_caps_digits_and_shared_punctuation_ignore_the_latch() {
+        for (code, plain, shifted) in [(2u16, '1', '!'), (12, '-', '_'), (51, ',', '<')] {
+            assert_eq!(
+                scancode_to_both_with_caps(code, false, false),
+                Some((plain, plain))
+            );
+            assert_eq!(
+                scancode_to_both_with_caps(code, false, true),
+                Some((plain, plain))
+            );
+            assert_eq!(
+                scancode_to_both_with_caps(code, true, false),
+                Some((shifted, shifted))
+            );
+            assert_eq!(
+                scancode_to_both_with_caps(code, true, true),
+                Some((shifted, shifted))
+            );
+        }
+    }
+
+    /// Special keys and unknown scancodes stay `None`, as with the shared
+    /// mapping, whatever the modifiers.
+    #[test]
+    fn test_with_caps_special_and_unknown_scancodes_are_none() {
+        for code in [57u16, 15, 999] {
+            for (shift_held, caps_lock) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                assert_eq!(
+                    scancode_to_both(code, shift_held),
+                    None,
+                    "baseline code {code}"
+                );
+                assert_eq!(
+                    scancode_to_both_with_caps(code, shift_held, caps_lock),
+                    None,
+                    "code {code} shift_held {shift_held} caps_lock {caps_lock}"
+                );
+            }
+        }
+    }
+
+    /// Exhaustive invariant over every scancode: without the latch the new
+    /// helper is exactly the shared mapping, and with the latch it is defined
+    /// for exactly the same codes (both tables are symmetric between their
+    /// unshifted and shifted rows, so the `?` chains cannot diverge).
+    #[test]
+    fn test_with_caps_matches_shared_mapping_for_every_scancode() {
+        for code in 0..=255u16 {
+            for shift_held in [false, true] {
+                let baseline = scancode_to_both(code, shift_held);
+                assert_eq!(
+                    scancode_to_both_with_caps(code, shift_held, false),
+                    baseline,
+                    "caps off must equal the shared mapping: code {code} shift {shift_held}"
+                );
+                assert_eq!(
+                    scancode_to_both_with_caps(code, shift_held, true).is_some(),
+                    baseline.is_some(),
+                    "caps on must be defined for the same codes: code {code} shift {shift_held}"
+                );
+            }
+        }
+    }
+
+    // ── LEGACY-PHONETIC-MAP-DIVERGENCE (test-only RED characterization) ─────
+    //
+    // The former ASCII table disagreed on `w`/`v` and omitted the bracket-key
+    // letters. These three genuine RED requirements retain their desired
+    // physical-layout assertions; the consistency guard replaces the former
+    // known-gap characterization after realignment.
+
+    const ALPHA_SCANCODES: [u16; 26] = [
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36, 37, 38, 44, 45, 46, 47,
+        48, 49, 50,
+    ];
+
+    /// RED: the legacy map must agree with the physical layout on every
+    /// letter key (fails today at evdev 17: `w` → legacy ш, physical в).
+    #[test]
+    fn test_legacy_phonetic_map_matches_physical_layout_on_letter_keys() {
+        for code in ALPHA_SCANCODES {
+            let (en, bg) = scancode_to_both(code, false).expect("letter key");
+            assert_eq!(
+                crate::lang_detect::phonetic_map(en),
+                Some(bg),
+                "code {code}: legacy map for {en} vs physical layout"
+            );
+        }
+    }
+
+    /// RED: a transliterated Latin spelling must equal what the physical keys
+    /// compose (the caps test types z d r a w e j and gets ЗДРАВЕЙ).
+    #[test]
+    fn test_legacy_transliterate_matches_physical_composition() {
+        assert_eq!(crate::lang_detect::transliterate("zdrawej"), "здравей");
+        assert_eq!(crate::lang_detect::transliterate("v"), "ж");
+        assert_eq!(crate::lang_detect::reverse_transliterate("вж"), "wv");
+    }
+
+    /// RED: the four BG-only letters live on the bracket keys; the legacy map
+    /// must reach them from those keys in both directions.
+    #[test]
+    fn test_legacy_transliterate_reaches_bg_only_letters() {
+        assert_eq!(crate::lang_detect::transliterate("[]`\\"), "шщчю");
+        assert_eq!(crate::lang_detect::reverse_transliterate("шщчю"), "[]`\\");
+    }
+
+    /// After realignment, every letter and letter-bearing symbol agrees with
+    /// the physical table; shifted partners preserve uppercase composition.
+    #[test]
+    fn test_phonetic_map_agrees_with_physical_letters_and_bracket_keys() {
+        let divergent: Vec<(u16, char, char, Option<char>)> = ALPHA_SCANCODES
+            .iter()
+            .filter_map(|&code| {
+                let (en, bg) = scancode_to_both(code, false).expect("letter key");
+                let legacy = crate::lang_detect::phonetic_map(en);
+                (legacy != Some(bg)).then_some((code, en, bg, legacy))
+            })
+            .collect();
+        assert!(
+            divergent.is_empty(),
+            "physical map divergence: {divergent:?}"
+        );
+        for (code, bg) in [(26u16, 'ш'), (27, 'щ'), (41, 'ч'), (43, 'ю')] {
+            let (en, physical) = scancode_to_both(code, false).expect("bracket key");
+            assert_eq!(physical, bg, "code {code}");
+            assert_eq!(
+                crate::lang_detect::phonetic_map(en),
+                Some(bg),
+                "code {code} ({en})"
+            );
+        }
+        for code in ALPHA_SCANCODES.into_iter().chain([26, 27, 41, 43]) {
+            for shift in [false, true] {
+                let (en, bg) = scancode_to_both(code, shift).expect("letter-bearing key");
+                assert_eq!(crate::lang_detect::phonetic_map(en), Some(bg));
+                assert_eq!(crate::lang_detect::reverse_phonetic_map(bg), Some(en));
+            }
+        }
     }
 }

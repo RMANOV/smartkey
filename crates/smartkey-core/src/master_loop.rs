@@ -151,7 +151,20 @@ impl MasterLoop {
         }
 
         // ── Phase 2: DELEGATE to core ────────────────────────────────
-        let is_accept_key = matches!(event.key, crate::input::Key::Tab | crate::input::Key::Right);
+        // Opt-in Space-accept (2026-08-22): an eligible Space is the same
+        // acceptance event as Tab/final Right and must be accounted once here.
+        // GREEN v4: the core's own predicate is necessary, not sufficient.
+        // The master loop owns the DISPLAY attribution (`last_shown_ghost`,
+        // consumed by the adapter's rejection feedback); only when the tracked
+        // (prefix, completion) is exactly the composition the core holds and
+        // the current top prediction does Space count as an acceptance — and
+        // the core is told so for exactly this key (one-shot attestation).
+        let is_space_accept = crate::input::InputMethodCore::is_space_event(&event)
+            && self.core.space_accept_armed()
+            && self.space_display_identity_ok();
+        self.core.attest_space_accept_display(is_space_accept);
+        let is_accept_key = matches!(event.key, crate::input::Key::Tab | crate::input::Key::Right)
+            || is_space_accept;
         let is_backspace = matches!(event.key, crate::input::Key::Backspace);
         // An accepted ghost is attributable to one immediate Backspace only.
         // Any other next key starts a new interaction and must not let a later
@@ -189,8 +202,18 @@ impl MasterLoop {
         // Track terminal Tab/final-Right acceptance for learning and immediate
         // accepted-then-Backspace rejection detection.
         if terminal_accept {
-            self.last_prediction_accept = Some(Instant::now());
             self.last_accepted_prediction = pre_accept_prediction;
+            if is_space_accept {
+                // A Space acceptance already landed its delimiter: the
+                // immediate Backspace removes only that space (text-native),
+                // so it must never be read as "accepted, then deleted".
+                // Positive learning is kept (last_accepted_prediction);
+                // the rejection attribution is not armed.
+                self.last_prediction_accept = None;
+                self.last_shown_ghost = None;
+            } else {
+                self.last_prediction_accept = Some(Instant::now());
+            }
         }
 
         // ── Phase 3: EVALUATE ────────────────────────────────────────
@@ -689,6 +712,25 @@ impl MasterLoop {
         left.trim().to_lowercase() == right.trim().to_lowercase()
     }
 
+    /// Display identity for the opt-in Space-accept (GREEN v4): the tracked
+    /// shown pair must match the live prefix, the live top prediction, and the
+    /// composition (prefix + ghost) the user currently sees.  Any gap — no
+    /// attribution (e.g. consumed by `record_ghost_rejection`), a different
+    /// prefix, a different completion — means "not the displayed candidate".
+    fn space_display_identity_ok(&self) -> bool {
+        let Some((shown_prefix, shown_completion)) = self.last_shown_ghost.as_ref() else {
+            return false;
+        };
+        let prefix = self.core.current_word();
+        let Some(top) = self.core.predictions().first() else {
+            return false;
+        };
+        let composition = format!("{prefix}{}", self.core.ghost_text());
+        Self::same_normalized(shown_prefix, prefix)
+            && Self::same_normalized(shown_completion, &top.word)
+            && Self::same_normalized(&top.word, &composition)
+    }
+
     // ======================================================================
     // Internal: Learning
     // ======================================================================
@@ -912,6 +954,175 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-9);
     }
 
+    // ── GREEN v4 (ADVOCATE_CODEX c423f1631ad2): the core Space decision must
+    // depend on the MasterLoop-authoritative DISPLAY identity, not only on the
+    // core-local predicate. ─────────────────────────────────────────────────
+
+    fn space_loop() -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig {
+            space_accept: true,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("здравей", 1_000_000);
+        for code in [44, 32, 19, 30] {
+            ml.handle_key(make_key(Key::RawCode(code)));
+        }
+        assert_eq!(ml.current_word(), "здра");
+        assert_eq!(ml.ghost_text(), "вей");
+        ml
+    }
+
+    fn assert_literal_space(ml: &mut MasterLoop) {
+        let before = ml.core.metrics().summary().accepted_predictions;
+        let actions = ml.handle_key(make_key(Key::Space));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(t) if t == "здра")),
+            "literal Space commits the typed prefix only, got {actions:?}"
+        );
+        assert!(actions.iter().any(|a| matches!(a, Action::ForwardKey)));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(t) if t.contains("здравей"))));
+        assert_eq!(
+            ml.core.metrics().summary().accepted_predictions,
+            before,
+            "no acceptance learning on a literal Space"
+        );
+    }
+
+    /// The native counterexample: the adapter's public rejection feedback
+    /// clears the display attribution while the core still holds ghost/top.
+    /// Space must then be literal.
+    #[test]
+    fn space_accept_is_literal_after_record_ghost_rejection() {
+        let mut ml = space_loop();
+        ml.record_ghost_rejection("здра", "здравей");
+        assert!(
+            ml.last_shown_ghost.is_none(),
+            "precondition: attribution consumed"
+        );
+        assert_eq!(ml.ghost_text(), "вей", "precondition: core ghost retained");
+
+        assert_literal_space(&mut ml);
+    }
+
+    #[test]
+    fn space_accept_is_literal_without_display_attribution() {
+        let mut ml = space_loop();
+        ml.last_shown_ghost = None;
+
+        assert_literal_space(&mut ml);
+    }
+
+    #[test]
+    fn space_accept_is_literal_when_tracked_prefix_differs() {
+        let mut ml = space_loop();
+        ml.last_shown_ghost = Some(("зд".to_string(), "здравей".to_string()));
+
+        assert_literal_space(&mut ml);
+    }
+
+    #[test]
+    fn space_accept_is_literal_when_tracked_completion_differs() {
+        let mut ml = space_loop();
+        ml.last_shown_ghost = Some(("здра".to_string(), "здравейте".to_string()));
+
+        assert_literal_space(&mut ml);
+    }
+
+    /// Retained-state guards: Escape (HideGhost) and a suppressed completion
+    /// both leave nothing acceptable.
+    #[test]
+    fn space_accept_is_literal_after_escape() {
+        let mut ml = space_loop();
+        ml.handle_key(make_key(Key::Escape));
+        assert!(!ml.has_ghost());
+
+        assert_literal_space(&mut ml);
+    }
+
+    #[test]
+    fn space_accept_is_literal_when_completion_is_suppressed() {
+        let mut ml = space_loop();
+        ml.record_ghost_rejection("здра", "здравей");
+        ml.record_ghost_rejection("здра", "здравей");
+        assert!(ml.is_ghost_suppressed("здра", "здравей"));
+
+        assert_literal_space(&mut ml);
+    }
+
+    /// The live adapter sends EVERY key as a raw scancode (process_keycode);
+    /// a raw Space (evdev 57) must be attested exactly like `Key::Space`.
+    #[test]
+    fn space_accept_via_raw_scancode_is_accepted() {
+        let mut ml = space_loop();
+
+        let actions = ml.handle_key(make_key(Key::RawCode(57)));
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(t) if t == "здравей ")));
+        assert!(!actions.iter().any(|a| matches!(a, Action::ForwardKey)));
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 1);
+    }
+
+    #[test]
+    fn raw_space_after_record_ghost_rejection_is_literal() {
+        let mut ml = space_loop();
+        ml.record_ghost_rejection("здра", "здравей");
+        let before = ml.core.metrics().summary().accepted_predictions;
+
+        let actions = ml.handle_key(make_key(Key::RawCode(57)));
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(t) if t == "здра")));
+        assert!(actions.iter().any(|a| matches!(a, Action::ForwardKey)));
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, before);
+    }
+
+    /// Positive control: the exact matching visible pair is accepted.
+    #[test]
+    fn space_accept_with_matching_display_identity_is_accepted() {
+        let mut ml = space_loop();
+        let shown = ml
+            .last_shown_ghost
+            .clone()
+            .expect("display attribution present");
+        assert_eq!(shown.0, "здра");
+        assert!(
+            MasterLoop::same_normalized(&shown.1, "здравей"),
+            "tracked completion is the shown word (case-normalized), got {shown:?}"
+        );
+
+        let actions = ml.handle_key(make_key(Key::Space));
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(t) if t == "здравей ")));
+        assert!(!actions.iter().any(|a| matches!(a, Action::ForwardKey)));
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 1);
+    }
+
+    /// Preservation: final Right then immediate Backspace still records the
+    /// rejection (the Tab/Right attribution path is untouched by Space).
+    #[test]
+    fn final_right_then_immediate_backspace_still_records_rejection() {
+        let mut ml = space_loop();
+        for _ in 0..3 {
+            ml.handle_key(make_key(Key::Right));
+        }
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 1);
+
+        ml.handle_key(make_key(Key::Backspace));
+
+        assert_eq!(ml.rejection_prefix_count(), 1);
+    }
+
     #[test]
     fn final_right_accept_updates_light_profile_like_tab() {
         let mut ml = MasterLoop::new(InputConfig {
@@ -937,6 +1148,144 @@ mod tests {
         assert!(
             ml.light_profile().ghost_accept_rate > before,
             "final Right is a prediction acceptance, not an ordinary commit"
+        );
+    }
+
+    /// Opt-in Space-accept (2026-08-22, ADVOCATE_CODEX bd9219aa448c A): an
+    /// eligible Space is ONE acceptance event through the master loop —
+    /// light-profile learning exactly like a terminal Tab/final Right, and the
+    /// emitted batch is the single delimiter-carrying commit with no forward.
+    #[test]
+    fn eligible_space_accept_updates_light_profile_like_tab() {
+        let mut ml = MasterLoop::new(InputConfig {
+            space_accept: true,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("здравей", 1_000_000);
+        for code in [44, 32, 19, 30] {
+            ml.handle_key(make_key(Key::RawCode(code)));
+        }
+        assert_eq!(ml.current_word(), "здра");
+        assert_eq!(ml.ghost_text(), "вей");
+
+        let before = ml.light_profile().ghost_accept_rate;
+        let actions = ml.handle_key(make_key(Key::Space));
+
+        assert!(ml.current_word().is_empty());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(t) if t == "здравей ")),
+            "one commit carrying word + delimiter, got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::ForwardKey)),
+            "the Space is consumed"
+        );
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 1);
+        assert!(
+            ml.light_profile().ghost_accept_rate > before,
+            "an eligible Space is a prediction acceptance, not an ordinary commit"
+        );
+    }
+
+    /// Flag off: the same keystrokes are an ordinary word boundary — typed
+    /// word committed, Space forwarded, nothing counted as an acceptance.
+    #[test]
+    fn literal_space_with_flag_off_is_not_an_acceptance() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("здравей", 1_000_000);
+        for code in [44, 32, 19, 30] {
+            ml.handle_key(make_key(Key::RawCode(code)));
+        }
+        assert_eq!(ml.ghost_text(), "вей");
+
+        let before = ml.light_profile().ghost_accept_rate;
+        let actions = ml.handle_key(make_key(Key::Space));
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(t) if t == "здра")));
+        assert!(actions.iter().any(|a| matches!(a, Action::ForwardKey)));
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 0);
+        assert_eq!(ml.light_profile().ghost_accept_rate, before);
+    }
+
+    /// Blocker 2 (ADVOCATE_CODEX 4f9970749edd): after a Space acceptance the
+    /// immediate Backspace removes only the delimiter (text-native), so it is
+    /// NOT a rejection of the completion. Space must record the positive
+    /// acceptance once but never arm the Tab/final-Right accepted-then-Backspace
+    /// rejection attribution.
+    #[test]
+    fn space_accept_then_immediate_backspace_is_not_a_rejection() {
+        let mut ml = MasterLoop::new(InputConfig {
+            space_accept: true,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("здравей", 1_000_000);
+        for code in [44, 32, 19, 30] {
+            ml.handle_key(make_key(Key::RawCode(code)));
+        }
+        assert_eq!(ml.ghost_text(), "вей");
+        let accepted = ml.handle_key(make_key(Key::Space));
+        assert!(accepted
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(t) if t == "здравей ")));
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 1);
+        let rate_after_accept = ml.light_profile().ghost_accept_rate;
+
+        let actions = ml.handle_key(make_key(Key::Backspace));
+
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::ForwardKey)),
+            "Backspace after a Space accept is forwarded untouched, got {actions:?}"
+        );
+        assert_eq!(
+            ml.rejection_prefix_count(),
+            0,
+            "deleting the delimiter must not record a rejection of the completion"
+        );
+        assert_eq!(
+            ml.light_profile().ghost_accept_rate,
+            rate_after_accept,
+            "no frustration REJECT may be attributed to a Space acceptance"
+        );
+        assert_eq!(ml.correction_count(), 0);
+    }
+
+    /// Guard: the Tab path keeps its attribution — Tab-accept then immediate
+    /// Backspace IS the rejection gesture (live trace 2026-08-03).
+    #[test]
+    fn tab_accept_then_immediate_backspace_still_records_rejection() {
+        let mut ml = MasterLoop::new(InputConfig {
+            space_accept: true,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("здравей", 1_000_000);
+        for code in [44, 32, 19, 30] {
+            ml.handle_key(make_key(Key::RawCode(code)));
+        }
+        assert_eq!(ml.ghost_text(), "вей");
+        ml.handle_key(make_key(Key::Tab));
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 1);
+        let rate_after_accept = ml.light_profile().ghost_accept_rate;
+
+        ml.handle_key(make_key(Key::Backspace));
+
+        assert_eq!(
+            ml.rejection_prefix_count(),
+            1,
+            "Tab-accept then immediate Backspace records one rejection"
+        );
+        assert!(
+            ml.light_profile().ghost_accept_rate < rate_after_accept,
+            "the frustration REJECT still lowers the accept rate on the Tab path"
         );
     }
 

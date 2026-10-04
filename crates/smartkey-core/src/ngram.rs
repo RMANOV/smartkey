@@ -69,6 +69,19 @@ impl NgramTrie {
         node.frequency = Some(frequency);
     }
 
+    /// Frequency stored for exactly `word`, or `None` when `word` is not a
+    /// stored word (missing path or a non-terminal node).  Unlike
+    /// [`prefix_search`](Self::prefix_search) this never returns a longer
+    /// completion, so a rare terminal is found even when a frequent child
+    /// outranks it.
+    pub fn exact_frequency(&self, word: &str) -> Option<u32> {
+        let mut node = &self.root;
+        for ch in word.chars() {
+            node = node.children.get(&ch)?;
+        }
+        node.frequency
+    }
+
     /// Return all words that start with `prefix`, sorted by frequency
     /// descending, truncated to `limit`. An empty prefix returns the
     /// highest-frequency words across the entire trie.
@@ -390,6 +403,26 @@ impl Default for NgramTrie {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_frequency_reads_the_terminal_not_the_best_completion() {
+        let mut trie = NgramTrie::new();
+        trie.insert("stat", 7);
+        trie.insert("status", 900_000);
+        trie.insert("статия", 50_000);
+
+        // A rare terminal is found although a frequent child outranks it.
+        assert_eq!(trie.exact_frequency("stat"), Some(7));
+        assert_eq!(trie.exact_frequency("status"), Some(900_000));
+        // Non-terminal node, missing path, longer word, Cyrillic.
+        assert_eq!(trie.exact_frequency("sta"), None);
+        assert_eq!(trie.exact_frequency("statiq"), None);
+        assert_eq!(trie.exact_frequency("statusx"), None);
+        assert_eq!(trie.exact_frequency("статия"), Some(50_000));
+        assert_eq!(trie.exact_frequency("стат"), None);
+        // The completion search would report the frequent child instead.
+        assert_eq!(trie.prefix_search("stat", 1)[0].word, "status");
+    }
 
     #[test]
     fn insert_and_lookup() {
