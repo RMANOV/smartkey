@@ -805,9 +805,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if self._is_spurious_zero_key_event(keyval, keycode, state):
             return True
 
-        # Track backspace so we can consume it when preedit is active,
-        # preventing the key from also deleting committed text in the app.
-        is_backspace = keyval == IBus.KEY_BackSpace
         key_release = bool(state & (1 << 30))  # IBUS_RELEASE_MASK
         pending_prediction = (
             dict(self._active_prediction)
@@ -826,17 +823,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         has_keycode_api = callable(getattr(self._core, "process_keycode", None))
         if keycode > 0 and _HAS_CORE and has_keycode_api:
             evdev_keycode = keycode if _IS_WAYLAND else max(keycode - 8, 0)
-            preedit_was_active = self._preedit_active
             actions = self._core.process_keycode(evdev_keycode, state)
             log.debug("actions (keycode): %s", actions)
             result = self._execute_actions(actions)
             self._finalize_prediction_outcome(
                 keyval, key_release, actions, pending_prediction
             )
-            # Consume backspace key-press when preedit was active so it does
-            # not reach the application.  Key-release is always forwarded.
-            if is_backspace and not key_release and preedit_was_active:
-                return True
+            # Honor the core's forward/consume decision uniformly.  ``result`` is
+            # False exactly when the core emitted a ForwardKey (key not
+            # consumed).  A composing-edit backspace already returns no
+            # ForwardKey, so it never reaches the application; keying off
+            # ``preedit_was_active`` instead swallowed a core-*forwarded*
+            # backspace whenever an anticipatory next-word ghost was showing,
+            # so committed text could not be deleted.
             return result
 
         # Fallback: keyval path (backward compat, or when keycode is 0).
@@ -858,17 +857,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             log.debug(
                 "keysym converted: 0x%04X → 0x%04X (%s)", orig_keyval, keyval, ch_repr
             )
-        preedit_was_active = self._preedit_active
         actions = self._core.handle_key(keyval, state)
         log.debug("actions: %s", actions)
         result = self._execute_actions(actions)
         self._finalize_prediction_outcome(
             keyval, key_release, actions, pending_prediction
         )
-        # Consume backspace key-press when preedit was active so it does
-        # not reach the application.  Key-release is always forwarded.
-        if is_backspace and not key_release and preedit_was_active:
-            return True
+        # Honor the core's forward/consume decision uniformly (see the keycode
+        # path above): return ``result`` rather than swallowing a
+        # core-forwarded backspace on mere ``preedit_was_active``.
         return result
 
     # -----------------------------------------------------------------------
