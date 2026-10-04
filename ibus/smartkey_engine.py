@@ -109,21 +109,15 @@ _ATTR_UNDERLINE_SINGLE = _ibus_enum_value(
 # Rust prediction engine via PyO3.
 # ---------------------------------------------------------------------------
 try:
-    from smartkey_py import (  # type: ignore[import-untyped]
-        PyInputMethodCore,
-        ffi_decode_composing_payload,
-        ffi_decode_replace_payload,
-    )
+    # Keep the core import independent from the optional protocol helpers.  A
+    # previously installed smartkey_py may expose PyInputMethodCore but predate
+    # ffi_decode_* and process_keycode; that core can still provide a safe,
+    # ordinary keyval path while the lab/native extension is rebuilt.
+    from smartkey_py import PyInputMethodCore  # type: ignore[import-untyped]
 
     _HAS_CORE = True
 except ImportError:
     _HAS_CORE = False
-
-    def ffi_decode_replace_payload(_payload: str) -> tuple[int, str] | None:
-        return None
-
-    def ffi_decode_composing_payload(_payload: str) -> tuple[str, str] | None:
-        return None
 
     class PyInputMethodCore:  # type: ignore[no-redef]
         """Stub when the native extension is not available."""
@@ -179,6 +173,37 @@ except ImportError:
 
         def predictions(self) -> list[tuple[str, float, float]]:
             return []
+
+
+def _decode_replace_payload_fallback(payload: str) -> tuple[int, str] | None:
+    """Decode the Rust ReplaceWord wire format without the optional FFI shim."""
+    if not isinstance(payload, str) or "\x1f" not in payload:
+        return None
+    length_text, text = payload.split("\x1f", 1)
+    if not length_text or not length_text.isascii() or not length_text.isdigit():
+        return None
+    return int(length_text), text
+
+
+def _decode_composing_payload_fallback(payload: str) -> tuple[str, str] | None:
+    """Decode the Rust ShowComposing wire format without the optional FFI shim."""
+    if not isinstance(payload, str) or "\x00" not in payload:
+        return None
+    return tuple(payload.split("\x00", 1))  # type: ignore[return-value]
+
+
+if _HAS_CORE:
+    try:
+        from smartkey_py import (  # type: ignore[import-untyped]
+            ffi_decode_composing_payload,
+            ffi_decode_replace_payload,
+        )
+    except ImportError:
+        ffi_decode_replace_payload = _decode_replace_payload_fallback
+        ffi_decode_composing_payload = _decode_composing_payload_fallback
+else:
+    ffi_decode_replace_payload = _decode_replace_payload_fallback
+    ffi_decode_composing_payload = _decode_composing_payload_fallback
 
 
 # ---------------------------------------------------------------------------
@@ -1096,7 +1121,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # v0.5.0: prefer raw scancode path for dual-buffer layout-agnostic input.
         # Rust tables use evdev codes. On Wayland IBus sends evdev directly;
         # on X11 IBus sends XKB (evdev + 8) — normalise to evdev.
-        if keycode > 0 and _HAS_CORE:
+        # Older installed native modules may not have the raw-scancode API.
+        # Keep those sessions usable by falling back to the ordinary keyval
+        # path instead of raising/consuming the browser's key event.
+        has_keycode_api = callable(getattr(self._core, "process_keycode", None))
+        if keycode > 0 and _HAS_CORE and has_keycode_api:
             evdev_keycode = keycode if _IS_WAYLAND else max(keycode - 8, 0)
             preedit_was_active = self._preedit_active
             actions = self._core.process_keycode(evdev_keycode, state)
