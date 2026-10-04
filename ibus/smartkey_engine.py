@@ -343,9 +343,6 @@ else:
 # ---------------------------------------------------------------------------
 # Paths & defaults.
 # ---------------------------------------------------------------------------
-_IS_WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
-
-
 def _open_private_text_log(path: str | Path):
     """Open an append-only text sink with repaired 0700/0600 permissions."""
     log_path = Path(path)
@@ -1767,15 +1764,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._refresh_surrounding_text()
 
         # v0.5.0: prefer raw scancode path for dual-buffer layout-agnostic input.
-        # Rust tables use evdev codes. On Wayland IBus sends evdev directly;
-        # on X11 IBus sends XKB (evdev + 8) — normalise to evdev.
+        # GTK/Qt IBus clients already convert XKB codes to evdev before IPC.
+        # Engine launch environment does not change that protocol; subtracting
+        # 8 here again corrupts letters and special keys after early startup.
         # Older installed native modules may not have the raw-scancode API.
         # Keep those sessions usable by falling back to the ordinary keyval
         # path instead of raising/consuming the browser's key event.
         has_keycode_api = callable(getattr(self._core, "process_keycode", None))
         if keycode > 0 and _HAS_CORE and has_keycode_api:
-            evdev_keycode = keycode if _IS_WAYLAND else max(keycode - 8, 0)
-            actions = self._core.process_keycode(evdev_keycode, state)
+            actions = self._core.process_keycode(keycode, state)
             log.debug("actions (keycode): %s", actions)
             result = self._execute_actions(actions)
             self._finalize_prediction_outcome(

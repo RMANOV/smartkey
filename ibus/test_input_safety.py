@@ -1193,7 +1193,7 @@ def test_current_native_core_reset_crosses_the_adapter_without_committing():
     eng._core = native
     eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
     def to_ibus(evdev):
-        return evdev if ske._IS_WAYLAND else evdev + 8
+        return evdev  # IBus clients already convert XKB codes to evdev.
 
     eng.do_process_key_event(ord("h"), to_ibus(35), 0)
     eng.do_process_key_event(ord("e"), to_ibus(18), 0)
@@ -1237,7 +1237,7 @@ def test_current_native_right_accept_keeps_locked_bg_preedit_synchronized():
     eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
 
     def to_ibus(evdev):
-        return evdev if ske._IS_WAYLAND else evdev + 8
+        return evdev  # IBus clients already convert XKB codes to evdev.
 
     for keyval, evdev in zip("zdraw", (44, 32, 19, 30, 17), strict=True):
         assert eng.do_process_key_event(ord(keyval), to_ibus(evdev), 0) is True
@@ -1352,3 +1352,102 @@ def test_an_unaskable_core_keeps_the_fail_safe_armed():
         "an unaskable core must not be read as 'resolved' — that is the unsafe "
         "direction (kill switch silently not firing inside a password field)"
     )
+
+
+@pytest.mark.parametrize(
+    "word,keyvals,codes",
+    [
+        ("здравей", "zdrawej", (44, 32, 19, 30, 17, 18, 36)),
+        ("hello", "hello", (35, 18, 38, 38, 24)),
+    ],
+)
+def test_native_ibus_protocol_codes_preserve_words_and_boundaries(word, keyvals, codes):
+    """GTK/Qt normalize to evdev before IBus IPC, with or without Wayland env."""
+    if not ske._HAS_CORE:
+        if os.environ.get("SMARTKEY_REQUIRE_NATIVE_TESTS") == "1":
+            pytest.fail("explicit native core is required for the protocol regression")
+        pytest.skip("smartkey_py is not built in this local Python environment")
+    native = ske.PyInputMethodCore(
+        json.dumps({"use_ppm": False, "use_reranker": False})
+    )
+    native.load_word(word, 1_000_000)
+    eng, rec = build_engine()
+    eng._core = native
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+
+    for keyval, code in zip(keyvals, codes, strict=True):
+        assert eng.do_process_key_event(ord(keyval), code, 0) is True
+    assert native.current_word() == word
+    assert eng._last_composing_typed == word
+    assert rec.commits == []
+
+    # Releases and shortcuts must neither compose nor change the physical key.
+    assert eng.do_process_key_event(ord(keyvals[-1]), codes[-1], MOD_RELEASE) is False
+    assert eng.do_process_key_event(ord("c"), 46, MOD_CONTROL) is False
+    assert native.current_word() == word
+
+    # Evdev Backspace is 14, not XKB 22; restore the removed final letter.
+    assert eng.do_process_key_event(ske.IBus.KEY_BackSpace, 14, 0) is True
+    assert native.current_word() == word[:-1]
+    assert eng.do_process_key_event(ord(keyvals[-1]), codes[-1], 0) is True
+    assert native.current_word() == word
+
+    # The real adapter commits exactly once, then forwards the Space delimiter.
+    assert eng.do_process_key_event(ske.IBus.KEY_space, 57, 0) is False
+    assert rec.commits == [word]
+    assert native.current_word() == ""
+    assert eng._preedit_active is False
+
+    for keyval, code in zip(keyvals, codes, strict=True):
+        assert eng.do_process_key_event(ord(keyval), code, 0) is True
+    assert eng.do_process_key_event(ske.IBus.KEY_Return, 28, 0) is False
+    assert rec.commits == [word, word]
+    assert native.current_word() == ""
+
+
+def test_native_ibus_unicode_fallback_preserves_literal_bulgarian():
+    """A keycode-less client still sends literal Unicode through the keyval API."""
+    if not ske._HAS_CORE:
+        if os.environ.get("SMARTKEY_REQUIRE_NATIVE_TESTS") == "1":
+            pytest.fail("explicit native core is required for the protocol regression")
+        pytest.skip("smartkey_py is not built in this local Python environment")
+    native = ske.PyInputMethodCore(None)
+    native.load_word("здравей", 1_000_000)
+    eng, rec = build_engine()
+    eng._core = native
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    for index, char in enumerate("здравей", 1):
+        assert eng.do_process_key_event(0x01000000 | ord(char), 0, 0) is False
+        assert native.current_word() == "здравей"[:index]
+    assert eng.do_process_key_event(ske.IBus.KEY_space, 0, 0) is False
+    assert native.current_word() == ""
+    assert rec.commits == []  # Each literal key was forwarded, never duplicated.
+
+
+def test_native_ibus_protocol_switches_english_bulgarian_english():
+    """Automatic language choice survives boundaries with one unchanged layout."""
+    if not ske._HAS_CORE:
+        if os.environ.get("SMARTKEY_REQUIRE_NATIVE_TESTS") == "1":
+            pytest.fail("explicit native core is required for the protocol regression")
+        pytest.skip("smartkey_py is not built in this local Python environment")
+    words = [
+        ("smart", (31, 50, 30, 19, 20)),
+        ("здравей", (44, 32, 19, 30, 17, 18, 36)),
+        ("chunks", (46, 35, 22, 49, 37, 31)),
+        ("smartkey", (31, 50, 30, 19, 20, 37, 18, 21)),
+    ]
+    native = ske.PyInputMethodCore(
+        json.dumps({"use_ppm": False, "use_reranker": False})
+    )
+    for word, _codes in words:
+        native.load_word(word, 1_000_000)
+    eng, rec = build_engine()
+    eng._core = native
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    for word, codes in words:
+        for char, code in zip(word, codes, strict=True):
+            eng.do_process_key_event(ord(char), code, 0)
+        assert native.current_word() == word
+        assert eng.do_process_key_event(ske.IBus.KEY_space, 57, 0) is False
+    assert rec.commits == [word for word, _codes in words]
+    assert native.current_word() == ""
