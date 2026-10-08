@@ -186,6 +186,7 @@ try {
     $helper = Join-Path $install 'smartkey-register.exe'
     $initialStatus = Invoke-Helper $helper '--status'
     Assert-True ($initialStatus.stdout -match '(?m)^TSF profile: disabled\.') 'Machine registration enabled SmartKey before this user opted in.'
+    Keyboard-Snapshot | Set-Content -LiteralPath (Join-Path $OutDir 'keyboard-after-initial-status.json') -Encoding UTF8
     New-Item -ItemType Directory -Path $data | Out-Null
     $personal = Join-Path $data 'personal.json'
     [IO.File]::WriteAllText($personal, '{"synthetic_smoke_sentinel":true}')
