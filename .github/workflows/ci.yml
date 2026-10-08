@@ -226,6 +226,25 @@ jobs:
             machine_install_exit=$null; machine_verify_exit=$null; machine_cleanup_exit=$null
             frozen_bundle_matches=$false; machine_state_removed=$false
             typing_exercised=$false; logon_exercised=$false; cleanup_errors=@()
+            machine_tip_snapshots=[ordered]@{}
+          }
+          function Save-OwnedTipSnapshot([string]$phase) {
+            try {
+              $present = Test-Path -LiteralPath $machineTip
+              $snapshot = [ordered]@{ present=$present; query_exit=$null }
+              if ($present) {
+                # Read only SmartKey's exact owned subtree; never modify CTF state.
+                $PSNativeCommandUseErrorActionPreference = $false
+                $lines = & reg.exe query "HKLM\Software\Microsoft\CTF\TIP\$guid" /s 2>&1
+                $snapshot.query_exit = $LASTEXITCODE
+                $lines | Set-Content -LiteralPath (Join-Path $root "machine-tip-$phase.txt") -Encoding utf8
+                if ($snapshot.query_exit -ne 0) { throw "Owned TIP query failed: $($snapshot.query_exit)" }
+              }
+              $result.machine_tip_snapshots[$phase] = $snapshot
+            } catch {
+              # A diagnostic failure must not prevent the cleanup attempt.
+              $result.cleanup_errors += "TIP snapshot ${phase}: $($_.Exception.Message)"
+            }
           }
           function Invoke-MachineHelper([string]$helper, [string]$action, [string]$exitField) {
             $process = [Diagnostics.Process]::new()
@@ -320,6 +339,7 @@ jobs:
             $result['error'] = $failure
           } finally {
             if ($machineAttempted) {
+              Save-OwnedTipSnapshot 'before-cleanup'
               try {
                 # The original archive helper can remove the installed EXE;
                 # the product deliberately refuses to delete its running self.
@@ -329,6 +349,7 @@ jobs:
                 }
                 $result.machine_state_removed = $true
               } catch { $result.cleanup_errors += "Machine cleanup: $($_.Exception.Message)" }
+              finally { Save-OwnedTipSnapshot 'after-cleanup' }
             }
             if ($created) {
               try { Remove-LocalUser -Name $name }

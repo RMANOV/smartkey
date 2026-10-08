@@ -61,7 +61,7 @@ pub fn unregister_user() -> Result<()> {
 pub fn unregister_machine() -> Result<()> {
     collect_removal_errors([
         ("Machine categories", unregister_categories()),
-        ("Machine TSF profile", unregister_tip_profile()),
+        ("Machine text service", unregister_text_service()),
         ("Machine COM", unregister_com_server(HKEY_LOCAL_MACHINE)),
     ])
 }
@@ -158,38 +158,54 @@ fn install_layout_or_tip(flags: u32) -> Result<()> {
     result
 }
 
-/// Fresh-process verification must use this query after the installer exits.
-/// It observes the actual TSF profile rather than a local registration flag.
+/// Verify exact registration metadata before querying current-user enablement.
+/// API failures remain failures; a missing profile is never treated as disabled.
 pub fn profile_enabled() -> Result<bool> {
-    Ok(query_profile()?.dwFlags & TF_IPP_FLAG_ENABLED != 0)
+    profile_present()?;
+    let profiles =
+        input_processor_profiles("Enabled-state CoCreateInstance(ITfInputProcessorProfiles)")?;
+    unsafe { profiles.IsEnabledLanguageProfile(&CLSID_SMARTKEY, LANGID_BG, &GUID_PROFILE) }
+        .map(|enabled| enabled.as_bool())
+        .map_err(|e| step_error("ITfInputProcessorProfiles::IsEnabledLanguageProfile", e))
 }
 
-/// Machine installation checks presence, without enabling the administrator.
+/// Machine verification reads registered metadata without requiring enablement.
+/// The caller's fresh process must see this exact CLSID/language/profile tuple.
 pub fn profile_present() -> Result<()> {
-    query_profile().map(|_| ())
+    let profiles = input_processor_profiles(
+        "Registration metadata CoCreateInstance(ITfInputProcessorProfiles)",
+    )?;
+    let description = unsafe {
+        profiles.GetLanguageProfileDescription(&CLSID_SMARTKEY, LANGID_BG, &GUID_PROFILE)
+    }
+    .map_err(|e| {
+        step_error(
+            "ITfInputProcessorProfiles::GetLanguageProfileDescription",
+            e,
+        )
+    })?;
+    if description != DISPLAY_NAME {
+        return Err(Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            "Registered SmartKey profile description does not match the expected metadata",
+        ));
+    }
+    Ok(())
 }
 
-fn query_profile() -> Result<TF_INPUTPROCESSORPROFILE> {
-    let mgr: ITfInputProcessorProfileMgr =
-        unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER) }
-            .map_err(|e| {
-            step_error(
-                "Verification CoCreateInstance(ITfInputProcessorProfileMgr)",
-                e,
-            )
-        })?;
-    let mut profile = TF_INPUTPROCESSORPROFILE::default();
-    unsafe {
-        mgr.GetProfile(
-            TF_PROFILETYPE_INPUTPROCESSOR,
-            LANGID_BG,
-            &CLSID_SMARTKEY,
-            &GUID_PROFILE,
-            HKL::default(),
-            &mut profile,
-        ).map_err(|e| step_error("Verification ITfInputProcessorProfileMgr::GetProfile(type=INPUTPROCESSOR, langid=0x0402, hkl=NULL)", e))?;
-    }
-    Ok(profile)
+fn input_processor_profiles(operation: &str) -> Result<ITfInputProcessorProfiles> {
+    unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER) }
+        .map_err(|e| step_error(operation, e))
+}
+
+/// Explicit machine removal owns the entire SmartKey text service. This is not
+/// called by ordinary user removal, and does not edit CTF registry keys directly.
+fn unregister_text_service() -> Result<()> {
+    let profiles = input_processor_profiles(
+        "Machine service removal CoCreateInstance(ITfInputProcessorProfiles)",
+    )?;
+    unsafe { profiles.Unregister(&CLSID_SMARTKEY) }
+        .map_err(|e| step_error("ITfInputProcessorProfiles::Unregister", e))
 }
 
 // -- COM server registration (registry) --------------------------------
