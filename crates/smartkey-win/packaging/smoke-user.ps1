@@ -56,7 +56,7 @@ function Get-Login {
     return (Get-Item -LiteralPath $run).GetValue('SmartKey', $null)
 }
 function Keyboard-Snapshot {
-    # Only the ephemeral account is read. The receipt reports equality, not values.
+    # Only the ephemeral account's bounded keyboard configuration is read.
     $snapshot = [ordered]@{}
     foreach ($name in @('Keyboard Layout\Preload', 'Keyboard Layout\Substitutes')) {
         $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($name)
@@ -143,6 +143,12 @@ $receipt = [ordered]@{
     machine_prerequisite_refused=$false; machine_install_preserved=$false
 }
 $before = Keyboard-Snapshot
+$before | Set-Content -LiteralPath (Join-Path $OutDir 'keyboard-before.json') -Encoding UTF8
+function Assert-KeyboardPreserved([string]$message) {
+    $after = Keyboard-Snapshot
+    $after | Set-Content -LiteralPath (Join-Path $OutDir ('keyboard-after-{0:D2}.json' -f $steps.Count)) -Encoding UTF8
+    Assert-True ($after -eq $before) $message
+}
 try {
     # Never use a daily account or delete a prior installation for this smoke.
     Assert-True (-not (Test-Path -LiteralPath $localInstall)) 'The ephemeral user already has a SmartKey install folder.'
@@ -162,7 +168,7 @@ try {
             Assert-True (-not (Test-Path -LiteralPath $path)) "Prerequisite refusal created unexpected state: $path"
         }
         Assert-True ($null -eq (Get-Login)) 'Prerequisite refusal created a login entry.'
-        Assert-True ((Keyboard-Snapshot) -eq $before) 'Prerequisite refusal changed keyboard/default settings.'
+        Assert-KeyboardPreserved 'Prerequisite refusal changed keyboard/default settings.'
         $receipt['machine_prerequisite_refused']=$true
         $receipt['keyboard_defaults_preserved']=$true
         $receipt['status']='PASS_NATIVE_STANDARD_USER_PREREQUISITE'
@@ -196,11 +202,11 @@ try {
         Assert-True (Test-Path -LiteralPath (Join-Path $menu $name) -PathType Leaf) "Missing Start menu command: $name"
     }
     Assert-True ((Get-Login) -eq ('"' + $helper + '" --login')) 'Login entry does not identify the stable installed helper.'
-    Assert-True ((Keyboard-Snapshot) -eq $before) 'Installation changed existing keyboard/default settings.'
+    Assert-KeyboardPreserved 'Installation changed existing keyboard/default settings.'
     Invoke-Helper $helper '--status' | Out-Null
     Invoke-Helper $helper '--disable' | Out-Null
     Assert-True ($null -eq (Get-Login)) 'Disable left the owned login entry.'
-    Assert-True ((Keyboard-Snapshot) -eq $before) 'Disable changed existing keyboard/default settings.'
+    Assert-KeyboardPreserved 'Disable changed existing keyboard/default settings.'
     Invoke-Helper $helper '--enable' | Out-Null
     Assert-True ((Get-Login) -eq ('"' + $helper + '" --login')) 'Enable did not restore the exact owned login entry.'
     Invoke-Helper $helper '--uninstall' | Out-Null
@@ -214,7 +220,7 @@ try {
     foreach ($name in @('Status-SmartKey.cmd','Enable-SmartKey.cmd','Disable-SmartKey.cmd')) {
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $menu $name))) "Uninstall left a user maintenance command: $name"
     }
-    Assert-True ((Keyboard-Snapshot) -eq $before) 'Maintenance changed existing keyboard/default settings.'
+    Assert-KeyboardPreserved 'Maintenance changed existing keyboard/default settings.'
     Assert-True ((Get-FileHash -LiteralPath $personal -Algorithm SHA256).Hash -eq $personalHash) 'Maintenance changed the synthetic personal file.'
     Assert-True (-not (Test-Path -LiteralPath $localInstall)) 'User setup created an unprotected local binary folder.'
     Assert-True ((Machine-Snapshot) -eq $machineBefore) 'User maintenance changed the protected bundle or machine registration.'
