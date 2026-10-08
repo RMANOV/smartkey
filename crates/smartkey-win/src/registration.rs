@@ -134,7 +134,13 @@ fn install_layout_or_tip(flags: u32) -> Result<()> {
 /// It observes the actual TSF profile rather than a local registration flag.
 pub fn profile_enabled() -> Result<bool> {
     let mgr: ITfInputProcessorProfileMgr =
-        unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)? };
+        unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|e| {
+            step_error(
+                "Verification CoCreateInstance(ITfInputProcessorProfileMgr)",
+                e,
+            )
+        })?;
     let mut profile = TF_INPUTPROCESSORPROFILE::default();
     unsafe {
         mgr.GetProfile(
@@ -144,7 +150,7 @@ pub fn profile_enabled() -> Result<bool> {
             &GUID_PROFILE,
             HKL::default(),
             &mut profile,
-        )?;
+        ).map_err(|e| step_error("Verification ITfInputProcessorProfileMgr::GetProfile(type=INPUTPROCESSOR, langid=0x0402, hkl=NULL)", e))?;
     }
     Ok(profile.dwFlags & TF_IPP_FLAG_ENABLED != 0)
 }

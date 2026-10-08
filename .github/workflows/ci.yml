@@ -259,6 +259,26 @@ jobs:
           try {
             & $helper --install --no-dialog 1> (Join-Path $root 'control-install.stdout.txt') 2> (Join-Path $root 'control-install.stderr.txt')
             $result.install_exit = $LASTEXITCODE
+            # Read only this candidate's identities before its cleanup.
+            $guid = '{7A3B9E1F-4C2D-4E5A-8F6B-1D2E3F4A5B6C}'
+            $snapshots = foreach ($path in @(
+              "HKCU:\Software\Microsoft\CTF\TIP\$guid",
+              "HKLM:\Software\Microsoft\CTF\TIP\$guid",
+              "HKCU:\Software\Classes\CLSID\$guid",
+              "HKLM:\Software\Classes\CLSID\$guid"
+            )) {
+              if (-not (Test-Path -LiteralPath $path)) {
+                [ordered]@{ path=$path; present=$false }
+                continue
+              }
+              $keys = @((Get-Item -LiteralPath $path)) + @(Get-ChildItem -LiteralPath $path -Recurse)
+              foreach ($key in $keys) {
+                $values = [ordered]@{}
+                foreach ($name in $key.GetValueNames()) { $values[$name] = $key.GetValue($name) }
+                [ordered]@{ path=$key.Name; present=$true; values=$values }
+              }
+            }
+            @($snapshots) | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'control-owned-registry.json') -Encoding utf8
           } finally {
             # Exact SmartKey identifiers only; no installer elevation fallback.
             & $helper --uninstall --no-dialog 1> (Join-Path $root 'control-cleanup.stdout.txt') 2> (Join-Path $root 'control-cleanup.stderr.txt')

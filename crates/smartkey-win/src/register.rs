@@ -70,6 +70,17 @@ fn run(action: &str) -> Result<String, String> {
                 .to_str()
                 .ok_or("DLL path is not valid Unicode")?;
             registration::register(dll).map_err(api_error)?;
+            // Diagnostic only: the fresh child below remains the acceptance check,
+            // including when this same query fails in the installing process.
+            match registration::profile_enabled() {
+                Ok(enabled) => println!(
+                    "SmartKey diagnostic: in-process TSF profile query succeeded; enabled={enabled}"
+                ),
+                Err(error) => eprintln!(
+                    "SmartKey diagnostic: in-process TSF profile query failed: {}",
+                    api_error(error)
+                ),
+            }
             // A separate process queries the actual persisted TSF profile.
             // A process-local registration cannot pass this check.
             let verification = std::process::Command::new(&installed_exe)
@@ -228,12 +239,23 @@ fn verify_com_path(expected: &std::path::Path) -> windows::core::Result<()> {
         "SOFTWARE\\Classes\\CLSID\\{{{}}}\\InProcServer32",
         smartkey_win::config::CLSID_SMARTKEY_STR
     );
-    let value = read_value(&key, None)?
-        .ok_or_else(|| Error::new(E_FAIL, "SmartKey HKCU registration is missing"))?;
+    let value = read_value(&key, None)
+        .map_err(|e| {
+            Error::new(
+                e.code(),
+                format!("Verification HKCU COM path / RegGetValueW: {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            Error::new(
+                E_FAIL,
+                "Verification HKCU COM path: SmartKey registration is missing",
+            )
+        })?;
     if std::path::Path::new(&value) != expected || !expected.is_file() {
         return Err(Error::new(
             E_FAIL,
-            "SmartKey registration does not point to the installed DLL",
+            "Verification HKCU COM path: registration does not point to the installed DLL",
         ));
     }
     Ok(())
