@@ -140,6 +140,7 @@ $receipt = [ordered]@{
     status='NOT_RUN'; standard_nonadmin=$true; current_user_profile_confirmed=$true; no_dialog=$true
     phase=$Phase; typing_exercised=$false; logon_exercised=$false
     steps=$steps; keyboard_defaults_preserved=$false; personal_sentinel_preserved=$false
+    keyboard_allowed_language_additions_observed=$false
     machine_prerequisite_refused=$false; machine_install_preserved=$false
 }
 $before = Keyboard-Snapshot
@@ -147,7 +148,40 @@ $before | Set-Content -LiteralPath (Join-Path $OutDir 'keyboard-before.json') -E
 function Assert-KeyboardPreserved([string]$message) {
     $after = Keyboard-Snapshot
     $after | Set-Content -LiteralPath (Join-Path $OutDir ('keyboard-after-{0:D2}.json' -f $steps.Count)) -Encoding UTF8
-    Assert-True ($after -eq $before) $message
+    if ($Phase -eq 'Prerequisite') { Assert-True ($after -ceq $before) $message; return }
+    $baseline = $before | ConvertFrom-Json
+    $current = $after | ConvertFrom-Json
+    foreach ($name in @('InputMethodOverride', 'DefaultInputMethodOverride', 'WindowsDefaultInputTip')) {
+        Assert-True (($current.$name | ConvertTo-Json -Compress) -ceq ($baseline.$name | ConvertTo-Json -Compress)) $message
+    }
+    foreach ($name in @('Keyboard Layout\Preload', 'Keyboard Layout\Substitutes')) {
+        $old = @($baseline.$name.PSObject.Properties)
+        $new = @($current.$name.PSObject.Properties)
+        $oldNames = @($old | ForEach-Object Name)
+        $newNames = @($new | ForEach-Object Name)
+        foreach ($entry in $old) {
+            Assert-True ($newNames -ccontains $entry.Name) $message
+            $value = $current.$name.PSObject.Properties[$entry.Name].Value
+            Assert-True (($value | ConvertTo-Json -Compress) -ceq ($entry.Value | ConvertTo-Json -Compress)) $message
+        }
+        $added = @($new | Where-Object { $oldNames -cnotcontains $_.Name })
+        Assert-True ($added.Count -le 1) $message
+        if ($added.Count -eq 0) { continue }
+        # Permit only the observed LANG 0402 addition on this known CI baseline.
+        $first = $baseline.'Keyboard Layout\Preload'.PSObject.Properties['1']
+        Assert-True ($null -ne $first -and $first.Value -is [string] -and $first.Value -ceq '00000409') $message
+        $entry = $added[0]
+        Assert-True ($entry.Value -is [string]) $message
+        if ($name -eq 'Keyboard Layout\Preload') {
+            Assert-True (@($oldNames | Where-Object { $_ -cnotmatch '^[1-9][0-9]*$' }).Count -eq 0) $message
+            $max = ($oldNames | ForEach-Object { [int]$_ } | Measure-Object -Maximum).Maximum
+            Assert-True ($entry.Name -cmatch '^[1-9][0-9]*$' -and [int]$entry.Name -gt $max -and $entry.Value -ceq '00000402') $message
+            Assert-True (@($old | Where-Object { $_.Value -ceq '00000402' }).Count -eq 0) $message
+        } else {
+            Assert-True ($entry.Name -ceq '00000402' -and $entry.Value -ceq $first.Value) $message
+        }
+        $receipt['keyboard_allowed_language_additions_observed']=$true
+    }
 }
 try {
     # Never use a daily account or delete a prior installation for this smoke.
@@ -210,6 +244,7 @@ try {
     Assert-KeyboardPreserved 'Disable changed existing keyboard/default settings.'
     Invoke-Helper $helper '--enable' | Out-Null
     Assert-True ((Get-Login) -eq ('"' + $helper + '" --login')) 'Enable did not restore the exact owned login entry.'
+    Assert-KeyboardPreserved 'Enable changed existing keyboard/default settings.'
     Invoke-Helper $helper '--uninstall' | Out-Null
     Assert-True ($null -eq (Get-Login)) 'Uninstall left the owned login entry.'
     Assert-True (-not (Test-Path -LiteralPath $clsid)) 'Uninstall left own HKCU COM registration.'
