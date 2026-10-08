@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "package_name": "smartkey-windows-standalone",
+  "status": "candidate_native_acceptance_pending",
+  "native_artifact_layout": "Extract complete ZIP; Install-SmartKey.cmd stages the per-user application in %LOCALAPPDATA%\\SmartKey.",
+  "runtime_data_destination_directory": "%APPDATA%\\smartkey",
+  "native_files": [
+    {
+      "name": "smartkey-register.exe",
+      "repository_source": "target/release/smartkey-register.exe",
+      "purpose": "Visible current-user setup, status, enable, disable and removal; fresh-process profile verification."
+    },
+    {
+      "name": "smartkey_win.dll",
+      "repository_source": "target/release/smartkey_win.dll",
+      "purpose": "Windows TSF COM server."
+    }
+  ],
+  "runtime_data_files": [
+    {
+      "name": "smartkey.json",
+      "repository_source": "config/smartkey.json",
+      "destination": "%APPDATA%\\smartkey\\smartkey.json",
+      "optional": true,
+      "provenance": "Tracked, reviewed non-personal starter configuration; GPL-3.0 under repository LICENSE."
+    },
+    {
+      "name": "corpus_en.json",
+      "repository_source": "corpus/corpus_en.json",
+      "destination": "%APPDATA%\\smartkey\\corpus_en.json",
+      "optional": false,
+      "provenance": "Tracked public repository corpus; GPL-3.0 under repository LICENSE."
+    },
+    {
+      "name": "corpus_bg.json",
+      "repository_source": "corpus/corpus_bg.json",
+      "destination": "%APPDATA%\\smartkey\\corpus_bg.json",
+      "optional": false,
+      "provenance": "Tracked public repository corpus; GPL-3.0 under repository LICENSE."
+    },
+    {
+      "name": "corpus_tech.json",
+      "repository_source": "corpus/corpus_tech.json",
+      "destination": "%APPDATA%\\smartkey\\corpus_tech.json",
+      "optional": false,
+      "provenance": "Tracked public repository corpus; GPL-3.0 under repository LICENSE."
+    }
+  ],
+  "artifact_ancillary_files": [
+    {
+      "name": "LICENSE",
+      "repository_source": "LICENSE",
+      "purpose": "Repository dual-license notice."
+    },
+    {
+      "name": "LICENSE-GPL",
+      "repository_source": "LICENSE-GPL",
+      "purpose": "GPL-3.0 license text for application and corpus payload."
+    },
+    {
+      "name": "LICENSE-APACHE",
+      "repository_source": "LICENSE-APACHE",
+      "purpose": "Apache-2.0 license text for smartkey-core."
+    },
+    {
+      "name": "artifact-source-manifest.json",
+      "repository_source": null,
+      "purpose": "CI-generated source SHA, source URL, and per-file SHA-256 receipt for every other archive file."
+    },
+    {
+      "name": "Install-SmartKey.cmd",
+      "repository_source": "crates/smartkey-win/packaging/Install-SmartKey.cmd",
+      "purpose": "Current-user standalone setup and maintenance"
+    },
+    {
+      "name": "Status-SmartKey.cmd",
+      "repository_source": "crates/smartkey-win/packaging/Status-SmartKey.cmd",
+      "purpose": "Current-user standalone setup and maintenance"
+    },
+    {
+      "name": "Enable-SmartKey.cmd",
+      "repository_source": "crates/smartkey-win/packaging/Enable-SmartKey.cmd",
+      "purpose": "Current-user standalone setup and maintenance"
+    },
+    {
+      "name": "Disable-SmartKey.cmd",
+      "repository_source": "crates/smartkey-win/packaging/Disable-SmartKey.cmd",
+      "purpose": "Current-user standalone setup and maintenance"
+    },
+    {
+      "name": "Uninstall-SmartKey.cmd",
+      "repository_source": "crates/smartkey-win/packaging/Uninstall-SmartKey.cmd",
+      "purpose": "Current-user standalone setup and maintenance"
+    },
+    {
+      "name": "README-WINDOWS.md",
+      "repository_source": "crates/smartkey-win/packaging/README-WINDOWS.md",
+      "purpose": "Current-user standalone setup and maintenance"
+    }
+  ],
+  "excluded_files": [
+    {
+      "name": "personal.json",
+      "reason": "Optional user-specific profile; never packaged."
+    },
+    {
+      "pattern": "corpus_*.bin",
+      "reason": "Runtime-generated caches are not source payload."
+    }
+  ],
+  "runtime_contract": {
+    "network_required": false,
+    "autostart_created": "One owned HKCU Run value after successful setup; removed by Disable/Uninstall",
+    "automatic_registration": "Only on explicit installer launch; no elevation fallback",
+    "automatic_appdata_mutation": "Setup copies only missing public starter data; preserves personal files",
+    "missing_public_corpus_is_package_failure": true
+  },
+  "uninstall_boundary": "Uninstall-SmartKey removes exact SmartKey registrations, its Run value and installed EXE/DLL. Existing keyboards/default and personal data remain. Locked files are reported.",
+  "dependency_evidence": {
+    "build_assumption": "x64 MSVC static CRT; CI inspects both PE import lists",
+    "runtime_dll_completeness": "Requires successful CI dependency check; Windows 10/11 system DLLs supplied by OS"
+  }
+}

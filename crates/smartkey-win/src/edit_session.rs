@@ -1,11 +1,4 @@
-// TSF Edit Session — executes text operations within a granted edit cookie.
-//
-// TSF requires all text modifications to go through ITfEditSession::DoEditSession().
-// The framework calls back with an `ec` (edit cookie) that grants write access.
-//
-// Architecture: Single SmartKeyEditSession with EditOp enum instead of 3 COM classes.
-// Rationale: 3 operations don't justify 3 COM classes; one struct reduces COM lifetime bugs.
-
+// Text operations run only inside the edit cookie granted by TSF.
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
@@ -14,45 +7,33 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::TextServices::*;
 
-/// The operation to perform inside the edit session.
 pub enum EditOp {
-    /// Display ghost text as a TSF composition.
     ShowGhost {
         text: String,
+        /// Zero for a suffix-only ghost; typed-prefix UTF-16 length for preedit.
+        typed_units: usize,
         composition: Rc<RefCell<Option<ITfComposition>>>,
-        /// Composition sink to receive OnCompositionTerminated callbacks.
         comp_sink: ITfCompositionSink,
-        /// TfGuidAtom for ghost display attribute (grey styling). 0 = no styling.
         ghost_attr_atom: u32,
     },
-    /// Remove ghost text and end the composition.
     HideGhost {
         composition: Rc<RefCell<Option<ITfComposition>>>,
     },
-    /// Commit (finalize) text into the document.
     CommitText {
         text: String,
         composition: Rc<RefCell<Option<ITfComposition>>>,
     },
+    ReplaceWord {
+        replace_len: usize,
+        text: String,
+        composition: Rc<RefCell<Option<ITfComposition>>>,
+    },
 }
 
-/// A one-shot edit session that executes a single EditOp.
 #[implement(ITfEditSession)]
 pub struct SmartKeyEditSession {
     context: ITfContext,
-    #[allow(dead_code)] // reserved for display attribute operations
-    client_id: u32,
     op: EditOp,
-}
-
-impl SmartKeyEditSession {
-    pub fn new(context: ITfContext, client_id: u32, op: EditOp) -> Self {
-        Self {
-            context,
-            client_id,
-            op,
-        }
-    }
 }
 
 impl ITfEditSession_Impl for SmartKeyEditSession_Impl {
@@ -60,157 +41,201 @@ impl ITfEditSession_Impl for SmartKeyEditSession_Impl {
         match &self.op {
             EditOp::ShowGhost {
                 text,
+                typed_units,
                 composition,
                 comp_sink,
                 ghost_attr_atom,
-            } => self.do_show_ghost(ec, text, composition, comp_sink, *ghost_attr_atom),
-            EditOp::HideGhost { composition } => self.do_hide_ghost(ec, composition),
-            EditOp::CommitText { text, composition } => self.do_commit_text(ec, text, composition),
+            } => self.show(
+                ec,
+                text,
+                *typed_units,
+                composition,
+                comp_sink,
+                *ghost_attr_atom,
+            ),
+            EditOp::HideGhost { composition } => self.hide(ec, composition),
+            EditOp::CommitText { text, composition } => {
+                // CommitText is an exact insertion, including partial Right acceptance.
+                self.hide(ec, composition)?;
+                self.insert(ec, text)
+            }
+            EditOp::ReplaceWord {
+                replace_len,
+                text,
+                composition,
+            } => {
+                self.hide(ec, composition)?;
+                self.replace(ec, *replace_len, text)
+            }
         }
     }
 }
 
 impl SmartKeyEditSession_Impl {
-    /// Show or update ghost text via a TSF composition.
-    ///
-    /// After inserting/updating ghost text, the selection (caret) is moved to the
-    /// START of the ghost range so that forwarded keys are inserted before the ghost.
-    fn do_show_ghost(
+    fn own_range(&self, active: &ITfComposition) -> Result<ITfRange> {
+        unsafe {
+            let range = active.GetRange()?;
+            if range.GetContext()? != self.context {
+                return Err(Error::from_hresult(E_INVALIDARG));
+            }
+            Ok(range)
+        }
+    }
+
+    fn show(
         &self,
         ec: u32,
         text: &str,
+        typed_units: usize,
         composition: &Rc<RefCell<Option<ITfComposition>>>,
         comp_sink: &ITfCompositionSink,
-        ghost_attr_atom: u32,
+        atom: u32,
     ) -> Result<()> {
-        let text_utf16: Vec<u16> = text.encode_utf16().collect();
-        let mut comp = composition.borrow_mut();
-
-        if let Some(ref active) = *comp {
-            // Update existing composition range.
-            unsafe {
-                let range = active.GetRange()?;
-                range.SetText(ec, 0, &text_utf16)?;
-                // Re-apply attribute after SetText (SetText clears properties).
-                self.apply_ghost_attr(ec, &range, ghost_attr_atom)?;
-                self.set_caret_to_range_start(ec, &range)?;
-            }
-        } else {
-            // Start a new composition.
-            unsafe {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let offset = i32::try_from(typed_units).map_err(|_| Error::from_hresult(E_INVALIDARG))?;
+        if typed_units > utf16.len() {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        }
+        // Never retain a RefCell borrow across COM: callbacks can reenter the sink.
+        let active = composition.borrow().clone();
+        unsafe {
+            let range = if let Some(active) = active {
+                let range = self.own_range(&active)?;
+                range.SetText(ec, 0, &utf16)?;
+                range
+            } else {
                 let insert: ITfInsertAtSelection = self.context.cast()?;
-                let range = insert.InsertTextAtSelection(ec, TF_IAS_NOQUERY, &text_utf16)?;
-
+                let range = insert.InsertTextAtSelection(ec, TF_IAS_NOQUERY, &utf16)?;
                 let ctx_comp: ITfContextComposition = self.context.cast()?;
                 let new_comp = ctx_comp.StartComposition(ec, &range, Some(comp_sink))?;
-                *comp = Some(new_comp);
+                *composition.borrow_mut() = Some(new_comp);
+                range
+            };
+            let prop = self.context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
+            prop.Clear(ec, &range)?;
+            if atom != 0 && typed_units < utf16.len() {
+                let ghost = range.Clone()?;
+                let mut shifted = 0;
+                ghost.ShiftStart(ec, offset, &mut shifted, std::ptr::null())?;
+                if shifted != offset {
+                    return Err(Error::from_hresult(E_FAIL));
+                }
+                prop.SetValue(ec, &ghost, &VARIANT::from(atom as i32))?;
+            }
+            let caret = range.Clone()?;
+            caret.Collapse(ec, TF_ANCHOR_START)?;
+            let mut shifted = 0;
+            caret.ShiftEnd(ec, offset, &mut shifted, std::ptr::null())?;
+            if shifted != offset {
+                return Err(Error::from_hresult(E_FAIL));
+            }
+            caret.Collapse(ec, TF_ANCHOR_END)?;
+            self.select(ec, caret)
+        }
+    }
 
-                self.apply_ghost_attr(ec, &range, ghost_attr_atom)?;
-                self.set_caret_to_range_start(ec, &range)?;
+    fn hide(&self, ec: u32, composition: &Rc<RefCell<Option<ITfComposition>>>) -> Result<()> {
+        let active = composition.borrow().clone();
+        if let Some(active) = active {
+            let range = self.own_range(&active)?;
+            // Clear the slot before EndComposition so our own callback cannot reset
+            // the core state that has already generated the remaining action batch.
+            unsafe {
+                // A refused deletion must keep ownership of the surviving preedit.
+                range.SetText(ec, 0, &[])?;
+                composition.borrow_mut().take();
+                if let Err(error) = active.EndComposition(ec) {
+                    *composition.borrow_mut() = Some(active);
+                    return Err(error);
+                }
             }
         }
         Ok(())
     }
 
-    /// Set GUID_PROP_ATTRIBUTE on a range to apply ghost text styling (grey).
-    ///
-    /// The atom is a TfGuidAtom obtained from ITfCategoryMgr::RegisterGUID.
-    /// TSF resolves it back through our ITfDisplayAttributeProvider to get
-    /// the actual TF_DISPLAYATTRIBUTE (grey foreground).
-    fn apply_ghost_attr(&self, ec: u32, range: &ITfRange, atom: u32) -> Result<()> {
-        if atom == 0 {
+    fn insert(&self, ec: u32, text: &str) -> Result<()> {
+        if text.is_empty() {
             return Ok(());
         }
         unsafe {
-            let prop = self.context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-            let variant = VARIANT::from(atom as i32);
-            prop.SetValue(ec, range, &variant)?;
+            let insert: ITfInsertAtSelection = self.context.cast()?;
+            let range = insert.InsertTextAtSelection(
+                ec,
+                TF_IAS_NOQUERY,
+                &text.encode_utf16().collect::<Vec<_>>(),
+            )?;
+            let caret = range.Clone()?;
+            caret.Collapse(ec, TF_ANCHOR_END)?;
+            self.select(ec, caret)
         }
-        Ok(())
     }
 
-    /// Remove ghost text and end the active composition.
-    fn do_hide_ghost(
-        &self,
-        ec: u32,
-        composition: &Rc<RefCell<Option<ITfComposition>>>,
-    ) -> Result<()> {
-        let mut comp = composition.borrow_mut();
-        if let Some(active) = comp.take() {
-            unsafe {
-                // Clear the composition text before ending.
-                let range = active.GetRange()?;
-                range.SetText(ec, 0, &[])?;
-                active.EndComposition(ec)?;
+    fn replace(&self, ec: u32, count: usize, text: &str) -> Result<()> {
+        let lookback = count
+            .checked_mul(2)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+        unsafe {
+            let mut selection = [TF_SELECTION::default()];
+            let mut fetched = 0;
+            let result =
+                self.context
+                    .GetSelection(ec, TF_DEFAULT_SELECTION, &mut selection, &mut fetched);
+            let caret = ManuallyDrop::take(&mut selection[0].range);
+            result?;
+            let caret = caret
+                .filter(|_| fetched == 1)
+                .ok_or_else(|| Error::from_hresult(E_FAIL))?;
+            if !caret.IsEmpty(ec)?.as_bool() {
+                return Err(Error::from_hresult(E_INVALIDARG));
             }
+            let previous = caret.Clone()?;
+            let mut shifted = 0;
+            previous.ShiftStart(ec, -lookback, &mut shifted, std::ptr::null())?;
+            let mut buffer = vec![0u16; lookback as usize];
+            let mut read = 0;
+            previous.GetText(ec, 0, &mut buffer, &mut read)?;
+            buffer.truncate(read as usize);
+            let units = crate::text_contract::suffix_units(&buffer, count)
+                .ok_or_else(|| Error::from_hresult(E_INVALIDARG))?;
+            let replacement = caret.Clone()?;
+            let requested = -(units as i32);
+            replacement.ShiftStart(ec, requested, &mut shifted, std::ptr::null())?;
+            if shifted != requested {
+                return Err(Error::from_hresult(E_FAIL));
+            }
+            replacement.SetText(ec, 0, &text.encode_utf16().collect::<Vec<_>>())?;
+            replacement.Collapse(ec, TF_ANCHOR_END)?;
+            self.select(ec, replacement)
         }
-        Ok(())
     }
 
-    /// Commit text: end the ghost composition so the suffix becomes permanent.
-    ///
-    /// When a ghost composition is active, the typed prefix is already in the
-    /// document (via ForwardKey) and the ghost suffix is in the composition range.
-    /// EndComposition makes the suffix permanent — no text replacement needed.
-    /// The `text` parameter is only used when there's no active composition
-    /// (e.g. direct commit without prior ghost).
-    fn do_commit_text(
-        &self,
-        ec: u32,
-        text: &str,
-        composition: &Rc<RefCell<Option<ITfComposition>>>,
-    ) -> Result<()> {
-        let mut comp = composition.borrow_mut();
-        if let Some(active) = comp.take() {
-            unsafe {
-                // Ghost suffix is already in the document. Just finalize it.
-                active.EndComposition(ec)?;
-            }
-        } else {
-            // No active composition — insert the full text at selection.
-            let text_utf16: Vec<u16> = text.encode_utf16().collect();
-            unsafe {
-                let insert: ITfInsertAtSelection = self.context.cast()?;
-                insert.InsertTextAtSelection(ec, TF_IAS_NOQUERY, &text_utf16)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Move the caret (selection) to the start of the given range.
-    ///
-    /// This ensures forwarded keys are inserted before the ghost text, not after.
-    unsafe fn set_caret_to_range_start(&self, ec: u32, range: &ITfRange) -> Result<()> {
-        let caret = range.Clone()?;
-        caret.Collapse(ec, TF_ANCHOR_START)?;
-
-        let selection = TF_SELECTION {
+    fn select(&self, ec: u32, caret: ITfRange) -> Result<()> {
+        let mut selection = [TF_SELECTION {
             range: ManuallyDrop::new(Some(caret)),
             style: TF_SELECTIONSTYLE {
                 ase: TF_AE_END,
                 fInterimChar: BOOL(0),
             },
-        };
-        self.context.SetSelection(ec, &[selection])?;
-        Ok(())
+        }];
+        unsafe {
+            let result = self.context.SetSelection(ec, &selection);
+            ManuallyDrop::drop(&mut selection[0].range);
+            result
+        }
     }
 }
 
-// -- Public helper to request an edit session from outside ---------------
-
-/// Request a synchronous edit session on the given context.
-///
-/// Creates a `SmartKeyEditSession` with the specified operation and asks TSF
-/// to execute it. Returns Ok(()) if the session completed successfully.
-///
-/// # Safety
-/// Must be called from a TSF key event handler (OnKeyDown) for TF_ES_SYNC
-/// to succeed — TSF only grants synchronous sessions during key callbacks.
+/// Synchronous write sessions are requested only from TSF key callbacks.
 pub fn request_edit_session(context: &ITfContext, client_id: u32, op: EditOp) -> Result<()> {
-    let session: ITfEditSession = SmartKeyEditSession::new(context.clone(), client_id, op).into();
-
-    let hr =
-        unsafe { context.RequestEditSession(client_id, &session, TF_ES_READWRITE | TF_ES_SYNC)? };
-
-    hr.ok()
+    let session: ITfEditSession = SmartKeyEditSession {
+        context: context.clone(),
+        op,
+    }
+    .into();
+    unsafe {
+        context
+            .RequestEditSession(client_id, &session, TF_ES_READWRITE | TF_ES_SYNC)?
+            .ok()
+    }
 }

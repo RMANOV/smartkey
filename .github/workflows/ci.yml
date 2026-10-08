@@ -95,6 +95,9 @@ jobs:
   build-windows:
     name: Build (Windows)
     runs-on: windows-latest
+    env:
+      # Keep the deliverable independent of a separately installed VC runtime.
+      RUSTFLAGS: -Dwarnings -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -106,13 +109,28 @@ jobs:
       - run: cargo check -p smartkey-win
       - run: cargo check -p smartkey-playground
       - run: cargo clippy -p smartkey-win -- -D warnings
-      - name: Build Windows pilot payload
+      - name: Build Windows standalone payload
         run: cargo build --locked -p smartkey-win --release
-      - name: Stage complete Windows pilot payload
+      - name: Verify standalone binary dependencies
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $stage = Join-Path $env:RUNNER_TEMP "smartkey-windows-pilot-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products '*' -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin was not found' }
+          foreach ($binary in @('smartkey-register.exe', 'smartkey_win.dll')) {
+            $imports = & $dumpbin /DEPENDENTS "target/release/$binary"
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect $binary" }
+            $imports
+            if ($imports -match '(?i)(VCRUNTIME[0-9_]*|MSVCP[0-9_]*|ucrtbase)\.dll') {
+              throw "$binary still depends on a separately installed C/C++ runtime"
+            }
+          }
+      - name: Stage complete Windows standalone payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP "smartkey-windows-standalone-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           if (Test-Path -LiteralPath $stage) {
             throw "Refusing to reuse staging directory: $stage"
           }
@@ -121,12 +139,17 @@ jobs:
           $payload = @(
             @{ Source = 'target/release/smartkey-register.exe'; Name = 'smartkey-register.exe' },
             @{ Source = 'target/release/smartkey_win.dll'; Name = 'smartkey_win.dll' },
-            @{ Source = 'crates/smartkey-win/pilot-runtime-manifest.json'; Name = 'pilot-runtime-manifest.json' },
+            @{ Source = 'crates/smartkey-win/windows-runtime-manifest.json'; Name = 'windows-runtime-manifest.json' },
             @{ Source = 'config/smartkey.json'; Name = 'smartkey.json' },
             @{ Source = 'corpus/corpus_en.json'; Name = 'corpus_en.json' },
             @{ Source = 'corpus/corpus_bg.json'; Name = 'corpus_bg.json' },
             @{ Source = 'corpus/corpus_tech.json'; Name = 'corpus_tech.json' },
-            @{ Source = 'crates/smartkey-win/tests/windows_pilot_manual.md'; Name = 'PILOT_README.md' },
+            @{ Source = 'crates/smartkey-win/packaging/Install-SmartKey.cmd'; Name = 'Install-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Status-SmartKey.cmd'; Name = 'Status-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Enable-SmartKey.cmd'; Name = 'Enable-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Disable-SmartKey.cmd'; Name = 'Disable-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Uninstall-SmartKey.cmd'; Name = 'Uninstall-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/README-WINDOWS.md'; Name = 'README-WINDOWS.md' },
             @{ Source = 'LICENSE'; Name = 'LICENSE' },
             @{ Source = 'LICENSE-GPL'; Name = 'LICENSE-GPL' },
             @{ Source = 'LICENSE-APACHE'; Name = 'LICENSE-APACHE' }
@@ -158,12 +181,65 @@ jobs:
           if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
             throw 'Staged payload differs from the exact allowlist.'
           }
-      - name: Upload Windows pilot payload
+      - name: Upload Windows standalone payload
         uses: actions/upload-artifact@v4
         with:
-          name: smartkey-windows-pilot
-          path: ${{ runner.temp }}/smartkey-windows-pilot-${{ github.run_id }}-${{ github.run_attempt }}
+          name: smartkey-windows-standalone
+          path: ${{ runner.temp }}/smartkey-windows-standalone-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Check install and reversal as a standard Windows user
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = "C:\Users\Public\SmartKeySmoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $name = "SKSmoke$env:GITHUB_RUN_ATTEMPT"
+          if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { throw 'Smoke account already exists' }
+          $secret = ConvertTo-SecureString ([Guid]::NewGuid().ToString('N') + 'aA!4') -AsPlainText -Force
+          $credential = [PSCredential]::new("$env:COMPUTERNAME\$name", $secret)
+          $created = $false
+          try {
+            New-LocalUser -Name $name -Password $secret -AccountNeverExpires | Out-Null
+            $created = $true
+            Add-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-545').Name -Member $name
+            New-Item -ItemType Directory -Path $root | Out-Null
+            $stage = Join-Path $env:RUNNER_TEMP "smartkey-windows-standalone-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+            Copy-Item -LiteralPath $stage -Destination (Join-Path $root 'bundle') -Recurse
+            Copy-Item -LiteralPath 'crates/smartkey-win/packaging/smoke-user.ps1' -Destination $root
+            & icacls $root /grant "${name}:(OI)(CI)M" /T /Q
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot grant disposable account its smoke directory' }
+            $script = Join-Path $root 'smoke-user.ps1'
+            $bundle = Join-Path $root 'bundle'
+            $output = Join-Path $root 'user-smoke'
+            $arguments = "-NoProfile -NonInteractive -File `"$script`" -Bundle `"$bundle`" -OutDir `"$output`""
+            $child = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -PassThru -RedirectStandardOutput (Join-Path $root 'launcher.stdout.txt') -RedirectStandardError (Join-Path $root 'launcher.stderr.txt')
+            if (-not $child.WaitForExit(180000)) {
+              & taskkill /PID $child.Id /T /F
+              throw 'Standard-user smoke exceeded three minutes'
+            }
+            $child.Refresh()
+            Get-Content -LiteralPath (Join-Path $root 'launcher.stdout.txt')
+            Get-Content -LiteralPath (Join-Path $root 'launcher.stderr.txt')
+            if (Test-Path -LiteralPath $output) {
+              Get-ChildItem -LiteralPath $output -File | ForEach-Object { Get-Content -LiteralPath $_.FullName }
+            }
+            if ($child.ExitCode -ne 0) { throw "Standard-user smoke failed: $($child.ExitCode)" }
+            $receipt = Get-Content -LiteralPath (Join-Path $output 'smoke-result.json') -Raw | ConvertFrom-Json
+            if ($receipt.status -ne 'PASS_NATIVE_STANDARD_USER_MAINTENANCE' -or -not $receipt.standard_nonadmin) {
+              throw 'Missing successful standard-user receipt'
+            }
+          } finally {
+            if ($created) { Remove-LocalUser -Name $name }
+          }
+      - name: Retain native standard-user result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartkey-windows-standard-user-result
+          path: C:/Users/Public/SmartKeySmoke-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
           retention-days: 14
 
   build-macos:
