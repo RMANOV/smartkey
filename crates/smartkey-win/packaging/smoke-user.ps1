@@ -78,18 +78,40 @@ function Invoke-Helper([string]$exe, [string]$action) {
     $stem = $action.TrimStart('-')
     $stdout = Join-Path $OutDir "$stem.stdout.txt"
     $stderr = Join-Path $OutDir "$stem.stderr.txt"
-    $process = Start-Process -FilePath $exe -ArgumentList @($action, '--no-dialog') -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    if (-not $process.WaitForExit(45000)) {
-        $process.Kill()
-        $process.WaitForExit()
-        throw "$action exceeded 45 seconds; the smoke stopped."
-    }
-    $process.Refresh()
-    $steps.Add([ordered]@{ action=$action; exit_code=$process.ExitCode })
-    if ($process.ExitCode -ne 0) {
-        # Exact helper HRESULT/error is retained as the failed native evidence.
-        throw "$action failed (exit $($process.ExitCode)); see $stderr."
-    }
+    # Keep our own .NET Process/handle from Start through ExitCode. Windows
+    # PowerShell Start-Process -PassThru can yield a null cached ExitCode even
+    # after WaitForExit/Refresh; null must never be recorded as native success.
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $process.StartInfo.FileName = $exe
+    $process.StartInfo.Arguments = "$action --no-dialog"
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    try {
+        if (-not $process.Start()) { throw "Cannot start $action." }
+        # Drain both streams asynchronously before waiting, avoiding pipe
+        # deadlocks while preserving the real helper HRESULT/error output.
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(45000)) {
+            $process.Kill()
+            if (-not $process.WaitForExit(5000)) { throw "$action timed out and did not exit after termination." }
+            [IO.File]::WriteAllText($stdout, $stdoutTask.GetAwaiter().GetResult())
+            [IO.File]::WriteAllText($stderr, $stderrTask.GetAwaiter().GetResult())
+            throw "$action exceeded 45 seconds; the smoke stopped."
+        }
+        $exitCode = $process.ExitCode
+        if ($null -eq $exitCode) { throw "$action exited but its real exit code was unavailable; refusing an inferred result." }
+        [IO.File]::WriteAllText($stdout, $stdoutTask.GetAwaiter().GetResult())
+        [IO.File]::WriteAllText($stderr, $stderrTask.GetAwaiter().GetResult())
+        $steps.Add([ordered]@{ action=$action; exit_code=[int]$exitCode })
+        if ($exitCode -ne 0) {
+            throw "$action failed (exit $exitCode); see $stderr."
+        }
+    } finally { $process.Dispose() }
+
 }
 $receipt = [ordered]@{
     status='NOT_RUN'; standard_nonadmin=$true; current_user_profile_confirmed=$true; no_dialog=$true

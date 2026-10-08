@@ -182,24 +182,27 @@ fn unregister_com_server_hkcu() -> Result<()> {
 
 fn register_tip_profile(dll_path: &str, flags: u32) -> Result<()> {
     let profile_mgr: ITfInputProcessorProfileMgr =
-        unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)? };
+        unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|e| step_error("CoCreateInstance(ITfInputProcessorProfileMgr)", e))?;
 
     let name_w: Vec<u16> = DISPLAY_NAME.encode_utf16().collect();
     let icon_w: Vec<u16> = dll_path.encode_utf16().collect();
 
     unsafe {
-        profile_mgr.RegisterProfile(
-            &CLSID_SMARTKEY,
-            LANGID_BG,
-            &GUID_PROFILE,
-            &name_w,
-            &icon_w,
-            0,              // icon index
-            HKL::default(), // no substitute layout
-            0,              // no preferred layout
-            true,           // enable by default
-            flags,
-        )?;
+        profile_mgr
+            .RegisterProfile(
+                &CLSID_SMARTKEY,
+                LANGID_BG,
+                &GUID_PROFILE,
+                &name_w,
+                &icon_w,
+                0,              // icon index
+                HKL::default(), // no substitute layout
+                0,              // no preferred layout
+                true,           // enable by default
+                flags,
+            )
+            .map_err(|e| step_error("ITfInputProcessorProfileMgr::RegisterProfile", e))?;
     }
 
     Ok(())

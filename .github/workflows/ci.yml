@@ -190,6 +190,7 @@ jobs:
           retention-days: 14
 
       - name: Check install and reversal as a standard Windows user
+        id: user-smoke
         timeout-minutes: 5
         shell: pwsh
         run: |
@@ -232,6 +233,39 @@ jobs:
             }
           } finally {
             if ($created) { Remove-LocalUser -Name $name }
+          }
+      - name: Diagnose registration in the existing runner profile
+        if: failure() && steps.user-smoke.outcome == 'failure'
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $root = "C:\Users\Public\SmartKeySmoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $helper = Join-Path $root 'bundle/smartkey-register.exe'
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          if (-not $elevated) { throw 'Runner-profile diagnostic requires an actual elevated token' }
+          if (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'SmartKey')) {
+            throw 'Refusing to alter a preexisting runner-profile SmartKey installation'
+          }
+          $result = [ordered]@{
+            diagnostic_only=$true; standard_user_acceptance=$false
+            elevated_token=$elevated; existing_runner_profile=$true
+            privilege_vs_profile_history='NOT_DISTINGUISHED'
+            install_exit=$null; cleanup_exit=$null
+          }
+          try {
+            & $helper --install --no-dialog 1> (Join-Path $root 'control-install.stdout.txt') 2> (Join-Path $root 'control-install.stderr.txt')
+            $result.install_exit = $LASTEXITCODE
+          } finally {
+            # Exact SmartKey identifiers only; no installer elevation fallback.
+            & $helper --uninstall --no-dialog 1> (Join-Path $root 'control-cleanup.stdout.txt') 2> (Join-Path $root 'control-cleanup.stderr.txt')
+            $result.cleanup_exit = $LASTEXITCODE
+            $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'control-result.json') -Encoding utf8
+            Get-Content -LiteralPath (Join-Path $root 'control-install.stderr.txt')
+            Get-Content -LiteralPath (Join-Path $root 'control-result.json')
           }
       - name: Retain native standard-user result
         if: always()
