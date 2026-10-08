@@ -36,10 +36,34 @@ const DISPLAY_NAME: &str = "SmartKey";
 /// Any denied TSF operation is a real installation failure, not a skipped step.
 pub fn register(dll_path: &str) -> Result<bool> {
     register_com_server_hkcu(dll_path).map_err(|e| step_error("HKCU COM registration", e))?;
-    register_tip_profile(dll_path, 0).map_err(|e| step_error("Persistent TSF profile", e))?;
+    register_tip_profile(dll_path, 0, true).map_err(|e| step_error("Persistent TSF profile", e))?;
     register_categories().map_err(|e| step_error("TSF categories", e))?;
     set_user_enabled(true)?;
     Ok(false)
+}
+
+/// Explicit elevated machine phase. The caller must stage and validate a
+/// protected machine DLL first. Never changes any user's availability or data.
+pub fn register_machine(dll_path: &str) -> Result<()> {
+    register_com_server(HKEY_LOCAL_MACHINE, dll_path)
+        .map_err(|e| step_error("Machine COM registration", e))?;
+    register_tip_profile(dll_path, 0, false)
+        .map_err(|e| step_error("Persistent machine TSF profile", e))?;
+    register_categories().map_err(|e| step_error("Machine TSF categories", e))
+}
+
+/// Remove only the executing user's availability. Shared catalog/COM remain.
+pub fn unregister_user() -> Result<()> {
+    install_layout_or_tip(1).map_err(|e| step_error("Current-user profile removal", e))
+}
+
+/// Explicit elevated machine cleanup; never changes a user's Run/data/menu.
+pub fn unregister_machine() -> Result<()> {
+    collect_removal_errors([
+        ("Machine categories", unregister_categories()),
+        ("Machine TSF profile", unregister_tip_profile()),
+        ("Machine COM", unregister_com_server(HKEY_LOCAL_MACHINE)),
+    ])
 }
 
 /// Attempt each own-identity cleanup and return failures rather than claiming
@@ -51,6 +75,10 @@ pub fn unregister() -> Result<()> {
         ("TSF profile", unregister_tip_profile()),
         ("HKCU COM", unregister_com_server_hkcu()),
     ];
+    collect_removal_errors(operations)
+}
+
+fn collect_removal_errors<const N: usize>(operations: [(&str, Result<()>); N]) -> Result<()> {
     let errors: Vec<_> = operations
         .into_iter()
         .filter_map(|(name, result)| result.err().map(|e| (e.code(), format!("{name}: {e}"))))
@@ -133,6 +161,15 @@ fn install_layout_or_tip(flags: u32) -> Result<()> {
 /// Fresh-process verification must use this query after the installer exits.
 /// It observes the actual TSF profile rather than a local registration flag.
 pub fn profile_enabled() -> Result<bool> {
+    Ok(query_profile()?.dwFlags & TF_IPP_FLAG_ENABLED != 0)
+}
+
+/// Machine installation checks presence, without enabling the administrator.
+pub fn profile_present() -> Result<()> {
+    query_profile().map(|_| ())
+}
+
+fn query_profile() -> Result<TF_INPUTPROCESSORPROFILE> {
     let mgr: ITfInputProcessorProfileMgr =
         unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER) }
             .map_err(|e| {
@@ -152,12 +189,16 @@ pub fn profile_enabled() -> Result<bool> {
             &mut profile,
         ).map_err(|e| step_error("Verification ITfInputProcessorProfileMgr::GetProfile(type=INPUTPROCESSOR, langid=0x0402, hkl=NULL)", e))?;
     }
-    Ok(profile.dwFlags & TF_IPP_FLAG_ENABLED != 0)
+    Ok(profile)
 }
 
 // -- COM server registration (registry) --------------------------------
 
 fn register_com_server_hkcu(dll_path: &str) -> Result<()> {
+    register_com_server(HKEY_CURRENT_USER, dll_path)
+}
+
+fn register_com_server(root: HKEY, dll_path: &str) -> Result<()> {
     let subkey = format!(
         "SOFTWARE\\Classes\\CLSID\\{{{}}}\\InProcServer32",
         CLSID_SMARTKEY_STR
@@ -165,7 +206,7 @@ fn register_com_server_hkcu(dll_path: &str) -> Result<()> {
     let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
 
     let mut hkey = HKEY::default();
-    check_win32(unsafe { RegCreateKeyW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr()), &mut hkey) })?;
+    check_win32(unsafe { RegCreateKeyW(root, PCWSTR(subkey_w.as_ptr()), &mut hkey) })?;
 
     let result = set_reg_sz(hkey, None, dll_path)
         .and_then(|_| set_reg_sz(hkey, Some("ThreadingModel"), "Apartment"));
@@ -174,9 +215,13 @@ fn register_com_server_hkcu(dll_path: &str) -> Result<()> {
 }
 
 fn unregister_com_server_hkcu() -> Result<()> {
+    unregister_com_server(HKEY_CURRENT_USER)
+}
+
+fn unregister_com_server(root: HKEY) -> Result<()> {
     let subkey = format!("SOFTWARE\\Classes\\CLSID\\{{{}}}", CLSID_SMARTKEY_STR);
     let subkey_w: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-    let result = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr())) };
+    let result = unsafe { RegDeleteTreeW(root, PCWSTR(subkey_w.as_ptr())) };
     if result == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND {
         Ok(())
     } else {
@@ -186,7 +231,7 @@ fn unregister_com_server_hkcu() -> Result<()> {
 
 // -- TSF TIP profile registration --------------------------------------
 
-fn register_tip_profile(dll_path: &str, flags: u32) -> Result<()> {
+fn register_tip_profile(dll_path: &str, flags: u32, enabled_by_default: bool) -> Result<()> {
     let profile_mgr: ITfInputProcessorProfileMgr =
         unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER) }
             .map_err(|e| step_error("CoCreateInstance(ITfInputProcessorProfileMgr)", e))?;
@@ -205,7 +250,7 @@ fn register_tip_profile(dll_path: &str, flags: u32) -> Result<()> {
                 0,              // icon index
                 HKL::default(), // no substitute layout
                 0,              // no preferred layout
-                true,           // enable by default
+                enabled_by_default,
                 flags,
             )
             .map_err(|e| step_error("ITfInputProcessorProfileMgr::RegisterProfile", e))?;

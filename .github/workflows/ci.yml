@@ -144,6 +144,8 @@ jobs:
             @{ Source = 'corpus/corpus_en.json'; Name = 'corpus_en.json' },
             @{ Source = 'corpus/corpus_bg.json'; Name = 'corpus_bg.json' },
             @{ Source = 'corpus/corpus_tech.json'; Name = 'corpus_tech.json' },
+            @{ Source = 'crates/smartkey-win/packaging/Install-Machine-SmartKey.cmd'; Name = 'Install-Machine-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Uninstall-Machine-SmartKey.cmd'; Name = 'Uninstall-Machine-SmartKey.cmd' },
             @{ Source = 'crates/smartkey-win/packaging/Install-SmartKey.cmd'; Name = 'Install-SmartKey.cmd' },
             @{ Source = 'crates/smartkey-win/packaging/Status-SmartKey.cmd'; Name = 'Status-SmartKey.cmd' },
             @{ Source = 'crates/smartkey-win/packaging/Enable-SmartKey.cmd'; Name = 'Enable-SmartKey.cmd' },
@@ -189,191 +191,161 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Check install and reversal as a standard Windows user
+      - name: Check machine setup and standard-user install and reversal
         id: user-smoke
-        timeout-minutes: 5
+        timeout-minutes: 8
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $root = "C:\Users\Public\SmartKeySmoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $name = "SKSmoke$env:GITHUB_RUN_ATTEMPT"
+          $stage = Join-Path $env:RUNNER_TEMP "smartkey-windows-standalone-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $stageHelper = Join-Path $stage 'smartkey-register.exe'
+          $machineDirectory = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) 'SmartKey'
+          $machineHelper = Join-Path $machineDirectory 'smartkey-register.exe'
+          $guid = '{7A3B9E1F-4C2D-4E5A-8F6B-1D2E3F4A5B6C}'
+          $machineClass = "HKLM:\Software\Classes\CLSID\$guid"
+          $machineTip = "HKLM:\Software\Microsoft\CTF\TIP\$guid"
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'The disposable runner must provide an actual elevated token for machine setup.'
+          }
           if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { throw 'Smoke account already exists' }
+          foreach ($path in @($root, $machineDirectory, $machineClass, $machineTip)) {
+            if (Test-Path -LiteralPath $path) { throw "Refusing preexisting smoke/machine state: $path" }
+          }
           $secret = ConvertTo-SecureString ([Guid]::NewGuid().ToString('N') + 'aA!4') -AsPlainText -Force
           $credential = [PSCredential]::new("$env:COMPUTERNAME\$name", $secret)
           $created = $false
+          $machineAttempted = $false
+          $failure = $null
+          $result = [ordered]@{
+            status='NOT_RUN'; elevated_machine_token=$true
+            standard_user_prerequisite=$false; standard_user_lifecycle=$false
+            machine_install_exit=$null; machine_verify_exit=$null; machine_cleanup_exit=$null
+            frozen_bundle_matches=$false; machine_state_removed=$false
+            typing_exercised=$false; logon_exercised=$false; cleanup_errors=@()
+          }
+          function Invoke-MachineHelper([string]$helper, [string]$action, [string]$exitField) {
+            $process = [Diagnostics.Process]::new()
+            try {
+              $process.StartInfo = [Diagnostics.ProcessStartInfo]::new($helper, "$action --no-dialog")
+              $process.StartInfo.UseShellExecute = $false
+              $process.StartInfo.CreateNoWindow = $true
+              $process.StartInfo.RedirectStandardOutput = $true
+              $process.StartInfo.RedirectStandardError = $true
+              if (-not $process.Start()) { throw "Cannot start $action" }
+              $stdout = $process.StandardOutput.ReadToEndAsync()
+              $stderr = $process.StandardError.ReadToEndAsync()
+              $timedOut = -not $process.WaitForExit(45000)
+              if ($timedOut) {
+                $process.Kill($true)
+                if (-not $process.WaitForExit(5000)) { throw "$action did not exit after timeout/termination" }
+              }
+              $stem = $action.TrimStart('-')
+              [IO.File]::WriteAllText((Join-Path $root "$stem.stdout.txt"), $stdout.GetAwaiter().GetResult())
+              [IO.File]::WriteAllText((Join-Path $root "$stem.stderr.txt"), $stderr.GetAwaiter().GetResult())
+              $exitCode = $process.ExitCode
+              if ($null -eq $exitCode) { throw "$action has no real exit code; inferred success is refused" }
+              $result[$exitField] = [int]$exitCode
+              if ($timedOut) { throw "$action exceeded 45 seconds" }
+              if ($exitCode -ne 0) { throw "$action failed with exit $exitCode" }
+            } finally { $process.Dispose() }
+          }
+          function Invoke-UserSmoke([string]$phase, [string]$expectedStatus, [int]$timeout) {
+            $output = Join-Path $root "user-$($phase.ToLowerInvariant())"
+            $arguments = "-NoProfile -NonInteractive -File `"$script`" -Bundle `"$bundle`" -OutDir `"$output`" -Phase $phase"
+            $child = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -PassThru -RedirectStandardOutput (Join-Path $root "$phase.launcher.stdout.txt") -RedirectStandardError (Join-Path $root "$phase.launcher.stderr.txt")
+            try {
+              if (-not $child.WaitForExit($timeout)) {
+                & taskkill /PID $child.Id /T /F
+                throw "Standard-user $phase exceeded its bounded timeout"
+              }
+              $child.Refresh()
+              if ($null -eq $child.ExitCode -or $child.ExitCode -ne 0) {
+                throw "Standard-user $phase failed or its real exit code is unavailable: $($child.ExitCode)"
+              }
+            } finally { $child.Dispose() }
+            $receipt = Get-Content -LiteralPath (Join-Path $output 'smoke-result.json') -Raw | ConvertFrom-Json
+            if ($receipt.status -ne $expectedStatus -or $receipt.phase -ne $phase -or
+                -not $receipt.standard_nonadmin -or -not $receipt.current_user_profile_confirmed -or
+                -not $receipt.keyboard_defaults_preserved) {
+              throw "Missing successful standard-user $phase receipt"
+            }
+            if ($phase -eq 'Prerequisite' -and -not $receipt.machine_prerequisite_refused) {
+              throw 'Missing explicit machine-prerequisite refusal'
+            }
+            if ($phase -eq 'Lifecycle' -and (-not $receipt.machine_install_preserved -or -not $receipt.personal_sentinel_preserved)) {
+              throw 'Lifecycle did not preserve the machine install and personal sentinel'
+            }
+          }
           try {
+            New-Item -ItemType Directory -Path $root | Out-Null
             New-LocalUser -Name $name -Password $secret -AccountNeverExpires | Out-Null
             $created = $true
             Add-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-545').Name -Member $name
-            New-Item -ItemType Directory -Path $root | Out-Null
-            $stage = Join-Path $env:RUNNER_TEMP "smartkey-windows-standalone-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
             Copy-Item -LiteralPath $stage -Destination (Join-Path $root 'bundle') -Recurse
             Copy-Item -LiteralPath 'crates/smartkey-win/packaging/smoke-user.ps1' -Destination $root
             & icacls $root /grant "${name}:(OI)(CI)M" /T /Q
             if ($LASTEXITCODE -ne 0) { throw 'Cannot grant disposable account its smoke directory' }
             $script = Join-Path $root 'smoke-user.ps1'
             $bundle = Join-Path $root 'bundle'
-            $output = Join-Path $root 'user-smoke'
-            $arguments = "-NoProfile -NonInteractive -File `"$script`" -Bundle `"$bundle`" -OutDir `"$output`""
-            $child = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -PassThru -RedirectStandardOutput (Join-Path $root 'launcher.stdout.txt') -RedirectStandardError (Join-Path $root 'launcher.stderr.txt')
-            if (-not $child.WaitForExit(180000)) {
-              & taskkill /PID $child.Id /T /F
-              throw 'Standard-user smoke exceeded three minutes'
+            Invoke-UserSmoke 'Prerequisite' 'PASS_NATIVE_STANDARD_USER_PREREQUISITE' 60000
+            $result.standard_user_prerequisite = $true
+
+            # Elevation uses the original frozen stage, never the user-writable copy.
+            # Set ownership before the attempt so partial installation is cleaned too.
+            $machineAttempted = $true
+            Invoke-MachineHelper $stageHelper '--install-machine' 'machine_install_exit'
+            $expected = @(Get-ChildItem -LiteralPath $stage -Force | ForEach-Object Name | Sort-Object)
+            $actual = @(Get-ChildItem -LiteralPath $machineDirectory -Force | ForEach-Object Name | Sort-Object)
+            if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
+              throw 'Protected machine directory differs from the exact frozen bundle'
             }
-            $child.Refresh()
-            Get-Content -LiteralPath (Join-Path $root 'launcher.stdout.txt')
-            Get-Content -LiteralPath (Join-Path $root 'launcher.stderr.txt')
-            if (Test-Path -LiteralPath $output) {
-              Get-ChildItem -LiteralPath $output -File | ForEach-Object { Get-Content -LiteralPath $_.FullName }
-            }
-            if ($child.ExitCode -ne 0) { throw "Standard-user smoke failed: $($child.ExitCode)" }
-            $receipt = Get-Content -LiteralPath (Join-Path $output 'smoke-result.json') -Raw | ConvertFrom-Json
-            if ($receipt.status -ne 'PASS_NATIVE_STANDARD_USER_MAINTENANCE' -or -not $receipt.standard_nonadmin) {
-              throw 'Missing successful standard-user receipt'
-            }
-          } finally {
-            if ($created) { Remove-LocalUser -Name $name }
-          }
-      - name: Diagnose registration in the existing runner profile
-        if: failure() && steps.user-smoke.outcome == 'failure'
-        timeout-minutes: 2
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $false
-          $root = "C:\Users\Public\SmartKeySmoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $helper = Join-Path $root 'bundle/smartkey-register.exe'
-          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-          $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-          if (-not $elevated) { throw 'Runner-profile diagnostic requires an actual elevated token' }
-          if (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'SmartKey')) {
-            throw 'Refusing to alter a preexisting runner-profile SmartKey installation'
-          }
-          $result = [ordered]@{
-            diagnostic_only=$true; standard_user_acceptance=$false
-            elevated_token=$elevated; existing_runner_profile=$true
-            privilege_vs_profile_history='NOT_DISTINGUISHED'
-            install_exit=$null; cleanup_exit=$null
-            token_integrity_sid=$null; enable_lua=$null
-            machine_com_control='NOT_RUN'; machine_verify_exit=$null
-            copied_dll_sha256=$null; diagnostic_error=$null; cleanup_errors=@()
-            machine_class_removed=$null; machine_directory_removed=$null
-          }
-          $machineClassCreated = $false
-          $machineDirectoryCreated = $false
-          $guid = '{7A3B9E1F-4C2D-4E5A-8F6B-1D2E3F4A5B6C}'
-          $machineClass = "HKLM:\Software\Classes\CLSID\$guid"
-          $machineDirectory = Join-Path $env:ProgramFiles "SmartKey-COM-Diagnostic-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          try {
-            & $helper --install --no-dialog 1> (Join-Path $root 'control-install.stdout.txt') 2> (Join-Path $root 'control-install.stderr.txt')
-            $result.install_exit = $LASTEXITCODE
-            # Read only this candidate's identities before its cleanup.
-            $snapshots = foreach ($path in @(
-              "HKCU:\Software\Microsoft\CTF\TIP\$guid",
-              "HKLM:\Software\Microsoft\CTF\TIP\$guid",
-              "HKCU:\Software\Classes\CLSID\$guid",
-              "HKLM:\Software\Classes\CLSID\$guid"
-            )) {
-              if (-not (Test-Path -LiteralPath $path)) {
-                [ordered]@{ path=$path; present=$false }
-                continue
-              }
-              $keys = @((Get-Item -LiteralPath $path)) + @(Get-ChildItem -LiteralPath $path -Recurse)
-              foreach ($key in $keys) {
-                $values = [ordered]@{}
-                foreach ($name in $key.GetValueNames()) { $values[$name] = $key.GetValue($name) }
-                [ordered]@{ path=$key.Name; present=$true; values=$values }
+            foreach ($file in $expected) {
+              if ((Get-FileHash -LiteralPath (Join-Path $stage $file) -Algorithm SHA256).Hash -ne
+                  (Get-FileHash -LiteralPath (Join-Path $machineDirectory $file) -Algorithm SHA256).Hash) {
+                throw "Protected machine file differs from frozen source: $file"
               }
             }
-            @($snapshots) | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'control-owned-registry.json') -Encoding utf8
-            # One diagnostic for elevated COM visibility; baseline evidence above
-            # is retained, and this cannot accept a standard-user installation.
-            if ($result.install_exit -ne 0) {
-              $groups = & "$env:SystemRoot\System32\whoami.exe" /groups /fo csv /nh
-              if ($LASTEXITCODE -ne 0) { throw 'Cannot read diagnostic token integrity' }
-              $integrity = [regex]::Match(($groups -join "`n"), 'S-1-16-[0-9]+')
-              if (-not $integrity.Success) { throw 'Diagnostic token integrity SID was not reported' }
-              $result.token_integrity_sid = $integrity.Value
-              $result.enable_lua = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA).EnableLUA
-              if (Test-Path -LiteralPath $machineClass) {
-                throw 'Refusing preexisting exact SmartKey machine COM class'
-              }
-              if (Test-Path -LiteralPath $machineDirectory) {
-                throw 'Refusing preexisting diagnostic Program Files directory'
-              }
-              New-Item -ItemType Directory -Path $machineDirectory | Out-Null
-              $machineDirectoryCreated = $true
-              $machineDll = Join-Path $machineDirectory 'smartkey_win.dll'
-              $sourceDll = Join-Path $env:LOCALAPPDATA 'SmartKey/smartkey_win.dll'
-              Copy-Item -LiteralPath $sourceDll -Destination $machineDll
-              $sourceHash = (Get-FileHash -LiteralPath $sourceDll -Algorithm SHA256).Hash
-              $result.copied_dll_sha256 = (Get-FileHash -LiteralPath $machineDll -Algorithm SHA256).Hash
-              if ($result.copied_dll_sha256 -ne $sourceHash) { throw 'Diagnostic DLL copy differs from installed DLL' }
-              # No TSF catalog or profile parameters are changed here.
-              New-Item -Path $machineClass | Out-Null
-              $machineClassCreated = $true
-              $serverKey = Join-Path $machineClass 'InProcServer32'
-              New-Item -Path $serverKey | Out-Null
-              Set-Item -LiteralPath $serverKey -Value $machineDll
-              New-ItemProperty -LiteralPath $serverKey -Name ThreadingModel -Value Apartment -PropertyType String | Out-Null
-              $process = [Diagnostics.Process]::new()
-              try {
-                $process.StartInfo = [Diagnostics.ProcessStartInfo]::new($helper, '--verify --no-dialog')
-                $process.StartInfo.UseShellExecute = $false
-                $process.StartInfo.CreateNoWindow = $true
-                $process.StartInfo.RedirectStandardOutput = $true
-                $process.StartInfo.RedirectStandardError = $true
-                if (-not $process.Start()) { throw 'Cannot start machine COM verification child' }
-                $stdout = $process.StandardOutput.ReadToEndAsync()
-                $stderr = $process.StandardError.ReadToEndAsync()
-                if (-not $process.WaitForExit(45000)) {
-                  $process.Kill($true)
-                  if (-not $process.WaitForExit(5000)) { throw 'Machine COM verification child did not stop after timeout' }
-                  $result.machine_com_control = 'TIMEOUT'
-                }
-                $stdout.GetAwaiter().GetResult() | Set-Content -LiteralPath (Join-Path $root 'control-machine-com.stdout.txt') -Encoding utf8
-                $stderr.GetAwaiter().GetResult() | Set-Content -LiteralPath (Join-Path $root 'control-machine-com.stderr.txt') -Encoding utf8
-                $result.machine_verify_exit = $process.ExitCode
-                if ($result.machine_com_control -ne 'TIMEOUT') {
-                  $result.machine_com_control = if ($process.ExitCode -eq 0) { 'QUERY_SUCCEEDED_DIAGNOSTIC_ONLY' } else { 'QUERY_FAILED' }
-                }
-              } finally { $process.Dispose() }
-            }
+            $result.frozen_bundle_matches = $true
+            Invoke-MachineHelper $machineHelper '--verify-machine' 'machine_verify_exit'
+            Invoke-UserSmoke 'Lifecycle' 'PASS_NATIVE_STANDARD_USER_MAINTENANCE' 180000
+            $result.standard_user_lifecycle = $true
+            $result.status = 'PASS_NATIVE_MACHINE_AND_STANDARD_USER_MAINTENANCE'
           } catch {
-            $result.diagnostic_error = $_.Exception.Message
-            if ($result.machine_com_control -eq 'NOT_RUN') { $result.machine_com_control = 'CONTROL_ERROR' }
+            $failure = $_.Exception.Message
+            $result.status = 'FAIL_NATIVE_MACHINE_AND_STANDARD_USER_MAINTENANCE'
+            $result['error'] = $failure
           } finally {
-            # Remove only objects this diagnostic created, even if query failed.
-            if ($machineClassCreated) {
+            if ($machineAttempted) {
               try {
-                Remove-Item -LiteralPath $machineClass -Recurse -Force
-                $result.machine_class_removed = -not (Test-Path -LiteralPath $machineClass)
-                if (-not $result.machine_class_removed) { throw 'Created machine COM class remains' }
-              } catch { $result.cleanup_errors += "Machine COM class: $($_.Exception.Message)" }
+                # The original archive helper can remove the installed EXE;
+                # the product deliberately refuses to delete its running self.
+                Invoke-MachineHelper $stageHelper '--uninstall-machine' 'machine_cleanup_exit'
+                foreach ($path in @($machineClass, $machineTip, $machineDirectory)) {
+                  if (Test-Path -LiteralPath $path) { throw "Owned machine state remains after cleanup: $path" }
+                }
+                $result.machine_state_removed = $true
+              } catch { $result.cleanup_errors += "Machine cleanup: $($_.Exception.Message)" }
             }
-            if ($machineDirectoryCreated) {
-              try {
-                Remove-Item -LiteralPath $machineDirectory -Recurse -Force
-                $result.machine_directory_removed = -not (Test-Path -LiteralPath $machineDirectory)
-                if (-not $result.machine_directory_removed) { throw 'Created diagnostic directory remains' }
-              } catch { $result.cleanup_errors += "Diagnostic directory: $($_.Exception.Message)" }
+            if ($created) {
+              try { Remove-LocalUser -Name $name }
+              catch { $result.cleanup_errors += "Disposable account cleanup: $($_.Exception.Message)" }
             }
-            # Existing exact SmartKey helper cleanup remains unconditional.
-            try {
-              & $helper --uninstall --no-dialog 1> (Join-Path $root 'control-cleanup.stdout.txt') 2> (Join-Path $root 'control-cleanup.stderr.txt')
-              $result.cleanup_exit = $LASTEXITCODE
-              if ($result.cleanup_exit -ne 0) { $result.cleanup_errors += "Helper cleanup exit: $($result.cleanup_exit)" }
-            } catch { $result.cleanup_errors += "Helper cleanup: $($_.Exception.Message)" }
-            $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'control-result.json') -Encoding utf8
-            if (Test-Path -LiteralPath (Join-Path $root 'control-install.stderr.txt')) {
-              Get-Content -LiteralPath (Join-Path $root 'control-install.stderr.txt')
+            if ($result.cleanup_errors.Count -ne 0) {
+              $result.status = 'FAIL_NATIVE_MACHINE_AND_STANDARD_USER_MAINTENANCE'
             }
-            if (Test-Path -LiteralPath (Join-Path $root 'control-machine-com.stderr.txt')) {
-              Get-Content -LiteralPath (Join-Path $root 'control-machine-com.stderr.txt')
+            if (Test-Path -LiteralPath $root) {
+              $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'machine-and-user-result.json') -Encoding utf8
+              Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object {
+                $_.Name -like '*.stdout.txt' -or $_.Name -like '*.stderr.txt' -or $_.Name -like '*result.json'
+              } | Sort-Object FullName | ForEach-Object { Get-Content -LiteralPath $_.FullName }
             }
-            Get-Content -LiteralPath (Join-Path $root 'control-result.json')
           }
+          if ($null -ne $failure) { throw $failure }
+          if ($result.cleanup_errors.Count -ne 0) { throw ($result.cleanup_errors -join '; ') }
       - name: Retain native standard-user result
         if: always()
         uses: actions/upload-artifact@v4

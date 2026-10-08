@@ -1,9 +1,9 @@
 @echo off
 setlocal
 set "SMARTKEY_HELPER=%~dp0smartkey-register.exe"
-if not exist "%SMARTKEY_HELPER%" set "SMARTKEY_HELPER=%LOCALAPPDATA%\SmartKey\smartkey-register.exe"
+if not exist "%SMARTKEY_HELPER%" set "SMARTKEY_HELPER=%ProgramFiles%\SmartKey\smartkey-register.exe"
 if not exist "%SMARTKEY_HELPER%" (
-  echo SmartKey helper is missing. Extract the whole SmartKey archive first.
+  echo SmartKey helper is missing. Extract the whole archive, then install the machine package once.
   pause
   exit /b 1
 )

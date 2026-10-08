@@ -72,6 +72,44 @@ impl SmartKeyTextService {
         }
     }
 
+    /// Respect the application's TSF eligibility flags before inspecting keys.
+    /// Unset compartments are normal; unavailable or malformed state is not.
+    fn context_accepts_input(context: Option<&ITfContext>) -> bool {
+        let Some(context) = context else {
+            return false;
+        };
+        let allowed = (|| -> Result<bool> {
+            let status = unsafe { context.GetStatus()? };
+            if status.dwDynamicFlags & TF_SD_READONLY != 0 {
+                return Ok(false);
+            }
+            let compartments: ITfCompartmentMgr = context.cast()?;
+            for guid in [
+                GUID_COMPARTMENT_KEYBOARD_DISABLED,
+                GUID_COMPARTMENT_EMPTYCONTEXT,
+            ] {
+                let value = unsafe { compartments.GetCompartment(&guid)?.GetValue()? };
+                if !compartment_allows_input(&value) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        allowed.unwrap_or(false)
+    }
+
+    fn admit_context(&self, context: Option<&ITfContext>) -> bool {
+        if Self::context_accepts_input(context) {
+            return true;
+        }
+        // reset discards pending text; focus_lost would commit and learn it.
+        // Do not dispatch an edit through a missing/disabled/new context.
+        let _ = self.core.borrow_mut().reset();
+        let stale_composition = self.composition.borrow_mut().take();
+        drop(stale_composition);
+        false
+    }
+
     /// Translate a Windows virtual key code to our platform-neutral Key.
     ///
     /// Uses `ToUnicodeEx` for layout-aware character resolution — supports
@@ -194,6 +232,14 @@ impl SmartKeyTextService {
     }
 }
 
+fn compartment_allows_input(value: &VARIANT) -> bool {
+    // The TSF compartments are VT_I4 flags. Do not coerce strings or booleans.
+    const VT_I4: u16 = 3;
+    value.is_empty()
+        || (unsafe { value.as_raw().Anonymous.Anonymous.vt } == VT_I4
+            && i32::try_from(value).is_ok_and(|flag| flag == 0))
+}
+
 // -- ITfTextInputProcessor implementation (base trait: Activate + Deactivate) --
 
 impl ITfTextInputProcessor_Impl for SmartKeyTextService_Impl {
@@ -295,10 +341,13 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
 
     fn OnTestKeyDown(
         &self,
-        _pic: Option<&ITfContext>,
+        pic: Option<&ITfContext>,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
+        if !self.admit_context(pic) {
+            return Ok(BOOL::from(false));
+        }
         let scan_code = ((lparam.0 >> 16) & 0xFF) as u32;
         let key = SmartKeyTextService::vk_to_key(wparam.0 as u32, scan_code);
         let core = self.core.borrow();
@@ -325,6 +374,9 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
     }
 
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
+        if !self.admit_context(pic) {
+            return Ok(BOOL::from(false));
+        }
         let vk = wparam.0 as u32;
         let scan_code = ((lparam.0 >> 16) & 0xFF) as u32;
         let key = SmartKeyTextService::vk_to_key(vk, scan_code);
@@ -390,5 +442,35 @@ impl ITfCompositionSink_Impl for SmartKeyTextService_Impl {
             let _ = self.core.borrow_mut().reset();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn unset_and_zero_compartments_allow_input_but_other_values_do_not() {
+        assert!(compartment_allows_input(&VARIANT::new()));
+        assert!(compartment_allows_input(&VARIANT::from(0i32)));
+        assert!(!compartment_allows_input(&VARIANT::from(1i32)));
+        assert!(!compartment_allows_input(&VARIANT::from(-1i32)));
+        assert!(!compartment_allows_input(&VARIANT::from(false)));
+        assert!(!compartment_allows_input(&VARIANT::from("0")));
+    }
+
+    #[test]
+    fn missing_context_neither_claims_nor_feeds_a_key_and_discards_pending_text() {
+        let service = windows_core::ComObject::new(SmartKeyTextService::new());
+        let sink: ITfKeyEventSink = service.to_interface();
+        let _ = service.core.borrow_mut().handle_key(KeyEvent {
+            key: Key::Char('q'),
+            modifiers: Modifiers::empty(),
+        });
+        assert_eq!(service.core.borrow().current_word(), "q");
+        assert!(!unsafe { sink.OnTestKeyDown(None, WPARAM(0x41), LPARAM(0)).unwrap() }.as_bool());
+        assert!(service.core.borrow().current_word().is_empty());
+        assert!(!unsafe { sink.OnKeyDown(None, WPARAM(0x41), LPARAM(0)).unwrap() }.as_bool());
+        assert!(service.core.borrow().current_word().is_empty());
     }
 }
