@@ -255,12 +255,20 @@ jobs:
             elevated_token=$elevated; existing_runner_profile=$true
             privilege_vs_profile_history='NOT_DISTINGUISHED'
             install_exit=$null; cleanup_exit=$null
+            token_integrity_sid=$null; enable_lua=$null
+            machine_com_control='NOT_RUN'; machine_verify_exit=$null
+            copied_dll_sha256=$null; diagnostic_error=$null; cleanup_errors=@()
+            machine_class_removed=$null; machine_directory_removed=$null
           }
+          $machineClassCreated = $false
+          $machineDirectoryCreated = $false
+          $guid = '{7A3B9E1F-4C2D-4E5A-8F6B-1D2E3F4A5B6C}'
+          $machineClass = "HKLM:\Software\Classes\CLSID\$guid"
+          $machineDirectory = Join-Path $env:ProgramFiles "SmartKey-COM-Diagnostic-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           try {
             & $helper --install --no-dialog 1> (Join-Path $root 'control-install.stdout.txt') 2> (Join-Path $root 'control-install.stderr.txt')
             $result.install_exit = $LASTEXITCODE
             # Read only this candidate's identities before its cleanup.
-            $guid = '{7A3B9E1F-4C2D-4E5A-8F6B-1D2E3F4A5B6C}'
             $snapshots = foreach ($path in @(
               "HKCU:\Software\Microsoft\CTF\TIP\$guid",
               "HKLM:\Software\Microsoft\CTF\TIP\$guid",
@@ -279,12 +287,91 @@ jobs:
               }
             }
             @($snapshots) | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'control-owned-registry.json') -Encoding utf8
+            # One diagnostic for elevated COM visibility; baseline evidence above
+            # is retained, and this cannot accept a standard-user installation.
+            if ($result.install_exit -ne 0) {
+              $groups = & "$env:SystemRoot\System32\whoami.exe" /groups /fo csv /nh
+              if ($LASTEXITCODE -ne 0) { throw 'Cannot read diagnostic token integrity' }
+              $integrity = [regex]::Match(($groups -join "`n"), 'S-1-16-[0-9]+')
+              if (-not $integrity.Success) { throw 'Diagnostic token integrity SID was not reported' }
+              $result.token_integrity_sid = $integrity.Value
+              $result.enable_lua = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA).EnableLUA
+              if (Test-Path -LiteralPath $machineClass) {
+                throw 'Refusing preexisting exact SmartKey machine COM class'
+              }
+              if (Test-Path -LiteralPath $machineDirectory) {
+                throw 'Refusing preexisting diagnostic Program Files directory'
+              }
+              New-Item -ItemType Directory -Path $machineDirectory | Out-Null
+              $machineDirectoryCreated = $true
+              $machineDll = Join-Path $machineDirectory 'smartkey_win.dll'
+              $sourceDll = Join-Path $env:LOCALAPPDATA 'SmartKey/smartkey_win.dll'
+              Copy-Item -LiteralPath $sourceDll -Destination $machineDll
+              $sourceHash = (Get-FileHash -LiteralPath $sourceDll -Algorithm SHA256).Hash
+              $result.copied_dll_sha256 = (Get-FileHash -LiteralPath $machineDll -Algorithm SHA256).Hash
+              if ($result.copied_dll_sha256 -ne $sourceHash) { throw 'Diagnostic DLL copy differs from installed DLL' }
+              # No TSF catalog or profile parameters are changed here.
+              New-Item -Path $machineClass | Out-Null
+              $machineClassCreated = $true
+              $serverKey = Join-Path $machineClass 'InProcServer32'
+              New-Item -Path $serverKey | Out-Null
+              Set-Item -LiteralPath $serverKey -Value $machineDll
+              New-ItemProperty -LiteralPath $serverKey -Name ThreadingModel -Value Apartment -PropertyType String | Out-Null
+              $process = [Diagnostics.Process]::new()
+              try {
+                $process.StartInfo = [Diagnostics.ProcessStartInfo]::new($helper, '--verify --no-dialog')
+                $process.StartInfo.UseShellExecute = $false
+                $process.StartInfo.CreateNoWindow = $true
+                $process.StartInfo.RedirectStandardOutput = $true
+                $process.StartInfo.RedirectStandardError = $true
+                if (-not $process.Start()) { throw 'Cannot start machine COM verification child' }
+                $stdout = $process.StandardOutput.ReadToEndAsync()
+                $stderr = $process.StandardError.ReadToEndAsync()
+                if (-not $process.WaitForExit(45000)) {
+                  $process.Kill($true)
+                  if (-not $process.WaitForExit(5000)) { throw 'Machine COM verification child did not stop after timeout' }
+                  $result.machine_com_control = 'TIMEOUT'
+                }
+                $stdout.GetAwaiter().GetResult() | Set-Content -LiteralPath (Join-Path $root 'control-machine-com.stdout.txt') -Encoding utf8
+                $stderr.GetAwaiter().GetResult() | Set-Content -LiteralPath (Join-Path $root 'control-machine-com.stderr.txt') -Encoding utf8
+                $result.machine_verify_exit = $process.ExitCode
+                if ($result.machine_com_control -ne 'TIMEOUT') {
+                  $result.machine_com_control = if ($process.ExitCode -eq 0) { 'QUERY_SUCCEEDED_DIAGNOSTIC_ONLY' } else { 'QUERY_FAILED' }
+                }
+              } finally { $process.Dispose() }
+            }
+          } catch {
+            $result.diagnostic_error = $_.Exception.Message
+            if ($result.machine_com_control -eq 'NOT_RUN') { $result.machine_com_control = 'CONTROL_ERROR' }
           } finally {
-            # Exact SmartKey identifiers only; no installer elevation fallback.
-            & $helper --uninstall --no-dialog 1> (Join-Path $root 'control-cleanup.stdout.txt') 2> (Join-Path $root 'control-cleanup.stderr.txt')
-            $result.cleanup_exit = $LASTEXITCODE
-            $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'control-result.json') -Encoding utf8
-            Get-Content -LiteralPath (Join-Path $root 'control-install.stderr.txt')
+            # Remove only objects this diagnostic created, even if query failed.
+            if ($machineClassCreated) {
+              try {
+                Remove-Item -LiteralPath $machineClass -Recurse -Force
+                $result.machine_class_removed = -not (Test-Path -LiteralPath $machineClass)
+                if (-not $result.machine_class_removed) { throw 'Created machine COM class remains' }
+              } catch { $result.cleanup_errors += "Machine COM class: $($_.Exception.Message)" }
+            }
+            if ($machineDirectoryCreated) {
+              try {
+                Remove-Item -LiteralPath $machineDirectory -Recurse -Force
+                $result.machine_directory_removed = -not (Test-Path -LiteralPath $machineDirectory)
+                if (-not $result.machine_directory_removed) { throw 'Created diagnostic directory remains' }
+              } catch { $result.cleanup_errors += "Diagnostic directory: $($_.Exception.Message)" }
+            }
+            # Existing exact SmartKey helper cleanup remains unconditional.
+            try {
+              & $helper --uninstall --no-dialog 1> (Join-Path $root 'control-cleanup.stdout.txt') 2> (Join-Path $root 'control-cleanup.stderr.txt')
+              $result.cleanup_exit = $LASTEXITCODE
+              if ($result.cleanup_exit -ne 0) { $result.cleanup_errors += "Helper cleanup exit: $($result.cleanup_exit)" }
+            } catch { $result.cleanup_errors += "Helper cleanup: $($_.Exception.Message)" }
+            $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'control-result.json') -Encoding utf8
+            if (Test-Path -LiteralPath (Join-Path $root 'control-install.stderr.txt')) {
+              Get-Content -LiteralPath (Join-Path $root 'control-install.stderr.txt')
+            }
+            if (Test-Path -LiteralPath (Join-Path $root 'control-machine-com.stderr.txt')) {
+              Get-Content -LiteralPath (Join-Path $root 'control-machine-com.stderr.txt')
+            }
             Get-Content -LiteralPath (Join-Path $root 'control-result.json')
           }
       - name: Retain native standard-user result
