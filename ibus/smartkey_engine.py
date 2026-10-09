@@ -1499,7 +1499,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             or getattr(self, "_keys_since_content_type", 0)
         )
 
-    def _reset_for_sensitive_switch(self) -> None:
+    def _reset_for_sensitive_switch(self) -> bool:
         """Drop every trace of the in-flight word across a sensitivity switch.
 
         The dual buffer holds the engine's *interpretation* of the keystrokes
@@ -1510,8 +1510,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         preedit word when a content type changes mid-word — deliberate, and
         the safe direction.
         """
+        reset_succeeded = False
         try:
             self._core.reset()  # actions discarded on purpose — see docstring
+            reset_succeeded = True
         except Exception:  # noqa: BLE001 — the kill switch must never fail open
             log.warning(
                 "smartkey: core reset failed on content-type switch", exc_info=True
@@ -1538,6 +1540,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._sync_surrounding_text(None, None)
         except Exception:  # noqa: BLE001
             log.debug("smartkey: could not clear surrounding text", exc_info=True)
+        return reset_succeeded
 
     # NOTE: there is deliberately no ``_forget_content_type()``.  One existed
     # and was removed; see the lifetime section of ``do_set_content_type``.
@@ -1598,7 +1601,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         What un-sticks the flag is an ordinary declaration.  Moving to a field
         whose content type differs from the cached one makes IBus send it, and
-        an explicit recognised non-sensitive purpose clears ``_sensitive``.  The
+        an explicit recognised non-sensitive purpose clears ``_sensitive`` only
+        after a successful core reset. A reset refusal keeps it armed until a
+        subsequent explicit ordinary declaration successfully resets. The
         residual is the mirror of the discarded design's: a client that
         declares PASSWORD and then hands focus to a client that never declares
         anything at all keeps SmartKey inert.  That direction is safe and
@@ -1642,25 +1647,26 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         if transition_in_flight:
             classification = "transition-guard"
+        self._content_type_key = decision_key
+        if sensitive != previous_sensitive:
+            # Keep the hard stop armed throughout reset in BOTH directions.
+            # Only a successful reset on an explicit ordinary declaration may
+            # release it; internal adapter cleanup still runs after refusal.
+            self._sensitive = True
+            reset_succeeded = self._reset_for_sensitive_switch()
+            if not sensitive and reset_succeeded:
+                self._sensitive = False
+
         trace = getattr(self, "_trace", None)
         if trace is not None:
             trace.emit(
                 "content_type",
                 seq=0,
                 classification=classification,
-                effective_sensitive=sensitive,
+                effective_sensitive=self._sensitive,
                 decision_changed=decision_changed,
-                state_changed=sensitive != previous_sensitive,
+                state_changed=self._sensitive != previous_sensitive,
             )
-
-        self._content_type_key = decision_key
-        if sensitive == getattr(self, "_sensitive", False):
-            return
-        self._sensitive = sensitive
-        # Entering AND leaving a sensitive field both clear the buffers:
-        # nothing composed before the switch may survive it in either
-        # direction.
-        self._reset_for_sensitive_switch()
 
     def do_set_surrounding_text(
         self, text: object, cursor_pos: int, anchor_pos: int
