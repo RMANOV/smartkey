@@ -505,6 +505,106 @@ def test_leaving_a_sensitive_field_resets_the_core_and_restores_normal_input():
     assert eng._preedit_active is True
 
 
+class _ResetRefusalCore(SpyCore):
+    """Keep synthetic old state until a scripted reset actually succeeds."""
+
+    def __init__(self, refusals):
+        super().__init__([[("composing", "new\x00dummy")]])
+        self.refusals = iter(refusals)
+        self.old_dummy_state = "old-dummy-word"
+
+    def reset(self):
+        self.calls.append(("reset", ()))
+        if next(self.refusals, False):
+            raise RuntimeError("synthetic reset refusal")
+        self.old_dummy_state = ""
+        return [("commit", "discarded-dummy-reset-action")]
+
+
+@pytest.mark.parametrize("entry_purpose", (PURPOSE_PASSWORD, PURPOSE_FUTURE, None))
+def test_reset_refusal_on_ordinary_recovery_blocks_until_explicit_success(entry_purpose):
+    eng, rec = build_engine()
+    eng._core = _ResetRefusalCore([True, True, True, False])
+    eng.do_set_content_type(entry_purpose, HINT_NONE)
+    trace = FakeTrace()
+    eng._trace = trace
+
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+
+    assert eng._sensitive is True
+    assert eng._core.old_dummy_state == "old-dummy-word"
+    assert _type(eng, "dummy") == [False] * 5
+    assert eng._core.key_calls() == []
+    assert trace.begins == 0
+    assert rec.commits == [] and rec.preedits == []
+    assert trace.events[-1][1]["effective_sensitive"] is True
+    assert trace.events[-1][1]["state_changed"] is False
+    # A focus cycle without a declaration cannot acknowledge the reset.
+    eng.do_focus_out()
+    eng.do_focus_in()
+    assert eng._sensitive is True
+    assert eng.do_process_key_event(ord("x"), 38, 0) is False
+    assert eng._core.names().count("reset") == 2
+
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    assert eng._sensitive is True
+    assert eng._core.key_calls() == []
+    # Only this explicitly delivered declaration has a successful reset.
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    assert eng._sensitive is False
+    assert eng._core.old_dummy_state == ""
+    assert trace.events[-1][1]["effective_sensitive"] is False
+    assert trace.events[-1][1]["state_changed"] is True
+    assert rec.commits == [], "reset actions must be discarded on recovery too"
+    assert eng.do_process_key_event(ord("n"), 38, 0) is True
+    assert len(eng._core.key_calls()) == 1
+    assert rec.preedits[-1] == ("newdummy", True)
+
+
+def test_ordinary_recovery_remains_sensitive_during_the_core_reset():
+    eng, _rec = build_engine(sensitive=True)
+    states_at_reset = []
+
+    def reset():
+        states_at_reset.append(eng._sensitive)
+        return []
+
+    eng._core.reset = reset
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    assert states_at_reset == [True]
+    assert eng._sensitive is False
+
+
+@pytest.mark.parametrize("hide_refuses", (False, True))
+def test_reset_refusal_still_cleans_adapter_state_when_leaving_sensitive(hide_refuses):
+    eng, rec = build_engine(sensitive=True)
+    eng._core = _ResetRefusalCore([True])
+    eng._preedit_active = True
+    eng._preedit_mode = "composing"
+    eng._last_composing_typed = "old-dummy-word"
+    eng._active_prediction = ("old-dummy-prediction", 1.0, 0.9)
+    eng._keys_since_content_type = 1
+    eng._surrounding_text = "old-dummy-context"
+    eng._surrounding_cursor_pos = 17
+    if hide_refuses:
+        def refuse_hide():
+            rec.hide_preedit_calls += 1
+            raise RuntimeError("synthetic hide refusal")
+        eng.hide_preedit_text = refuse_hide
+
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+
+    assert eng._preedit_active is False and eng._preedit_mode is None
+    assert eng._last_composing_typed == "" and eng._active_prediction is None
+    assert eng._keys_since_content_type == 0
+    assert eng._surrounding_text is None and eng._surrounding_cursor_pos is None
+    assert ("set_surrounding_text", (None, None)) in eng._core.calls
+    assert rec.hide_preedit_calls == 1
+    assert eng._sensitive is True
+    assert eng.do_process_key_event(ord("x"), 38, 0) is False
+    assert eng._core.key_calls() == [] and rec.commits == []
+
+
 # --- Fail-safe: ambiguity must read as sensitive, never as ordinary text -----
 @pytest.mark.parametrize(
     "purpose,label",
