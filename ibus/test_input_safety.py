@@ -21,9 +21,10 @@ deduplicated against the proxy's cached property, so returning to the same
 password field never re-declares.  Clearing on focus-out would leave the engine
 live inside that field. What un-sticks it is a correctly published ordinary
 declaration — its purpose differs from the cached secret one. A client that
-reuses a context without updating ContentType stays safely inert. The
-mid-composition latch is released as soon as the core resolves the word, so it
-cannot turn "this field is secret" into "SmartKey is off everywhere".
+reuses a context without updating ContentType stays safely inert. When the
+release is owed — the core refused the reset, or the mid-composition latch
+fired for an ordinary declaration — the next key press retries the reset, so
+neither can turn "this field is secret" into "SmartKey is off everywhere".
 
 FIX 2 — the phantom-key filter compared the modifier mask for equality
 (``state in (16, 272)``), so every other combination leaked a 25 Hz storm into
@@ -236,6 +237,8 @@ def build_engine(
     # State introduced by the sensitive-input / phantom-key fixes.
     eng._sensitive = sensitive
     eng._content_type_key = None
+    eng._declared_ordinary = False
+    eng._reset_refusals = 0
     eng._keys_since_content_type = 0
     eng._spurious_zero_key_count = 0
     eng._spurious_zero_key_logged = 0.0
@@ -520,43 +523,84 @@ class _ResetRefusalCore(SpyCore):
         return [("commit", "discarded-dummy-reset-action")]
 
 
+# Refuse every reset until a test sets ``refusals = 0``.
+_ALWAYS = 10**9
+
+
+class _IBusContentTypeFeed:
+    """Deliver focus changes and content types the way IBus does to ONE engine.
+
+    libibus emits ``set-content-type`` only when the raw (purpose, hints)
+    differs from the value this engine object last stored, and that store
+    starts zero-filled at FREE_FORM/NONE; the daemon pushes the newly focused
+    context's value after FocusIn.  So an identical declaration is never
+    delivered twice in a row, and (0, 0) never first.
+    """
+
+    def __init__(self, eng) -> None:
+        self.eng = eng
+        self.stored = (PURPOSE_FREE_FORM, HINT_NONE)
+        self.delivered: list[tuple] = []
+
+    def focus(self, purpose, hints) -> None:
+        self.eng.do_focus_out()
+        self.eng.do_focus_in()
+        if (purpose, hints) != self.stored:
+            self.stored = (purpose, hints)
+            self.delivered.append((purpose, hints))
+            self.eng.do_set_content_type(purpose, hints)
+
+
 @pytest.mark.parametrize("entry_purpose", (PURPOSE_PASSWORD, PURPOSE_FUTURE, None))
-def test_reset_refusal_on_ordinary_recovery_blocks_until_explicit_success(entry_purpose):
+def test_reset_refusal_on_ordinary_recovery_is_retried_on_the_next_key_press(
+    entry_purpose,
+):
+    # IBus never re-delivers the ordinary declaration whose reset was refused,
+    # so the owed reset is retried on the next key PRESS; IBus dispatches every
+    # declaration it pushed for the focused field before that key.
     eng, rec = build_engine()
-    eng._core = _ResetRefusalCore(3)
-    eng.do_set_content_type(entry_purpose, HINT_NONE)
+    core = _ResetRefusalCore(_ALWAYS)
+    eng._core = core
+    bus = _IBusContentTypeFeed(eng)
+    bus.focus(entry_purpose, HINT_NONE)
+    core.calls.clear()
     trace = FakeTrace()
     eng._trace = trace
 
-    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    bus.focus(PURPOSE_FREE_FORM, HINT_NONE)  # ordinary field; its reset is refused
 
-    assert eng._sensitive is True
-    assert _type(eng, "dummy") == [False] * 5
-    assert eng._core.key_calls() == []
-    assert trace.begins == 0
-    assert rec.commits == [] and rec.preedits == []
+    assert eng._sensitive is True and eng._declared_ordinary is True
     assert trace.events[-1][1]["effective_sensitive"] is True
     assert trace.events[-1][1]["state_changed"] is False
-    # A focus cycle without a declaration cannot acknowledge the reset.
-    eng.do_focus_out()
-    eng.do_focus_in()
+    resets = core.names().count("reset")
+    # While the core refuses, every key press retries and the key stays inert.
+    assert _type(eng, "dummy") == [False] * 5
+    assert core.names().count("reset") == resets + 5
+    # Refocusing the same field delivers nothing (IBus dedup), and a focus
+    # cycle never retries or releases: FocusIn precedes the new declaration.
+    for _ in range(3):
+        bus.focus(PURPOSE_FREE_FORM, HINT_NONE)
+    assert bus.delivered == [(entry_purpose, HINT_NONE), (PURPOSE_FREE_FORM, HINT_NONE)]
     assert eng._sensitive is True
-    assert eng.do_process_key_event(ord("x"), 38, 0) is False
-    assert eng._core.names().count("reset") == 2
+    assert core.names().count("reset") == resets + 5
+    assert "focus_lost" not in core.names(), "the hard stop never flushes the core"
+    assert core.key_calls() == []
+    assert trace.begins == 0 and len(trace.events) == 1
+    assert rec.commits == [] and rec.preedits == []
 
-    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
-    assert eng._sensitive is True
-    assert eng._core.key_calls() == []
-    # Only this explicitly delivered declaration has a successful reset.
-    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
-    assert eng._sensitive is False
-    assert eng._core.names().count("reset") == 4
-    assert trace.events[-1][1]["effective_sensitive"] is False
-    assert trace.events[-1][1]["state_changed"] is True
-    assert rec.commits == [], "reset actions must be discarded on recovery too"
+    core.refusals = 0  # the core recovers; no declaration will ever repeat
+
     assert eng.do_process_key_event(ord("n"), 38, 0) is True
-    assert len(eng._core.key_calls()) == 1
+    assert eng._sensitive is False
+    assert core.names().count("reset") == resets + 6
+    assert rec.commits == [], "reset actions must be discarded on recovery too"
+    assert len(core.key_calls()) == 1, "the releasing key is the first one composed"
     assert rec.preedits[-1] == ("newdummy", True)
+    assert trace.events[1] == (
+        "hard_stop",
+        {"seq": 0, "transition": "released", "cause": "deferred_reset"},
+    )
+    assert trace.begins == 1
 
 
 def test_ordinary_recovery_remains_sensitive_during_the_core_reset():
@@ -568,10 +612,32 @@ def test_ordinary_recovery_remains_sensitive_during_the_core_reset():
     assert eng._sensitive is False
 
 
+def test_the_key_press_retry_resets_the_core_with_the_hard_stop_armed():
+    eng, _rec = build_engine(sensitive=True)
+    core = _ResetRefusalCore(1)
+    eng._core = core
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)  # refused: release owed
+    assert eng._sensitive is True and eng._declared_ordinary is True
+    states_at_reset = []
+    scripted_reset = core.reset
+
+    def probe():
+        states_at_reset.append(eng._sensitive)
+        return scripted_reset()
+
+    core.reset = probe
+
+    assert eng.do_process_key_event(ord("n"), 38, 0) is True
+    assert states_at_reset == [True]
+    assert eng._sensitive is False
+
+
 @pytest.mark.parametrize("hide_refuses", (False, True))
 def test_reset_refusal_still_cleans_adapter_state_when_leaving_sensitive(hide_refuses):
     eng, rec = build_engine(sensitive=True)
-    eng._core = _ResetRefusalCore(1)
+    # Persistent: the key press below retries the owed reset and must be
+    # refused again for "still inert" to mean anything.
+    eng._core = _ResetRefusalCore(_ALWAYS)
     eng._preedit_active = True
     eng._preedit_mode = "composing"
     eng._last_composing_typed = "old-dummy-word"
@@ -596,6 +662,237 @@ def test_reset_refusal_still_cleans_adapter_state_when_leaving_sensitive(hide_re
     assert eng._sensitive is True
     assert eng.do_process_key_event(ord("x"), 38, 0) is False
     assert eng._core.key_calls() == [] and rec.commits == []
+
+
+def test_key_releases_and_phantom_events_never_retry_the_owed_reset():
+    eng, _rec = build_engine(sensitive=True)
+    core = _ResetRefusalCore(1)
+    eng._core = core
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)  # refused: release owed
+    resets = core.names().count("reset")
+
+    assert eng.do_process_key_event(ord("n"), 38, MOD_RELEASE) is False
+    assert eng.do_process_key_event(0, 240, 16) is False  # phantom keycode-240
+    assert core.names().count("reset") == resets
+    assert eng._sensitive is True and eng._declared_ordinary is True
+
+    assert eng.do_process_key_event(ord("n"), 38, 0) is True
+    assert eng._sensitive is False
+
+
+def test_repeated_refusals_warn_once_and_the_recovery_is_logged(caplog):
+    eng, _rec = build_engine(sensitive=True)
+    core = _ResetRefusalCore(_ALWAYS)
+    eng._core = core
+    with caplog.at_level(logging.DEBUG, logger="smartkey"):
+        eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+        _type(eng, "dummy")
+        core.refusals = 0
+        eng.do_process_key_event(ord("n"), 38, 0)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    refusals = [r for r in caplog.records if "refused" in r.getMessage()]
+    assert len(warnings) == 1, "one warning for the run of refusals, not one per key"
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert "synthetic reset refusal" not in warnings[0].getMessage()
+    assert len(refusals) == 1 + 6, "the warning plus one debug line per refusal"
+    assert any("accepted after 6 refusal(s)" in r.getMessage() for r in caplog.records)
+    assert all("dummy" not in r.getMessage() for r in refusals)
+    assert eng._reset_refusals == 0
+
+
+@pytest.mark.parametrize(
+    "purpose,hints",
+    [
+        (PURPOSE_PASSWORD, HINT_NONE),
+        (PURPOSE_FREE_FORM, HINT_PRIVATE),
+        (PURPOSE_FUTURE, HINT_NONE),
+    ],
+)
+def test_a_later_sensitive_declaration_cancels_the_owed_release(purpose, hints):
+    eng, _rec = build_engine(sensitive=True)
+    core = _ResetRefusalCore(1)  # only the ordinary declaration's reset fails
+    eng._core = core
+    eng.do_set_content_type(PURPOSE_EMAIL, HINT_NONE)
+    assert eng._sensitive is True and eng._declared_ordinary is True
+
+    eng.do_set_content_type(purpose, hints)  # a different value: IBus delivers it
+
+    assert eng._declared_ordinary is False
+    resets = core.names().count("reset")
+    # The core would now accept a reset; a retry here would open the field.
+    assert _type(eng, "hunter2") == [False] * 7
+    assert core.names().count("reset") == resets, "no retry inside a sensitive field"
+    assert core.key_calls() == []
+    assert eng._sensitive is True
+
+
+def test_a_declaration_that_fails_half_way_withdraws_the_owed_release():
+    eng, _rec = build_engine(sensitive=True)
+    core = _ResetRefusalCore(1)
+    eng._core = core
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)  # refused: release owed
+    assert eng._declared_ordinary is True
+
+    def broken_decision(purpose, hints):
+        raise RuntimeError("synthetic decoding failure")
+
+    eng._content_type_decision = broken_decision
+    with pytest.raises(RuntimeError):
+        eng.do_set_content_type(PURPOSE_PASSWORD, HINT_NONE)
+
+    assert eng._declared_ordinary is False
+    assert eng.do_process_key_event(ord("x"), 38, 0) is False
+    assert core.key_calls() == [] and eng._sensitive is True
+
+
+def test_strict_undeclared_mode_is_never_released_by_the_key_path(monkeypatch):
+    monkeypatch.setenv("SMARTKEY_SENSITIVE_UNTIL_DECLARED", "1")
+    eng, _rec = build_engine(sensitive=True)
+
+    assert _type(eng, "abc") == [False] * 3
+    assert eng._core.calls == [], "no declaration, so no retry and no core call"
+    assert eng._sensitive is True
+
+
+class _FlushingRefusalCore(_ResetRefusalCore):
+    """A dirty core the way the native one behaves: focus_lost() flushes."""
+
+    def focus_lost(self):
+        self.calls.append(("focus_lost", ()))
+        return [("hide", ""), ("commit", "stale-word")]
+
+
+@pytest.mark.parametrize("prior", (None, (PURPOSE_EMAIL, HINT_NONE)))
+def test_focus_out_under_the_hard_stop_never_flushes_a_dirty_core(prior):
+    # Positive control: in an ordinary field focus-out does deliver the flush.
+    live, live_rec = build_engine()
+    live._core = _FlushingRefusalCore(0)
+    live.do_focus_out()
+    assert live_rec.commits == ["stale-word"], "harness cannot see a flush"
+
+    # Keys reach the core before a (late) PASSWORD declaration whose reset is
+    # refused: the word stays in the core while the stop is armed.
+    eng, rec = build_engine()
+    core = _FlushingRefusalCore(_ALWAYS)
+    eng._core = core
+    if prior is not None:
+        eng.do_set_content_type(*prior)
+    assert eng.do_process_key_event(ord("n"), 38, 0) is True
+    eng.do_set_content_type(PURPOSE_PASSWORD, HINT_NONE)
+    assert eng._sensitive is True
+    core.calls.clear()
+
+    eng.do_focus_out()
+
+    assert "focus_lost" not in core.names(), "a flush commits and learns the word"
+    assert rec.commits == []
+    assert eng._sensitive is True
+
+
+class _NativePanic(BaseException):
+    """Stand-in for pyo3's PanicException, which derives from BaseException."""
+
+
+class _PanickingResetCore(SpyCore):
+    def __init__(self) -> None:
+        super().__init__([[("composing", "new\x00dummy")]])
+        self.panicking = True
+
+    def reset(self):
+        self.calls.append(("reset", ()))
+        if self.panicking:
+            raise _NativePanic("synthetic Rust panic in reset()")
+        return []
+
+
+def test_a_native_panic_in_reset_is_a_refusal_not_an_escape():
+    eng, rec = build_engine(sensitive=True)
+    core = _PanickingResetCore()
+    eng._core = core
+    eng._preedit_active = True
+    eng._preedit_mode = "composing"
+    eng._last_composing_typed = "old-dummy-word"
+    eng._keys_since_content_type = 1
+    eng._surrounding_text = "old-dummy-context"
+
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)  # must not raise
+
+    assert eng._sensitive is True and eng._declared_ordinary is True
+    assert eng._preedit_active is False and eng._last_composing_typed == ""
+    assert eng._keys_since_content_type == 0 and eng._surrounding_text is None
+    assert rec.hide_preedit_calls == 1
+    assert eng.do_process_key_event(ord("x"), 38, 0) is False
+    assert core.key_calls() == []
+
+    core.panicking = False
+    assert eng.do_process_key_event(ord("n"), 38, 0) is True
+    assert eng._sensitive is False
+
+
+def test_keyboard_interrupt_in_the_switch_reset_propagates_with_the_stop_armed():
+    eng, _rec = build_engine()
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    eng._core.reset = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        eng.do_set_content_type(PURPOSE_PASSWORD, HINT_NONE)
+    assert eng._sensitive is True
+
+
+class _RefusingNativeCore:
+    """Wrap the real PyO3 core and refuse the next ``refusals`` resets."""
+
+    def __init__(self, native, refusals: int) -> None:
+        self._native = native
+        self.refusals = refusals
+        self.focus_lost_calls = 0
+
+    def reset(self):
+        if self.refusals:
+            self.refusals -= 1
+            raise RuntimeError("synthetic reset refusal")
+        return self._native.reset()
+
+    def focus_lost(self):
+        self.focus_lost_calls += 1
+        return self._native.focus_lost()
+
+    def __getattr__(self, name):
+        return getattr(self._native, name)
+
+
+def test_native_stale_word_never_surfaces_after_a_refused_entering_reset():
+    """Real core: a refused reset leaves the word in the dual buffer; the
+    focus-out under the stop must leave it inert, never flush it."""
+    if not ske._HAS_CORE:
+        if os.environ.get("SMARTKEY_REQUIRE_NATIVE_TESTS") == "1":
+            pytest.fail("current-checkout smartkey_py is required for the native seam test")
+        pytest.skip("smartkey_py is not built in this local Python environment")
+    native = ske.PyInputMethodCore(json.dumps({"use_ppm": False, "use_reranker": False}))
+    native.load_word("hello", 1_000_000)
+    core = _RefusingNativeCore(native, 0)
+    eng, rec = build_engine()
+    eng._core = core
+    eng.do_set_content_type(PURPOSE_EMAIL, HINT_NONE)
+    for keyval, code in zip("hel", (35, 18, 38), strict=True):
+        assert eng.do_process_key_event(ord(keyval), code, 0) is True
+    assert native.current_word() == "hel", "premise broken: no native word in flight"
+
+    core.refusals = 1
+    eng.do_set_content_type(PURPOSE_PASSWORD, HINT_NONE)
+    assert eng._sensitive is True and native.current_word() == "hel"
+    eng.do_focus_out()
+
+    assert core.focus_lost_calls == 0
+    assert rec.commits == [], f"a stale word was flushed under the stop: {rec.commits!r}"
+    eng.do_focus_in()
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)  # a different field
+    assert eng._sensitive is False
+    assert native.current_word() == ""
+    assert rec.commits == []
 
 
 # --- Fail-safe: ambiguity must read as sensitive, never as ordinary text -----
@@ -690,23 +987,26 @@ def test_content_type_change_mid_composition_fails_safe():
     assert eng.do_process_key_event(ord("o"), 24, 0) is False
 
 
-def test_mid_composition_fail_safe_recovers_on_the_next_clean_declaration():
+def test_mid_composition_fail_safe_recovers_on_the_next_key_press():
     # Bounded blast radius: the ambiguity latch costs one word, not the field.
-    # Escalation is gated on "the content type changed while something was in
-    # flight"; de-escalation is not, so the client's next notification — even
-    # an identical re-send, which GTK issues on focus — clears it.
-    eng, _rec = build_engine(
+    # IBus never re-sends the EMAIL declaration that tripped it, so for an
+    # ordinary declaration the release is owed and the next key press resets
+    # the core and goes on as the first key in the new field.
+    eng, rec = build_engine(
         scripts=[[("composing", "hel\x00lo")], [("composing", "hell\x00o")]]
     )
     eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
     assert eng.do_process_key_event(ord("l"), 38, 0) is True
     eng.do_set_content_type(PURPOSE_EMAIL, HINT_NONE)
-    assert eng._sensitive is True
+    assert eng._sensitive is True and eng._declared_ordinary is True
+    resets = eng._core.names().count("reset")
 
-    eng.do_set_content_type(PURPOSE_EMAIL, HINT_NONE)  # now unambiguous
+    assert eng.do_process_key_event(ord("l"), 38, 0) is True
 
     assert eng._sensitive is False
-    assert eng.do_process_key_event(ord("l"), 38, 0) is True
+    assert eng._core.names().count("reset") == resets + 1
+    assert len(eng._core.key_calls()) == 2
+    assert rec.commits == [], "the dropped word is discarded, never committed"
 
 
 def test_content_type_change_mid_typing_fails_safe_without_a_visible_preedit():
@@ -724,8 +1024,10 @@ def test_content_type_change_mid_typing_fails_safe_without_a_visible_preedit():
 
 
 def test_repeated_or_irrelevant_content_type_updates_are_not_a_field_switch():
-    # GTK re-sends the content type routinely; treating a no-op re-send as a
-    # field switch would kill the engine mid-word on every keystroke burst.
+    # A hints-only change the adapter does not act on (SPELLCHECK) IS delivered
+    # mid-word, and treating it as a field switch would kill the engine
+    # mid-word.  IBus never delivers an identical declaration twice in a row;
+    # the identical call below only pins the adapter's own idempotence.
     eng, _rec = build_engine(scripts=[[("composing", "hel\x00lo")]])
     eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
     assert eng.do_process_key_event(ord("l"), 38, 0) is True
