@@ -830,16 +830,80 @@ def test_a_native_panic_in_reset_is_a_refusal_not_an_escape():
     assert eng._sensitive is False
 
 
-def test_keyboard_interrupt_in_the_switch_reset_propagates_with_the_stop_armed():
-    eng, _rec = build_engine()
+@pytest.mark.parametrize("step", ("hide_preedit_text", "set_surrounding_text"))
+def test_a_native_panic_in_the_switch_cleanup_neither_escapes_nor_skips_it(step):
+    # core.set_surrounding_text is a pyo3 call: a Rust panic arrives as a
+    # BaseException.  The cleanup handlers treat it like the reset does.
+    eng, rec = build_engine(sensitive=True)
+    core = _ResetRefusalCore(1)
+    eng._core = core
+    eng._preedit_active = True
+    eng._last_composing_typed = "old-dummy-word"
+
+    def panic(*_args) -> None:
+        raise _NativePanic(f"synthetic Rust panic in {step}()")
+
+    if step == "hide_preedit_text":
+        eng.hide_preedit_text = panic
+    else:
+        core.set_surrounding_text = panic
+
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)  # must not raise
+
+    assert eng._sensitive is True and eng._declared_ordinary is True
+    assert eng._preedit_active is False and eng._last_composing_typed == ""
+    assert eng._surrounding_text is None
+    # The owed release is still retried, and releases once the reset succeeds.
+    assert eng.do_process_key_event(ord("n"), 38, 0) is True
+    assert eng._sensitive is False
+    assert rec.commits == []
+
+
+@pytest.mark.parametrize("exc_type", (KeyboardInterrupt, SystemExit))
+@pytest.mark.parametrize("path", ("entering", "leaving", "key_press_retry"))
+def test_interpreter_exits_in_the_switch_reset_propagate_with_the_stop_armed(
+    exc_type, path
+):
+    eng, _rec = build_engine(sensitive=path != "entering")
+    core = _ResetRefusalCore(1)
+    eng._core = core
+    if path == "key_press_retry":
+        eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)  # refused: owed
+        assert eng._declared_ordinary is True
 
     def interrupted():
-        raise KeyboardInterrupt
+        raise exc_type
 
-    eng._core.reset = interrupted
-    with pytest.raises(KeyboardInterrupt):
-        eng.do_set_content_type(PURPOSE_PASSWORD, HINT_NONE)
+    core.reset = interrupted
+    with pytest.raises(exc_type):
+        if path == "entering":
+            eng.do_set_content_type(PURPOSE_PASSWORD, HINT_NONE)
+        elif path == "leaving":
+            eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+        else:
+            eng.do_process_key_event(ord("n"), 38, 0)
     assert eng._sensitive is True
+    assert core.key_calls() == []
+
+
+def test_a_new_run_of_refusals_warns_again_after_a_recovery(caplog):
+    eng, _rec = build_engine(sensitive=True)
+    core = _ResetRefusalCore(_ALWAYS)
+    eng._core = core
+    with caplog.at_level(logging.DEBUG, logger="smartkey"):
+        eng.do_set_content_type(PURPOSE_EMAIL, HINT_NONE)  # run 1: refused
+        core.refusals = 0
+        assert eng.do_process_key_event(ord("n"), 38, 0) is True  # recovered
+        core.refusals = _ALWAYS
+        eng.do_set_content_type(PURPOSE_PASSWORD, HINT_NONE)  # run 2: refused
+
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "refused" in r.getMessage()
+    ]
+    assert len(warnings) == 2, "each run of refusals warns once"
+    assert eng._reset_refusals == 1 and eng._sensitive is True
 
 
 class _RefusingNativeCore:
@@ -859,6 +923,9 @@ class _RefusingNativeCore:
     def focus_lost(self):
         self.focus_lost_calls += 1
         return self._native.focus_lost()
+
+    def save_personal(self):
+        """Never write the operator's real personal.json."""
 
     def __getattr__(self, name):
         return getattr(self._native, name)
@@ -984,7 +1051,10 @@ def test_content_type_change_mid_composition_fails_safe():
     assert eng._sensitive is True, "a mid-composition switch must read as sensitive"
     assert eng._preedit_active is False
     assert rec.commits == []
-    assert eng.do_process_key_event(ord("o"), 24, 0) is False
+    # The latch costs the word, not the field: the release is owed to the next
+    # key press (see test_mid_composition_fail_safe_recovers_on_the_next_key_press).
+    assert eng._declared_ordinary is True
+    assert eng._core.key_calls() == [("process_keycode", (38, 0))]
 
 
 def test_mid_composition_fail_safe_recovers_on_the_next_key_press():

@@ -479,10 +479,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         # Sensitive-input state (see do_set_content_type).  ``_content_type_key``
         # is the decision-relevant projection of the last declared content type
-        # so that a mere re-send, or a hints change we do not act on, is not
-        # mistaken for a field switch.  ``_declared_ordinary`` records whether
-        # the latest declaration itself was ordinary; while the hard stop is
-        # still armed it marks the release as owed (see do_process_key_event).
+        # so that a hints change we do not act on is not mistaken for a field
+        # switch.  ``_declared_ordinary`` records whether the latest declaration
+        # itself was ordinary; while the hard stop is still armed it marks the
+        # release as owed (see do_process_key_event).
         self._sensitive: bool = _sensitive_until_declared()
         self._content_type_key: tuple[int, int] | None = None
         self._declared_ordinary: bool = False
@@ -1614,13 +1614,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         guarantee that SmartKey never sees a password, and it must not be
         described as one.  Three gaps are open by construction:
 
-        * A client that never calls ``set_content_type`` — the callback simply
-          never fires, and the field is handled as prose.  Whether GTK, Qt,
+        * A client that never calls ``set_content_type`` — its context stays
+          at FREE_FORM/NONE, and the field is handled as prose.  Whether GTK, Qt,
           Electron and terminal emulators each publish it is a per-client fact,
           not something this adapter can assert.
         * A field that gets its focus before its declaration.  The declaration
           race is one keystroke wide at worst; ``SMARTKEY_SENSITIVE_UNTIL_DECLARED=1``
-          closes it at the cost of one dead keystroke per undeclared field.
+          closes it by keeping SmartKey inert until a declaration arrives (see
+          the residuals below).
         * Anything that does not go through IBus at all — a browser password
           manager, a client with its own input handling, an X11 grab.
 
