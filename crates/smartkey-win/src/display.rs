@@ -76,6 +76,12 @@ pub struct SingleItemEnum {
     yielded: std::cell::Cell<bool>,
 }
 
+impl Default for SingleItemEnum {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SingleItemEnum {
     pub fn new() -> Self {
         Self {

@@ -19,6 +19,8 @@ pub mod dll;
 mod edit_session;
 #[cfg(windows)]
 pub mod registration;
+#[cfg(any(windows, test))]
+mod text_contract;
 #[cfg(windows)]
 mod tsf;
 

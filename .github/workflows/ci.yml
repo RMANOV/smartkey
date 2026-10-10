@@ -95,6 +95,9 @@ jobs:
   build-windows:
     name: Build (Windows)
     runs-on: windows-latest
+    env:
+      # Keep the deliverable independent of a separately installed VC runtime.
+      RUSTFLAGS: -Dwarnings -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -106,13 +109,28 @@ jobs:
       - run: cargo check -p smartkey-win
       - run: cargo check -p smartkey-playground
       - run: cargo clippy -p smartkey-win -- -D warnings
-      - name: Build Windows pilot payload
+      - name: Build Windows standalone payload
         run: cargo build --locked -p smartkey-win --release
-      - name: Stage complete Windows pilot payload
+      - name: Verify standalone binary dependencies
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $stage = Join-Path $env:RUNNER_TEMP "smartkey-windows-pilot-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products '*' -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin was not found' }
+          foreach ($binary in @('smartkey-register.exe', 'smartkey_win.dll')) {
+            $imports = & $dumpbin /DEPENDENTS "target/release/$binary"
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect $binary" }
+            $imports
+            if ($imports -match '(?i)(VCRUNTIME[0-9_]*|MSVCP[0-9_]*|ucrtbase)\.dll') {
+              throw "$binary still depends on a separately installed C/C++ runtime"
+            }
+          }
+      - name: Stage complete Windows standalone payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP "smartkey-windows-standalone-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           if (Test-Path -LiteralPath $stage) {
             throw "Refusing to reuse staging directory: $stage"
           }
@@ -121,12 +139,19 @@ jobs:
           $payload = @(
             @{ Source = 'target/release/smartkey-register.exe'; Name = 'smartkey-register.exe' },
             @{ Source = 'target/release/smartkey_win.dll'; Name = 'smartkey_win.dll' },
-            @{ Source = 'crates/smartkey-win/pilot-runtime-manifest.json'; Name = 'pilot-runtime-manifest.json' },
+            @{ Source = 'crates/smartkey-win/windows-runtime-manifest.json'; Name = 'windows-runtime-manifest.json' },
             @{ Source = 'config/smartkey.json'; Name = 'smartkey.json' },
             @{ Source = 'corpus/corpus_en.json'; Name = 'corpus_en.json' },
             @{ Source = 'corpus/corpus_bg.json'; Name = 'corpus_bg.json' },
             @{ Source = 'corpus/corpus_tech.json'; Name = 'corpus_tech.json' },
-            @{ Source = 'crates/smartkey-win/tests/windows_pilot_manual.md'; Name = 'PILOT_README.md' },
+            @{ Source = 'crates/smartkey-win/packaging/Install-Machine-SmartKey.cmd'; Name = 'Install-Machine-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Uninstall-Machine-SmartKey.cmd'; Name = 'Uninstall-Machine-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Install-SmartKey.cmd'; Name = 'Install-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Status-SmartKey.cmd'; Name = 'Status-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Enable-SmartKey.cmd'; Name = 'Enable-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Disable-SmartKey.cmd'; Name = 'Disable-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/Uninstall-SmartKey.cmd'; Name = 'Uninstall-SmartKey.cmd' },
+            @{ Source = 'crates/smartkey-win/packaging/README-WINDOWS.md'; Name = 'README-WINDOWS.md' },
             @{ Source = 'LICENSE'; Name = 'LICENSE' },
             @{ Source = 'LICENSE-GPL'; Name = 'LICENSE-GPL' },
             @{ Source = 'LICENSE-APACHE'; Name = 'LICENSE-APACHE' }
@@ -158,12 +183,197 @@ jobs:
           if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
             throw 'Staged payload differs from the exact allowlist.'
           }
-      - name: Upload Windows pilot payload
+      - name: Upload Windows standalone payload
         uses: actions/upload-artifact@v4
         with:
-          name: smartkey-windows-pilot
-          path: ${{ runner.temp }}/smartkey-windows-pilot-${{ github.run_id }}-${{ github.run_attempt }}
+          name: smartkey-windows-standalone
+          path: ${{ runner.temp }}/smartkey-windows-standalone-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Check machine setup and standard-user install and reversal
+        id: user-smoke
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = "C:\Users\Public\SmartKeySmoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $name = "SKSmoke$env:GITHUB_RUN_ATTEMPT"
+          $stage = Join-Path $env:RUNNER_TEMP "smartkey-windows-standalone-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $stageHelper = Join-Path $stage 'smartkey-register.exe'
+          $machineDirectory = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) 'SmartKey'
+          $machineHelper = Join-Path $machineDirectory 'smartkey-register.exe'
+          $guid = '{7A3B9E1F-4C2D-4E5A-8F6B-1D2E3F4A5B6C}'
+          $machineClass = "HKLM:\Software\Classes\CLSID\$guid"
+          $machineTip = "HKLM:\Software\Microsoft\CTF\TIP\$guid"
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'The disposable runner must provide an actual elevated token for machine setup.'
+          }
+          if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { throw 'Smoke account already exists' }
+          foreach ($path in @($root, $machineDirectory, $machineClass, $machineTip)) {
+            if (Test-Path -LiteralPath $path) { throw "Refusing preexisting smoke/machine state: $path" }
+          }
+          $secret = ConvertTo-SecureString ([Guid]::NewGuid().ToString('N') + 'aA!4') -AsPlainText -Force
+          $credential = [PSCredential]::new("$env:COMPUTERNAME\$name", $secret)
+          $created = $false
+          $machineAttempted = $false
+          $failure = $null
+          $result = [ordered]@{
+            status='NOT_RUN'; elevated_machine_token=$true
+            standard_user_prerequisite=$false; standard_user_lifecycle=$false
+            machine_install_exit=$null; machine_verify_exit=$null; machine_cleanup_exit=$null
+            frozen_bundle_matches=$false; machine_state_removed=$false
+            typing_exercised=$false; logon_exercised=$false; cleanup_errors=@()
+            machine_tip_snapshots=[ordered]@{}
+          }
+          function Save-OwnedTipSnapshot([string]$phase) {
+            try {
+              $present = Test-Path -LiteralPath $machineTip
+              $snapshot = [ordered]@{ present=$present; query_exit=$null }
+              if ($present) {
+                # Read only SmartKey's exact owned subtree; never modify CTF state.
+                $PSNativeCommandUseErrorActionPreference = $false
+                $lines = & reg.exe query "HKLM\Software\Microsoft\CTF\TIP\$guid" /s 2>&1
+                $snapshot.query_exit = $LASTEXITCODE
+                $lines | Set-Content -LiteralPath (Join-Path $root "machine-tip-$phase.txt") -Encoding utf8
+                if ($snapshot.query_exit -ne 0) { throw "Owned TIP query failed: $($snapshot.query_exit)" }
+              }
+              $result.machine_tip_snapshots[$phase] = $snapshot
+            } catch {
+              # A diagnostic failure must not prevent the cleanup attempt.
+              $result.cleanup_errors += "TIP snapshot ${phase}: $($_.Exception.Message)"
+            }
+          }
+          function Invoke-MachineHelper([string]$helper, [string]$action, [string]$exitField) {
+            $process = [Diagnostics.Process]::new()
+            try {
+              $process.StartInfo = [Diagnostics.ProcessStartInfo]::new($helper, "$action --no-dialog")
+              $process.StartInfo.UseShellExecute = $false
+              $process.StartInfo.CreateNoWindow = $true
+              $process.StartInfo.RedirectStandardOutput = $true
+              $process.StartInfo.RedirectStandardError = $true
+              if (-not $process.Start()) { throw "Cannot start $action" }
+              $stdout = $process.StandardOutput.ReadToEndAsync()
+              $stderr = $process.StandardError.ReadToEndAsync()
+              $timedOut = -not $process.WaitForExit(45000)
+              if ($timedOut) {
+                $process.Kill($true)
+                if (-not $process.WaitForExit(5000)) { throw "$action did not exit after timeout/termination" }
+              }
+              $stem = $action.TrimStart('-')
+              [IO.File]::WriteAllText((Join-Path $root "$stem.stdout.txt"), $stdout.GetAwaiter().GetResult())
+              [IO.File]::WriteAllText((Join-Path $root "$stem.stderr.txt"), $stderr.GetAwaiter().GetResult())
+              $exitCode = $process.ExitCode
+              if ($null -eq $exitCode) { throw "$action has no real exit code; inferred success is refused" }
+              $result[$exitField] = [int]$exitCode
+              if ($timedOut) { throw "$action exceeded 45 seconds" }
+              if ($exitCode -ne 0) { throw "$action failed with exit $exitCode" }
+            } finally { $process.Dispose() }
+          }
+          function Invoke-UserSmoke([string]$phase, [string]$expectedStatus, [int]$timeout) {
+            $output = Join-Path $root "user-$($phase.ToLowerInvariant())"
+            $arguments = "-NoProfile -NonInteractive -File `"$script`" -Bundle `"$bundle`" -OutDir `"$output`" -Phase $phase"
+            $child = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Credential $credential -LoadUserProfile -UseNewEnvironment -PassThru -RedirectStandardOutput (Join-Path $root "$phase.launcher.stdout.txt") -RedirectStandardError (Join-Path $root "$phase.launcher.stderr.txt")
+            try {
+              if (-not $child.WaitForExit($timeout)) {
+                & taskkill /PID $child.Id /T /F
+                throw "Standard-user $phase exceeded its bounded timeout"
+              }
+              $child.Refresh()
+              if ($null -eq $child.ExitCode -or $child.ExitCode -ne 0) {
+                throw "Standard-user $phase failed or its real exit code is unavailable: $($child.ExitCode)"
+              }
+            } finally { $child.Dispose() }
+            $receipt = Get-Content -LiteralPath (Join-Path $output 'smoke-result.json') -Raw | ConvertFrom-Json
+            if ($receipt.status -ne $expectedStatus -or $receipt.phase -ne $phase -or
+                -not $receipt.standard_nonadmin -or -not $receipt.current_user_profile_confirmed -or
+                -not $receipt.keyboard_defaults_preserved) {
+              throw "Missing successful standard-user $phase receipt"
+            }
+            if ($phase -eq 'Prerequisite' -and -not $receipt.machine_prerequisite_refused) {
+              throw 'Missing explicit machine-prerequisite refusal'
+            }
+            if ($phase -eq 'Lifecycle' -and (-not $receipt.machine_install_preserved -or -not $receipt.personal_sentinel_preserved)) {
+              throw 'Lifecycle did not preserve the machine install and personal sentinel'
+            }
+          }
+          try {
+            New-Item -ItemType Directory -Path $root | Out-Null
+            New-LocalUser -Name $name -Password $secret -AccountNeverExpires | Out-Null
+            $created = $true
+            Add-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-545').Name -Member $name
+            Copy-Item -LiteralPath $stage -Destination (Join-Path $root 'bundle') -Recurse
+            Copy-Item -LiteralPath 'crates/smartkey-win/packaging/smoke-user.ps1' -Destination $root
+            & icacls $root /grant "${name}:(OI)(CI)M" /T /Q
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot grant disposable account its smoke directory' }
+            $script = Join-Path $root 'smoke-user.ps1'
+            $bundle = Join-Path $root 'bundle'
+            Invoke-UserSmoke 'Prerequisite' 'PASS_NATIVE_STANDARD_USER_PREREQUISITE' 60000
+            $result.standard_user_prerequisite = $true
+
+            # Elevation uses the original frozen stage, never the user-writable copy.
+            # Set ownership before the attempt so partial installation is cleaned too.
+            $machineAttempted = $true
+            Invoke-MachineHelper $stageHelper '--install-machine' 'machine_install_exit'
+            $expected = @(Get-ChildItem -LiteralPath $stage -Force | ForEach-Object Name | Sort-Object)
+            $actual = @(Get-ChildItem -LiteralPath $machineDirectory -Force | ForEach-Object Name | Sort-Object)
+            if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
+              throw 'Protected machine directory differs from the exact frozen bundle'
+            }
+            foreach ($file in $expected) {
+              if ((Get-FileHash -LiteralPath (Join-Path $stage $file) -Algorithm SHA256).Hash -ne
+                  (Get-FileHash -LiteralPath (Join-Path $machineDirectory $file) -Algorithm SHA256).Hash) {
+                throw "Protected machine file differs from frozen source: $file"
+              }
+            }
+            $result.frozen_bundle_matches = $true
+            Invoke-MachineHelper $machineHelper '--verify-machine' 'machine_verify_exit'
+            Invoke-UserSmoke 'Lifecycle' 'PASS_NATIVE_STANDARD_USER_MAINTENANCE' 180000
+            $result.standard_user_lifecycle = $true
+            $result.status = 'PASS_NATIVE_MACHINE_AND_STANDARD_USER_MAINTENANCE'
+          } catch {
+            $failure = $_.Exception.Message
+            $result.status = 'FAIL_NATIVE_MACHINE_AND_STANDARD_USER_MAINTENANCE'
+            $result['error'] = $failure
+          } finally {
+            if ($machineAttempted) {
+              Save-OwnedTipSnapshot 'before-cleanup'
+              try {
+                # The original archive helper can remove the installed EXE;
+                # the product deliberately refuses to delete its running self.
+                Invoke-MachineHelper $stageHelper '--uninstall-machine' 'machine_cleanup_exit'
+                foreach ($path in @($machineClass, $machineTip, $machineDirectory)) {
+                  if (Test-Path -LiteralPath $path) { throw "Owned machine state remains after cleanup: $path" }
+                }
+                $result.machine_state_removed = $true
+              } catch { $result.cleanup_errors += "Machine cleanup: $($_.Exception.Message)" }
+              finally { Save-OwnedTipSnapshot 'after-cleanup' }
+            }
+            if ($created) {
+              try { Remove-LocalUser -Name $name }
+              catch { $result.cleanup_errors += "Disposable account cleanup: $($_.Exception.Message)" }
+            }
+            if ($result.cleanup_errors.Count -ne 0) {
+              $result.status = 'FAIL_NATIVE_MACHINE_AND_STANDARD_USER_MAINTENANCE'
+            }
+            if (Test-Path -LiteralPath $root) {
+              $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'machine-and-user-result.json') -Encoding utf8
+              Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object {
+                $_.Name -like '*.stdout.txt' -or $_.Name -like '*.stderr.txt' -or $_.Name -like '*result.json'
+              } | Sort-Object FullName | ForEach-Object { Get-Content -LiteralPath $_.FullName }
+            }
+          }
+          if ($null -ne $failure) { throw $failure }
+          if ($result.cleanup_errors.Count -ne 0) { throw ($result.cleanup_errors -join '; ') }
+      - name: Retain native standard-user result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartkey-windows-standard-user-result
+          path: C:/Users/Public/SmartKeySmoke-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
           retention-days: 14
 
   build-macos:
