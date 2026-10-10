@@ -506,25 +506,24 @@ def test_leaving_a_sensitive_field_resets_the_core_and_restores_normal_input():
 
 
 class _ResetRefusalCore(SpyCore):
-    """Keep synthetic old state until a scripted reset actually succeeds."""
+    """Refuse the first ``refusals`` resets, then succeed."""
 
-    def __init__(self, refusals):
+    def __init__(self, refusals: int):
         super().__init__([[("composing", "new\x00dummy")]])
-        self.refusals = iter(refusals)
-        self.old_dummy_state = "old-dummy-word"
+        self.refusals = refusals
 
     def reset(self):
         self.calls.append(("reset", ()))
-        if next(self.refusals, False):
+        if self.refusals:
+            self.refusals -= 1
             raise RuntimeError("synthetic reset refusal")
-        self.old_dummy_state = ""
         return [("commit", "discarded-dummy-reset-action")]
 
 
 @pytest.mark.parametrize("entry_purpose", (PURPOSE_PASSWORD, PURPOSE_FUTURE, None))
 def test_reset_refusal_on_ordinary_recovery_blocks_until_explicit_success(entry_purpose):
     eng, rec = build_engine()
-    eng._core = _ResetRefusalCore([True, True, True, False])
+    eng._core = _ResetRefusalCore(3)
     eng.do_set_content_type(entry_purpose, HINT_NONE)
     trace = FakeTrace()
     eng._trace = trace
@@ -532,7 +531,6 @@ def test_reset_refusal_on_ordinary_recovery_blocks_until_explicit_success(entry_
     eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
 
     assert eng._sensitive is True
-    assert eng._core.old_dummy_state == "old-dummy-word"
     assert _type(eng, "dummy") == [False] * 5
     assert eng._core.key_calls() == []
     assert trace.begins == 0
@@ -552,7 +550,7 @@ def test_reset_refusal_on_ordinary_recovery_blocks_until_explicit_success(entry_
     # Only this explicitly delivered declaration has a successful reset.
     eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
     assert eng._sensitive is False
-    assert eng._core.old_dummy_state == ""
+    assert eng._core.names().count("reset") == 4
     assert trace.events[-1][1]["effective_sensitive"] is False
     assert trace.events[-1][1]["state_changed"] is True
     assert rec.commits == [], "reset actions must be discarded on recovery too"
@@ -564,12 +562,7 @@ def test_reset_refusal_on_ordinary_recovery_blocks_until_explicit_success(entry_
 def test_ordinary_recovery_remains_sensitive_during_the_core_reset():
     eng, _rec = build_engine(sensitive=True)
     states_at_reset = []
-
-    def reset():
-        states_at_reset.append(eng._sensitive)
-        return []
-
-    eng._core.reset = reset
+    eng._core.reset = lambda: states_at_reset.append(eng._sensitive)
     eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
     assert states_at_reset == [True]
     assert eng._sensitive is False
@@ -578,7 +571,7 @@ def test_ordinary_recovery_remains_sensitive_during_the_core_reset():
 @pytest.mark.parametrize("hide_refuses", (False, True))
 def test_reset_refusal_still_cleans_adapter_state_when_leaving_sensitive(hide_refuses):
     eng, rec = build_engine(sensitive=True)
-    eng._core = _ResetRefusalCore([True])
+    eng._core = _ResetRefusalCore(1)
     eng._preedit_active = True
     eng._preedit_mode = "composing"
     eng._last_composing_typed = "old-dummy-word"
@@ -794,7 +787,7 @@ def test_the_composition_counter_measures_keys_since_the_last_resolution():
 
 def test_a_failing_preedit_takedown_cannot_abort_the_sensitive_reset():
     # ``hide_preedit_text()`` is a D-Bus round trip and can fail.  It was the
-    # one unguarded call in _reset_for_sensitive_switch, so a raise aborted the
+    # one unguarded call in _switch_sensitivity, so a raise aborted the
     # reset mid-way: the previous field's word stayed in the adapter's state
     # and a stale preedit was left displayed over the now-sensitive field.
     eng, rec = build_engine(scripts=[[("composing", "secr\x00et")]])

@@ -1499,8 +1499,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             or getattr(self, "_keys_since_content_type", 0)
         )
 
-    def _reset_for_sensitive_switch(self) -> bool:
-        """Drop every trace of the in-flight word across a sensitivity switch.
+    def _switch_sensitivity(self, sensitive: bool) -> None:
+        """Switch sensitive mode, dropping every trace of the in-flight word.
 
         The dual buffer holds the engine's *interpretation* of the keystrokes
         (it can be the transliterated hypothesis rather than the literal keys),
@@ -1509,15 +1509,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         the previous field's word into a password box.  The price is one lost
         preedit word when a content type changes mid-word — deliberate, and
         the safe direction.
+
+        The hard stop stays armed throughout the switch in BOTH directions and
+        is released only after a successful core reset.  A refused reset keeps
+        it armed; the adapter cleanup below runs either way.
         """
-        reset_succeeded = False
+        self._sensitive = True
         try:
             self._core.reset()  # actions discarded on purpose — see docstring
-            reset_succeeded = True
         except Exception:  # noqa: BLE001 — the kill switch must never fail open
             log.warning(
                 "smartkey: core reset failed on content-type switch", exc_info=True
             )
+            sensitive = True
         if getattr(self, "_preedit_active", False):
             try:
                 self._clear_ghost()
@@ -1540,7 +1544,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._sync_surrounding_text(None, None)
         except Exception:  # noqa: BLE001
             log.debug("smartkey: could not clear surrounding text", exc_info=True)
-        return reset_succeeded
+        self._sensitive = sensitive
 
     # NOTE: there is deliberately no ``_forget_content_type()``.  One existed
     # and was removed; see the lifetime section of ``do_set_content_type``.
@@ -1635,27 +1639,20 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # drop the state instead of guessing which field wins.
         transition_in_flight = (
             previous_key is not None
-            and previous_key != decision_key
+            and decision_changed
             and self._composition_in_flight()
         )
         if transition_in_flight:
             sensitive = True
+            classification = "transition-guard"
             log.warning(
                 "content-type transition discarded an in-flight composition "
                 "(structural event; no text logged)"
             )
 
-        if transition_in_flight:
-            classification = "transition-guard"
         self._content_type_key = decision_key
         if sensitive != previous_sensitive:
-            # Keep the hard stop armed throughout reset in BOTH directions.
-            # Only a successful reset on an explicit ordinary declaration may
-            # release it; internal adapter cleanup still runs after refusal.
-            self._sensitive = True
-            reset_succeeded = self._reset_for_sensitive_switch()
-            if not sensitive and reset_succeeded:
-                self._sensitive = False
+            self._switch_sensitivity(sensitive)
 
         trace = getattr(self, "_trace", None)
         if trace is not None:
