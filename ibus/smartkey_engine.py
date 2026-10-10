@@ -177,6 +177,11 @@ for _known_hint in _KNOWN_HINT_VALUES:
 _MOD_CONTROL = 1 << 2  # IBus.ModifierType.CONTROL_MASK
 _MOD_ALT = 1 << 3  # IBus.ModifierType.MOD1_MASK
 _MOD_RELEASE = 1 << 30  # IBus.ModifierType.RELEASE_MASK
+
+# Exceptions the hard-stop paths let propagate.  Everything else counts as a
+# refusal: pyo3 raises a Rust panic as ``PanicException``, which derives from
+# ``BaseException``, so ``except Exception`` would let it escape the cleanup.
+_UNCATCHABLE = (KeyboardInterrupt, SystemExit)
 # The inert zero-key callback storm always carries this hardware code.
 _SPURIOUS_KEYCODE = 240
 
@@ -474,10 +479,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         # Sensitive-input state (see do_set_content_type).  ``_content_type_key``
         # is the decision-relevant projection of the last declared content type
-        # so that a mere re-send, or a hints change we do not act on, is not
-        # mistaken for a field switch.
+        # so that a hints change we do not act on is not mistaken for a field
+        # switch.  ``_declared_ordinary`` records whether the latest declaration
+        # itself was ordinary; while the hard stop is still armed it marks the
+        # release as owed (see do_process_key_event).
         self._sensitive: bool = _sensitive_until_declared()
         self._content_type_key: tuple[int, int] | None = None
+        self._declared_ordinary: bool = False
+        self._reset_refusals: int = 0
         self._keys_since_content_type: int = 0
         self._undeclared_bypass_logged: bool = False
 
@@ -1499,8 +1508,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             or getattr(self, "_keys_since_content_type", 0)
         )
 
-    def _reset_for_sensitive_switch(self) -> bool:
-        """Drop every trace of the in-flight word across a sensitivity switch.
+    def _switch_sensitivity(self, sensitive: bool) -> None:
+        """Switch sensitive mode, dropping every trace of the in-flight word.
 
         The dual buffer holds the engine's *interpretation* of the keystrokes
         (it can be the transliterated hypothesis rather than the literal keys),
@@ -1509,19 +1518,53 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         the previous field's word into a password box.  The price is one lost
         preedit word when a content type changes mid-word — deliberate, and
         the safe direction.
+
+        The hard stop stays armed throughout the switch in BOTH directions and
+        is released only after a successful core reset.  A refused reset keeps
+        it armed; the adapter cleanup below runs either way.  A refusal is any
+        exception except ``_UNCATCHABLE`` — including pyo3's ``PanicException``,
+        a ``BaseException`` that ``except Exception`` would let skip the
+        cleanup.  ``KeyboardInterrupt``/``SystemExit`` propagate and leave the
+        stop armed.
+
+        A refusal on the way to an ordinary declaration leaves the release
+        owed, and ``do_process_key_event`` retries it through this method.  The
+        first refusal in a row warns with the exception type only; repeats log
+        at debug level, so a core that keeps refusing does not warn on every
+        keystroke.
         """
-        reset_succeeded = False
+        self._sensitive = True
         try:
             self._core.reset()  # actions discarded on purpose — see docstring
-            reset_succeeded = True
-        except Exception:  # noqa: BLE001 — the kill switch must never fail open
-            log.warning(
-                "smartkey: core reset failed on content-type switch", exc_info=True
+        except _UNCATCHABLE:
+            raise
+        except BaseException as exc:  # noqa: BLE001 — the kill switch must never fail open
+            sensitive = True
+            self._reset_refusals = getattr(self, "_reset_refusals", 0) + 1
+            if self._reset_refusals == 1:
+                log.warning(
+                    "smartkey: core reset refused on content-type switch (%s); "
+                    "hard stop stays armed",
+                    type(exc).__name__,
+                )
+            log.debug(
+                "smartkey: core reset refused %d time(s) in a row",
+                self._reset_refusals,
+                exc_info=True,
             )
+        else:
+            if getattr(self, "_reset_refusals", 0):
+                log.info(
+                    "smartkey: core reset accepted after %d refusal(s)",
+                    self._reset_refusals,
+                )
+                self._reset_refusals = 0
         if getattr(self, "_preedit_active", False):
             try:
                 self._clear_ghost()
-            except Exception:  # noqa: BLE001 — the kill switch must never fail open
+            except _UNCATCHABLE:
+                raise
+            except BaseException:  # noqa: BLE001 — the kill switch must never fail open
                 # ``hide_preedit_text()`` is a D-Bus round trip and can fail.
                 # Letting it abort the reset would leave the previous field's
                 # word in ``_last_composing_typed``/``_active_prediction`` and
@@ -1538,9 +1581,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._keys_since_content_type = 0
         try:
             self._sync_surrounding_text(None, None)
-        except Exception:  # noqa: BLE001
+        except _UNCATCHABLE:
+            raise
+        except BaseException:  # noqa: BLE001
             log.debug("smartkey: could not clear surrounding text", exc_info=True)
-        return reset_succeeded
+        self._sensitive = sensitive
 
     # NOTE: there is deliberately no ``_forget_content_type()``.  One existed
     # and was removed; see the lifetime section of ``do_set_content_type``.
@@ -1558,7 +1603,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         The callback is ADVISORY and adapter-specific, so the policy here is
         deliberately asymmetric: any ambiguity in PURPOSE or HINTS turns
         sensitive mode ON, and only an explicit, recognised, non-sensitive
-        declaration outside a live composition turns it back off.  A valid
+        declaration authorises turning it back off; the release itself waits
+        for a successful core reset (see LIFETIME).  A valid
         HINT_NONE value is ordinary; malformed values and future hint bits that
         this adapter has not audited fail closed until their semantics are
         understood.
@@ -1568,13 +1614,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         guarantee that SmartKey never sees a password, and it must not be
         described as one.  Three gaps are open by construction:
 
-        * A client that never calls ``set_content_type`` — the callback simply
-          never fires, and the field is handled as prose.  Whether GTK, Qt,
+        * A client that never calls ``set_content_type`` — its context stays
+          at FREE_FORM/NONE, and the field is handled as prose.  Whether GTK, Qt,
           Electron and terminal emulators each publish it is a per-client fact,
           not something this adapter can assert.
         * A field that gets its focus before its declaration.  The declaration
           race is one keystroke wide at worst; ``SMARTKEY_SENSITIVE_UNTIL_DECLARED=1``
-          closes it at the cost of one dead keystroke per undeclared field.
+          closes it by keeping SmartKey inert until a declaration arrives (see
+          the residuals below).
         * Anything that does not go through IBus at all — a browser password
           manager, a client with its own input handling, an X11 grab.
 
@@ -1594,21 +1641,40 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         (verified against the installed ``libibus-1.0.so.5`` — the ``g_variant_equal``
         and ``g_dbus_proxy_get_cached_property`` relocations are both there in
         that function, and the ``g_dbus_proxy_call`` is on the unequal branch).
-        So a client does not re-declare on every focus-in; it declares when the
-        type *changes*.  Expiring on focus-out therefore reopens the password
-        field itself: focus away from the password box and back, no new
-        declaration arrives, and the engine is live inside it.
+        The daemon repeats the check against its engine proxy's cached value
+        (``bus_engine_proxy_set_content_type``) and pushes the focused
+        context's (purpose, hints) at every focus-in, and libibus on the engine
+        side drops a Set whose raw value equals the one THIS engine object last
+        stored (that store starts zero-filled at FREE_FORM/NONE).  So this
+        callback never sees the same raw value twice in a row, and a fresh
+        engine never sees (0, 0) first.  A client does not re-declare on every
+        focus-in; the engine is told when the type *changes*.  Expiring on
+        focus-out therefore reopens the password field itself: focus away from
+        the password box and back, no new declaration arrives, and the engine
+        is live inside it.
 
         What un-sticks the flag is an ordinary declaration.  Moving to a field
-        whose content type differs from the cached one makes IBus send it, and
-        an explicit recognised non-sensitive purpose clears ``_sensitive`` only
-        after a successful core reset. A reset refusal keeps it armed until a
-        subsequent explicit ordinary declaration successfully resets. The
-        residual is the mirror of the discarded design's: a client that
-        declares PASSWORD and then hands focus to a client that never declares
-        anything at all keeps SmartKey inert.  That direction is safe and
-        recoverable — one declaration restores it — whereas the other direction
-        types into a password box.
+        whose raw content type differs from the last one delivered makes IBus
+        send it — including a client that never declares, whose context still
+        holds (0, 0) and so differs from a cached secret value.  An explicit
+        recognised non-sensitive declaration releases the stop only after a
+        successful core reset.  When that reset is refused, or when the
+        transition guard below arms the stop for an ordinary declaration, the
+        release is OWED: the declaration will not come again, so
+        ``do_process_key_event`` retries the reset on the next key press.  IBus
+        orders that key after every declaration it pushed for the focused
+        field.  Focus-in is never a release point, because IBus sends FocusIn
+        BEFORE the new field's declaration.  Every declaration withdraws an
+        owed release first, so a release always answers the latest one.
+
+        Residuals, all in the safe direction (SmartKey inert, never live in a
+        secret field):
+
+        * A core whose reset keeps failing keeps SmartKey inert.
+        * With ``SMARTKEY_SENSITIVE_UNTIL_DECLARED=1`` a FREE_FORM/NONE field
+          is never declared to a fresh engine (libibus already holds (0, 0)),
+          so the stop holds until some other value and then an ordinary one
+          have been delivered.
 
         IBus 1.5.34 does expose a per-context focus API
         (``focus_in_id(object_path, client)`` / ``focus_out_id(object_path)``,
@@ -1618,13 +1684,18 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         this policy warrants.
 
         No chain-up: IBus 1.5.34 exposes no ``content-type`` GObject property,
-        and its default ``set_content_type`` vfunc is a no-op (verified — it
-        does not even update ``get_content_type()``), so there is nothing for
-        the parent to do.
+        and its default ``set_content_type`` vfunc is a no-op, so there is
+        nothing for the parent to do.  (``get_content_type()`` is kept by
+        libibus's D-Bus property handler, which stores the value before it
+        emits this signal — not by the vfunc.)
         """
+        # Every declaration supersedes an owed release: from here on a release
+        # may only answer THIS declaration, and only if it is ordinary.
+        self._declared_ordinary = False
         sensitive, decision_key, classification = self._content_type_decision(
             purpose, hints
         )
+        declared_ordinary = not sensitive
         previous_key = getattr(self, "_content_type_key", None)
         previous_sensitive = getattr(self, "_sensitive", False)
         decision_changed = previous_key != decision_key
@@ -1632,30 +1703,26 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # Fail safe: a content type that changes while a word is still in
         # flight means the composition may already belong to a different field
         # than the one it was started in.  Treat that window as sensitive and
-        # drop the state instead of guessing which field wins.
+        # drop the state instead of guessing which field wins.  The doubt is
+        # about the dropped word only: for an ordinary declaration the release
+        # is owed, so the latch costs one word, not the field.
         transition_in_flight = (
             previous_key is not None
-            and previous_key != decision_key
+            and decision_changed
             and self._composition_in_flight()
         )
         if transition_in_flight:
             sensitive = True
+            classification = "transition-guard"
             log.warning(
                 "content-type transition discarded an in-flight composition "
                 "(structural event; no text logged)"
             )
 
-        if transition_in_flight:
-            classification = "transition-guard"
         self._content_type_key = decision_key
         if sensitive != previous_sensitive:
-            # Keep the hard stop armed throughout reset in BOTH directions.
-            # Only a successful reset on an explicit ordinary declaration may
-            # release it; internal adapter cleanup still runs after refusal.
-            self._sensitive = True
-            reset_succeeded = self._reset_for_sensitive_switch()
-            if not sensitive and reset_succeeded:
-                self._sensitive = False
+            self._switch_sensitivity(sensitive)
+        self._declared_ordinary = declared_ordinary
 
         trace = getattr(self, "_trace", None)
         if trace is not None:
@@ -1692,7 +1759,30 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         engine for layout-agnostic input.  Falls back to the keyval path
         (``handle_key()``) when keycode is unavailable.
         """
-        # Sensitive field: hard stop BEFORE anything else — no trace event, no
+        # Owed release (see do_set_content_type): the latest declaration is
+        # ordinary but the stop is still armed, because its core reset was
+        # refused or the transition guard fired.  That declaration is never
+        # delivered again, so the reset is retried here, on a real key PRESS,
+        # before anything reads the key.  IBus has already dispatched every
+        # declaration it pushed for the focused context: the daemon sends
+        # ContentType before it forwards a key, on the same ordered D-Bus
+        # connection.  _switch_sensitivity keeps the stop armed for the reset
+        # and releases it only if the reset succeeds; the key then goes to the
+        # core like any key in an ordinary field.
+        if (
+            getattr(self, "_sensitive", False)
+            and getattr(self, "_declared_ordinary", False)
+            and not state & _MOD_RELEASE
+            and not self._is_spurious_zero_key_event(keyval, keycode, state)
+        ):
+            self._switch_sensitivity(False)
+            trace = getattr(self, "_trace", None)
+            if not self._sensitive and trace is not None:
+                trace.emit(
+                    "hard_stop", seq=0, transition="released", cause="deferred_reset"
+                )
+
+        # Sensitive field: hard stop BEFORE anything reads the key — no trace, no
         # surrounding-text read, no core call, and therefore no composing, no
         # transliteration, no prediction and no learning.  Returning False
         # hands the untouched key straight back to IBus for the client.
@@ -1839,7 +1929,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_focus_in(self) -> None:
         self._core.focus_gained()
         if getattr(self, "_sensitive", False):
-            # Never pull a sensitive field's contents into the core.
+            # Never pull a sensitive field's contents into the core.  Nor is
+            # an owed release retried here: IBus sends FocusIn BEFORE the new
+            # context's ContentType, so the declaration in hand may still be
+            # the previous field's.
             return
         self._refresh_surrounding_text()
 
@@ -1853,9 +1946,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # libibus-1.0.so.5, whose call sequence is
         # g_dbus_proxy_get_cached_property -> g_variant_new -> g_variant_equal
         # -> (only when unequal) g_dbus_proxy_call -> set_cached_property.  The
-        # daemon does the same in bus/engineproxy.c.  So the engine is told the
-        # content type only when it CHANGES relative to what this proxy was last
-        # told.
+        # daemon does the same in bus/engineproxy.c, and libibus drops a Set
+        # equal to the value this engine object last stored.  So the engine is
+        # told the content type only when it CHANGES relative to what it was
+        # last told.
         #
         # Clearing the flag here would desynchronise us from that cache and
         # re-open the exact hole this feature exists to close: leave a password
@@ -1866,14 +1960,22 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         #
         # Stickiness does not strand correctly declaring clients either:
         # BusInputContext holds per-context purpose/hints defaulting to
-        # FREE_FORM (0, 0) and pushes them at every focus-in, so a client that
-        # publishes an ordinary field pushes a value that DIFFERS from
-        # (PASSWORD, 0); do_set_content_type(0, 0) then clears sensitivity.
+        # FREE_FORM (0, 0) and pushes them at every focus-in, so an ordinary
+        # field — even in a client that never declares — pushes a value that
+        # DIFFERS from (PASSWORD, 0); do_set_content_type(0, 0) then clears
+        # sensitivity.
         #
         # Only the in-flight keystroke counter is a genuinely per-context value.
         self._keys_since_content_type = 0
-        actions = self._core.focus_lost()
-        self._execute_actions(actions)
+        if not getattr(self, "_sensitive", False):
+            # Under the hard stop the core is never flushed.  focus_lost()
+            # commits AND learns the in-flight word, and while the stop is
+            # armed that word can only be residue a refused reset left behind:
+            # the previous field's word, or keys typed into this secret field
+            # before its declaration arrived.  It stays unflushed; the stop is
+            # released only after a successful reset, which discards it.
+            actions = self._core.focus_lost()
+            self._execute_actions(actions)
         self._active_prediction = None
         collector = getattr(self, "_o1", None)
         if collector is not None:
