@@ -100,6 +100,22 @@ def _refresh_identity(rec: dict) -> None:
     rec["id"] = V.compute_id(rec)
 
 
+@pytest.mark.parametrize(
+    "source,additions,expected_message",
+    [([], [], "source registry must be a JSON object"), ({}, {}, "append input must be a JSON array")],
+)
+def test_writer_reports_the_actual_invalid_input_shape(tmp_path, source, additions, expected_message):
+    source_path = tmp_path / "source.json"
+    source_bytes = json.dumps(source).encode("utf-8")
+    source_path.write_bytes(source_bytes)
+    output = tmp_path / "candidate.json"
+    result = _run_writer_cli(source_path, additions, output, hashlib.sha256(source_bytes).hexdigest())
+    assert result.returncode != 0
+    assert expected_message in result.stderr
+    assert not output.exists()
+    assert source_path.read_bytes() == source_bytes
+
+
 def _legacy_append(label: str) -> dict:
     cyrillic_labels = {
         "alpha": "алфа",
