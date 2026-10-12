@@ -848,7 +848,7 @@ impl InputMethodCore {
                 // atomic `typed+ghost+" "` commit with the key consumed.  With
                 // the flag off, or without an eligible ghost, both keys stay
                 // exactly literal (the unchanged paths below).
-                if matches!(event.key, Key::Space)
+                if Self::is_space_event(&event)
                     && self.config.space_accept
                     && display_attested
                     && self.space_accept_eligible()
@@ -1097,12 +1097,16 @@ impl InputMethodCore {
         self.config.space_accept && self.space_accept_eligible()
     }
 
-    /// Whether this event is a Space press, on either entry path: the keyval
+    /// Whether this event is a plain Space press (Caps Lock latch allowed),
+    /// on either entry path: the keyval
     /// path (`Key::Space`) or the raw-scancode path the live adapter uses for
     /// every key (`Key::RawCode` that the keymap resolves to Space).  The
     /// master loop must not match `Key::Space` alone — raw codes are resolved
     /// only inside `handle_key`, so a raw Space would never be attested.
     pub fn is_space_event(event: &KeyEvent) -> bool {
+        if !event.modifiers.difference(Modifiers::CAPS_LOCK).is_empty() {
+            return false;
+        }
         match event.key {
             Key::Space => true,
             Key::RawCode(code) => matches!(
@@ -4235,6 +4239,51 @@ mod space_accept_tests {
 
     const FLAG_ON: &str = r#"{"accept": {"space_accept": true}}"#;
     const FLAG_ABSENT: &str = "{}";
+
+    #[test]
+    fn space_event_requires_a_plain_press_but_allows_caps_lock() {
+        for key in [Key::Space, Key::RawCode(57)] {
+            for modifiers in [Modifiers::empty(), Modifiers::CAPS_LOCK] {
+                assert!(InputMethodCore::is_space_event(&KeyEvent {
+                    key: key.clone(),
+                    modifiers,
+                }));
+            }
+            for modifiers in [
+                Modifiers::SHIFT,
+                Modifiers::SUPER,
+                Modifiers::CTRL,
+                Modifiers::ALT,
+                Modifiers::RELEASE,
+                Modifiers::SHIFT | Modifiers::CAPS_LOCK,
+            ] {
+                assert!(
+                    !InputMethodCore::is_space_event(&KeyEvent {
+                        key: key.clone(),
+                        modifiers,
+                    }),
+                    "{key:?} with {modifiers:?}"
+                );
+            }
+        }
+        assert!(!InputMethodCore::is_space_event(&press(Key::Return)));
+    }
+
+    #[test]
+    fn modified_space_cannot_accept_even_with_display_attestation() {
+        for key in [Key::Space, Key::RawCode(57)] {
+            for modifiers in [Modifiers::SHIFT, Modifiers::SUPER] {
+                let mut core = core_with(FLAG_ON);
+                composing(&mut core, "hel", "lo", true);
+                let actions = core.handle_key(KeyEvent {
+                    key: key.clone(),
+                    modifiers,
+                });
+                assert_eq!(commits(&actions), vec!["hel".to_string()]);
+                assert!(has(&actions, &Action::ForwardKey));
+            }
+        }
+    }
 
     // ── Delimiter folding vs post-commit replacement (bd9219aa448c B) ────
 
