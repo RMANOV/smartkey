@@ -882,6 +882,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if not pending_prediction:
             return
 
+        word_state_available, post_word = self._core_word_state()
+        if word_state_available and post_word is None:
+            # Retire an unclassifiable interaction without inventing an
+            # outcome or leaking its prediction into the next word.
+            self._clear_active_prediction_if(int(pending_prediction["prediction_id"]))
+            return
+        continuing_word = word_state_available and bool(post_word)
         prediction_id = int(pending_prediction["prediction_id"])
         action_types = {action_type for action_type, _ in actions}
         # Space/Return commits are the TYPED word, never an acceptance — they
@@ -891,6 +898,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # "space_autocommit" reason died with the aggressive path; a Space
         # ``replace`` now only means a post-commit caps/translit correction.
         accept_reason = self._prediction_accept_reason(keyval, key_release, actions)
+        if continuing_word:
+            accept_reason = None
 
         if accept_reason is not None:
             self._log_replay_event(
@@ -913,7 +922,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             reason = "navigation"
         elif keyval == IBus.KEY_BackSpace:
             reason = "backspace"
-        elif (
+        elif not continuing_word and (
             keyval in (IBus.KEY_space, IBus.KEY_Return)
             or self._is_punctuation_boundary(keyval)
             or ("commit" in action_types and "forward" in action_types)
@@ -951,9 +960,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         collector = getattr(self, "_o1", None)
         if collector is None or key_release:
             return
-        committed = any(action_type == "commit" for action_type, _ in actions)
-        if not committed:
+        word_state_available, post_word = self._core_word_state()
+        if word_state_available and post_word != "":
+            # A delivered BG letter may carry a punctuation-looking EN keyval.
+            # A failed query also cannot attest a word boundary.
             return
+        committed = any(action_type == "commit" for action_type, _ in actions)
         accept_reason = self._prediction_accept_reason(keyval, key_release, actions)
         if accept_reason is not None:
             word = str((pending_prediction or {}).get("word") or "")
@@ -964,18 +976,29 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     payload for action_type, payload in actions if action_type == "commit"
                 ).rstrip(" ")
         else:
+            if not committed and not (word_state_available and pre_key_word):
+                return
             word = pre_key_word
         if word:
             collector.on_word_commit(word)
 
-    def _core_current_word(self) -> str:
+    def _core_word_state(self) -> tuple[bool, str | None]:
+        """Return getter capability and known word; None means query failure."""
         getter = getattr(self._core, "current_word", None)
         if not callable(getter):
-            return ""
+            # Legacy cores/fakes retain their action-based compatibility path.
+            return False, None
         try:
-            return getter() or ""
+            word = getter()
         except Exception:  # noqa: BLE001 -- diagnostics must never break input
-            return ""
+            return True, None
+        if not isinstance(word, str):
+            return True, None
+        return True, word
+
+    def _core_current_word(self) -> str:
+        _available, word = self._core_word_state()
+        return word or ""
 
     def _is_genuine_ghost_rejection(
         self,
@@ -1287,27 +1310,20 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def _composition_resolved_by(self, actions: list[tuple[str, str]]) -> bool:
         """True when this batch means the core is no longer holding a word.
 
-        ``commit``/``replace`` answer on their own. A bare ``hide`` is
-        ambiguous, so ask the only component that knows — the core. When it
-        cannot be asked (an older native module, or a fake in a test), the
-        answer is False: leaving the counter running keeps the fail-safe armed,
-        and the cost of a false "still composing" is one content-type change
-        treated as sensitive, against the cost of a false "resolved", which is
-        the kill switch not firing inside a password field.
+        Delivery commits may be fragments of an active canonical word, so
+        query the core before clearing the privacy counter. A failed query
+        keeps it armed. Legacy cores without this capability retain their
+        commit/replace contract; a bare hide remains ambiguous and fails safe.
         """
-        if any(a[0] in self._COMPOSITION_RESOLVING_ACTIONS for a in actions):
-            return True
-        if not any(a[0] == "hide" for a in actions):
+        resolving_action = any(
+            a[0] in self._COMPOSITION_RESOLVING_ACTIONS for a in actions
+        )
+        if not resolving_action and not any(a[0] == "hide" for a in actions):
             return False
-        current_word = getattr(self._core, "current_word", None)
-        if current_word is None:
-            return False
-        try:
-            return not current_word()
-        except Exception:  # noqa: BLE001
-            log.debug("smartkey: current_word() failed, keeping the fail-safe armed",
-                      exc_info=True)
-            return False
+        word_state_available, word = self._core_word_state()
+        if word_state_available:
+            return word == ""
+        return resolving_action
 
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
@@ -1317,9 +1333,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._preedit_active
             and getattr(self, "_preedit_mode", None) == "composing"
         )
-        # Decided on the batch, before dispatch: the core's own view of the
-        # in-flight word is the tie-breaker for a bare ``hide``, and dispatch
-        # does not change it.
+        # Query post-core token state before dispatch: a delivery commit may
+        # leave the same word active, and dispatch does not change that state.
         composition_resolved = self._composition_resolved_by(actions)
         consumed = True
         for idx, (action_type, payload) in enumerate(actions):
@@ -1838,13 +1853,13 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 getattr(self, "_keys_since_content_type", 0) + 1
             )
 
-        # Capture the word before a key that can terminate composition. The
-        # post-core action list decides whether a commit actually happened.
+        # Capture the word before a key that can terminate composition. Its
+        # post-core token state distinguishes a word ending from delivery only.
         o1_pre_word = ""
         if getattr(self, "_o1", None) is not None and not key_release:
             is_digit_boundary = 0x30 <= keyval <= 0x39
             if (
-                keyval in (IBus.KEY_space, IBus.KEY_Return)
+                keyval in (IBus.KEY_Tab, IBus.KEY_space, IBus.KEY_Return)
                 or self._is_punctuation_boundary(keyval)
                 or is_digit_boundary
             ):

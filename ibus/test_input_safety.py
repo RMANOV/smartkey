@@ -1820,6 +1820,136 @@ def test_an_unaskable_core_keeps_the_fail_safe_armed():
 
 
 @pytest.mark.parametrize(
+    "delivery,keycode_route",
+    [
+        ("partial_right", False),
+        ("partial_right", True),
+        ("semantic_handoff", False),
+        ("raw_fragment", True),
+    ],
+    ids=[
+        "partial-right-keyval",
+        "partial-right-raw",
+        "semantic-handoff",
+        "raw-fragment",
+    ],
+)
+def test_hybrid_delivery_nonterminal_commit_keeps_privacy_guard_armed(
+    monkeypatch, keycode_route, delivery
+):
+    """A client text commit can leave the same canonical word in flight."""
+
+    class ContinuingCore(SpyCore):
+        def __init__(self, actions, initial_word, post_word):
+            super().__init__([actions])
+            self.word = initial_word
+            self.post_word = post_word
+
+        def _next(self):
+            actions = super()._next()
+            self.word = self.post_word
+            return actions
+
+        def current_word(self):
+            return self.word
+
+    if delivery == "partial_right":
+        actions = [("commit", "l"), ("ghost", "o")]
+        keyval, raw_code = ske.IBus.KEY_Right, 106
+        expected_commit, expected_consumed = "l", True
+        initial_word, post_word = "hel", "hell"
+    elif delivery == "semantic_handoff":
+        actions = [("hide", ""), ("commit", "hel"), ("forward", "")]
+        keyval, raw_code = ord("l"), 38
+        expected_commit, expected_consumed = "hel", False
+        initial_word, post_word = "hel", "hell"
+    else:
+        actions = [("commit", "o")]
+        keyval, raw_code = ord("o"), 24
+        expected_commit, expected_consumed = "o", True
+        initial_word, post_word = "hell", "hello"
+
+    eng, rec = build_engine()
+    eng._core = ContinuingCore(actions, initial_word, post_word)
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    eng._keys_since_content_type = len(initial_word)
+    # Test both adapter dispatch paths without importing or constructing a
+    # native core. The staged post-word is the producer-consumer contract.
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    consumed = eng.do_process_key_event(keyval, raw_code if keycode_route else 0, 0)
+
+    assert consumed is expected_consumed
+    assert rec.commits == [expected_commit]
+    assert eng._core.current_word() == post_word
+    # A visible replacement ghost can mask this bug in _composition_in_flight;
+    # the counter must independently retain the content-type privacy guard.
+    assert eng._keys_since_content_type > 0, (
+        "nonterminal delivery cleared the privacy guard while the core still "
+        "holds the same word"
+    )
+
+
+@pytest.mark.parametrize("keycode_route", [False, True], ids=["keyval", "raw"])
+def test_hybrid_delivery_true_boundary_still_clears_privacy_guard(
+    monkeypatch, keycode_route
+):
+    class BoundaryCore(SpyCore):
+        def __init__(self):
+            super().__init__([[("hide", ""), ("commit", "hel"), ("forward", "")]])
+            self.word = "hel"
+
+        def _next(self):
+            actions = super()._next()
+            self.word = ""
+            return actions
+
+        def current_word(self):
+            return self.word
+
+    eng, rec = build_engine()
+    eng._core = BoundaryCore()
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    eng._keys_since_content_type = 3
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+
+    assert (
+        eng.do_process_key_event(ske.IBus.KEY_space, 57 if keycode_route else 0, 0)
+        is False
+    )
+    assert rec.commits == ["hel"]
+    assert eng._keys_since_content_type == 0
+
+
+def test_hybrid_delivery_failed_postword_query_keeps_guard_and_does_not_tap_o1():
+    class FailingPostWordCore(SpyCore):
+        def __init__(self):
+            super().__init__([[("hide", ""), ("commit", "hel"), ("forward", "")]])
+            self.failed = False
+
+        def current_word(self):
+            if self.failed:
+                raise RuntimeError("scripted post-state query failure")
+            return "hel"
+
+        def _next(self):
+            actions = super()._next()
+            self.failed = True
+            return actions
+
+    eng, rec = build_engine()
+    eng._core = FailingPostWordCore()
+    eng.do_set_content_type(PURPOSE_FREE_FORM, HINT_NONE)
+    eng._keys_since_content_type = 3
+    committed_words = []
+    eng._o1 = types.SimpleNamespace(on_word_commit=committed_words.append)
+
+    assert eng.do_process_key_event(ske.IBus.KEY_space, 0, 0) is False
+    assert rec.commits == ["hel"]
+    assert eng._keys_since_content_type > 0, "a failed getter does not prove resolution"
+    assert committed_words == [], "a failed getter does not attest a word boundary"
+
+
+@pytest.mark.parametrize(
     "word,keyvals,codes",
     [
         ("здравей", "zdrawej", (44, 32, 19, 30, 17, 18, 36)),

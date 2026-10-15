@@ -200,6 +200,16 @@ impl MasterLoop {
         let commit_learning = self.core.take_commit_learning();
         self.apply_correction_override(&mut actions);
         self.enforce_rejection_suppression(&mut actions);
+        if !self.core.current_word().is_empty()
+            && actions.iter().any(|a| matches!(a, Action::CommitText(_)))
+            && actions
+                .iter()
+                .any(|a| matches!(a, Action::ForwardKey | Action::HideGhost))
+        {
+            // Forwarded handoffs and consumed delivery can both remove the
+            // displayed ghost. Retire its old identity before further edits.
+            self.last_shown_ghost = None;
+        }
         let terminal_accept =
             pre_accept_prediction.is_some() && commit_learning.accepted_prediction;
 
@@ -2422,8 +2432,30 @@ mod terminal_alignment_contract_tests {
         }
     }
 
-    fn assert_full_token(ml: &mut MasterLoop, expected: &str) {
+    fn step(ml: &mut MasterLoop, key: Key, text: &mut String, preedit: &mut String) {
+        let actions = ml.handle_key(KeyEvent {
+            key: key.clone(),
+            modifiers: Modifiers::empty(),
+        });
+        super::hybrid_delivery_contract_tests::project(&actions, &key, text, preedit);
+    }
+
+    fn assert_full_token(
+        ml: &mut MasterLoop,
+        expected: &str,
+        text: &mut String,
+        preedit: &mut String,
+    ) {
+        assert_eq!(ml.current_word(), expected);
+        assert_eq!(
+            text, expected,
+            "handoff delivered the prefix and semantic suffix once"
+        );
+        assert!(preedit.is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 0);
         let actions = ml.handle_key(raw(57));
+        super::hybrid_delivery_contract_tests::project(&actions, &Key::RawCode(57), text, preedit);
+        assert_eq!(text, &format!("{expected} "));
         assert_eq!(
             actions
                 .iter()
@@ -2432,7 +2464,7 @@ mod terminal_alignment_contract_tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![expected],
+            Vec::<&str>::new(),
             "{actions:?}"
         );
         assert_eq!(
@@ -2447,6 +2479,14 @@ mod terminal_alignment_contract_tests {
             .any(|a| matches!(a, Action::ReplaceWord { .. })));
         assert_eq!(ml.current_word(), "");
         assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert!(ml
+            .core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|word| word == expected));
     }
 
     #[test]
@@ -2457,15 +2497,13 @@ mod terminal_alignment_contract_tests {
         ml.load_word_lang("ви", 2_137_962, LangId::Bg);
         let text = "Искам да благодаря ";
         ml.set_surrounding_text(Some(text.to_string()), Some(text.chars().count()));
-        ml.handle_key(raw(17));
-        ml.handle_key(raw(23));
+        let (mut text, mut preedit) = (String::new(), String::new());
+        step(&mut ml, Key::RawCode(17), &mut text, &mut preedit);
+        step(&mut ml, Key::RawCode(23), &mut text, &mut preedit);
         assert_eq!(ml.current_word(), "wi");
-        ml.handle_key(KeyEvent {
-            key: Key::Char('x'),
-            modifiers: Modifiers::empty(),
-        });
+        step(&mut ml, Key::Char('x'), &mut text, &mut preedit);
         assert_eq!(ml.current_word(), "wix");
-        assert_full_token(&mut ml, "wix");
+        assert_full_token(&mut ml, "wix", &mut text, &mut preedit);
     }
 
     #[test]
@@ -2479,17 +2517,15 @@ mod terminal_alignment_contract_tests {
             ml.load_word_lang(word, frequency, LangId::En);
         }
         ml.load_word_lang("статия", 50_000, LangId::Bg);
+        let (mut text, mut preedit) = (String::new(), String::new());
         for code in [31, 20, 30, 20, 23, 16] {
-            ml.handle_key(raw(code));
+            step(&mut ml, Key::RawCode(code), &mut text, &mut preedit);
         }
         assert_eq!(ml.current_word(), "statiq");
         assert_eq!(ml.core.debug_state(), (true, true, false));
-        ml.handle_key(KeyEvent {
-            key: Key::Char('x'),
-            modifiers: Modifiers::empty(),
-        });
+        step(&mut ml, Key::Char('x'), &mut text, &mut preedit);
         assert_eq!(ml.current_word(), "statiqx");
-        assert_full_token(&mut ml, "statiqx");
+        assert_full_token(&mut ml, "statiqx", &mut text, &mut preedit);
     }
 }
 
@@ -2565,5 +2601,1045 @@ mod no_regression_contract_tests {
     #[test]
     fn no_regression_absent_context_keeps_observational_latin_control() {
         check(None, "no");
+    }
+}
+
+#[cfg(test)]
+mod hybrid_delivery_contract_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn scenario(name: &str) -> (Vec<Key>, &'static str) {
+        use Key::{Backspace as Bs, Char as Ch, RawCode as Raw};
+        match name {
+            "raw_suffix" => (vec![Raw(16), Ch('a'), Raw(45)], "qax"),
+            "one_raw_backspace" => (vec![Raw(16), Ch('a'), Bs], "q"),
+            "two_raw_backspace" => (vec![Raw(16), Raw(45), Ch('a'), Bs], "qx"),
+            "direct_prefix" => (vec![Ch('a'), Raw(16)], "aq"),
+            "immediate_space" => (vec![Raw(16), Ch('a')], "qa"),
+            "raw_only" => (vec![Raw(16), Raw(45), Bs], "q"),
+            "direct_only" => (vec![Ch('q'), Ch('a')], "qa"),
+            "unicode_mixed" => (vec![Ch('é'), Ch('д'), Bs, Ch('я')], "éя"),
+            _ => panic!("unknown test scenario"),
+        }
+    }
+
+    // Projection of the bounded IBus dispatcher contract: composing replaces
+    // preedit, hide discards it, safe_commit clears it before insertion, and a
+    // ForwardKey delivers the ORIGINAL event keyval after the action batch.
+    // Raw fixture keyvals below are explicitly Latin q/x, not inferred winners.
+    pub(super) fn project(actions: &[Action], key: &Key, text: &mut String, preedit: &mut String) {
+        for action in actions {
+            match action {
+                Action::ShowComposing { typed, .. } => preedit.clone_from(typed),
+                Action::HideGhost | Action::ShowGhost(_) => preedit.clear(),
+                Action::CommitText(word) => {
+                    preedit.clear();
+                    text.push_str(word);
+                }
+                Action::ReplaceWord { .. } => panic!("unexpected replacement: {actions:?}"),
+                Action::ForwardKey => {}
+            }
+        }
+        if actions
+            .iter()
+            .any(|action| matches!(action, Action::ForwardKey))
+        {
+            match key {
+                Key::Char(ch) => text.push(*ch),
+                Key::RawCode(16) => text.push('q'),
+                Key::RawCode(45) => text.push('x'),
+                Key::RawCode(57) | Key::Space => text.push(' '),
+                Key::Backspace => {
+                    text.pop();
+                }
+                _ => panic!("unmodelled ORIGINAL forwarded keyval: {key:?}"),
+            }
+        }
+    }
+
+    fn run(name: &str, canonical: bool) {
+        let (keys, expected) = scenario(name);
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        let (mut delivered, mut preedit, mut trace) = (String::new(), String::new(), Vec::new());
+        for key in keys.into_iter().chain([Key::RawCode(57)]) {
+            let word_before = ml.current_word().to_string();
+            let actions = ml.handle_key(KeyEvent {
+                key: key.clone(),
+                modifiers: Modifiers::empty(),
+            });
+            project(&actions, &key, &mut delivered, &mut preedit);
+            trace.push(format!("key={key:?}; word={:?}; actions={actions:?}; committed={delivered:?}; preedit={preedit:?}", ml.current_word()));
+            if key != Key::RawCode(57) {
+                assert_eq!(ml.metrics().summary().total_commits, 0, "{trace:#?}");
+            }
+            if key == Key::RawCode(57) {
+                eprintln!("scenario={name}; trace={trace:#?}");
+                assert_eq!(ml.current_word(), "");
+                assert!(preedit.is_empty());
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|a| matches!(a, Action::ForwardKey))
+                        .count(),
+                    1
+                );
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                if canonical {
+                    assert_eq!(
+                        word_before, expected,
+                        "canonical token conservation; {trace:#?}"
+                    );
+                } else {
+                    assert_eq!(
+                        delivered,
+                        format!("{expected} "),
+                        "client delivery projection; {trace:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    macro_rules! contract {
+        ($test:ident, $scenario:literal, $canonical:literal) => {
+            #[test]
+            fn $test() {
+                run($scenario, $canonical);
+            }
+        };
+    }
+    contract!(hybrid_canonical_raw_suffix, "raw_suffix", true);
+    contract!(
+        hybrid_canonical_one_raw_backspace,
+        "one_raw_backspace",
+        true
+    );
+    contract!(
+        hybrid_canonical_two_raw_backspace,
+        "two_raw_backspace",
+        true
+    );
+    contract!(hybrid_canonical_direct_prefix, "direct_prefix", true);
+    contract!(hybrid_client_raw_suffix, "raw_suffix", false);
+    contract!(hybrid_client_one_raw_backspace, "one_raw_backspace", false);
+    contract!(hybrid_client_two_raw_backspace, "two_raw_backspace", false);
+    contract!(hybrid_client_direct_prefix, "direct_prefix", false);
+    contract!(hybrid_client_immediate_space, "immediate_space", false);
+    contract!(hybrid_control_raw_only, "raw_only", false);
+    contract!(hybrid_control_direct_only, "direct_only", false);
+    contract!(hybrid_control_unicode_mixed, "unicode_mixed", false);
+}
+
+#[cfg(test)]
+mod hybrid_handoff_control_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn key(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn core(ghost: bool) -> MasterLoop {
+        MasterLoop::new(InputConfig {
+            ghost_text: ghost,
+            ..InputConfig::default()
+        })
+    }
+
+    fn handoff(ml: &mut MasterLoop) {
+        key(ml, Key::RawCode(16));
+        let prefix = ml.current_word().to_string();
+        let actions = key(ml, Key::Char('a'));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [prefix.as_str()]
+        );
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::ReplaceWord { .. } | Action::ShowGhost(_) | Action::ShowComposing { .. }
+        )));
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        assert!(ml.core.export_personal_profile().cvm.words.is_empty());
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn hybrid_control_layout_snapshot_preserves_caps_and_physical_punctuation() {
+        for bg in [false, true] {
+            for modifiers in [
+                Modifiers::empty(),
+                Modifiers::CAPS_LOCK,
+                Modifiers::SHIFT,
+                Modifiers::SHIFT | Modifiers::CAPS_LOCK,
+            ] {
+                for (code, en, shifted_en, bg_lower, bg_upper) in [
+                    (26, '[', '{', 'ш', 'Ш'),
+                    (27, ']', '}', 'щ', 'Щ'),
+                    (41, '`', '~', 'ч', 'Ч'),
+                    (43, '\\', '|', 'ю', 'Ю'),
+                ] {
+                    let mut ml = core(false);
+                    ml.load_word_lang(
+                        if bg { "яяя" } else { "question" },
+                        1000,
+                        if bg { LangId::Bg } else { LangId::En },
+                    );
+                    handoff(&mut ml);
+                    let before = ml.core.detected_language();
+                    let prior = ml.light_profile().lang_prior;
+                    let actions = ml.handle_key(KeyEvent {
+                        key: Key::RawCode(code),
+                        modifiers,
+                    });
+                    let selected = if bg {
+                        if modifiers.contains(Modifiers::SHIFT)
+                            ^ modifiers.contains(Modifiers::CAPS_LOCK)
+                        {
+                            bg_upper
+                        } else {
+                            bg_lower
+                        }
+                    } else if modifiers.contains(Modifiers::SHIFT) {
+                        shifted_en
+                    } else {
+                        en
+                    };
+                    assert!(
+                        actions.contains(&Action::CommitText(selected.to_string())),
+                        "{actions:?}"
+                    );
+                    assert!(!actions
+                        .iter()
+                        .any(|a| matches!(a, Action::ForwardKey | Action::ReplaceWord { .. })));
+                    assert_eq!(
+                        ml.current_word(),
+                        format!("{}a{selected}", if bg { "я" } else { "q" })
+                    );
+                    let after = ml.core.detected_language();
+                    assert_eq!(
+                        (after.lang, after.confidence),
+                        (before.lang, before.confidence)
+                    );
+                    assert_eq!(ml.metrics().summary().total_commits, 0);
+                    assert_eq!(ml.light_profile().lang_prior, prior);
+                    assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+                    let boundary = key(&mut ml, Key::Space);
+                    assert!(!boundary
+                        .iter()
+                        .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+                    assert_eq!(ml.metrics().summary().total_commits, 1);
+                    assert_eq!(
+                        ml.light_profile().lang_prior,
+                        prior,
+                        "mixed/inferred word did not become direct proof"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_control_semantic_prefix_has_explicit_en_raw_default() {
+        let mut ml = core(false);
+        let bg = "Искам да благодаря ";
+        ml.set_surrounding_text(Some(bg.to_string()), Some(bg.chars().count()));
+        key(&mut ml, Key::Char('а'));
+        let before = ml.core.detected_language();
+        let actions = key(&mut ml, Key::RawCode(26));
+        assert_eq!(ml.current_word(), "а[");
+        assert!(actions.contains(&Action::CommitText("[".to_string())));
+        assert!(!actions.contains(&Action::ForwardKey));
+        let after = ml.core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence)
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+    }
+
+    #[test]
+    fn hybrid_control_literal_handoff_resists_legacy_transliteration() {
+        let setup = || {
+            let mut ml = core(false);
+            ml.load_word_lang("question", 2_000_000, LangId::En);
+            ml.load_word_lang("яа", 1_000_000, LangId::Bg);
+            ml
+        };
+        let mut ml = setup();
+        handoff(&mut ml);
+        assert_eq!(ml.current_word(), "qa");
+        let actions = key(&mut ml, Key::Char('a'));
+        assert_eq!(ml.current_word(), "qaa");
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        let mut direct = setup();
+        key(&mut direct, Key::Char('q'));
+        let actions = key(&mut direct, Key::Char('a'));
+        assert_eq!(
+            direct.current_word(),
+            "яа",
+            "semantic-only legacy policy is unchanged"
+        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { text, .. } if text == "яа")));
+    }
+
+    #[test]
+    fn hybrid_control_resets_and_empty_backspace_restore_raw_composition() {
+        for exit in [0, 1, 2] {
+            let mut ml = core(false);
+            handoff(&mut ml);
+            match exit {
+                0 => {
+                    ml.reset();
+                }
+                1 => {
+                    ml.focus_lost();
+                }
+                _ => {
+                    key(&mut ml, Key::Left);
+                }
+            }
+            assert_eq!(ml.current_word(), "");
+            let actions = key(&mut ml, Key::RawCode(16));
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, Action::ShowComposing { .. })),
+                "exit={exit}: {actions:?}"
+            );
+            assert!(!actions.iter().any(|a| matches!(a, Action::CommitText(_))));
+        }
+        let mut escaped = core(false);
+        handoff(&mut escaped);
+        key(&mut escaped, Key::Escape);
+        assert_eq!(
+            escaped.current_word(),
+            "qa",
+            "Escape dismisses, not cancels, a delivered token"
+        );
+        assert!(key(&mut escaped, Key::RawCode(45)).contains(&Action::CommitText("x".to_string())));
+        assert_eq!(escaped.current_word(), "qax");
+        let mut ml = core(false);
+        handoff(&mut ml);
+        key(&mut ml, Key::Backspace);
+        key(&mut ml, Key::Backspace);
+        assert_eq!(ml.current_word(), "");
+        for ch in "123".chars() {
+            key(&mut ml, Key::Char(ch));
+        }
+        key(&mut ml, Key::Space);
+        for (actual, expected) in ml
+            .light_profile()
+            .lang_prior
+            .iter()
+            .zip([0.3234, 0.3332, 0.3434])
+        {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "editing baseline survives handoff and deletion"
+            );
+        }
+        let prior = ml.light_profile().lang_prior;
+        key(&mut ml, Key::Space);
+        assert_eq!(ml.light_profile().lang_prior, prior);
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert!(key(&mut ml, Key::RawCode(16))
+            .iter()
+            .any(|a| matches!(a, Action::ShowComposing { .. })));
+    }
+
+    #[test]
+    fn hybrid_control_hidden_handoff_prediction_cannot_be_accepted() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: true,
+            space_accept: true,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("qabc", 1_000_000, LangId::En);
+        handoff(&mut ml);
+        assert_eq!(ml.current_word(), "qa");
+        assert!(!ml.has_ghost() && ml.predictions().is_empty());
+        assert!(ml.last_shown_ghost.is_none());
+        let tab = key(&mut ml, Key::Tab);
+        assert_eq!(tab, vec![Action::HideGhost, Action::ForwardKey]);
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        let boundary = key(&mut ml, Key::Space);
+        assert!(boundary.contains(&Action::ForwardKey));
+        assert!(!boundary.iter().any(|a| matches!(a, Action::CommitText(_))));
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+    }
+
+    #[test]
+    fn hybrid_control_next_raw_prediction_partial_right_and_full_accept_once() {
+        for partial in [false, true] {
+            let mut ml = core(true);
+            ml.load_word_lang("qaxyz", 1_000_000, LangId::En);
+            handoff(&mut ml);
+            key(&mut ml, Key::RawCode(45));
+            assert_eq!(ml.current_word(), "qax");
+            assert!(ml.has_ghost());
+            if partial {
+                let actions = key(&mut ml, Key::Right);
+                assert_eq!(ml.current_word(), "qaxy");
+                assert!(actions.contains(&Action::CommitText("y".to_string())));
+                assert_eq!(ml.metrics().summary().total_commits, 0);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+            let actions = key(&mut ml, if partial { Key::Right } else { Key::Tab });
+            assert!(actions.contains(&Action::CommitText(
+                if partial { "z" } else { "yz" }.to_string()
+            )));
+            assert_eq!(ml.current_word(), "");
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+            assert_eq!(
+                key(&mut ml, Key::Space)
+                    .iter()
+                    .filter(|a| matches!(a, Action::CommitText(_)))
+                    .count(),
+                0
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_punctuation_parity_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    #[test]
+    fn hybrid_punctuation_matches_existing_nondual_semantic_token_policy() {
+        for raw in [false, true] {
+            let mut ml = MasterLoop::new(InputConfig {
+                ghost_text: false,
+                ..InputConfig::default()
+            });
+            for key in [
+                if raw {
+                    Key::RawCode(16)
+                } else {
+                    Key::Char('q')
+                },
+                Key::Char('a'),
+                if raw {
+                    Key::RawCode(26)
+                } else {
+                    Key::Char('[')
+                },
+            ] {
+                ml.handle_key(KeyEvent {
+                    key,
+                    modifiers: Modifiers::empty(),
+                });
+            }
+            assert_eq!(ml.current_word(), "qa[");
+            assert_eq!(ml.metrics().summary().total_commits, 0);
+            let actions = ml.handle_key(KeyEvent {
+                key: Key::Space,
+                modifiers: Modifiers::empty(),
+            });
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::CommitText(_)))
+                    .count(),
+                0
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_space_regained_ghost_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn run(space: Key) {
+        for hybrid in [true, false] {
+            let mut ml = MasterLoop::new(InputConfig {
+                ghost_text: true,
+                space_accept: true,
+                ..InputConfig::default()
+            });
+            ml.load_word_lang("qaxyz", 1_000_000, LangId::En);
+            let keys = [
+                Key::RawCode(16),
+                if hybrid {
+                    Key::Char('a')
+                } else {
+                    Key::RawCode(30)
+                },
+                Key::RawCode(45),
+            ];
+            let (mut delivered, mut preedit, mut trace) =
+                (String::new(), String::new(), Vec::new());
+            for key in keys {
+                let actions = ml.handle_key(KeyEvent {
+                    key: key.clone(),
+                    modifiers: Modifiers::empty(),
+                });
+                super::hybrid_delivery_contract_tests::project(
+                    &actions,
+                    &key,
+                    &mut delivered,
+                    &mut preedit,
+                );
+                trace.push(format!(
+                    "{key:?}: {actions:?}; word={:?}; delivered={delivered:?}",
+                    ml.current_word()
+                ));
+                assert_eq!(ml.metrics().summary().total_commits, 0);
+            }
+            assert_eq!(ml.current_word(), "qax");
+            assert_eq!(ml.ghost_text(), "yz", "visible regained ghost is required");
+            assert!(
+                ml.space_display_identity_ok(),
+                "display attribution must actually match"
+            );
+            assert_eq!(ml.debug_state().0, !hybrid);
+            assert_eq!(ml.core.space_accept_armed(), !hybrid);
+            assert_eq!(delivered, if hybrid { "qax" } else { "" });
+            let actions = ml.handle_key(KeyEvent {
+                key: space.clone(),
+                modifiers: Modifiers::empty(),
+            });
+            super::hybrid_delivery_contract_tests::project(
+                &actions,
+                &space,
+                &mut delivered,
+                &mut preedit,
+            );
+            trace.push(format!("{space:?}: {actions:?}; delivered={delivered:?}"));
+            eprintln!("hybrid={hybrid}; trace={trace:#?}");
+            let commits = actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                commits,
+                if hybrid { vec![] } else { vec!["qaxyz "] },
+                "{trace:#?}"
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::ForwardKey))
+                    .count(),
+                usize::from(hybrid)
+            );
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+            assert_eq!(delivered, if hybrid { "qax " } else { "qaxyz " });
+            assert!(
+                ml.current_word().is_empty() && ml.ghost_text().is_empty() && preedit.is_empty()
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(
+                ml.metrics().summary().accepted_predictions,
+                u64::from(!hybrid)
+            );
+            assert!(!ml
+                .handle_key(KeyEvent {
+                    key: space.clone(),
+                    modifiers: Modifiers::empty()
+                })
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_))));
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(
+                ml.metrics().summary().accepted_predictions,
+                u64::from(!hybrid)
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_space_regained_ghost_raw_boundary_is_literal() {
+        run(Key::RawCode(57));
+    }
+
+    #[test]
+    fn hybrid_space_regained_ghost_semantic_boundary_is_literal() {
+        run(Key::Space);
+    }
+}
+
+#[cfg(test)]
+mod delivered_tab_boundary_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn run(prefix: &[Key], composed: bool) {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        let (mut client, mut preedit) = (String::new(), String::new());
+        for key in prefix {
+            let actions = press(&mut ml, key.clone());
+            super::hybrid_delivery_contract_tests::project(
+                &actions,
+                key,
+                &mut client,
+                &mut preedit,
+            );
+        }
+        assert_eq!(ml.current_word(), "qa");
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        let tab = press(&mut ml, Key::Tab);
+        // Bounded client projection: this text client inserts a forwarded Tab.
+        super::hybrid_delivery_contract_tests::project(
+            &tab,
+            &Key::Char('\t'),
+            &mut client,
+            &mut preedit,
+        );
+        let commits = tab
+            .iter()
+            .filter_map(|action| match action {
+                Action::CommitText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(commits, if composed { vec!["qa"] } else { vec![] });
+        assert_eq!(
+            tab.iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert_eq!(
+            client, "qa\t",
+            "Tab must never redeliver an owned prefix: {tab:?}"
+        );
+        assert!(preedit.is_empty());
+        assert_eq!(
+            ml.current_word(),
+            "",
+            "Tab ended the delivered token: {tab:?}"
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert_eq!(ml.core.context_words().0, Some("qa"));
+        assert_eq!(ml.core.export_personal_profile().cvm.words, ["qa"]);
+
+        let next = press(&mut ml, Key::RawCode(45));
+        super::hybrid_delivery_contract_tests::project(
+            &next,
+            &Key::RawCode(45),
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(
+            ml.current_word(),
+            "x",
+            "new raw input must start a fresh token"
+        );
+        assert_eq!(format!("{client}{preedit}"), "qa\tx");
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        let boundary = press(&mut ml, Key::Space);
+        super::hybrid_delivery_contract_tests::project(
+            &boundary,
+            &Key::Space,
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(client, "qa\tx ");
+        assert!(preedit.is_empty() && ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 2);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        let words = ml.core.export_personal_profile().cvm.words;
+        assert_eq!(words.iter().filter(|w| w.as_str() == "qa").count(), 1);
+        assert_eq!(words.iter().filter(|w| w.as_str() == "x").count(), 1);
+        eprintln!("prefix={prefix:?}; tab={tab:?}; next={next:?}; boundary={boundary:?}; client={client:?}");
+    }
+
+    #[test]
+    fn delivered_tab_boundary_hybrid_finishes_without_recommit() {
+        run(&[Key::RawCode(16), Key::Char('a')], false);
+    }
+
+    #[test]
+    fn delivered_tab_boundary_semantic_finishes_without_recommit() {
+        run(&[Key::Char('q'), Key::Char('a')], false);
+    }
+
+    #[test]
+    fn delivered_tab_boundary_raw_preedit_commits_once() {
+        run(&[Key::RawCode(16), Key::RawCode(30)], true);
+    }
+
+    #[test]
+    fn delivered_tab_boundary_empty_forwards_without_learning() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        assert_eq!(press(&mut ml, Key::Tab), [Action::ForwardKey]);
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        assert!(ml.current_word().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hybrid_active_transliteration_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    pub(super) fn legacy_prefix() -> (MasterLoop, String, String) {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        let (mut client, mut preedit) = (String::new(), String::new());
+        let first = press(&mut ml, Key::Char('z'));
+        super::hybrid_delivery_contract_tests::project(
+            &first,
+            &Key::Char('z'),
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(client, "z");
+        let second = press(&mut ml, Key::Char('d'));
+        assert!(
+            second.contains(&Action::ReplaceWord {
+                replace_len: 1,
+                text: "зд".to_string(),
+            }),
+            "must exercise the actual legacy transliteration producer: {second:?}"
+        );
+        assert!(!second
+            .iter()
+            .any(|a| matches!(a, Action::ForwardKey | Action::CommitText(_))));
+        // The real replacement consumes d and replaces the earlier forwarded z.
+        client.pop();
+        client.push_str("зд");
+        preedit.clear();
+        assert_eq!(ml.current_word(), "зд");
+        assert!(!ml.debug_state().0);
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        eprintln!(
+            "legacy producer={second:?}; client={client:?}; word={:?}",
+            ml.current_word()
+        );
+        (ml, client, preedit)
+    }
+
+    #[test]
+    fn hybrid_active_transliteration_raw_continuation_preserves_layout_without_new_evidence() {
+        let (mut ml, mut client, mut preedit) = legacy_prefix();
+        let detector = ml.detected_language();
+        let prior = ml.light_profile().lang_prior;
+        for (code, glyph, word) in [(19, "р", "здр"), (30, "а", "здра")] {
+            let actions = press(&mut ml, Key::RawCode(code));
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::ForwardKey | Action::ReplaceWord { .. })));
+            super::hybrid_delivery_contract_tests::project(
+                &actions,
+                &Key::RawCode(code),
+                &mut client,
+                &mut preedit,
+            );
+            let after = ml.detected_language();
+            eprintln!("raw={code}; actions={actions:?}; word={:?}; client={client:?}; detector={:?}->{:?}; prior={prior:?}->{:?}", ml.current_word(), (detector.lang, detector.confidence), (after.lang, after.confidence), ml.light_profile().lang_prior);
+            assert!(
+                actions.contains(&Action::CommitText(glyph.to_string())),
+                "{actions:?}"
+            );
+            assert_eq!(ml.current_word(), word);
+            assert_eq!(client, word);
+            assert!(!ml.debug_state().0 && preedit.is_empty());
+            assert_eq!(
+                (after.lang, after.confidence),
+                (detector.lang, detector.confidence)
+            );
+            assert_eq!(ml.light_profile().lang_prior, prior);
+            assert_eq!(ml.metrics().summary().total_commits, 0);
+            assert!(ml.core.export_personal_profile().cvm.words.is_empty());
+            assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+        }
+        let backspace = press(&mut ml, Key::Backspace);
+        super::hybrid_delivery_contract_tests::project(
+            &backspace,
+            &Key::Backspace,
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(client, "здр");
+        assert_eq!(ml.current_word(), "здр");
+        let next = press(&mut ml, Key::RawCode(18));
+        assert!(next.contains(&Action::CommitText("е".to_string())));
+        super::hybrid_delivery_contract_tests::project(
+            &next,
+            &Key::RawCode(18),
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(ml.current_word(), "здре");
+        assert_eq!(client, "здре");
+        let boundary = press(&mut ml, Key::Space);
+        super::hybrid_delivery_contract_tests::project(
+            &boundary,
+            &Key::Space,
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(boundary, [Action::HideGhost, Action::ForwardKey]);
+        assert_eq!(client, "здре ");
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn hybrid_active_transliteration_empty_backspace_or_reset_releases_delivery_snapshot() {
+        for reset in [false, true] {
+            let (mut ml, mut client, mut preedit) = legacy_prefix();
+            let raw = press(&mut ml, Key::RawCode(19));
+            assert!(raw.contains(&Action::CommitText("р".to_string())));
+            super::hybrid_delivery_contract_tests::project(
+                &raw,
+                &Key::RawCode(19),
+                &mut client,
+                &mut preedit,
+            );
+            if reset {
+                assert_eq!(ml.reset(), [Action::HideGhost]);
+            } else {
+                for _ in 0..3 {
+                    let actions = press(&mut ml, Key::Backspace);
+                    super::hybrid_delivery_contract_tests::project(
+                        &actions,
+                        &Key::Backspace,
+                        &mut client,
+                        &mut preedit,
+                    );
+                }
+            }
+            assert!(ml.current_word().is_empty());
+            if !reset {
+                assert!(client.is_empty());
+            }
+            let fresh = press(&mut ml, Key::RawCode(26));
+            assert!(
+                ml.debug_state().0,
+                "first raw after empty must start a fresh dual buffer"
+            );
+            assert!(fresh
+                .iter()
+                .any(|a| matches!(a, Action::ShowComposing { .. })));
+            assert!(!fresh
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ForwardKey)));
+            assert_eq!(ml.metrics().summary().total_commits, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_followup_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn step(
+        ml: &mut MasterLoop,
+        client: &mut String,
+        preedit: &mut String,
+        key: Key,
+    ) -> Vec<Action> {
+        let actions = ml.handle_key(KeyEvent {
+            key: key.clone(),
+            modifiers: Modifiers::empty(),
+        });
+        super::hybrid_delivery_contract_tests::project(&actions, &key, client, preedit);
+        actions
+    }
+
+    fn visible_ghost() -> (MasterLoop, String, String) {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: true,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("qaxyz", 1_000_000, LangId::En);
+        let (mut client, mut preedit) = (String::new(), String::new());
+        for key in [
+            Key::RawCode(16),
+            Key::Char('a'),
+            Key::RawCode(45),
+            Key::RawCode(21),
+        ] {
+            step(&mut ml, &mut client, &mut preedit, key);
+        }
+        assert_eq!(ml.current_word(), "qaxy");
+        assert_eq!(client, "qaxy");
+        assert_eq!(ml.ghost_text(), "z");
+        assert!(ml.last_shown_ghost.is_some());
+        (ml, client, preedit)
+    }
+
+    #[test]
+    fn hybrid_followup_consumed_hide_retires_attribution_before_backspace() {
+        let (mut ml, mut client, mut preedit) = visible_ghost();
+        let finished = step(&mut ml, &mut client, &mut preedit, Key::RawCode(44));
+        assert_eq!(
+            finished,
+            [Action::CommitText("z".to_string()), Action::HideGhost]
+        );
+        assert_eq!(ml.current_word(), "qaxyz");
+        assert_eq!(client, "qaxyz");
+        let hidden_attribution = ml.last_shown_ghost.clone();
+        let backspace = step(&mut ml, &mut client, &mut preedit, Key::Backspace);
+        eprintln!("finished={finished:?}; hidden={hidden_attribution:?}; backspace={backspace:?}; client={client:?}; rejections={}", ml.rejection_prefix_count());
+        assert_eq!(ml.current_word(), "qaxy");
+        assert_eq!(client, "qaxy");
+        assert_eq!(
+            ml.rejection_prefix_count(),
+            0,
+            "editing a manually finished word must not reject an invisible ghost"
+        );
+        assert!(hidden_attribution.is_none());
+        assert_eq!(ml.ghost_text(), "z");
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+    }
+
+    #[test]
+    fn hybrid_followup_manual_completion_edits_never_suppress_the_valid_ghost() {
+        let (mut ml, mut client, mut preedit) = visible_ghost();
+        for _ in 0..3 {
+            let finished = step(&mut ml, &mut client, &mut preedit, Key::RawCode(44));
+            let edited = step(&mut ml, &mut client, &mut preedit, Key::Backspace);
+            eprintln!("finished={finished:?}; edited={edited:?}; client={client:?}; ghost={:?}; suppressed={}", ml.ghost_text(), ml.is_ghost_suppressed("qaxy", "qaxyz"));
+            assert_eq!(client, "qaxy");
+            assert_eq!(ml.current_word(), "qaxy");
+        }
+        assert_eq!(
+            ml.ghost_text(),
+            "z",
+            "manual edits must not train suppression"
+        );
+        assert!(!ml.is_ghost_suppressed("qaxy", "qaxyz"));
+        assert_eq!(ml.rejection_prefix_count(), 0);
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn hybrid_followup_backspace_over_a_visible_ghost_still_records_rejection() {
+        let (mut ml, mut client, mut preedit) = visible_ghost();
+        step(&mut ml, &mut client, &mut preedit, Key::Backspace);
+        assert_eq!(ml.rejection_prefix_count(), 1);
+        assert!(!ml.is_ghost_suppressed("qaxy", "qaxyz"));
+        assert_eq!(ml.current_word(), "qax");
+        assert_eq!(client, "qax");
+    }
+
+    #[test]
+    fn hybrid_followup_active_transliteration_survives_raw_then_semantic() {
+        let (mut ml, mut client, mut preedit) =
+            super::hybrid_active_transliteration_tests::legacy_prefix();
+        step(&mut ml, &mut client, &mut preedit, Key::RawCode(19));
+        assert_eq!(client, "здр");
+        let semantic = step(&mut ml, &mut client, &mut preedit, Key::Char('a'));
+        eprintln!(
+            "semantic={semantic:?}; current={:?}; client={client:?}",
+            ml.current_word()
+        );
+        assert_eq!(ml.current_word(), "здра");
+        assert_eq!(client, "здра");
+        assert_eq!(
+            semantic,
+            [Action::CommitText("а".to_string()), Action::HideGhost]
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        assert!(ml.core.export_personal_profile().cvm.words.is_empty());
+        step(&mut ml, &mut client, &mut preedit, Key::Space);
+        assert_eq!(client, "здра ");
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn hybrid_followup_raw_handoff_retires_stale_transliteration_latch() {
+        let (mut ml, mut client, mut preedit) =
+            super::hybrid_active_transliteration_tests::legacy_prefix();
+        for _ in 0..2 {
+            step(&mut ml, &mut client, &mut preedit, Key::Backspace);
+        }
+        assert!(ml.current_word().is_empty() && client.is_empty());
+        step(&mut ml, &mut client, &mut preedit, Key::RawCode(44));
+        assert_eq!(ml.current_word(), "з");
+        assert!(ml.debug_state().0 && client.is_empty());
+        let handoff = step(&mut ml, &mut client, &mut preedit, Key::Char('a'));
+        eprintln!(
+            "handoff={handoff:?}; current={:?}; client={client:?}",
+            ml.current_word()
+        );
+        assert_eq!(
+            ml.current_word(),
+            "зa",
+            "fresh raw handoff owns its literal semantic key"
+        );
+        assert_eq!(client, "зa");
+        assert_eq!(
+            handoff
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["з"]
+        );
+        assert_eq!(
+            handoff
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        step(&mut ml, &mut client, &mut preedit, Key::Space);
+        assert_eq!(client, "зa ");
+        assert_eq!(ml.metrics().summary().total_commits, 1);
     }
 }
