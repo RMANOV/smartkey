@@ -462,7 +462,7 @@ def test_native_hybrid_snapshot_and_semantic_prefix_default(tmp_path):
 
 
 def test_native_hybrid_handoff_hides_unshown_acceptance(tmp_path):
-    core = _native().PyInputMethodCore(json.dumps({"ghost_text": True, "space_accept": True}))
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": True, "accept": {"space_accept": True}}))
     core.load_word("qabc", 1_000_000)
     before = _profile(core, tmp_path, "hidden-before.json")
     engine, client, preedit = _hybrid_client(core)
@@ -514,3 +514,31 @@ def test_native_hybrid_cancel_focus_and_navigation_never_redeliver_prefix():
         assert client.text == "qa" and core.current_word() == ""
         restarted = _hybrid_step(core, engine, client, preedit, "raw", 16)
         assert any(kind == "composing" for kind, _ in restarted["actions"])
+
+
+@pytest.mark.parametrize("space_kind,space_code", [("raw", 57), ("char", 0x20)])
+def test_native_hybrid_space_regained_ghost_stays_literal(space_kind, space_code):
+    # A regained visible ghost cannot re-enable Space acceptance after delivery
+    # handoff. Pure raw input proves the nested opt-in flag really is enabled.
+    for hybrid in (True, False):
+        core = _native().PyInputMethodCore(json.dumps({
+            "ghost_text": True, "accept": {"space_accept": True},
+        }))
+        core.load_word("qaxyz", 1_000_000)
+        engine, client, preedit = _hybrid_client(core)
+        trace = []
+        for kind, code in (("raw", 16), ("char", ord("a")) if hybrid else ("raw", 30), ("raw", 45)):
+            trace.append(_hybrid_step(core, engine, client, preedit, kind, code))
+        assert core.current_word() == "qax" and core.predictions()[0][0] == "qaxyz", trace
+        expected_display = ("ghost", "yz") if hybrid else ("composing", "qax\x00yz")
+        assert expected_display in trace[-1]["actions"], trace
+        assert core.debug_state()[0] is (not hybrid)
+        assert client.text == ("qax" if hybrid else ""), trace
+        boundary = _hybrid_step(core, engine, client, preedit, space_kind, space_code)
+        commits = [text for kind, text in boundary["actions"] if kind == "commit"]
+        assert commits == ([] if hybrid else ["qaxyz "]), [*trace, boundary]
+        assert sum(kind == "forward" for kind, _ in boundary["actions"]) == int(hybrid)
+        assert client.text == ("qax " if hybrid else "qaxyz "), [*trace, boundary]
+        assert core.current_word() == "" and not core.predictions() and preedit[0] == ""
+        following = _hybrid_step(core, engine, client, preedit, space_kind, space_code)
+        assert not any(kind == "commit" for kind, _ in following["actions"])

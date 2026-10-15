@@ -3067,3 +3067,122 @@ mod hybrid_punctuation_parity_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod hybrid_space_regained_ghost_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn run(space: Key) {
+        for hybrid in [true, false] {
+            let mut ml = MasterLoop::new(InputConfig {
+                ghost_text: true,
+                space_accept: true,
+                ..InputConfig::default()
+            });
+            ml.load_word_lang("qaxyz", 1_000_000, LangId::En);
+            let keys = [
+                Key::RawCode(16),
+                if hybrid {
+                    Key::Char('a')
+                } else {
+                    Key::RawCode(30)
+                },
+                Key::RawCode(45),
+            ];
+            let (mut delivered, mut preedit, mut trace) =
+                (String::new(), String::new(), Vec::new());
+            for key in keys {
+                let actions = ml.handle_key(KeyEvent {
+                    key: key.clone(),
+                    modifiers: Modifiers::empty(),
+                });
+                super::hybrid_delivery_contract_tests::project(
+                    &actions,
+                    &key,
+                    &mut delivered,
+                    &mut preedit,
+                );
+                trace.push(format!(
+                    "{key:?}: {actions:?}; word={:?}; delivered={delivered:?}",
+                    ml.current_word()
+                ));
+                assert_eq!(ml.metrics().summary().total_commits, 0);
+            }
+            assert_eq!(ml.current_word(), "qax");
+            assert_eq!(ml.ghost_text(), "yz", "visible regained ghost is required");
+            assert!(
+                ml.space_display_identity_ok(),
+                "display attribution must actually match"
+            );
+            assert_eq!(ml.debug_state().0, !hybrid);
+            assert_eq!(ml.core.space_accept_armed(), !hybrid);
+            assert_eq!(delivered, if hybrid { "qax" } else { "" });
+            let actions = ml.handle_key(KeyEvent {
+                key: space.clone(),
+                modifiers: Modifiers::empty(),
+            });
+            super::hybrid_delivery_contract_tests::project(
+                &actions,
+                &space,
+                &mut delivered,
+                &mut preedit,
+            );
+            trace.push(format!("{space:?}: {actions:?}; delivered={delivered:?}"));
+            eprintln!("hybrid={hybrid}; trace={trace:#?}");
+            let commits = actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                commits,
+                if hybrid { vec![] } else { vec!["qaxyz "] },
+                "{trace:#?}"
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::ForwardKey))
+                    .count(),
+                usize::from(hybrid)
+            );
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+            assert_eq!(delivered, if hybrid { "qax " } else { "qaxyz " });
+            assert!(
+                ml.current_word().is_empty() && ml.ghost_text().is_empty() && preedit.is_empty()
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(
+                ml.metrics().summary().accepted_predictions,
+                u64::from(!hybrid)
+            );
+            assert!(!ml
+                .handle_key(KeyEvent {
+                    key: space.clone(),
+                    modifiers: Modifiers::empty()
+                })
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_))));
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(
+                ml.metrics().summary().accepted_predictions,
+                u64::from(!hybrid)
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_space_regained_ghost_raw_boundary_is_literal() {
+        run(Key::RawCode(57));
+    }
+
+    #[test]
+    fn hybrid_space_regained_ghost_semantic_boundary_is_literal() {
+        run(Key::Space);
+    }
+}

@@ -7472,3 +7472,40 @@ mod terminal_context_evidence_tests {
         assert!(core.word_origins == origins);
     }
 }
+
+#[cfg(test)]
+mod hybrid_space_eligibility_tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_space_regained_ghost_attestation_cannot_bypass_delivery_guard() {
+        for space in [Key::Space, Key::RawCode(57)] {
+            let mut core = InputMethodCore::new(InputConfig {
+                ghost_text: true,
+                space_accept: true,
+                ..InputConfig::default()
+            });
+            core.load_word("qaxyz", 1_000_000);
+            for key in [Key::RawCode(16), Key::Char('a'), Key::RawCode(45)] {
+                core.handle_key(KeyEvent {
+                    key,
+                    modifiers: Modifiers::empty(),
+                });
+            }
+            assert_eq!(core.current_word(), "qax");
+            assert_eq!(core.ghost_text(), "yz");
+            assert!(core.dual_buffer.is_none());
+            assert!(!core.space_accept_armed());
+            core.attest_space_accept_display(true);
+            let actions = core.handle_key(KeyEvent {
+                key: space,
+                modifiers: Modifiers::empty(),
+            });
+            assert_eq!(actions, vec![Action::HideGhost, Action::ForwardKey]);
+            let batch = core.take_commit_learning();
+            assert_eq!(batch.words.len(), 1);
+            assert!(!batch.accepted_prediction);
+            assert!(core.current_word().is_empty() && !core.has_ghost());
+        }
+    }
+}
