@@ -1276,8 +1276,12 @@ def test_closure_without_evidence_rejected(status):
 
 def test_red_tested_requires_red_test():
     doc = _doc()
-    rec = _find(doc, "li", "ли")  # reproduced, no red test
+    rec = _find(doc, "li", "ли")
     rec["status"] = "red_tested"
+    for field in (
+        "red_test", "red_test_waiver", "fix_commit", "verification", "closure_reason"
+    ):
+        rec[field] = None
     assert any(
         "RED test" in e
         for e in V.validate_document(doc, _schema())
@@ -1289,6 +1293,10 @@ def test_fixed_requires_fix_commit_and_test_or_waiver():
     doc = _doc()
     rec = _find(doc, "li", "ли")
     rec["status"] = "fixed"
+    for field in (
+        "red_test", "red_test_waiver", "fix_commit", "verification", "closure_reason"
+    ):
+        rec[field] = None
     gate = [e for e in V.validate_document(doc, _schema()) if e.startswith("E_GATE")]
     assert any("fix_commit" in e for e in gate)
     assert any("regression test" in e for e in gate)
@@ -1331,7 +1339,82 @@ def test_fixed_b9_records_carry_fix_chain_but_no_verification():
         assert rec["reproducer"] and rec["red_test"] and rec["fix_commit"]
         assert rec["verification"] is None
         assert V.SHA_RE.match(rec["fix_commit"])
-    assert not [r for r in doc["records"] if r["status"] == "verified"]
+
+
+@pytest.mark.parametrize("status", ["verified", "closed"])
+def test_synthetic_context_bound_offline_record_can_advance_with_complete_evidence(status):
+    rec = _legacy_append("alpha")
+    surface = "synthetic offline probe"
+    rec["environment"] = {
+        "app_surface": surface, "os": "synthetic", "build_sha": "a" * 40,
+        "build_label": "synthetic lifecycle fixture", "flags": None,
+    }
+    rec["minimal_context"] = {"before": "syntheticbefore", "after": "syntheticafter"}
+    rec["source_refs"] = [{
+        "kind": "other", "ref": "synthetic:lifecycle:reported",
+        "observed_utc": None, "build_sha": "a" * 40, "surface": surface,
+        "note": "Synthetic report with explicitly bound preceding context.",
+    }]
+    rec["reproducer"] = {
+        "kind": "offline_probe", "ref": "synthetic:lifecycle:red",
+        "build_sha": "a" * 40,
+        "summary": "Synthetic failure on the declared offline surface and context.",
+    }
+    rec["red_test"] = {
+        "path": "synthetic/lifecycle.py", "name": "synthetic_lifecycle_red",
+        "commit": "a" * 40,
+    }
+    rec["fix_commit"] = "b" * 40
+    rec["verification"] = {
+        "build_sha": "b" * 40, "evidence_refs": ["synthetic:lifecycle:postfix"],
+        "surface": surface,
+        "summary": "Synthetic post-fix success on the same reported surface and context.",
+    }
+    rec["status"] = status
+    rec["closure_reason"] = "Synthetic reported surface and context verified." if status == "closed" else None
+    doc = {
+        "schema_version": 1, "registry": "smartkey-anomaly-registry",
+        "gate_ref": "af4d6969b2ad", "records": [rec],
+    }
+    assert V.validate_document(doc, _schema()) == []
+
+
+def test_li_fixed_record_preserves_partial_evidence_and_reported_live_surface_gap():
+    rec = _find(_doc(), "li", "ли")
+    assert rec["status"] == "fixed"
+    assert rec["closure_reason"] is None
+    assert rec["environment"]["app_surface"] == "unknown (operator live text)"
+    assert rec["environment"]["build_sha"] == "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2"
+    assert {"7670aa00c53a", "f09e9917b91f"} <= {
+        source["ref"] for source in rec["source_refs"] if source["kind"] == "ledger"
+    }
+    assert "CURRENT_RECONSTRUCTED" in rec["reproducer"]["summary"]
+    assert "offline PyO3" in rec["verification"]["surface"]
+    assert "PARTIAL" in rec["verification"]["summary"]
+    assert "original reported live surface remains unverified" in rec["verification"]["summary"]
+    assert rec["red_test_waiver"] is None
+
+
+def test_wi_fixed_record_preserves_unknown_context_and_partial_terminal_evidence():
+    rec = _find(_doc(), "wi", "ви")
+    assert rec["status"] == "fixed"
+    assert rec["closure_reason"] is None
+    assert rec["environment"]["app_surface"] == "offline probe"
+    assert rec["minimal_context"] == {"before": None, "after": None}
+    assert {
+        source["build_sha"]
+        for source in rec["source_refs"]
+        if source["kind"] == "ledger"
+    } == {
+        "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "d8b01c076babc24881632739ebe4d4da763be86d",
+    }
+    assert "CURRENT_RECONSTRUCTED" in rec["reproducer"]["summary"]
+    assert "terminal" in rec["verification"]["summary"].lower()
+    assert "preboundary Latin remains" in rec["verification"]["summary"]
+    assert "PARTIAL" in rec["verification"]["summary"]
+    assert "original context is unknown and not bound" in rec["verification"]["summary"]
+    assert rec["red_test_waiver"] is None
 
 
 def test_promoting_fixed_to_verified_requires_verification_evidence():
