@@ -1098,3 +1098,60 @@ def test_native_shift_insert_withdraws_stale_boundary_after_client_paste(tmp_pat
     context = "hello. seed "
     core.set_surrounding_text(context, len(context))
     _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=False)
+
+
+@pytest.mark.parametrize("route", ["semantic", "shared-raw"])
+@pytest.mark.parametrize("boundary", ["survives", "removed"])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_sentence_tail_deletion_preserves_only_surviving_boundary(
+    tmp_path, route, boundary, mode
+):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    _raw_sentence_prefix(core, whitespace=False)
+    if route == "semantic":
+        tails = [core.handle_key(ord(char), 0) for char in "”)]"]
+    else:
+        # Shared quote, repeated terminator, closing parenthesis: three glyphs.
+        tails = [core.process_keycode(code, mask) for code, mask in ((40, 1), (52, 0), (11, 1))]
+    assert tails == [[("forward", "")]] * 3, tails
+    assert core.current_word() == ""
+
+    def delete_literal():
+        actions = core.process_keycode(14, 0)
+        assert actions.count(("forward", "")) == 1 and core.current_word() == "", actions
+        assert not any(kind in {"commit", "replace", "composing"} for kind, _ in actions), actions
+
+    delete_literal()  # Two known tail glyphs remain after the original terminator.
+    for _ in range(2):
+        actions = core.process_keycode(57, 0)
+        assert actions == [("hide", ""), ("forward", "")], actions
+    for _ in range(2):
+        delete_literal()  # Delete both Spaces, restoring the same pending tail.
+    for _ in range(1 if boundary == "survives" else 3):
+        delete_literal()  # Remove a closer, or the whole tail plus original terminator.
+    actions = core.process_keycode(57, 0)
+    assert actions == [("hide", ""), ("forward", "")], actions
+    _assert_native_sentence_review_target(
+        core, tmp_path, prediction=prediction, capitalized=boundary == "survives"
+    )
+
+
+@pytest.mark.parametrize("api,identity,mask", [
+    ("raw", 29, 1 << 2),          # Left Ctrl, physical IBus control mask.
+    ("keysym", 0xFFE4, 1 << 2),  # Right Ctrl.
+    ("raw", 100, 1 << 3),        # Right Alt.
+    ("keysym", 0xFFE9, 1 << 3),  # Left Alt.
+    ("raw", 125, 1 << 6),        # Left Super, physical MOD4 mask.
+    ("keysym", 0xFFEC, 1 << 26), # Right Super, virtual SUPER mask.
+])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_modifier_only_tap_preserves_sentence_hint(tmp_path, api, identity, mask, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    _raw_sentence_prefix(core)
+    call = core.process_keycode if api == "raw" else core.handle_key
+    assert call(identity, mask) == [("forward", "")]
+    assert call(identity, mask | (1 << 30)) == [("forward", "")]
+    assert core.current_word() == ""
+    _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=True)

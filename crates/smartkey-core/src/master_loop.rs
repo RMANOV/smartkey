@@ -133,7 +133,9 @@ impl MasterLoop {
         }
         // Forwarded shortcuts can edit client text. Invalidate attribution,
         // but do not start anticipation or count them as adaptation events.
-        if event.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT) {
+        if !event.key.is_pure_modifier()
+            && event.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT)
+        {
             self.last_prediction_accept = None;
             self.last_shown_ghost = None;
             return self.core.handle_key(event);
@@ -3693,5 +3695,190 @@ mod external_rewrite_delegation_tests {
             text: "зд".into()
         }));
         assert_eq!(ml.current_word(), "зд");
+    }
+}
+
+#[cfg(test)]
+mod sentence_modifier_review_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn send(ml: &mut MasterLoop, key: Key, modifiers: Modifiers) -> Vec<Action> {
+        ml.handle_key(KeyEvent { key, modifiers })
+    }
+
+    fn plain(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        send(ml, key, Modifiers::empty())
+    }
+
+    // Core/native tests cover every identity. These exercise the ML paths.
+    fn modifiers() -> [(Key, Modifiers); 3] {
+        [
+            (Key::RawCode(29), Modifiers::CTRL),
+            (Key::Other(0xffea), Modifiers::ALT),
+            (Key::RawCode(126), Modifiers::SUPER),
+        ]
+    }
+
+    fn sentence(confirmed: bool, space_accept: bool) -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_min_confidence: 0.0,
+            ghost_text_separation_margin: 0.0,
+            space_accept,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("hello", 1_000_000, LangId::En);
+        ml.load_word_lang("world", 1_000_000, LangId::En);
+        for code in [35, 18, 38, 38, 24, 52] {
+            plain(&mut ml, Key::RawCode(code));
+        }
+        if confirmed {
+            plain(&mut ml, Key::Space);
+        }
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        ml
+    }
+
+    fn prediction(ml: &mut MasterLoop) -> String {
+        plain(ml, Key::RawCode(17));
+        ml.predictions()[0].word.clone()
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_taps_preserve_pending_and_confirmed_hints() {
+        for (key, held) in modifiers() {
+            for confirmed in [false, true] {
+                let mut ml = sentence(confirmed, false);
+                let prior = ml.light_profile.lang_prior;
+                assert_eq!(send(&mut ml, key.clone(), held), [Action::ForwardKey]);
+                assert_eq!(
+                    send(&mut ml, key.clone(), held | Modifiers::RELEASE),
+                    [Action::ForwardKey]
+                );
+                assert_eq!(ml.light_profile.lang_prior, prior);
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                if !confirmed {
+                    plain(&mut ml, Key::Space);
+                }
+                assert_eq!(
+                    prediction(&mut ml),
+                    "World",
+                    "{key:?}, confirmed={confirmed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_shortcuts_withdraw_but_releases_preserve() {
+        for confirmed in [false, true] {
+            for (key, held) in [
+                (Key::RawCode(46), Modifiers::CTRL),
+                (Key::Char('c'), Modifiers::ALT),
+            ] {
+                let mut ml = sentence(confirmed, false);
+                assert_eq!(send(&mut ml, key, held), [Action::ForwardKey]);
+                if !confirmed {
+                    plain(&mut ml, Key::Space);
+                }
+                assert_eq!(prediction(&mut ml), "world");
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+            let mut ml = sentence(confirmed, false);
+            assert_eq!(
+                send(
+                    &mut ml,
+                    Key::RawCode(29),
+                    Modifiers::CTRL | Modifiers::RELEASE
+                ),
+                [Action::ForwardKey]
+            );
+            if !confirmed {
+                plain(&mut ml, Key::Space);
+            }
+            assert_eq!(prediction(&mut ml), "World");
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_super_space_and_kill_keep_existing_contracts() {
+        let mut ml = sentence(true, true);
+        assert_eq!(prediction(&mut ml), "World");
+        let actions = send(&mut ml, Key::RawCode(57), Modifiers::SUPER);
+        assert_eq!(
+            actions,
+            [
+                Action::HideGhost,
+                Action::CommitText("w".into()),
+                Action::ForwardKey
+            ]
+        );
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert_eq!(ml.metrics().summary().total_commits, 2);
+        let mut ml = sentence(true, false);
+        assert_eq!(
+            send(&mut ml, Key::Escape, Modifiers::SUPER),
+            [Action::HideGhost]
+        );
+        assert!(!ml.is_enabled());
+        assert_eq!(
+            send(&mut ml, Key::Escape, Modifiers::SUPER | Modifiers::RELEASE),
+            [Action::ForwardKey]
+        );
+        assert!(!ml.is_enabled());
+        send(&mut ml, Key::Escape, Modifiers::SUPER);
+        assert!(ml.is_enabled());
+        assert_eq!(prediction(&mut ml), "world");
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_tap_keeps_visible_space_acceptance_attributable() {
+        let mut control = sentence(true, true);
+        assert_eq!(prediction(&mut control), "World");
+        assert!(control.core.space_accept_armed());
+        assert_eq!(
+            plain(&mut control, Key::Space),
+            [Action::HideGhost, Action::CommitText("world ".into())]
+        );
+        assert_eq!(control.metrics().summary().accepted_predictions, 1);
+        let mut ml = sentence(true, true);
+        assert_eq!(prediction(&mut ml), "World");
+        assert_eq!(ml.ghost_text(), "orld");
+        assert!(ml.last_shown_ghost.is_some());
+        send(&mut ml, Key::RawCode(29), Modifiers::CTRL);
+        send(
+            &mut ml,
+            Key::RawCode(29),
+            Modifiers::CTRL | Modifiers::RELEASE,
+        );
+        assert_eq!(
+            plain(&mut ml, Key::Space),
+            [Action::HideGhost, Action::CommitText("world ".into())]
+        );
+        assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+        assert_eq!(ml.metrics().summary().total_commits, 2);
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_after_tab_retires_immediate_backspace_attribution() {
+        for (key, held) in modifiers() {
+            let mut ml = sentence(true, false);
+            assert_eq!(prediction(&mut ml), "World");
+            assert!(plain(&mut ml, Key::Tab).contains(&Action::CommitText("world".into())));
+            assert!(ml.last_prediction_accept.is_some());
+            assert_eq!(send(&mut ml, key.clone(), held), [Action::ForwardKey]);
+            assert!(ml.last_prediction_accept.is_none(), "{key:?}");
+            assert!(ml.last_shown_ghost.is_none(), "{key:?}");
+            send(&mut ml, key, held | Modifiers::RELEASE);
+            let deleted = plain(&mut ml, Key::Backspace);
+            assert!(!deleted
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+            assert_eq!(ml.rejection_prefix_count(), 0);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+            assert_eq!(ml.metrics().summary().total_commits, 2);
+        }
     }
 }
