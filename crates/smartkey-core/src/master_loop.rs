@@ -1569,3 +1569,99 @@ mod tests {
         assert_eq!(ml.phase(), Phase::Tracking);
     }
 }
+
+#[cfg(test)]
+mod commit_language_receipt_contract_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    // Break caught: focus_lost commits in core without synchronously consuming
+    // its language evidence, then a later key learns the old commit.
+    #[test]
+    fn focus_lost_learns_language_immediately_and_only_once() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.load_word("мама", 1_000_000);
+        for code in [50, 30, 50, 30] {
+            ml.handle_key(press(Key::RawCode(code)));
+        }
+        assert_eq!(ml.current_word(), "мама");
+        let mut expected = ml.light_profile.clone();
+        expected.observe_lang(LangId::Bg);
+        let before_commits = ml.metrics().commit_count();
+        ml.focus_lost();
+        assert_eq!(ml.metrics().commit_count(), before_commits + 1);
+        assert_eq!(
+            ml.light_profile.lang_prior, expected.lang_prior,
+            "focus_lost must consume its own word evidence before returning"
+        );
+        ml.handle_key(press(Key::Space));
+        ml.focus_lost();
+        assert_eq!(
+            ml.light_profile.lang_prior, expected.lang_prior,
+            "empty boundaries must not relearn the old commit"
+        );
+    }
+
+    // Break caught: using one stale prefix-detector language for all words in
+    // one fully accepted completion; accepting once must still update UX once.
+    #[test]
+    fn multiword_tab_accept_observes_each_words_language_once() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 1_000_000);
+        ml.load_word("здравей", 1_000_000);
+        for ch in "hel".chars() {
+            ml.handle_key(press(Key::Char(ch)));
+        }
+        assert!(ml.core.apply_prediction_override("hello здравей").is_some());
+        let mut expected = ml.light_profile.clone();
+        expected.record_accept(LangId::En);
+        expected.observe_lang(LangId::Bg);
+        ml.handle_key(press(Key::Tab));
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+        assert_eq!(
+            ml.light_profile.ghost_accept_rate,
+            expected.ghost_accept_rate
+        );
+        assert_eq!(
+            ml.light_profile.lang_prior, expected.lang_prior,
+            "accepted words must not all inherit the prefix detector language"
+        );
+        ml.handle_key(press(Key::Space));
+        assert_eq!(ml.light_profile.lang_prior, expected.lang_prior);
+    }
+
+    #[test]
+    fn unsupported_delimiter_does_not_reinforce_inherited_language_prior() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.light_profile.lang_prior = [0.80, 0.10, 0.10];
+        for code in [16, 45] {
+            ml.handle_key(press(Key::RawCode(code)));
+        }
+        assert!(!ml.current_word().is_empty());
+        let before = ml.light_profile.clone();
+        ml.handle_key(press(Key::Space));
+        assert_eq!(ml.metrics().commit_count(), 1);
+        assert_eq!(
+            ml.light_profile.lang_prior, before.lang_prior,
+            "an inherited unsupported winner is not new language evidence"
+        );
+        assert_eq!(ml.light_profile.ghost_accept_rate, before.ghost_accept_rate);
+    }
+}

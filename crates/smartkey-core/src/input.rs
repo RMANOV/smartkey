@@ -5639,3 +5639,308 @@ mod lang_prior_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod language_evidence_contract_tests {
+    use super::*;
+    use crate::dual_buffer::EvidenceOrigin;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn fresh(ghost_text: bool) -> InputMethodCore {
+        InputMethodCore::new(InputConfig {
+            ghost_text,
+            ..InputConfig::default()
+        })
+    }
+
+    fn prior(core: &mut InputMethodCore, lang: LangId) {
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(lang),
+            ..Default::default()
+        });
+    }
+
+    fn raw(core: &mut InputMethodCore, codes: &[u16]) {
+        for &code in codes {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+    }
+
+    fn assert_no_language_words(core: &InputMethodCore) {
+        let profile = core.export_personal_profile();
+        assert!(
+            profile.lang_cvm.unwrap().tracks.is_empty(),
+            "an unconfirmed inferred word must not enter a language CVM track"
+        );
+    }
+
+    // Break caught: feeding a derived dual winner through the observed-script
+    // classifier or accepting UnsupportedBoth as independent detector evidence.
+    #[test]
+    fn unsupported_push_preserves_detector_state_and_literal_display() {
+        let mut core = fresh(false);
+        let before = core.detected_language();
+        raw(&mut core, &[16, 45]); // synthetic qx / яь, no corpus
+        assert_eq!(core.current_word(), "qx");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::UnsupportedBoth
+        );
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence),
+            "inferred fallback display is not a new detector observation"
+        );
+    }
+
+    #[test]
+    fn prior_only_push_preserves_detector_state_and_inherited_display() {
+        let mut core = fresh(false);
+        prior(&mut core, LangId::Bg);
+        let before = core.detected_language();
+        core.handle_key(press(Key::RawCode(16)));
+        assert_eq!(core.current_word(), "я");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::PriorOnly
+        );
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence),
+            "a surrounding prior may choose display without becoming a new vote"
+        );
+    }
+
+    #[test]
+    fn ordinary_delimiter_keeps_generic_learning_without_language_cvm() {
+        let mut core = fresh(false);
+        core.context.push_back("seed".into());
+        prior(&mut core, LangId::Bg);
+        raw(&mut core, &[16, 45, 44]); // synthetic novel Cyrillic name яьз
+        let actions = core.handle_key(press(Key::Space));
+        assert!(actions.contains(&Action::CommitText("яьз".into())));
+        let profile = core.export_personal_profile();
+        assert!(
+            profile.cvm.words.iter().any(|word| word == "яьз"),
+            "generic vocabulary still learns"
+        );
+        assert!(
+            profile
+                .markov_bigrams
+                .iter()
+                .any(|(ctx, word, count)| ctx == "seed" && word == "яьз" && *count == 1),
+            "generic Markov still learns"
+        );
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn ordinary_delimiter_does_not_manufacture_momentum() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.lang_detector.momentum_lang(),
+            None,
+            "a delimiter confirms text delivery, not the inferred script"
+        );
+    }
+
+    #[test]
+    fn ordinary_delimiter_does_not_manufacture_regime_language_ratio() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.regime_detector.lang_ratio(),
+            0.5,
+            "non-language word statistics may update while language ratio stays neutral"
+        );
+    }
+
+    #[test]
+    fn repeated_unconfirmed_word_does_not_become_corpus_evidence() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        raw(&mut core, &[16, 45, 44]);
+        assert_eq!(core.current_word(), "qxz");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::UnsupportedBoth,
+            "prediction-only self-insertion cannot attest its own script"
+        );
+    }
+
+    #[test]
+    fn prediction_only_word_is_excluded_from_exact_and_correction_frequency() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        assert_eq!(core.engine.score_exact_both("qxz", "яьз"), (0.0, 0.0));
+        assert_eq!(core.engine.word_frequency("qxz", LangId::En), 0.0);
+    }
+
+    #[test]
+    fn lower_ranked_trusted_prefix_is_not_hidden_by_prediction_candidate() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        core.load_word_lang("qxtrusted", 2, LangId::En);
+        assert_eq!(core.engine.score_both("qx", "яь"), (2.0, 0.0),
+            "trusted prefix search must ignore the higher-frequency unconfirmed candidate and still find trusted evidence");
+    }
+
+    #[test]
+    fn unsupported_suffix_after_a_corpus_lock_does_not_gain_commit_language() {
+        let mut core = fresh(false);
+        core.load_word_lang("мама", 100_000, LangId::Bg);
+        raw(&mut core, &[50, 30, 50, 30]);
+        assert!(
+            core.debug_state().1,
+            "premise: trusted prefix locked the display"
+        );
+        raw(&mut core, &[45]);
+        assert_eq!(core.current_word(), "мамаь");
+        assert_eq!(
+            core.engine.score_both("mamax", "мамаь"),
+            (0.0, 0.0),
+            "premise: current full word has no trusted support"
+        );
+        core.handle_key(press(Key::Space));
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn focus_flush_is_unconfirmed_language() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        assert!(core
+            .focus_lost()
+            .contains(&Action::CommitText("qxz".into())));
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn tab_without_ghost_is_unconfirmed_language() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        assert!(core
+            .handle_key(press(Key::Tab))
+            .contains(&Action::CommitText("qxz".into())));
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn partial_right_then_delimiter_is_unconfirmed_language() {
+        let mut core = fresh(true);
+        raw(&mut core, &[16, 45]);
+        assert!(core.apply_prediction_override("qxzz").is_some());
+        core.handle_key(press(Key::Right));
+        assert_eq!(core.current_word(), "qxz");
+        assert_eq!(core.ghost_text(), "z");
+        let actions = core.handle_key(press(Key::Space));
+        assert!(actions.contains(&Action::CommitText("qxz".into())));
+        assert_no_language_words(&core);
+    }
+
+    // Guards protect useful learning and real evidence from a skip-everything fix.
+    #[test]
+    fn novel_bg_name_remains_available_for_prediction() {
+        let mut core = fresh(false);
+        prior(&mut core, LangId::Bg);
+        raw(&mut core, &[44, 24, 19, 23, 17, 30, 49]); // synthetic зориван
+        assert_eq!(core.current_word(), "зориван");
+        core.handle_key(press(Key::Space));
+        assert!(
+            core.engine
+                .predict("зори", &[], 5, Some(LangId::Bg))
+                .iter()
+                .any(|p| p.word == "зориван"),
+            "unknown names need candidate generation as well as personal Markov"
+        );
+    }
+
+    #[test]
+    fn full_visible_accept_can_promote_word_specific_language_evidence() {
+        let mut core = fresh(true);
+        raw(&mut core, &[16, 45]);
+        assert!(core.apply_prediction_override("qxz").is_some());
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(actions.contains(&Action::CommitText("qxz".into())));
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::En));
+        assert!(core.engine.score_exact_both("qxz", "яьз").0 > 0.0);
+        let before = core.metrics().commit_count();
+        core.handle_key(press(Key::Tab));
+        assert_eq!(
+            core.metrics().commit_count(),
+            before,
+            "second Tab has no acceptance to learn"
+        );
+    }
+
+    #[test]
+    fn final_right_on_direct_text_records_one_full_acceptance() {
+        let mut core = fresh(true);
+        for ch in "qx".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert!(core.apply_prediction_override("qxz").is_some());
+        let actions = core.handle_key(press(Key::Right));
+        assert!(
+            actions.contains(&Action::CommitText("z".into())),
+            "the direct prefix is already delivered"
+        );
+        assert_eq!(
+            core.metrics().summary().accepted_predictions,
+            1,
+            "the last Right consumes the full visible completion"
+        );
+        assert!(core.current_word().is_empty());
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::En));
+    }
+
+    #[test]
+    fn multiword_full_accept_records_word_specific_language_tracks() {
+        let mut core = fresh(true);
+        for ch in "hel".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert!(core.apply_prediction_override("hello здравей").is_some());
+        core.handle_key(press(Key::Tab));
+        let tracks = core.export_personal_profile().lang_cvm.unwrap().tracks;
+        let en = tracks.iter().find(|(lang, _)| lang == "en").unwrap();
+        assert!(en.1.words.iter().any(|word| word == "hello"));
+        assert!(
+            !en.1.words.iter().any(|word| word == "здравей"),
+            "each accepted word needs its own script evidence"
+        );
+        let bg = tracks
+            .iter()
+            .find(|(lang, _)| lang == "bg")
+            .expect("accepted Cyrillic word belongs in Bg");
+        assert!(bg.1.words.iter().any(|word| word == "здравей"));
+    }
+
+    #[test]
+    fn genuine_corpus_tie_still_reaches_detector_at_half_confidence() {
+        let mut core = fresh(false);
+        core.load_word_lang("qx", 100, LangId::En);
+        core.load_word_lang("яь", 100, LangId::Bg);
+        raw(&mut core, &[16, 45]);
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::Corpus
+        );
+        let detected = core.detected_language();
+        assert_eq!((detected.lang, detected.confidence), (LangId::En, 0.5));
+    }
+}
