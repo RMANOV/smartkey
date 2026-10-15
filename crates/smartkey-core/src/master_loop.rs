@@ -1628,6 +1628,79 @@ mod review_tech_prior_tests {
 }
 
 #[cfg(test)]
+mod retraction_prior_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn assert_retracted_tech_prior(keys: impl IntoIterator<Item = Key>, boundary: Key) {
+        let mut config = InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        };
+        config.dual_buffer.enabled = false;
+        let mut ml = MasterLoop::new(config);
+        for key in keys {
+            ml.handle_key(press(key));
+        }
+        ml.handle_key(press(boundary));
+        let priors = ml.light_profile().lang_prior;
+        for (actual, expected) in priors.iter().zip([0.3234, 0.3332, 0.3434]) {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "one surviving direct Tech token must update its prior: {priors:?}"
+            );
+        }
+        assert_eq!(ml.light_profile().ghost_accept_rate, 0.5);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        ml.handle_key(press(Key::Space));
+        assert_eq!(ml.light_profile().lang_prior, priors);
+    }
+
+    #[test]
+    fn retraction_deleted_inferred_raw_suffix_restores_tech_prior() {
+        assert_retracted_tech_prior(
+            [
+                Key::Char('_'),
+                Key::RawCode(26),
+                Key::Backspace,
+                Key::Char('_'),
+                Key::Char('_'),
+            ],
+            Key::Space,
+        );
+    }
+
+    #[test]
+    fn retraction_deleted_script_restores_tech_prior() {
+        assert_retracted_tech_prior(
+            "123a".chars().map(Key::Char).chain([Key::Backspace]),
+            Key::Return,
+        );
+    }
+
+    #[test]
+    fn retraction_deleted_entire_prefix_does_not_suppress_tech_prior() {
+        assert_retracted_tech_prior(
+            [
+                Key::Char('a'),
+                Key::Backspace,
+                Key::Char('1'),
+                Key::Char('2'),
+                Key::Char('3'),
+            ],
+            Key::Space,
+        );
+    }
+}
+
+#[cfg(test)]
 mod commit_language_receipt_contract_tests {
     use super::*;
     use crate::input::Key;

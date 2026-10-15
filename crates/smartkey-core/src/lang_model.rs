@@ -50,7 +50,8 @@ impl LanguageModel {
         }
     }
 
-    /// Original corpus frequency takes precedence even when below confirmation5.
+    /// Original corpus frequency takes precedence even when below the fixed
+    /// frequency of 5 assigned to a novel confirmed word.
     pub(crate) fn trusted_exact_frequency(&self, word: &str) -> Option<u32> {
         self.trie
             .exact_frequency(word)
@@ -152,8 +153,9 @@ impl LanguageModelBank {
     pub fn load_word(&mut self, word: &str, freq: u32, lang: LangId) {
         let model = self.get_mut_or_create(lang);
         model.trie.insert(word, freq);
-        // Synchronize before top-K selection: a shadowed confirmation5 must not
-        // hide a different novel confirmation5 behind a later corpus2 entry.
+        // Synchronize before top-K selection: a confirmation shadowed by a
+        // corpus frequency of 2 must not retain its previous frequency of 5
+        // and hide a different novel confirmed word with frequency 5.
         if model.confirmed_trie.exact_frequency(word).is_some() {
             model.confirmed_trie.insert(word, freq);
         }
