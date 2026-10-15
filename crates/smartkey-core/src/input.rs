@@ -571,6 +571,8 @@ pub struct InputMethodCore {
     caps_engine: CapsEngine,
     /// Hints injected by MasterLoop (v0.6: proactive anticipation).
     active_hints: Option<crate::master_loop::Hints>,
+    /// Latest client context for terminal routing; never detector evidence.
+    terminal_context_lang: Option<LangId>,
     /// True when an anticipatory (next-word) ghost is showing, not a prefix ghost.
     /// Used to distinguish Tab-accept behavior.
     anticipatory_ghost_active: bool,
@@ -602,6 +604,7 @@ impl InputMethodCore {
             current_word_had_flip: false,
             caps_engine: CapsEngine::new(),
             active_hints: None,
+            terminal_context_lang: None,
             anticipatory_ghost_active: false,
             space_accept_display_attested: false,
         }
@@ -618,7 +621,12 @@ impl InputMethodCore {
     /// Clear any active hints (on word boundary).
     pub fn clear_hints(&mut self) {
         self.active_hints = None;
+        self.terminal_context_lang = None;
         self.lang_detector.clear_prior();
+    }
+
+    pub(crate) fn set_terminal_context_lang(&mut self, lang: Option<LangId>) {
+        self.terminal_context_lang = lang.filter(|lang| matches!(lang, LangId::En | LangId::Bg));
     }
 
     // -- passive calibration tap (delegates to the engine) --------------
@@ -1016,6 +1024,7 @@ impl InputMethodCore {
                             self.dual_buffer = None;
                             self.current_word.clear();
                             self.word_origins.clear();
+                            self.terminal_context_lang = None;
                             self.ghost.clear();
                             return vec![Action::HideGhost];
                         }
@@ -1043,6 +1052,9 @@ impl InputMethodCore {
                 }
                 if !self.current_word.is_empty() {
                     self.pop_word_char();
+                }
+                if self.current_word.is_empty() {
+                    self.terminal_context_lang = None;
                 }
                 let ghost_action = self.update_predictions();
                 vec![ghost_action, Action::ForwardKey]
@@ -2088,20 +2100,38 @@ impl InputMethodCore {
     ///
     /// The display lock is a scoring signal on the PREFIX; it must not decide
     /// the committed word when the full physical word has exact corpus
-    /// support on exactly one side.  Only that one-sided case switches the
-    /// reading (S03/P3a): both-supported words keep the existing evidence
-    /// decision, unsupported words keep the displayed reading, and a `Tech`
-    /// winner is left alone.  When the reading switches, the language
-    /// detector is realigned BEFORE `commit_word_internal` so learning,
-    /// momentum and the regime observation all see the selected script.
+    /// support on exactly one side. Both-supported words may switch only
+    /// while unlocked, when exact-frequency dominance and current client
+    /// context agree. Unsupported words and a `Tech` winner are left alone.
+    /// Only one-sided evidence realigns the detector here; client context
+    /// never supplies detector confidence or confirms a new trusted word.
     fn resolve_word_boundary(&mut self) -> String {
         let Some(db) = self.dual_buffer.as_ref() else {
             return self.current_word.clone();
         };
+        // Semantic input may extend the rendered token without extending the
+        // physical buffer. A shorter buffer cannot attest the complete word.
+        if self.current_word != db.winner_text() {
+            return self.current_word.clone();
+        }
         let (en_exact, bg_exact) = self.engine.score_exact_both(db.en_text(), db.bg_text());
+        let one_sided = (en_exact > 0.0) != (bg_exact > 0.0);
         let selected = match (en_exact > 0.0, bg_exact > 0.0, db.winner_lang()) {
             (true, false, LangId::Bg) => LangId::En,
             (false, true, LangId::En) => LangId::Bg,
+            (true, true, LangId::En | LangId::Bg) if !db.is_locked() => {
+                let dominant = if en_exact > bg_exact {
+                    LangId::En
+                } else if bg_exact > en_exact {
+                    LangId::Bg
+                } else {
+                    return self.current_word.clone();
+                };
+                if self.terminal_context_lang != Some(dominant) || dominant == db.winner_lang() {
+                    return self.current_word.clone();
+                }
+                dominant
+            }
             _ => return self.current_word.clone(),
         };
         let word = match selected {
@@ -2110,7 +2140,7 @@ impl InputMethodCore {
         };
         self.replace_word_with_derived(word.clone());
         self.current_word_had_flip = true;
-        if self.config.lang_detection {
+        if self.config.lang_detection && one_sided {
             // Normalised one-sided exact evidence, not a calibrated probability.
             self.lang_detector.feed_dual_result(selected, 1.0);
         }
@@ -2142,6 +2172,7 @@ impl InputMethodCore {
 
     fn reset_word(&mut self) {
         self.current_word.clear();
+        self.terminal_context_lang = None;
         self.word_origins.clear();
         self.word_detector_baseline = WordDetectorBaseline::Unstarted;
         self.ghost.clear();
@@ -7314,5 +7345,66 @@ mod shortword_routing_contract_tests {
         );
         assert!(core.export_personal_profile().confirmed_words.is_empty());
         assert_eq!(core.engine.word_frequency("ли", LangId::Bg), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod terminal_context_evidence_tests {
+    use super::*;
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn terminal_context_exact_selection_does_not_create_detector_confidence_or_trust() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("with", 7_079_457, LangId::En);
+        core.load_word_lang("wi", 12_302, LangId::En);
+        core.load_word_lang("ви", 2_137_962, LangId::Bg);
+        core.set_terminal_context_lang(Some(LangId::Bg));
+        core.handle_key(raw(17));
+        core.handle_key(raw(23));
+        assert_eq!(core.current_word(), "wi");
+        let detected = core.detected_language();
+
+        let actions = core.handle_key(raw(57));
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(word) if word == "ви")));
+        assert_eq!(core.detected_language().lang, detected.lang);
+        assert_eq!(core.detected_language().confidence, detected.confidence);
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Bg)
+            }]
+        );
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::Bg));
+        assert!(core.export_personal_profile().confirmed_words.is_empty());
+        assert_eq!(core.engine.word_frequency("wi", LangId::En), 12_302.0);
+        assert_eq!(core.engine.word_frequency("ви", LangId::Bg), 2_137_962.0);
+        assert_eq!(core.terminal_context_lang, None);
+    }
+
+    #[test]
+    fn terminal_context_agreement_with_current_word_does_not_mark_a_flip() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("wi", 1_000_000, LangId::En);
+        core.load_word_lang("ви", 1, LangId::Bg);
+        core.set_terminal_context_lang(Some(LangId::En));
+        core.handle_key(raw(17));
+        core.handle_key(raw(23));
+        assert!(!core.current_word_had_flip);
+        let origins = core.word_origins.clone();
+
+        assert_eq!(core.resolve_word_boundary(), "wi");
+
+        assert!(!core.current_word_had_flip);
+        assert!(core.word_origins == origins);
     }
 }

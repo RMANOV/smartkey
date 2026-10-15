@@ -238,3 +238,98 @@ def test_native_shortword_english_continuation_overcomes_bg_context():
     actions = core.process_keycode(57, 0)
     assert actions.count(("commit", "like")) == 1
     assert actions.count(("forward", "")) == 1
+
+
+_TERMINAL_BG_CONTEXT = "Искам да благодаря "
+
+
+def _terminal_core():
+    # Public reduced fixture; the actual copied-corpus replay is a separate gate.
+    core = _native().PyInputMethodCore()
+    core.load_word("with", 7_079_457)
+    core.load_word("wi", 12_302)
+    core.load_word("ви", 2_137_962)
+    core.set_surrounding_text(_TERMINAL_BG_CONTEXT, len(_TERMINAL_BG_CONTEXT))
+    return core
+
+
+def _terminal_type_wi(core):
+    for code in (17, 23):
+        core.process_keycode(code, 0)
+    assert core.current_word() == "wi"
+    assert list(core.debug_state()) == [True, False, True]
+
+
+def _terminal_assert_boundary(core, code, expected):
+    actions = core.process_keycode(code, 0)
+    assert [text for kind, text in actions if kind == "commit"] == [expected], actions
+    assert actions.count(("forward", "")) == 1
+    assert not any(kind == "replace" for kind, _ in actions)
+    assert core.current_word() == ""
+
+
+@pytest.mark.parametrize("boundary", [57, 28])
+def test_native_terminal_context_uses_exact_word_without_accepting_ghost(tmp_path, boundary):
+    core = _terminal_core()
+    before = _profile(core, tmp_path, "before-terminal.json")
+    _terminal_type_wi(core)
+
+    _terminal_assert_boundary(core, boundary, "ви")
+
+    after = _profile(core, tmp_path, "after-terminal.json")
+    assert after["ghost_accept_rate"] == before["ghost_accept_rate"]
+    assert after["lang_prior"][0] == pytest.approx(0.3434)
+    core.process_keycode(57, 0)
+    core.focus_lost()
+    assert _profile(core, tmp_path, "after-terminal-empty.json")["lang_prior"] == after["lang_prior"]
+
+
+@pytest.mark.parametrize("text,cursor,expected", [
+    (None, None, "wi"),
+    ("I want to thank ", len("I want to thank "), "wi"),
+    (_TERMINAL_BG_CONTEXT, len(_TERMINAL_BG_CONTEXT), "ви"),
+    (_TERMINAL_BG_CONTEXT, None, "wi"),
+    (_TERMINAL_BG_CONTEXT, len(_TERMINAL_BG_CONTEXT) + 1, "wi"),
+    (_TERMINAL_BG_CONTEXT, 0, "wi"),
+])
+def test_native_terminal_context_refresh_replaces_only_terminal_authority(text, cursor, expected):
+    core = _terminal_core()
+    _terminal_type_wi(core)
+
+    core.set_surrounding_text(text, cursor)
+
+    _terminal_assert_boundary(core, 57, expected)
+
+
+@pytest.mark.parametrize("withdraw", [False, True])
+def test_native_terminal_context_erase_retype_uses_current_client_cache(withdraw):
+    core = _terminal_core()
+    _terminal_type_wi(core)
+    core.process_keycode(14, 0)
+    core.process_keycode(14, 0)
+    assert core.current_word() == ""
+    if withdraw:
+        core.set_surrounding_text(None, None)
+
+    _terminal_type_wi(core)
+
+    _terminal_assert_boundary(core, 57, "wi" if withdraw else "ви")
+
+
+@pytest.mark.parametrize("fixture,expected", [("both-supported", "wix"), ("one-sided", "statiqx")])
+def test_native_terminal_resolution_keeps_direct_semantic_suffix(fixture, expected):
+    if fixture == "both-supported":
+        core = _terminal_core()
+        _terminal_type_wi(core)
+    else:
+        core = _native().PyInputMethodCore()
+        for word, frequency in (("status", 900_000), ("static", 600_000), ("station", 500_000), ("статия", 50_000)):
+            core.load_word(word, frequency)
+        for code in (31, 20, 30, 20, 23, 16):
+            core.process_keycode(code, 0)
+        assert core.current_word() == "statiq"
+        assert list(core.debug_state()) == [True, True, False]
+    core.handle_key(ord("x"), 0)
+    assert core.current_word() == expected
+
+    _terminal_assert_boundary(core, 57, expected)

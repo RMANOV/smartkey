@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::context_sampler::{self, ContextSampler, NullContextSampler};
+use crate::context_sampler::{self, ContextAnalysis, ContextSampler, NullContextSampler};
 use crate::correction_memory::CorrectionMemory;
 use crate::ensemble::Prediction;
 use crate::eval::PredictionMetrics;
@@ -152,12 +152,17 @@ impl MasterLoop {
             && !self.core.has_ghost());
 
         // ── Phase 1: ANTICIPATE (on word start) ──────────────────────
-        if !self.anticipated && self.core.current_word().is_empty() {
-            self.phase = Phase::Anticipating;
-            let hints = self.anticipate();
-            self.core.apply_hints(&hints);
-            self.anticipated = true;
-            self.phase = Phase::Tracking;
+        if self.core.current_word().is_empty() {
+            let cached_analysis = self.cached_surrounding_analysis();
+            let terminal_lang = self.terminal_context_language(cached_analysis.as_ref());
+            self.core.set_terminal_context_lang(terminal_lang);
+            if !self.anticipated {
+                self.phase = Phase::Anticipating;
+                let hints = self.anticipate(cached_analysis);
+                self.core.apply_hints(&hints);
+                self.anticipated = true;
+                self.phase = Phase::Tracking;
+            }
         }
 
         // ── Phase 2: DELEGATE to core ────────────────────────────────
@@ -428,6 +433,9 @@ impl MasterLoop {
     pub fn set_surrounding_text(&mut self, text: Option<String>, cursor_pos: Option<usize>) {
         self.surrounding_text = text.filter(|value| !value.trim().is_empty());
         self.surrounding_cursor_pos = cursor_pos;
+        let analysis = self.cached_surrounding_analysis();
+        let terminal_lang = self.terminal_context_language(analysis.as_ref());
+        self.core.set_terminal_context_lang(terminal_lang);
     }
 
     /// Current phase of the master loop state machine.
@@ -476,15 +484,15 @@ impl MasterLoop {
     // Internal: Anticipation
     // ======================================================================
 
-    fn anticipate(&mut self) -> Hints {
+    fn anticipate(&mut self, cached_analysis: Option<ContextAnalysis>) -> Hints {
         let mut hints = Hints::default();
 
         // 1. Sample surrounding text for context.
-        if let Some(text) = self
-            .cached_surrounding_excerpt(100)
-            .or_else(|| self.context_sampler.get_surrounding_text(100))
-        {
-            let analysis = context_sampler::analyze_surrounding(&text);
+        if let Some(analysis) = cached_analysis.or_else(|| {
+            self.context_sampler
+                .get_surrounding_text(100)
+                .map(|text| context_sampler::analyze_surrounding(&text))
+        }) {
             if let Some(lang) = analysis.lang {
                 hints.lang_prior = Some(lang);
             }
@@ -533,6 +541,24 @@ impl MasterLoop {
         hints.confidence_floor = Some(self.light_profile.confidence_floor);
 
         hints
+    }
+
+    fn cached_surrounding_analysis(&self) -> Option<ContextAnalysis> {
+        self.cached_surrounding_excerpt(100)
+            .map(|text| context_sampler::analyze_surrounding(&text))
+    }
+
+    fn terminal_context_language(&self, analysis: Option<&ContextAnalysis>) -> Option<LangId> {
+        let text = self.surrounding_text.as_deref()?;
+        let cursor = self.surrounding_cursor_pos?;
+        // Legacy live hints accept absent/byte-like cursors. Terminal routing
+        // requires an actual client character position and its pre-cursor text.
+        if cursor > text.chars().count() {
+            return None;
+        }
+        analysis?
+            .lang
+            .filter(|lang| matches!(lang, LangId::En | LangId::Bg))
     }
 
     fn cached_surrounding_excerpt(&self, max_chars: usize) -> Option<String> {
@@ -1894,5 +1920,575 @@ mod shortword_surrounding_routing_tests {
                 .iter()
                 .any(|action| matches!(action, Action::CommitText(word) if word == "li")));
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_context_contract_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    const BG_CONTEXT: &str = "Искам да благодаря ";
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn raw(code: u16) -> KeyEvent {
+        press(Key::RawCode(code))
+    }
+
+    fn context(ml: &mut MasterLoop, text: Option<&str>) {
+        ml.set_surrounding_text(text.map(str::to_string), text.map(|s| s.chars().count()));
+    }
+
+    fn reduced(text: Option<&str>) -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        // Public reduced fixtures distinguish completed words from a longer
+        // prefix candidate. They do not stand in for the copied-corpus replay.
+        ml.load_word_lang("with", 7_079_457, LangId::En);
+        ml.load_word_lang("wi", 12_302, LangId::En);
+        ml.load_word_lang("ви", 2_137_962, LangId::Bg);
+        context(&mut ml, text);
+        ml
+    }
+
+    fn type_wi(ml: &mut MasterLoop) {
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        assert_eq!(
+            ml.current_word(),
+            "wi",
+            "prefix selection remains unchanged"
+        );
+        assert_eq!(ml.core.debug_state(), (true, false, true));
+    }
+
+    fn boundary(ml: &mut MasterLoop, key: Key, expected: &str) {
+        let before = ml.metrics().summary();
+        let actions = ml.handle_key(press(key));
+        let commits: Vec<&str> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::CommitText(word) => Some(word.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commits, vec![expected], "{actions:?}");
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1,
+            "{actions:?}"
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(ml.current_word(), "");
+        assert_eq!(
+            ml.metrics().summary().total_commits,
+            before.total_commits + 1
+        );
+        assert_eq!(
+            ml.metrics().summary().accepted_predictions,
+            before.accepted_predictions
+        );
+    }
+
+    #[test]
+    fn terminal_context_bg_exact_word_wins_at_space_without_accepting_ghost() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        assert_eq!(ml.ghost_text(), "th");
+        boundary(&mut ml, Key::RawCode(57), "ви");
+        assert_eq!(ml.light_profile().ghost_accept_rate, 0.5);
+        assert!((ml.light_profile().lang_prior[0] - 0.3434).abs() < 1e-12);
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+        let prior = ml.light_profile().lang_prior;
+        let commits = ml.metrics().summary().total_commits;
+        ml.handle_key(raw(57));
+        ml.focus_lost();
+        assert_eq!(
+            ml.light_profile().lang_prior,
+            prior,
+            "one language observation only"
+        );
+        assert_eq!(ml.metrics().summary().total_commits, commits);
+    }
+
+    #[test]
+    fn terminal_context_bg_exact_word_wins_at_return() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::RawCode(28), "ви");
+    }
+
+    #[test]
+    fn terminal_context_bg_exact_word_wins_at_punctuation() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Char(','), "ви");
+    }
+
+    #[test]
+    fn terminal_context_unchanged_bg_setter_keeps_current_authority() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        context(&mut ml, Some(BG_CONTEXT));
+        boundary(&mut ml, Key::Space, "ви");
+    }
+
+    #[test]
+    fn terminal_context_withdrawn_midword_cannot_use_stale_bg_authority() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        context(&mut ml, None);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_changed_to_en_midword_cannot_use_stale_bg_authority() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        context(&mut ml, Some("I want to thank "));
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_erase_to_empty_withdraw_and_retype_cannot_reuse_authority() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        ml.handle_key(raw(14));
+        ml.handle_key(raw(14));
+        assert_eq!(ml.current_word(), "");
+        context(&mut ml, None);
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_absent_opposed_and_tech_context_keep_display() {
+        for text in [None, Some("I want to thank "), Some("_!!! ")] {
+            let mut ml = reduced(text);
+            type_wi(&mut ml);
+            boundary(&mut ml, Key::Space, "wi");
+        }
+    }
+
+    #[test]
+    fn terminal_context_profile_prior_alone_is_not_surrounding_proof() {
+        let mut ml = reduced(None);
+        ml.light_profile.lang_prior = [0.8, 0.1, 0.1];
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_committed_momentum_alone_is_not_surrounding_proof() {
+        let mut ml = reduced(None);
+        for ch in "име".chars() {
+            ml.handle_key(press(Key::Char(ch)));
+        }
+        ml.handle_key(raw(57));
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_exact_tie_keeps_display() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        ml.load_word_lang("wi", 2_137_962, LangId::En);
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_symmetric_english_exact_word_can_win() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("wi", 2_137_962, LangId::En);
+        ml.load_word_lang("вина", 7_079_457, LangId::Bg);
+        ml.load_word_lang("ви", 12_302, LangId::Bg);
+        context(&mut ml, Some("I want to thank "));
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        assert_eq!(ml.current_word(), "ви");
+        assert_eq!(ml.core.debug_state(), (true, false, true));
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_strong_exact_english_survives_bg_context() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("he", 1_000_000, LangId::En);
+        ml.load_word_lang("хе", 1, LangId::Bg);
+        context(&mut ml, Some(BG_CONTEXT));
+        ml.handle_key(raw(35));
+        ml.handle_key(raw(18));
+        assert_eq!(ml.current_word(), "he");
+        boundary(&mut ml, Key::Space, "he");
+    }
+
+    #[test]
+    fn terminal_context_existing_li_absent_en_and_mixed_guards_survive() {
+        for text in [None, Some("hello "), Some("има hello ")] {
+            let mut ml = MasterLoop::new(InputConfig::default());
+            ml.load_word_lang("like", 2_570_395, LangId::En);
+            ml.load_word_lang("li", 17_782, LangId::En);
+            ml.load_word_lang("ли", 2_511_886, LangId::Bg);
+            context(&mut ml, text);
+            ml.handle_key(raw(38));
+            ml.handle_key(raw(23));
+            assert_eq!(ml.current_word(), "li");
+            boundary(&mut ml, Key::Space, "li");
+        }
+    }
+
+    #[test]
+    fn terminal_context_casing_uses_original_selected_buffer() {
+        for (modifiers, expected) in [(Modifiers::SHIFT, "Ви"), (Modifiers::CAPS_LOCK, "ВИ")] {
+            let mut ml = reduced(Some(BG_CONTEXT));
+            ml.handle_key(KeyEvent {
+                key: Key::RawCode(17),
+                modifiers,
+            });
+            ml.handle_key(KeyEvent {
+                key: Key::RawCode(23),
+                modifiers: if modifiers == Modifiers::SHIFT {
+                    Modifiers::empty()
+                } else {
+                    modifiers
+                },
+            });
+            assert_eq!(ml.core.debug_state(), (true, false, true));
+            boundary(&mut ml, Key::Space, expected);
+        }
+    }
+
+    #[test]
+    fn terminal_context_direct_semantic_chars_stay_literal() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        for ch in "wi".chars() {
+            ml.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(ml.current_word(), "wi");
+        assert!(!ml.core.debug_state().0);
+        let actions = ml.handle_key(raw(57));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+    }
+
+    #[test]
+    fn terminal_context_explicit_full_tab_accepts_visible_completion() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        assert_eq!(ml.ghost_text(), "th");
+        let actions = ml.handle_key(press(Key::Tab));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["with"]
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ForwardKey | Action::ReplaceWord { .. })));
+        assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+        let commits = ml.metrics().summary().total_commits;
+        ml.handle_key(raw(57));
+        assert_eq!(ml.metrics().summary().total_commits, commits);
+    }
+
+    #[test]
+    fn terminal_context_partial_right_keeps_accepted_prefix_locked() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        ml.load_word_lang("wit", 12_302, LangId::En);
+        ml.load_word_lang("вит", 2_137_962, LangId::Bg);
+        type_wi(&mut ml);
+        ml.handle_key(press(Key::Right));
+        assert_eq!(ml.current_word(), "wit");
+        assert_eq!(ml.core.debug_state(), (true, true, false));
+        boundary(&mut ml, Key::Space, "wit");
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn terminal_context_locked_both_supported_keeps_existing_decision() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("withers", 90_000_000, LangId::En);
+        ml.load_word_lang("with", 1, LangId::En);
+        ml.load_word_lang("витх", 2_137_962, LangId::Bg);
+        context(&mut ml, Some(BG_CONTEXT));
+        for code in [17, 23, 20, 35] {
+            ml.handle_key(raw(code));
+        }
+        assert_eq!(ml.current_word(), "with");
+        assert_eq!(ml.core.debug_state(), (true, true, false));
+        boundary(&mut ml, Key::Space, "with");
+    }
+}
+
+#[cfg(test)]
+mod terminal_context_source_quality_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    const BG_CONTEXT: &str = "Искам да благодаря ";
+
+    struct BgSampler;
+
+    impl ContextSampler for BgSampler {
+        fn get_surrounding_text(&self, _max_chars: usize) -> Option<String> {
+            Some(BG_CONTEXT.to_string())
+        }
+    }
+
+    fn fixture(ml: &mut MasterLoop) {
+        ml.load_word_lang("with", 7_079_457, LangId::En);
+        ml.load_word_lang("wi", 12_302, LangId::En);
+        ml.load_word_lang("ви", 2_137_962, LangId::Bg);
+    }
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn assert_no_terminal_crossover(ml: &mut MasterLoop) {
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        assert_eq!(ml.current_word(), "wi");
+        let actions = ml.handle_key(raw(57));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["wi"]
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+    }
+
+    #[test]
+    fn terminal_context_sampler_return_without_client_cache_is_not_authority() {
+        let mut ml = MasterLoop::with_context_sampler(InputConfig::default(), Box::new(BgSampler));
+        fixture(&mut ml);
+        ml.handle_key(raw(17));
+        assert_eq!(
+            ml.current_word(),
+            "в",
+            "nonempty BG sampler still supplies the existing live hint"
+        );
+        ml.handle_key(raw(23));
+        assert_eq!(ml.current_word(), "wi");
+        let actions = ml.handle_key(raw(57));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["wi"]
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+    }
+
+    #[test]
+    fn terminal_context_unknown_or_out_of_range_cursor_is_not_authority() {
+        for cursor in [None, Some(BG_CONTEXT.chars().count() + 1), Some(usize::MAX)] {
+            let mut ml = MasterLoop::new(InputConfig::default());
+            fixture(&mut ml);
+            ml.set_surrounding_text(Some(BG_CONTEXT.to_string()), cursor);
+            assert_no_terminal_crossover(&mut ml);
+        }
+    }
+
+    #[test]
+    fn terminal_context_erase_retype_reseeds_still_valid_client_cache() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        fixture(&mut ml);
+        ml.set_surrounding_text(
+            Some(BG_CONTEXT.to_string()),
+            Some(BG_CONTEXT.chars().count()),
+        );
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        ml.handle_key(raw(14));
+        ml.handle_key(raw(14));
+        assert_eq!(ml.current_word(), "");
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        assert_eq!(ml.current_word(), "wi");
+        let actions = ml.handle_key(raw(57));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["ви"]
+        );
+    }
+
+    #[test]
+    fn terminal_context_uses_only_known_pre_cursor_client_text() {
+        for (text, cursor, expected) in [
+            (
+                format!("hello {BG_CONTEXT}"),
+                "hello ".chars().count(),
+                "wi",
+            ),
+            (
+                format!("{BG_CONTEXT}hello "),
+                BG_CONTEXT.chars().count(),
+                "ви",
+            ),
+            (BG_CONTEXT.to_string(), 0, "wi"),
+        ] {
+            let mut ml = MasterLoop::new(InputConfig::default());
+            fixture(&mut ml);
+            ml.set_surrounding_text(Some(text), Some(cursor));
+            ml.handle_key(raw(17));
+            ml.handle_key(raw(23));
+            assert_eq!(ml.current_word(), "wi");
+            let actions = ml.handle_key(raw(57));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter_map(|a| match a {
+                        Action::CommitText(word) => Some(word.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![expected]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_alignment_contract_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn assert_full_token(ml: &mut MasterLoop, expected: &str) {
+        let actions = ml.handle_key(raw(57));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![expected],
+            "{actions:?}"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(ml.current_word(), "");
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+    }
+
+    #[test]
+    fn terminal_alignment_both_supported_cannot_discard_direct_semantic_suffix() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("with", 7_079_457, LangId::En);
+        ml.load_word_lang("wi", 12_302, LangId::En);
+        ml.load_word_lang("ви", 2_137_962, LangId::Bg);
+        let text = "Искам да благодаря ";
+        ml.set_surrounding_text(Some(text.to_string()), Some(text.chars().count()));
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        assert_eq!(ml.current_word(), "wi");
+        ml.handle_key(KeyEvent {
+            key: Key::Char('x'),
+            modifiers: Modifiers::empty(),
+        });
+        assert_eq!(ml.current_word(), "wix");
+        assert_full_token(&mut ml, "wix");
+    }
+
+    #[test]
+    fn terminal_alignment_one_sided_cannot_discard_direct_semantic_suffix() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        for (word, frequency) in [
+            ("status", 900_000),
+            ("static", 600_000),
+            ("station", 500_000),
+        ] {
+            ml.load_word_lang(word, frequency, LangId::En);
+        }
+        ml.load_word_lang("статия", 50_000, LangId::Bg);
+        for code in [31, 20, 30, 20, 23, 16] {
+            ml.handle_key(raw(code));
+        }
+        assert_eq!(ml.current_word(), "statiq");
+        assert_eq!(ml.core.debug_state(), (true, true, false));
+        ml.handle_key(KeyEvent {
+            key: Key::Char('x'),
+            modifiers: Modifiers::empty(),
+        });
+        assert_eq!(ml.current_word(), "statiqx");
+        assert_full_token(&mut ml, "statiqx");
     }
 }
