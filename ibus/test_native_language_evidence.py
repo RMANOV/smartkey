@@ -1231,3 +1231,36 @@ def test_native_refreshed_positive_extra_space_then_shortcut_keeps_stale_context
     assert core.process_keycode(47, 1 << 2) == [("forward", "")]  # Ctrl+V.
     assert core.current_word() == ""
     _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=False)
+
+
+@pytest.mark.parametrize("context,deletions,restore_space,capitalized", [
+    ("hello.\n  ", 1, False, True),
+    ("hello.\n  ", 2, False, True),
+    ("hello.\n  ", 3, False, False),
+    ("hello.\n  ", 3, True, True),
+    ("hello.\n  ", 4, True, False),
+    ("hello.\r\n  ", 3, False, True),
+    ("  ", 1, False, True),
+    ("  ", 2, False, True),
+])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_line_indentation_deletion_reclassifies_exact_cursor(
+    tmp_path, context, deletions, restore_space, capitalized, mode
+):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    core.set_surrounding_text("", 0)
+    _raw_sentence_prefix(core)
+    # A real public client report supplies the layout. Subsequent Backspaces
+    # use the raw API; the test never assigns the projected text or caps state.
+    core.set_surrounding_text(context, len(context))
+    for _ in range(deletions):
+        assert core.current_word() == ""
+        actions = core.process_keycode(14, 0)
+        assert actions.count(("forward", "")) == 1 and core.current_word() == "", actions
+        assert not any(kind in {"commit", "replace", "composing"} for kind, _ in actions), actions
+    if restore_space:
+        assert core.process_keycode(57, 0) == [("hide", ""), ("forward", "")]
+    _assert_native_sentence_review_target(
+        core, tmp_path, prediction=prediction, capitalized=capitalized
+    )

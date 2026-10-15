@@ -8,6 +8,7 @@
 //
 // Implements the Decorator pattern: mirrors InputMethodCore's public API 1:1.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Instant;
 
@@ -185,6 +186,49 @@ impl SentenceEchoes {
         image.inserted.push_str(insert);
         image.cursor += insert.chars().count();
         self.push(image)
+    }
+
+    fn has_known_linebreak_or_blank_prefix(&self) -> bool {
+        if self.opaque.is_some() {
+            return false;
+        }
+        let image = self.images.last().expect("base image");
+        let mut linebreak = false;
+        let mut only_spaces = true;
+        for ch in self.base[..image.left]
+            .chars()
+            .chain(image.inserted.chars())
+            .rev()
+        {
+            if !ch.is_whitespace() {
+                return linebreak;
+            }
+            linebreak |= matches!(ch, '\r' | '\n');
+            only_spaces &= ch == ' ';
+        }
+        linebreak || only_spaces
+    }
+
+    fn before_cursor(&self) -> Option<Cow<'_, str>> {
+        if self.opaque.is_some() {
+            return None;
+        }
+        let image = self.images.last()?;
+        let left = &self.base[..image.left];
+        if image.inserted.is_empty() {
+            return Some(Cow::Borrowed(left));
+        }
+        if left.is_empty() {
+            return Some(Cow::Borrowed(image.inserted.as_str()));
+        }
+        let bytes = left.len().checked_add(image.inserted.len())?;
+        if bytes > MAX_SENTENCE_ECHO_BYTES {
+            return None;
+        }
+        let mut prefix = String::with_capacity(bytes);
+        prefix.push_str(left);
+        prefix.push_str(&image.inserted);
+        Some(Cow::Owned(prefix))
     }
 
     fn record(&mut self, event: &KeyEvent, actions: &[Action], mut composing: bool) -> bool {
@@ -415,6 +459,7 @@ impl MasterLoop {
         };
         let hint_was_live = self.core.has_sentence_boundary_hint();
         let was_composing = self.core.debug_state().0;
+        let word_was_empty = self.core.current_word().is_empty();
         let mut actions = self.core.handle_key(event.clone());
         let commit_learning = self.core.take_commit_learning();
         let word_committed = !commit_learning.words.is_empty();
@@ -510,6 +555,7 @@ impl MasterLoop {
             &actions,
             hint_was_live,
             was_composing,
+            word_was_empty,
             word_committed,
         );
 
@@ -722,11 +768,43 @@ impl MasterLoop {
         actions: &[Action],
         hint_was_live: bool,
         was_composing: bool,
+        word_was_empty: bool,
         word_committed: bool,
     ) {
-        let hint_is_live = self.core.has_sentence_boundary_hint();
         let forwarded_backspace = matches!(event.key, Key::Backspace)
             && actions.iter().any(|a| matches!(a, Action::ForwardKey));
+        if self.core.is_enabled()
+            && forwarded_backspace
+            && word_was_empty
+            && self.core.current_word().is_empty()
+            && !word_committed
+            && !actions.iter().any(|a| matches!(a, Action::CommitText(_)))
+            && self
+                .sentence_echoes
+                .as_ref()
+                .is_some_and(SentenceEchoes::has_known_linebreak_or_blank_prefix)
+        {
+            // The generic Core hint cannot retract opaque layout whitespace.
+            // This existing exact, nonopaque image can: project the final wire
+            // batch once, then classify the actual remaining client prefix.
+            let echoes = self.sentence_echoes.as_mut().expect("checked bound image");
+            let retained = if echoes.record(event, actions, was_composing) {
+                if let Some(prefix) = echoes.before_cursor() {
+                    self.core.reconcile_sentence_boundary_hint(&prefix);
+                    self.core.has_sentence_boundary_hint()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !retained {
+                self.core.withdraw_sentence_boundary_hint();
+                self.sentence_echoes = None;
+            }
+            return;
+        }
+        let hint_is_live = self.core.has_sentence_boundary_hint();
         if !self.core.is_enabled()
             || (!hint_is_live
                 && (self.sentence_echoes.is_none() || word_committed || forwarded_backspace))
@@ -5002,8 +5080,12 @@ mod sentence_modifier_review_tests {
         }
 
         #[test]
-        fn sentence_boundary_surrounding_mixed_observed_whitespace_remains_opaque() {
-            for whitespace in ["\t  ", "\r\n  ", "\u{00a0}  "] {
+        fn sentence_boundary_surrounding_mixed_observed_whitespace_requires_known_linebreak() {
+            for (whitespace, expected) in [
+                ("\t  ", "world"),
+                ("\u{00a0}  ", "world"),
+                ("\r\n  ", "World"), // A bound observed linebreak survives this deletion.
+            ] {
                 let mut ml =
                     fresh_snapshot_after_sentence(false, &format!("hello. seed.{whitespace}"));
                 assert_eq!(
@@ -5018,7 +5100,7 @@ mod sentence_modifier_review_tests {
                 assert_eq!(ml.current_word(), "w");
                 assert_eq!(
                     ml.predictions().first().map(|p| p.word.as_str()),
-                    Some("world"),
+                    Some(expected),
                     "opaque whitespace={whitespace:?}"
                 );
                 assert_eq!(ml.metrics().summary().total_commits, 1);
@@ -5056,6 +5138,236 @@ mod sentence_modifier_review_tests {
                     ml.predictions().first().map(|p| p.word.as_str()),
                     Some(expected),
                     "shortcut={shortcut}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_known_linebreak_indent_deletion_keeps_prediction() {
+            for (prefix, linebreak, suffix) in [
+                ("", "\n", ""),
+                ("", "\r\n", ""),
+                ("", "\n\n", ""),
+                ("😀 ", "\n", " unchanged"),
+            ] {
+                for deletions in [1, 2] {
+                    for own_echo in [false, true] {
+                        let before = format!("{prefix}hello. seed.{linebreak}  ");
+                        let mut text = format!("{before}{suffix}");
+                        let mut cursor = before.chars().count();
+                        let mut ml = fresh_snapshot_after_sentence(false, &text);
+                        report(&mut ml, &text, cursor);
+                        assert!(ml.core.has_sentence_boundary_hint());
+                        assert!(ml.sentence_echoes.is_some());
+                        for _ in 0..deletions {
+                            assert_eq!(
+                                plain(&mut ml, Key::Backspace),
+                                [Action::HideGhost, Action::ForwardKey]
+                            );
+                            let byte = text.char_indices().nth(cursor - 1).unwrap().0;
+                            text.remove(byte); // Explicit client applies one Unicode-char deletion.
+                            cursor -= 1;
+                            assert!(text.ends_with(suffix));
+                            if own_echo {
+                                report(&mut ml, &text, cursor);
+                            }
+                        }
+                        plain(&mut ml, Key::RawCode(17));
+                        assert_eq!(ml.current_word(), "w");
+                        assert_eq!(
+                            ml.predictions().first().map(|p| p.word.as_str()),
+                            Some("World"),
+                            "linebreak={linebreak:?}, deleted={deletions}, own_echo={own_echo}, prefix={prefix:?}"
+                        );
+                        assert_eq!(ml.metrics().summary().total_commits, 1);
+                        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_known_linebreak_removal_reveals_literal_dot() {
+            for linebreak in ["\n", "\r\n", "\n\n"] {
+                for (remove_dot, separator, expected) in [
+                    (false, false, "world"), // The surviving dot still needs whitespace.
+                    (false, true, "World"),
+                    (true, true, "world"),
+                ] {
+                    let mut text = format!("hello. seed.{linebreak}  ");
+                    let mut ml = fresh_snapshot_after_sentence(false, &text);
+                    for _ in 0..2 + linebreak.chars().count() + usize::from(remove_dot) {
+                        assert_eq!(
+                            plain(&mut ml, Key::Backspace),
+                            [Action::HideGhost, Action::ForwardKey]
+                        );
+                        text.pop();
+                        report(&mut ml, &text, text.chars().count());
+                    }
+                    assert_eq!(
+                        text,
+                        if remove_dot {
+                            "hello. seed"
+                        } else {
+                            "hello. seed."
+                        }
+                    );
+                    assert_eq!(ml.core.has_sentence_boundary_hint(), !remove_dot);
+                    if separator {
+                        assert_eq!(
+                            plain(&mut ml, Key::Space),
+                            [Action::HideGhost, Action::ForwardKey]
+                        );
+                    }
+                    plain(&mut ml, Key::RawCode(17));
+                    assert_eq!(ml.current_word(), "w");
+                    assert_eq!(
+                        ml.predictions().first().map(|p| p.word.as_str()),
+                        Some(expected),
+                        "linebreak={linebreak:?}, remove_dot={remove_dot}, separator={separator}"
+                    );
+                    assert_eq!(ml.metrics().summary().total_commits, 1);
+                    assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_known_linebreak_delete_keeps_owned_postcaps_once() {
+            for own_echo in [false, true] {
+                let mut ml = fresh_snapshot_after_sentence(true, "hello. seed.\n  ");
+                assert_eq!(
+                    plain(&mut ml, Key::Backspace),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                if own_echo {
+                    report(&mut ml, "hello. seed.\n ", 14);
+                }
+                for code in [17, 24, 19, 38, 32] {
+                    plain(&mut ml, Key::RawCode(code));
+                }
+                assert_eq!(ml.current_word(), "world");
+                assert_eq!(
+                    plain(&mut ml, Key::Space),
+                    [
+                        Action::HideGhost,
+                        Action::CommitText("world".into()),
+                        Action::ForwardKey,
+                        Action::ReplaceWord {
+                            replace_len: 5,
+                            text: "World".into()
+                        },
+                    ],
+                    "own_echo={own_echo}"
+                );
+                assert!(ml.current_word().is_empty());
+                assert_eq!(ml.metrics().summary().total_commits, 2);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                assert!(ml.core.take_commit_learning().words.is_empty());
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_known_blank_deletion_and_revalidation_fences() {
+            for fence in [0, 1, 2, 3, 4, 5] {
+                let mut ml = match fence {
+                    0 => fresh_snapshot_after_sentence(false, "hello\nseed "),
+                    1 => {
+                        let mut unbound = sentence(true, false);
+                        report(&mut unbound, "hello. seed.\n  ", 15);
+                        assert!(unbound.sentence_echoes.is_none());
+                        unbound
+                    }
+                    2 => {
+                        let mut retired = fresh_snapshot_after_sentence(false, "hello. seed.\n  ");
+                        send(&mut retired, Key::Char('v'), Modifiers::CTRL);
+                        report(&mut retired, "hello. seed.\n  ", 15);
+                        assert!(retired.sentence_echoes.is_none());
+                        retired
+                    }
+                    3 => {
+                        let mut invalid = fresh_snapshot_after_sentence(false, "ordinary ");
+                        report(&mut invalid, "hello. seed.\n  ", 999);
+                        invalid
+                    }
+                    _ => {
+                        let mut opaque = fresh_snapshot_after_sentence(false, "hello. seed.\n  ");
+                        plain(&mut opaque, if fence == 4 { Key::Tab } else { Key::Return });
+                        opaque // No client ACK makes either separator a known literal image.
+                    }
+                };
+                assert_eq!(
+                    plain(&mut ml, Key::Backspace),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                assert!(ml.current_word().is_empty());
+                assert!(ml.sentence_echoes.is_none(), "fence={fence}");
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some("world"),
+                    "fence={fence}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+
+            // Deleting an already delivered semantic token is not an empty-token edit.
+            let mut delivered = fresh_snapshot_after_sentence(false, "hello. seed.\n  ");
+            let typed = plain(&mut delivered, Key::Char('a'));
+            assert!(typed.contains(&Action::ForwardKey));
+            assert_eq!(delivered.current_word(), "a");
+            plain(&mut delivered, Key::Backspace);
+            assert!(delivered.current_word().is_empty());
+            assert!(delivered.sentence_echoes.is_none());
+            plain(&mut delivered, Key::RawCode(17));
+            assert_eq!(delivered.current_word(), "w");
+            assert_eq!(
+                delivered.predictions().first().map(|p| p.word.as_str()),
+                Some("world")
+            );
+            assert_eq!(delivered.metrics().summary().total_commits, 1);
+            assert_eq!(delivered.metrics().summary().accepted_predictions, 0);
+
+            // Local preedit deletion never forwards a client Backspace or consumes the linebreak.
+            let mut preedit = fresh_snapshot_after_sentence(false, "hello. seed.\n  ");
+            plain(&mut preedit, Key::RawCode(17));
+            assert_eq!(preedit.current_word(), "w");
+            assert_eq!(
+                preedit.predictions().first().map(|p| p.word.as_str()),
+                Some("World")
+            );
+            assert_eq!(plain(&mut preedit, Key::Backspace), [Action::HideGhost]);
+            assert!(preedit.current_word().is_empty());
+            assert!(preedit.sentence_echoes.is_some());
+            plain(&mut preedit, Key::RawCode(17));
+            assert_eq!(preedit.current_word(), "w");
+            assert_eq!(
+                preedit.predictions().first().map(|p| p.word.as_str()),
+                Some("World")
+            );
+            assert_eq!(preedit.metrics().summary().total_commits, 1);
+            assert_eq!(preedit.metrics().summary().accepted_predictions, 0);
+
+            for deletions in [1, 2, 3] {
+                let mut ml = fresh_snapshot_after_sentence(false, "  ");
+                for _ in 0..deletions {
+                    assert_eq!(
+                        plain(&mut ml, Key::Backspace),
+                        [Action::HideGhost, Action::ForwardKey]
+                    );
+                }
+                if deletions == 3 {
+                    assert!(ml.sentence_echoes.is_none(), "past known document start");
+                }
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(if deletions < 3 { "World" } else { "world" })
                 );
                 assert_eq!(ml.metrics().summary().total_commits, 1);
                 assert_eq!(ml.metrics().summary().accepted_predictions, 0);
