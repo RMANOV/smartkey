@@ -333,3 +333,27 @@ def test_native_terminal_resolution_keeps_direct_semantic_suffix(fixture, expect
     assert core.current_word() == expected
 
     _terminal_assert_boundary(core, 57, expected)
+
+
+@pytest.mark.parametrize("context,expected", [(_TERMINAL_BG_CONTEXT, "но"), (None, "no")])
+def test_native_no_known_bg_context_and_observational_control(context, expected):
+    # Reduced verified current JSON frequencies; copied-corpus replay and the
+    # historical invocation/GUI are separate evidence boundaries.
+    core = _native().PyInputMethodCore()
+    for word, frequency in (("no", 2_238_721), ("not", 4_897_788), ("но", 3_630_780)):
+        core.load_word(word, frequency)
+    if context is not None:
+        core.set_surrounding_text(context, len(context))
+    readings = []
+    for code in (49, 24):
+        actions = core.process_keycode(code, 0)
+        word = core.current_word()
+        assert any(kind == "composing" and text.split("\x00", 1)[0] == word for kind, text in actions)
+        assert not any(kind in {"commit", "forward", "replace"} for kind, _ in actions)
+        readings.append(word)
+
+    _terminal_assert_boundary(core, 57, expected)
+
+    assert readings[-1] == expected
+    if context is not None:
+        assert readings[0] == "н"
