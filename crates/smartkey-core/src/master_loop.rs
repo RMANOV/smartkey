@@ -4770,6 +4770,32 @@ mod sentence_modifier_review_tests {
                                 plain(&mut ml, Key::Backspace),
                                 [Action::HideGhost, Action::ForwardKey]
                             );
+                            assert!(ml.current_word().is_empty());
+                            assert_eq!(ml.metrics().summary().total_commits, 1);
+                            assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                            if text == "hello. seed. " {
+                                // The observed plain Space was removed, leaving
+                                // the original dot pending rather than opaque.
+                                assert!(ml.sentence_echoes.is_some());
+                                assert!(ml.core.has_sentence_boundary_hint());
+                                report(&mut ml, "hello. seed.", 12);
+                                assert!(ml.sentence_echoes.is_some());
+                                assert!(ml.core.has_sentence_boundary_hint());
+                                // Public behavior distinguishes pending from a
+                                // confirmed start without a new Core test API.
+                                let mut adjacent = fresh_snapshot_after_sentence(false, text);
+                                plain(&mut adjacent, Key::Backspace);
+                                plain(&mut adjacent, Key::RawCode(17));
+                                assert_eq!(adjacent.current_word(), "w");
+                                assert_eq!(
+                                    adjacent.predictions().first().map(|p| p.word.as_str()),
+                                    Some("world")
+                                );
+                                assert_eq!(
+                                    plain(&mut ml, Key::Backspace),
+                                    [Action::HideGhost, Action::ForwardKey]
+                                );
+                            }
                         }
                         _ => {
                             for code in [17, 24, 19, 38, 32] {
@@ -4850,6 +4876,187 @@ mod sentence_modifier_review_tests {
                 report(&mut ml, text, text.chars().count());
                 assert!(ml.sentence_echoes.is_none());
                 assert!(!ml.core.has_sentence_boundary_hint());
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_observed_two_spaces_one_delete_keeps_prediction() {
+            for own_echo in [false, true] {
+                let mut document = "hello. seed.  ".to_string();
+                let mut ml = fresh_snapshot_after_sentence(false, &document);
+                assert_eq!(
+                    plain(&mut ml, Key::Backspace),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                assert!(ml.current_word().is_empty());
+                document.pop(); // Explicit synthetic client applies the forwarded Backspace.
+                if own_echo {
+                    report(&mut ml, &document, document.chars().count());
+                }
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some("World"),
+                    "own delete echo={own_echo}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_observed_space_delete_keeps_owned_postcaps() {
+            let mut ml = fresh_snapshot_after_sentence(true, "hello. seed.  ");
+            assert_eq!(
+                plain(&mut ml, Key::Backspace),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            for code in [17, 24, 19, 38, 32] {
+                plain(&mut ml, Key::RawCode(code));
+            }
+            assert_eq!(
+                plain(&mut ml, Key::Space),
+                [
+                    Action::HideGhost,
+                    Action::CommitText("world".into()),
+                    Action::ForwardKey,
+                    Action::ReplaceWord {
+                        replace_len: 5,
+                        text: "World".into()
+                    },
+                ]
+            );
+            assert!(ml.current_word().is_empty());
+            assert_eq!(ml.metrics().summary().total_commits, 2);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_observed_space_removal_and_reinsert_track_boundary() {
+            for (deletions, separator, expected) in [
+                (2, false, "world"), // No separator: adjacent input stays lowercase.
+                (3, true, "world"),  // The original dot was removed too.
+                (2, true, "World"),  // Surviving dot becomes a start on real Space.
+            ] {
+                let mut ml = fresh_snapshot_after_sentence(false, "hello. seed.  ");
+                for _ in 0..deletions {
+                    assert_eq!(
+                        plain(&mut ml, Key::Backspace),
+                        [Action::HideGhost, Action::ForwardKey]
+                    );
+                }
+                if separator {
+                    assert_eq!(
+                        plain(&mut ml, Key::Space),
+                        [Action::HideGhost, Action::ForwardKey]
+                    );
+                }
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected),
+                    "deleted={deletions}, separator={separator}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_observed_closers_and_repeated_terminators_retract() {
+            for (text, tail_count) in [
+                ("hello. seed.!)]  ", 3),
+                ("hello. seed.!)]”  ", 4), // Count Unicode characters, not bytes.
+                ("hello. seed)!  ", 0),    // The closer precedes the first terminator.
+            ] {
+                for (remove_first, expected) in [(true, "world"), (false, "World")] {
+                    let mut ml = fresh_snapshot_after_sentence(false, text);
+                    let deletions = 2 + tail_count + usize::from(remove_first);
+                    // Remove both Spaces and all characters AFTER the first
+                    // terminator; only remove that terminator in the negative arm.
+                    for _ in 0..deletions {
+                        assert_eq!(
+                            plain(&mut ml, Key::Backspace),
+                            [Action::HideGhost, Action::ForwardKey]
+                        );
+                    }
+                    assert_eq!(
+                        plain(&mut ml, Key::Space),
+                        [Action::HideGhost, Action::ForwardKey]
+                    );
+                    plain(&mut ml, Key::RawCode(17));
+                    assert_eq!(ml.current_word(), "w");
+                    assert_eq!(
+                        ml.predictions().first().map(|p| p.word.as_str()),
+                        Some(expected),
+                        "text={text:?}, deleted={deletions}"
+                    );
+                    assert_eq!(ml.metrics().summary().total_commits, 1);
+                    assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_mixed_observed_whitespace_remains_opaque() {
+            for whitespace in ["\t  ", "\r\n  ", "\u{00a0}  "] {
+                let mut ml =
+                    fresh_snapshot_after_sentence(false, &format!("hello. seed.{whitespace}"));
+                assert_eq!(
+                    plain(&mut ml, Key::Backspace),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                assert_eq!(
+                    plain(&mut ml, Key::Space),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some("world"),
+                    "opaque whitespace={whitespace:?}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_empty_space_keeps_fallback_veto_after_shortcut() {
+            for shortcut in [false, true] {
+                let mut ml = fresh(false);
+                report(&mut ml, "", 0);
+                for code in [35, 18, 38, 38, 24, 52] {
+                    plain(&mut ml, Key::RawCode(code));
+                }
+                // Adapter refresh before Space makes anticipation cache the
+                // punctuation-bearing old token, separate from the local hint.
+                report(&mut ml, "hello.", 6);
+                plain(&mut ml, Key::Space);
+                report(&mut ml, "hello. seed.  ", 14);
+                assert_eq!(
+                    plain(&mut ml, Key::Space),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                if shortcut {
+                    assert_eq!(
+                        send(&mut ml, Key::Char('v'), Modifiers::CTRL),
+                        [Action::ForwardKey]
+                    );
+                }
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                let expected = if shortcut { "world" } else { "World" };
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected),
+                    "shortcut={shortcut}"
+                );
                 assert_eq!(ml.metrics().summary().total_commits, 1);
                 assert_eq!(ml.metrics().summary().accepted_predictions, 0);
             }

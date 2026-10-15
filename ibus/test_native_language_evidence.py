@@ -1186,3 +1186,48 @@ def test_native_refreshed_sentence_start_revalidates_current_cursor(tmp_path, pr
     core.set_surrounding_text(context, len(context))
     assert core.current_word() == ""
     _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=True)
+
+
+@pytest.mark.parametrize("context,deletions,restore_space,capitalized", [
+    ("hello. seed.  ", 1, False, True),
+    ("hello. seed.  ", 2, False, False),
+    ("hello. seed.  ", 2, True, True),
+    ("hello. seed.!)]  ", 5, True, True),
+    ("hello. seed.!)]  ", 6, True, False),
+])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_literal_tail_deletion_preserves_surviving_separator(
+    tmp_path, context, deletions, restore_space, capitalized, mode
+):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    core.set_surrounding_text("", 0)
+    _raw_sentence_prefix(core)
+    core.set_surrounding_text(context, len(context))
+    for _ in range(deletions):
+        actions = core.process_keycode(14, 0)
+        assert actions.count(("forward", "")) == 1 and core.current_word() == "", actions
+        assert not any(kind in {"commit", "replace", "composing"} for kind, _ in actions), actions
+    if restore_space:
+        assert core.process_keycode(57, 0) == [("hide", ""), ("forward", "")]
+    _assert_native_sentence_review_target(
+        core, tmp_path, prediction=prediction, capitalized=capitalized
+    )
+
+
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_positive_extra_space_then_shortcut_keeps_stale_context_veto(tmp_path, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    core.set_surrounding_text("", 0)
+    _raw_sentence_prefix(core, whitespace=False)
+    # Cache a real sentence-ending lexical hint before the following report
+    # changes the cursor context. No context, word or learning state is assigned.
+    core.set_surrounding_text("hello.", 6)
+    assert core.process_keycode(57, 0) == [("hide", ""), ("forward", "")]
+    context = "hello. seed.  "
+    core.set_surrounding_text(context, len(context))
+    assert core.process_keycode(57, 0) == [("hide", ""), ("forward", "")]
+    assert core.process_keycode(47, 1 << 2) == [("forward", "")]  # Ctrl+V.
+    assert core.current_word() == ""
+    _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=False)

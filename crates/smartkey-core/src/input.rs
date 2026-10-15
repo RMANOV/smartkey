@@ -698,12 +698,30 @@ impl InputMethodCore {
                 tail_count: 0,
             }
         } else if CapsEngine::requires_capitalization(trimmed) {
+            // Count characters after the earliest terminator in this literal suffix.
+            let mut tail_count = 0;
+            for (offset, ch) in trimmed
+                .chars()
+                .rev()
+                .take_while(|&ch| {
+                    CapsEngine::is_closing_punctuation(ch) || matches!(ch, '.' | '!' | '?')
+                })
+                .enumerate()
+            {
+                if matches!(ch, '.' | '!' | '?') {
+                    tail_count = offset;
+                }
+            }
             if whitespace.is_empty() {
-                SentenceBoundaryHint::AwaitingWhitespace { tail_count: 0 }
+                SentenceBoundaryHint::AwaitingWhitespace { tail_count }
             } else {
                 SentenceBoundaryHint::SentenceStart {
-                    spaces: 0,
-                    tail_count: 0,
+                    spaces: if whitespace.bytes().all(|byte| byte == b' ') {
+                        whitespace.len()
+                    } else {
+                        0
+                    },
+                    tail_count,
                 }
             }
         } else {
@@ -1152,14 +1170,12 @@ impl InputMethodCore {
                 let sentence_start = self.sentence_start_override();
                 // Empty Space does not finish a word; retain its current-position
                 // decision. Return instead establishes a new local boundary.
-                let next_presentation_override = if event.key == Key::Space
-                    && self.current_word.is_empty()
-                    && self.sentence_boundary == SentenceBoundaryHint::None
-                {
-                    self.sentence_presentation_override
-                } else {
-                    None
-                };
+                let next_presentation_override =
+                    if event.key == Key::Space && self.current_word.is_empty() {
+                        self.sentence_presentation_override
+                    } else {
+                        None
+                    };
                 let next_boundary = if event.key == Key::Return {
                     SentenceBoundaryHint::SentenceStart {
                         spaces: 0,
