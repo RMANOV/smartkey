@@ -1168,3 +1168,21 @@ def test_native_refreshed_client_text_withdraws_stale_sentence_hint(tmp_path, mo
     core.set_surrounding_text(context, len(context))
     assert core.current_word() == ""
     _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=False)
+
+
+@pytest.mark.parametrize("prior_report", ["sentence", "ordinary-word"])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_sentence_start_revalidates_current_cursor(tmp_path, prior_report, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    # The observer has an actual known empty report before its own delivery.
+    core.set_surrounding_text("", 0)
+    _raw_sentence_prefix(core)
+    if prior_report == "ordinary-word":
+        context = "hello. seed "
+        core.set_surrounding_text(context, len(context))
+    # A second external edit can establish a new sentence after a prior veto.
+    context = "hello. seed. "
+    core.set_surrounding_text(context, len(context))
+    assert core.current_word() == ""
+    _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=True)

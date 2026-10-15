@@ -688,6 +688,32 @@ impl InputMethodCore {
         self.sentence_presentation_override = Some(false);
     }
 
+    /// Reconcile a valid current-position report, never lexical context.
+    pub(crate) fn reconcile_sentence_boundary_hint(&mut self, before_cursor: &str) {
+        let trimmed = before_cursor.trim_end();
+        let whitespace = &before_cursor[trimmed.len()..];
+        self.sentence_boundary = if trimmed.is_empty() || whitespace.contains(['\r', '\n']) {
+            SentenceBoundaryHint::SentenceStart {
+                spaces: 0,
+                tail_count: 0,
+            }
+        } else if CapsEngine::requires_capitalization(trimmed) {
+            if whitespace.is_empty() {
+                SentenceBoundaryHint::AwaitingWhitespace { tail_count: 0 }
+            } else {
+                SentenceBoundaryHint::SentenceStart {
+                    spaces: 0,
+                    tail_count: 0,
+                }
+            }
+        } else {
+            SentenceBoundaryHint::None
+        };
+        // A fresh positive lives in the enum. If an uncertain edit withdraws
+        // it, stale lexical casing must not reappear through the fallback.
+        self.sentence_presentation_override = Some(false);
+    }
+
     fn sentence_start_override(&self) -> Option<bool> {
         // A genuine new local boundary supersedes an older external veto.
         self.sentence_boundary
@@ -9541,5 +9567,57 @@ mod sentence_boundary_followup_tests {
         );
         assert!(profile.markov_trigrams.is_empty());
         assert!(profile.confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn sentence_boundary_reconciled_positive_withdrawal_keeps_false_floor() {
+        for event in [
+            None,
+            Some(KeyEvent {
+                key: Key::Other(0xff63),
+                modifiers: Modifiers::SHIFT,
+            }),
+            Some(KeyEvent {
+                key: Key::RawCode(47),
+                modifiers: Modifiers::CTRL,
+            }),
+            Some(KeyEvent {
+                key: Key::RawCode(u16::MAX),
+                modifiers: Modifiers::empty(),
+            }),
+            Some(KeyEvent {
+                key: Key::Backspace,
+                modifiers: Modifiers::empty(),
+            }),
+        ] {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            // This stale lexical hint is independently overridden by the
+            // current-position decision, including after its positive expires.
+            core.apply_hints(&crate::master_loop::Hints {
+                context_words: vec!["hello.".into()],
+                ..Default::default()
+            });
+            core.reconcile_sentence_boundary_hint("hello. seed. ");
+            let expected = if let Some(event) = event {
+                let actions = core.handle_key(event);
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|a| matches!(a, Action::ForwardKey))
+                        .count(),
+                    1
+                );
+                assert!(!actions
+                    .iter()
+                    .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+                assert!(core.current_word().is_empty());
+                "world"
+            } else {
+                "World"
+            };
+            assert_eq!(prediction(&mut core), expected);
+            review_only_hello_learned(&core);
+        }
     }
 }

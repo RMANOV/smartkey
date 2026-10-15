@@ -80,8 +80,8 @@ enum OpaqueSeparator {
     Tab,
 }
 
-/// Only possible echoes of actions actually delivered while a local sentence
-/// hint is live. A matching report acknowledges progress, never an undo log.
+/// Possible delivered echoes while sentence presentation remains bound to a
+/// client segment. Matching acknowledges progress, never an undo log.
 struct SentenceEchoes {
     base: Box<str>,
     anchor: usize,
@@ -417,6 +417,7 @@ impl MasterLoop {
         let was_composing = self.core.debug_state().0;
         let mut actions = self.core.handle_key(event.clone());
         let commit_learning = self.core.take_commit_learning();
+        let word_committed = !commit_learning.words.is_empty();
         self.apply_correction_override(&mut actions);
         self.enforce_rejection_suppression(&mut actions);
         if !self.core.current_word().is_empty()
@@ -487,7 +488,7 @@ impl MasterLoop {
         }
 
         // Word committed? → LEARNING phase.
-        if !commit_learning.words.is_empty() {
+        if word_committed {
             self.phase = Phase::Learning;
             self.learn_from_commit(commit_learning);
             self.phase = Phase::Anticipating;
@@ -504,7 +505,13 @@ impl MasterLoop {
         }
 
         self.note_shown_ghost(&actions);
-        self.record_sentence_delivery(&event, &actions, hint_was_live, was_composing);
+        self.record_sentence_delivery(
+            &event,
+            &actions,
+            hint_was_live,
+            was_composing,
+            word_committed,
+        );
 
         actions
     }
@@ -677,8 +684,7 @@ impl MasterLoop {
     }
 
     fn reconcile_sentence_report(&mut self) {
-        if !self.core.has_sentence_boundary_hint() {
-            self.sentence_echoes = None;
+        if self.sentence_echoes.is_none() && !self.core.has_sentence_boundary_hint() {
             return;
         }
         let Some((text, cursor)) = self
@@ -691,15 +697,22 @@ impl MasterLoop {
             // to lift an already established negative presentation decision.
             return;
         };
-        if !self
-            .sentence_echoes
-            .as_mut()
-            .is_some_and(|echoes| echoes.acknowledge(text, cursor))
-        {
+        let Some(echoes) = self.sentence_echoes.as_mut() else {
             // An unbound first report cannot be assumed to echo an empty
             // document. Withdraw presentation only; retain the active token.
             self.core.withdraw_sentence_boundary_hint();
-            self.sentence_echoes = None;
+            return;
+        };
+        if !echoes.acknowledge(text, cursor) {
+            let byte = text
+                .char_indices()
+                .nth(cursor)
+                .map(|(byte, _)| byte)
+                .unwrap_or(text.len());
+            self.core.reconcile_sentence_boundary_hint(&text[..byte]);
+            // The lease already existed. A fresh valid report can replace
+            // its anchor even when ordinary text removed the local hint.
+            self.sentence_echoes = SentenceEchoes::new(text, cursor);
         }
     }
 
@@ -709,12 +722,19 @@ impl MasterLoop {
         actions: &[Action],
         hint_was_live: bool,
         was_composing: bool,
+        word_committed: bool,
     ) {
-        if !self.core.has_sentence_boundary_hint() {
+        let hint_is_live = self.core.has_sentence_boundary_hint();
+        let forwarded_backspace = matches!(event.key, Key::Backspace)
+            && actions.iter().any(|a| matches!(a, Action::ForwardKey));
+        if !self.core.is_enabled()
+            || (!hint_is_live
+                && (self.sentence_echoes.is_none() || word_committed || forwarded_backspace))
+        {
             self.sentence_echoes = None;
             return;
         }
-        if !hint_was_live {
+        if !hint_was_live && hint_is_live && self.sentence_echoes.is_none() {
             self.sentence_echoes = self
                 .surrounding_text
                 .as_deref()
@@ -4555,6 +4575,283 @@ mod sentence_modifier_review_tests {
                 report(&mut ml, &text, cursor);
                 assert!(ml.sentence_echoes.is_none());
                 assert!(!ml.core.has_sentence_boundary_hint());
+            }
+        }
+
+        fn fresh_snapshot_after_sentence(post: bool, text: &str) -> MasterLoop {
+            let mut ml = fresh(post);
+            // Explicit empty report is a real anchor, never an inferred base.
+            report(&mut ml, "", 0);
+            for code in [35, 18, 38, 38, 24, 52, 57] {
+                plain(&mut ml, Key::RawCode(code));
+            }
+            let prior = ml.light_profile.lang_prior;
+            report(&mut ml, text, text.chars().count());
+            assert_eq!(ml.light_profile.lang_prior, prior);
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            ml
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_terminal_prediction_matches_current_report() {
+            for (text, expected) in [
+                ("hello. seed ", "world"),
+                ("hello. seed.", "world"), // Adjacent input has no separator.
+                ("hello. seed. ", "World"),
+            ] {
+                let mut ml = fresh_snapshot_after_sentence(false, text);
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected),
+                    "fresh report {text:?}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_pending_terminator_requires_real_space() {
+            let mut ml = fresh_snapshot_after_sentence(false, "hello. seed.");
+            assert_eq!(
+                plain(&mut ml, Key::Space),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            plain(&mut ml, Key::RawCode(17));
+            assert_eq!(ml.current_word(), "w");
+            assert_eq!(
+                ml.predictions().first().map(|p| p.word.as_str()),
+                Some("World")
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_terminal_controls_optin_postcaps() {
+            for (text, capitalize) in [("hello. seed ", false), ("hello. seed. ", true)] {
+                let mut ml = fresh_snapshot_after_sentence(true, text);
+                for code in [17, 24, 19, 38, 32] {
+                    plain(&mut ml, Key::RawCode(code));
+                }
+                let actions = plain(&mut ml, Key::Space);
+                let mut expected = vec![
+                    Action::HideGhost,
+                    Action::CommitText("world".into()),
+                    Action::ForwardKey,
+                ];
+                if capitalize {
+                    expected.push(Action::ReplaceWord {
+                        replace_len: 5,
+                        text: "World".into(),
+                    });
+                }
+                assert_eq!(actions, expected, "fresh report {text:?}");
+                assert!(ml.current_word().is_empty());
+                assert_eq!(ml.metrics().summary().total_commits, 2);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_reports_reconcile_both_directions() {
+            for (first, second, expected) in [
+                ("hello. seed. ", "hello. seed. other ", "world"),
+                ("hello. seed ", "hello. seed. ", "World"),
+            ] {
+                let mut ml = fresh_snapshot_after_sentence(false, first);
+                let prior = ml.light_profile.lang_prior;
+                report(&mut ml, second, second.chars().count());
+                assert_eq!(ml.light_profile.lang_prior, prior);
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected),
+                    "{first:?} -> {second:?}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_reports_preserve_preedit_and_user_case() {
+            for (upper, text, word) in
+                [(true, "hello. seed ", "Wo"), (false, "hello. seed. ", "wo")]
+            {
+                let mut ml = fresh_snapshot_after_sentence(false, "hello. ");
+                send(
+                    &mut ml,
+                    Key::RawCode(17),
+                    if upper {
+                        Modifiers::SHIFT
+                    } else {
+                        Modifiers::empty()
+                    },
+                );
+                plain(&mut ml, Key::RawCode(24));
+                assert_eq!(ml.current_word(), word);
+                let prior = ml.light_profile.lang_prior;
+                report(&mut ml, text, text.chars().count());
+                assert_eq!(ml.current_word(), word);
+                assert!(ml.debug_state().0);
+                assert_eq!(ml.light_profile.lang_prior, prior);
+                plain(&mut ml, Key::RawCode(19));
+                assert_eq!(ml.current_word(), if upper { "Wor" } else { "wor" });
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some("World")
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_observed_linebreak_with_indent_starts_sentence() {
+            let mut ml = fresh_snapshot_after_sentence(false, "hello. seed\n  ");
+            plain(&mut ml, Key::RawCode(17));
+            assert_eq!(ml.current_word(), "w");
+            assert_eq!(
+                ml.predictions().first().map(|p| p.word.as_str()),
+                Some("World")
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_own_forwarded_word_echo_keeps_token_start_decision() {
+            for (base, expected) in [("hello. ", "World"), ("hello. seed ", "world")] {
+                let mut ml = fresh_snapshot_after_sentence(false, base);
+                let mut document = base.to_string();
+                for ch in ['w', 'o'] {
+                    let actions = plain(&mut ml, Key::Char(ch));
+                    assert_eq!(
+                        actions
+                            .iter()
+                            .filter(|a| matches!(a, Action::ForwardKey))
+                            .count(),
+                        1
+                    );
+                    assert!(!actions
+                        .iter()
+                        .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+                    // Actual semantic Forward delivers this original glyph;
+                    // ShowGhost is preedit, not document text.
+                    document.push(ch);
+                    report(&mut ml, &document, document.chars().count());
+                }
+                assert_eq!(ml.current_word(), "wo");
+                plain(&mut ml, Key::RawCode(19));
+                assert_eq!(ml.current_word(), "wor");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected)
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_lease_retires_on_client_edits_and_word_completion() {
+            for text in ["hello. seed. ", "hello. seed "] {
+                for transition in [0, 1, 2, 3] {
+                    let mut ml = fresh_snapshot_after_sentence(false, text);
+                    assert!(ml.sentence_echoes.is_some());
+                    match transition {
+                        0 => {
+                            plain(&mut ml, Key::Other(0xff63));
+                        }
+                        1 => {
+                            send(&mut ml, Key::Char('v'), Modifiers::CTRL);
+                        }
+                        2 => {
+                            assert_eq!(
+                                plain(&mut ml, Key::Backspace),
+                                [Action::HideGhost, Action::ForwardKey]
+                            );
+                        }
+                        _ => {
+                            for code in [17, 24, 19, 38, 32] {
+                                plain(&mut ml, Key::RawCode(code));
+                            }
+                            plain(&mut ml, Key::Space);
+                            assert_eq!(ml.metrics().summary().total_commits, 2);
+                        }
+                    }
+                    assert!(ml.current_word().is_empty());
+                    assert!(ml.sentence_echoes.is_none());
+                    assert!(!ml.core.has_sentence_boundary_hint());
+                    // A discarded lease cannot be recreated just because an
+                    // old report has a sentence-looking suffix or a false veto.
+                    report(&mut ml, "hello. seed. ", 13);
+                    assert!(ml.sentence_echoes.is_none());
+                    assert!(!ml.core.has_sentence_boundary_hint());
+                    if transition != 3 {
+                        plain(&mut ml, Key::RawCode(17));
+                        assert_eq!(ml.current_word(), "w");
+                        assert_eq!(
+                            ml.predictions().first().map(|p| p.word.as_str()),
+                            Some("world")
+                        );
+                        assert_eq!(ml.metrics().summary().total_commits, 1);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_lease_ignores_unavailable_geometry() {
+            for (text, expected) in [("hello. seed. ", "World"), ("hello. seed ", "world")] {
+                for unavailable in [0, 1] {
+                    let mut ml = fresh_snapshot_after_sentence(false, text);
+                    assert!(ml.sentence_echoes.is_some());
+                    if unavailable == 0 {
+                        ml.set_surrounding_text(None, None);
+                    } else {
+                        report(&mut ml, "ordinary ", 999);
+                    }
+                    assert!(ml.sentence_echoes.is_some());
+                    plain(&mut ml, Key::RawCode(17));
+                    assert_eq!(ml.current_word(), "w");
+                    assert_eq!(
+                        ml.predictions().first().map(|p| p.word.as_str()),
+                        Some(expected)
+                    );
+                    assert_eq!(ml.metrics().summary().total_commits, 1);
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_lease_kill_and_reenable_retire_authority() {
+            for text in ["hello. seed. ", "hello. seed "] {
+                let mut ml = fresh_snapshot_after_sentence(false, text);
+                assert!(ml.sentence_echoes.is_some());
+                assert!(ml.is_enabled());
+                assert_eq!(
+                    send(&mut ml, Key::Escape, Modifiers::SUPER),
+                    [Action::HideGhost]
+                );
+                assert!(!ml.is_enabled());
+                assert!(ml.current_word().is_empty());
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+                report(&mut ml, "hello. seed. other. ", 20);
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+                assert_eq!(
+                    send(&mut ml, Key::Escape, Modifiers::SUPER),
+                    [Action::HideGhost]
+                );
+                assert!(ml.is_enabled());
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+                report(&mut ml, text, text.chars().count());
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
             }
         }
     }
