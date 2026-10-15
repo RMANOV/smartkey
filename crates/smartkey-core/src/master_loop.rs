@@ -200,6 +200,14 @@ impl MasterLoop {
         let commit_learning = self.core.take_commit_learning();
         self.apply_correction_override(&mut actions);
         self.enforce_rejection_suppression(&mut actions);
+        if !self.core.current_word().is_empty()
+            && actions.iter().any(|a| matches!(a, Action::CommitText(_)))
+            && actions.iter().any(|a| matches!(a, Action::ForwardKey))
+        {
+            // A mid-token delivery handoff hides the previous composing ghost;
+            // its old display identity must not survive as an acceptance proof.
+            self.last_shown_ghost = None;
+        }
         let terminal_accept =
             pre_accept_prediction.is_some() && commit_learning.accepted_prediction;
 
@@ -2422,8 +2430,30 @@ mod terminal_alignment_contract_tests {
         }
     }
 
-    fn assert_full_token(ml: &mut MasterLoop, expected: &str) {
+    fn step(ml: &mut MasterLoop, key: Key, text: &mut String, preedit: &mut String) {
+        let actions = ml.handle_key(KeyEvent {
+            key: key.clone(),
+            modifiers: Modifiers::empty(),
+        });
+        super::hybrid_delivery_contract_tests::project(&actions, &key, text, preedit);
+    }
+
+    fn assert_full_token(
+        ml: &mut MasterLoop,
+        expected: &str,
+        text: &mut String,
+        preedit: &mut String,
+    ) {
+        assert_eq!(ml.current_word(), expected);
+        assert_eq!(
+            text, expected,
+            "handoff delivered the prefix and semantic suffix once"
+        );
+        assert!(preedit.is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 0);
         let actions = ml.handle_key(raw(57));
+        super::hybrid_delivery_contract_tests::project(&actions, &Key::RawCode(57), text, preedit);
+        assert_eq!(text, &format!("{expected} "));
         assert_eq!(
             actions
                 .iter()
@@ -2432,7 +2462,7 @@ mod terminal_alignment_contract_tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![expected],
+            Vec::<&str>::new(),
             "{actions:?}"
         );
         assert_eq!(
@@ -2447,6 +2477,14 @@ mod terminal_alignment_contract_tests {
             .any(|a| matches!(a, Action::ReplaceWord { .. })));
         assert_eq!(ml.current_word(), "");
         assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert!(ml
+            .core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|word| word == expected));
     }
 
     #[test]
@@ -2457,15 +2495,13 @@ mod terminal_alignment_contract_tests {
         ml.load_word_lang("ви", 2_137_962, LangId::Bg);
         let text = "Искам да благодаря ";
         ml.set_surrounding_text(Some(text.to_string()), Some(text.chars().count()));
-        ml.handle_key(raw(17));
-        ml.handle_key(raw(23));
+        let (mut text, mut preedit) = (String::new(), String::new());
+        step(&mut ml, Key::RawCode(17), &mut text, &mut preedit);
+        step(&mut ml, Key::RawCode(23), &mut text, &mut preedit);
         assert_eq!(ml.current_word(), "wi");
-        ml.handle_key(KeyEvent {
-            key: Key::Char('x'),
-            modifiers: Modifiers::empty(),
-        });
+        step(&mut ml, Key::Char('x'), &mut text, &mut preedit);
         assert_eq!(ml.current_word(), "wix");
-        assert_full_token(&mut ml, "wix");
+        assert_full_token(&mut ml, "wix", &mut text, &mut preedit);
     }
 
     #[test]
@@ -2479,17 +2515,15 @@ mod terminal_alignment_contract_tests {
             ml.load_word_lang(word, frequency, LangId::En);
         }
         ml.load_word_lang("статия", 50_000, LangId::Bg);
+        let (mut text, mut preedit) = (String::new(), String::new());
         for code in [31, 20, 30, 20, 23, 16] {
-            ml.handle_key(raw(code));
+            step(&mut ml, Key::RawCode(code), &mut text, &mut preedit);
         }
         assert_eq!(ml.current_word(), "statiq");
         assert_eq!(ml.core.debug_state(), (true, true, false));
-        ml.handle_key(KeyEvent {
-            key: Key::Char('x'),
-            modifiers: Modifiers::empty(),
-        });
+        step(&mut ml, Key::Char('x'), &mut text, &mut preedit);
         assert_eq!(ml.current_word(), "statiqx");
-        assert_full_token(&mut ml, "statiqx");
+        assert_full_token(&mut ml, "statiqx", &mut text, &mut preedit);
     }
 }
 
@@ -2565,5 +2599,471 @@ mod no_regression_contract_tests {
     #[test]
     fn no_regression_absent_context_keeps_observational_latin_control() {
         check(None, "no");
+    }
+}
+
+#[cfg(test)]
+mod hybrid_delivery_contract_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn scenario(name: &str) -> (Vec<Key>, &'static str) {
+        use Key::{Backspace as Bs, Char as Ch, RawCode as Raw};
+        match name {
+            "raw_suffix" => (vec![Raw(16), Ch('a'), Raw(45)], "qax"),
+            "one_raw_backspace" => (vec![Raw(16), Ch('a'), Bs], "q"),
+            "two_raw_backspace" => (vec![Raw(16), Raw(45), Ch('a'), Bs], "qx"),
+            "direct_prefix" => (vec![Ch('a'), Raw(16)], "aq"),
+            "immediate_space" => (vec![Raw(16), Ch('a')], "qa"),
+            "raw_only" => (vec![Raw(16), Raw(45), Bs], "q"),
+            "direct_only" => (vec![Ch('q'), Ch('a')], "qa"),
+            "unicode_mixed" => (vec![Ch('é'), Ch('д'), Bs, Ch('я')], "éя"),
+            _ => panic!("unknown test scenario"),
+        }
+    }
+
+    // Projection of the bounded IBus dispatcher contract: composing replaces
+    // preedit, hide discards it, safe_commit clears it before insertion, and a
+    // ForwardKey delivers the ORIGINAL event keyval after the action batch.
+    // Raw fixture keyvals below are explicitly Latin q/x, not inferred winners.
+    pub(super) fn project(actions: &[Action], key: &Key, text: &mut String, preedit: &mut String) {
+        for action in actions {
+            match action {
+                Action::ShowComposing { typed, .. } => preedit.clone_from(typed),
+                Action::HideGhost | Action::ShowGhost(_) => preedit.clear(),
+                Action::CommitText(word) => {
+                    preedit.clear();
+                    text.push_str(word);
+                }
+                Action::ReplaceWord { .. } => panic!("unexpected replacement: {actions:?}"),
+                Action::ForwardKey => {}
+            }
+        }
+        if actions
+            .iter()
+            .any(|action| matches!(action, Action::ForwardKey))
+        {
+            match key {
+                Key::Char(ch) => text.push(*ch),
+                Key::RawCode(16) => text.push('q'),
+                Key::RawCode(45) => text.push('x'),
+                Key::RawCode(57) | Key::Space => text.push(' '),
+                Key::Backspace => {
+                    text.pop();
+                }
+                _ => panic!("unmodelled ORIGINAL forwarded keyval: {key:?}"),
+            }
+        }
+    }
+
+    fn run(name: &str, canonical: bool) {
+        let (keys, expected) = scenario(name);
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        let (mut delivered, mut preedit, mut trace) = (String::new(), String::new(), Vec::new());
+        for key in keys.into_iter().chain([Key::RawCode(57)]) {
+            let word_before = ml.current_word().to_string();
+            let actions = ml.handle_key(KeyEvent {
+                key: key.clone(),
+                modifiers: Modifiers::empty(),
+            });
+            project(&actions, &key, &mut delivered, &mut preedit);
+            trace.push(format!("key={key:?}; word={:?}; actions={actions:?}; committed={delivered:?}; preedit={preedit:?}", ml.current_word()));
+            if key != Key::RawCode(57) {
+                assert_eq!(ml.metrics().summary().total_commits, 0, "{trace:#?}");
+            }
+            if key == Key::RawCode(57) {
+                eprintln!("scenario={name}; trace={trace:#?}");
+                assert_eq!(ml.current_word(), "");
+                assert!(preedit.is_empty());
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|a| matches!(a, Action::ForwardKey))
+                        .count(),
+                    1
+                );
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                if canonical {
+                    assert_eq!(
+                        word_before, expected,
+                        "canonical token conservation; {trace:#?}"
+                    );
+                } else {
+                    assert_eq!(
+                        delivered,
+                        format!("{expected} "),
+                        "client delivery projection; {trace:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    macro_rules! contract {
+        ($test:ident, $scenario:literal, $canonical:literal) => {
+            #[test]
+            fn $test() {
+                run($scenario, $canonical);
+            }
+        };
+    }
+    contract!(hybrid_canonical_raw_suffix, "raw_suffix", true);
+    contract!(
+        hybrid_canonical_one_raw_backspace,
+        "one_raw_backspace",
+        true
+    );
+    contract!(
+        hybrid_canonical_two_raw_backspace,
+        "two_raw_backspace",
+        true
+    );
+    contract!(hybrid_canonical_direct_prefix, "direct_prefix", true);
+    contract!(hybrid_client_raw_suffix, "raw_suffix", false);
+    contract!(hybrid_client_one_raw_backspace, "one_raw_backspace", false);
+    contract!(hybrid_client_two_raw_backspace, "two_raw_backspace", false);
+    contract!(hybrid_client_direct_prefix, "direct_prefix", false);
+    contract!(hybrid_client_immediate_space, "immediate_space", false);
+    contract!(hybrid_control_raw_only, "raw_only", false);
+    contract!(hybrid_control_direct_only, "direct_only", false);
+    contract!(hybrid_control_unicode_mixed, "unicode_mixed", false);
+}
+
+#[cfg(test)]
+mod hybrid_handoff_control_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn key(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn core(ghost: bool) -> MasterLoop {
+        MasterLoop::new(InputConfig {
+            ghost_text: ghost,
+            ..InputConfig::default()
+        })
+    }
+
+    fn handoff(ml: &mut MasterLoop) {
+        key(ml, Key::RawCode(16));
+        let prefix = ml.current_word().to_string();
+        let actions = key(ml, Key::Char('a'));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [prefix.as_str()]
+        );
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::ReplaceWord { .. } | Action::ShowGhost(_) | Action::ShowComposing { .. }
+        )));
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        assert!(ml.core.export_personal_profile().cvm.words.is_empty());
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn hybrid_control_layout_snapshot_preserves_caps_and_physical_punctuation() {
+        for bg in [false, true] {
+            for modifiers in [
+                Modifiers::empty(),
+                Modifiers::CAPS_LOCK,
+                Modifiers::SHIFT,
+                Modifiers::SHIFT | Modifiers::CAPS_LOCK,
+            ] {
+                for (code, en, shifted_en, bg_lower, bg_upper) in [
+                    (26, '[', '{', 'ш', 'Ш'),
+                    (27, ']', '}', 'щ', 'Щ'),
+                    (41, '`', '~', 'ч', 'Ч'),
+                    (43, '\\', '|', 'ю', 'Ю'),
+                ] {
+                    let mut ml = core(false);
+                    ml.load_word_lang(
+                        if bg { "яяя" } else { "question" },
+                        1000,
+                        if bg { LangId::Bg } else { LangId::En },
+                    );
+                    handoff(&mut ml);
+                    let before = ml.core.detected_language();
+                    let prior = ml.light_profile().lang_prior;
+                    let actions = ml.handle_key(KeyEvent {
+                        key: Key::RawCode(code),
+                        modifiers,
+                    });
+                    let selected = if bg {
+                        if modifiers.contains(Modifiers::SHIFT)
+                            ^ modifiers.contains(Modifiers::CAPS_LOCK)
+                        {
+                            bg_upper
+                        } else {
+                            bg_lower
+                        }
+                    } else if modifiers.contains(Modifiers::SHIFT) {
+                        shifted_en
+                    } else {
+                        en
+                    };
+                    assert!(
+                        actions.contains(&Action::CommitText(selected.to_string())),
+                        "{actions:?}"
+                    );
+                    assert!(!actions
+                        .iter()
+                        .any(|a| matches!(a, Action::ForwardKey | Action::ReplaceWord { .. })));
+                    assert_eq!(
+                        ml.current_word(),
+                        format!("{}a{selected}", if bg { "я" } else { "q" })
+                    );
+                    let after = ml.core.detected_language();
+                    assert_eq!(
+                        (after.lang, after.confidence),
+                        (before.lang, before.confidence)
+                    );
+                    assert_eq!(ml.metrics().summary().total_commits, 0);
+                    assert_eq!(ml.light_profile().lang_prior, prior);
+                    assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+                    let boundary = key(&mut ml, Key::Space);
+                    assert!(!boundary
+                        .iter()
+                        .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+                    assert_eq!(ml.metrics().summary().total_commits, 1);
+                    assert_eq!(
+                        ml.light_profile().lang_prior,
+                        prior,
+                        "mixed/inferred word did not become direct proof"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_control_semantic_prefix_has_explicit_en_raw_default() {
+        let mut ml = core(false);
+        let bg = "Искам да благодаря ";
+        ml.set_surrounding_text(Some(bg.to_string()), Some(bg.chars().count()));
+        key(&mut ml, Key::Char('а'));
+        let before = ml.core.detected_language();
+        let actions = key(&mut ml, Key::RawCode(26));
+        assert_eq!(ml.current_word(), "а[");
+        assert!(actions.contains(&Action::CommitText("[".to_string())));
+        assert!(!actions.contains(&Action::ForwardKey));
+        let after = ml.core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence)
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+    }
+
+    #[test]
+    fn hybrid_control_literal_handoff_resists_legacy_transliteration() {
+        let setup = || {
+            let mut ml = core(false);
+            ml.load_word_lang("question", 2_000_000, LangId::En);
+            ml.load_word_lang("яа", 1_000_000, LangId::Bg);
+            ml
+        };
+        let mut ml = setup();
+        handoff(&mut ml);
+        assert_eq!(ml.current_word(), "qa");
+        let actions = key(&mut ml, Key::Char('a'));
+        assert_eq!(ml.current_word(), "qaa");
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        let mut direct = setup();
+        key(&mut direct, Key::Char('q'));
+        let actions = key(&mut direct, Key::Char('a'));
+        assert_eq!(
+            direct.current_word(),
+            "яа",
+            "semantic-only legacy policy is unchanged"
+        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { text, .. } if text == "яа")));
+    }
+
+    #[test]
+    fn hybrid_control_resets_and_empty_backspace_restore_raw_composition() {
+        for exit in [0, 1, 2] {
+            let mut ml = core(false);
+            handoff(&mut ml);
+            match exit {
+                0 => {
+                    ml.reset();
+                }
+                1 => {
+                    ml.focus_lost();
+                }
+                _ => {
+                    key(&mut ml, Key::Left);
+                }
+            }
+            assert_eq!(ml.current_word(), "");
+            let actions = key(&mut ml, Key::RawCode(16));
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, Action::ShowComposing { .. })),
+                "exit={exit}: {actions:?}"
+            );
+            assert!(!actions.iter().any(|a| matches!(a, Action::CommitText(_))));
+        }
+        let mut escaped = core(false);
+        handoff(&mut escaped);
+        key(&mut escaped, Key::Escape);
+        assert_eq!(
+            escaped.current_word(),
+            "qa",
+            "Escape dismisses, not cancels, a delivered token"
+        );
+        assert!(key(&mut escaped, Key::RawCode(45)).contains(&Action::CommitText("x".to_string())));
+        assert_eq!(escaped.current_word(), "qax");
+        let mut ml = core(false);
+        handoff(&mut ml);
+        key(&mut ml, Key::Backspace);
+        key(&mut ml, Key::Backspace);
+        assert_eq!(ml.current_word(), "");
+        for ch in "123".chars() {
+            key(&mut ml, Key::Char(ch));
+        }
+        key(&mut ml, Key::Space);
+        for (actual, expected) in ml
+            .light_profile()
+            .lang_prior
+            .iter()
+            .zip([0.3234, 0.3332, 0.3434])
+        {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "editing baseline survives handoff and deletion"
+            );
+        }
+        let prior = ml.light_profile().lang_prior;
+        key(&mut ml, Key::Space);
+        assert_eq!(ml.light_profile().lang_prior, prior);
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert!(key(&mut ml, Key::RawCode(16))
+            .iter()
+            .any(|a| matches!(a, Action::ShowComposing { .. })));
+    }
+
+    #[test]
+    fn hybrid_control_hidden_handoff_prediction_cannot_be_accepted() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: true,
+            space_accept: true,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("qabc", 1_000_000, LangId::En);
+        handoff(&mut ml);
+        assert_eq!(ml.current_word(), "qa");
+        assert!(!ml.has_ghost() && ml.predictions().is_empty());
+        assert!(ml.last_shown_ghost.is_none());
+        let tab = key(&mut ml, Key::Tab);
+        assert_eq!(tab, vec![Action::ForwardKey]);
+        let boundary = key(&mut ml, Key::Space);
+        assert!(boundary.contains(&Action::ForwardKey));
+        assert!(!boundary.iter().any(|a| matches!(a, Action::CommitText(_))));
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+    }
+
+    #[test]
+    fn hybrid_control_next_raw_prediction_partial_right_and_full_accept_once() {
+        for partial in [false, true] {
+            let mut ml = core(true);
+            ml.load_word_lang("qaxyz", 1_000_000, LangId::En);
+            handoff(&mut ml);
+            key(&mut ml, Key::RawCode(45));
+            assert_eq!(ml.current_word(), "qax");
+            assert!(ml.has_ghost());
+            if partial {
+                let actions = key(&mut ml, Key::Right);
+                assert_eq!(ml.current_word(), "qaxy");
+                assert!(actions.contains(&Action::CommitText("y".to_string())));
+                assert_eq!(ml.metrics().summary().total_commits, 0);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+            let actions = key(&mut ml, if partial { Key::Right } else { Key::Tab });
+            assert!(actions.contains(&Action::CommitText(
+                if partial { "z" } else { "yz" }.to_string()
+            )));
+            assert_eq!(ml.current_word(), "");
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+            assert_eq!(
+                key(&mut ml, Key::Space)
+                    .iter()
+                    .filter(|a| matches!(a, Action::CommitText(_)))
+                    .count(),
+                0
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_punctuation_parity_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    #[test]
+    fn hybrid_punctuation_matches_existing_nondual_semantic_token_policy() {
+        for raw in [false, true] {
+            let mut ml = MasterLoop::new(InputConfig {
+                ghost_text: false,
+                ..InputConfig::default()
+            });
+            for key in [
+                if raw {
+                    Key::RawCode(16)
+                } else {
+                    Key::Char('q')
+                },
+                Key::Char('a'),
+                if raw {
+                    Key::RawCode(26)
+                } else {
+                    Key::Char('[')
+                },
+            ] {
+                ml.handle_key(KeyEvent {
+                    key,
+                    modifiers: Modifiers::empty(),
+                });
+            }
+            assert_eq!(ml.current_word(), "qa[");
+            assert_eq!(ml.metrics().summary().total_commits, 0);
+            let actions = ml.handle_key(KeyEvent {
+                key: Key::Space,
+                modifiers: Modifiers::empty(),
+            });
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::CommitText(_)))
+                    .count(),
+                0
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+        }
     }
 }

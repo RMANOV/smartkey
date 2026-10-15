@@ -563,6 +563,8 @@ pub struct InputMethodCore {
     /// Dual-interpretation buffer for layout-agnostic input (v0.5.0).
     /// `Some` when active (after first `Key::RawCode` in a word), `None` otherwise.
     dual_buffer: Option<DualBuffer>,
+    /// Rendering layout after a token leaves preedit; never language evidence.
+    word_delivery_layout: Option<keymap::Layout>,
     /// Typing regime detector (v0.5+) — gates tech vocab δ weight in the ensemble.
     regime_detector: RegimeDetector,
     /// True when the current word triggered a dual-buffer layout flip (for regime detection).
@@ -600,6 +602,7 @@ impl InputMethodCore {
             last_prediction_language: None,
             transliteration_active: false,
             dual_buffer: None,
+            word_delivery_layout: None,
             regime_detector: RegimeDetector::new(),
             current_word_had_flip: false,
             caps_engine: CapsEngine::new(),
@@ -790,6 +793,20 @@ impl InputMethodCore {
                 keymap::scancode_to_both_with_caps(code, shift_held, caps_lock)
             {
                 if en_ch != bg_ch && self.config.dual_buffer.enabled {
+                    let layout = self.word_delivery_layout.or_else(|| {
+                        (self.dual_buffer.is_none() && !self.current_word.is_empty())
+                            .then_some(keymap::Layout::En)
+                    });
+                    if let Some(layout) = layout {
+                        // A semantic prefix is already in the client. Keep it
+                        // intact; the old nondual fallback uses EN by default.
+                        self.word_delivery_layout = Some(layout);
+                        let ch = match layout {
+                            keymap::Layout::En => en_ch,
+                            keymap::Layout::Bg => bg_ch,
+                        };
+                        return self.append_delivered_raw_char(ch);
+                    }
                     // Dual-interpretable character → handle via dual buffer.
                     return self.handle_dual_buffer_key(en_ch, bg_ch);
                 }
@@ -1025,6 +1042,7 @@ impl InputMethodCore {
                             self.current_word.clear();
                             self.word_origins.clear();
                             self.terminal_context_lang = None;
+                            self.word_delivery_layout = None;
                             self.ghost.clear();
                             return vec![Action::HideGhost];
                         }
@@ -1055,6 +1073,7 @@ impl InputMethodCore {
                 }
                 if self.current_word.is_empty() {
                     self.terminal_context_lang = None;
+                    self.word_delivery_layout = None;
                 }
                 let ghost_action = self.update_predictions();
                 vec![ghost_action, Action::ForwardKey]
@@ -1085,6 +1104,15 @@ impl InputMethodCore {
                     return actions;
                 }
 
+                // Semantic letters are exact glyphs, not physical pairs. Deliver
+                // the old preedit once, then keep this entire token in the
+                // noncomposing path without committing a word or its evidence.
+                let mut actions = if ch.is_alphabetic() {
+                    self.handoff_preedit()
+                } else {
+                    Vec::new()
+                };
+
                 // Clear anticipatory ghost if active — user is typing a new word.
                 if self.anticipatory_ghost_active {
                     self.anticipatory_ghost_active = false;
@@ -1099,7 +1127,7 @@ impl InputMethodCore {
 
                 // v0.4.1: transliteration — auto-map Latin to Cyrillic when
                 // the user is on the wrong keyboard layout.
-                if self.transliteration_active {
+                if self.word_delivery_layout.is_none() && self.transliteration_active {
                     if let Some(cyrillic) = lang_detect::phonetic_map(ch) {
                         self.pop_word_char(); // Remove the observed Latin char.
                         self.push_word_char(cyrillic, false);
@@ -1112,7 +1140,8 @@ impl InputMethodCore {
                 }
 
                 // Check for wrong layout on 2nd+ Latin char.
-                if !self.transliteration_active
+                if self.word_delivery_layout.is_none()
+                    && !self.transliteration_active
                     && self.current_word.chars().count() >= 2
                     && self.check_wrong_layout()
                 {
@@ -1134,7 +1163,19 @@ impl InputMethodCore {
                 }
 
                 let ghost_action = self.update_predictions();
-                vec![ghost_action, Action::ForwardKey]
+                if actions.is_empty() {
+                    actions.push(ghost_action);
+                } else {
+                    // The adapter drops a fresh ghost before this forwarded
+                    // letter lands. Do not attest or accept that hidden pair.
+                    self.ghost.clear();
+                    self.last_predictions.clear();
+                    self.last_prediction_language = None;
+                    self.space_accept_display_attested = false;
+                    actions.push(Action::HideGhost);
+                }
+                actions.push(Action::ForwardKey);
+                actions
             }
 
             // RawCode is resolved before this match — unreachable.
@@ -1659,6 +1700,28 @@ impl InputMethodCore {
 
     // -- internal helpers -----------------------------------------------
 
+    fn handoff_preedit(&mut self) -> Vec<Action> {
+        let Some(db) = self.dual_buffer.take() else {
+            return Vec::new();
+        };
+        self.word_delivery_layout = Some(match db.winner_lang() {
+            LangId::Bg => keymap::Layout::Bg,
+            LangId::En | LangId::Tech => keymap::Layout::En,
+        });
+        vec![
+            Action::HideGhost,
+            Action::CommitText(self.current_word.clone()),
+        ]
+    }
+
+    fn append_delivered_raw_char(&mut self, ch: char) -> Vec<Action> {
+        self.push_word_char(ch, false);
+        let ghost = self.update_predictions();
+        // ForwardKey delivers the original keyval, which need not match this
+        // rendering layout. Consume the key and insert the selected glyph.
+        vec![Action::CommitText(ch.to_string()), ghost]
+    }
+
     fn begin_word_edit(&mut self) {
         if !self
             .word_origins
@@ -2180,6 +2243,7 @@ impl InputMethodCore {
         self.last_prediction_language = None;
         self.transliteration_active = false;
         self.dual_buffer = None;
+        self.word_delivery_layout = None;
         self.current_word_had_flip = false;
         self.anticipatory_ghost_active = false;
     }

@@ -318,21 +318,23 @@ def test_native_terminal_context_erase_retype_uses_current_client_cache(withdraw
 
 @pytest.mark.parametrize("fixture,expected", [("both-supported", "wix"), ("one-sided", "statiqx")])
 def test_native_terminal_resolution_keeps_direct_semantic_suffix(fixture, expected):
-    if fixture == "both-supported":
-        core = _terminal_core()
-        _terminal_type_wi(core)
-    else:
-        core = _native().PyInputMethodCore()
+    core = _terminal_core() if fixture == "both-supported" else _native().PyInputMethodCore()
+    if fixture == "one-sided":
         for word, frequency in (("status", 900_000), ("static", 600_000), ("station", 500_000), ("статия", 50_000)):
             core.load_word(word, frequency)
-        for code in (31, 20, 30, 20, 23, 16):
-            core.process_keycode(code, 0)
-        assert core.current_word() == "statiq"
+    engine, client, preedit = _hybrid_client(core)
+    codes = (17, 23) if fixture == "both-supported" else (31, 20, 30, 20, 23, 16)
+    for code in codes:
+        _hybrid_step(core, engine, client, preedit, "raw", code)
+    assert core.current_word() == expected[:-1]
+    if fixture == "one-sided":
         assert list(core.debug_state()) == [True, True, False]
-    core.handle_key(ord("x"), 0)
-    assert core.current_word() == expected
-
-    _terminal_assert_boundary(core, 57, expected)
+    _hybrid_step(core, engine, client, preedit, "char", ord("x"))
+    assert core.current_word() == expected and client.text == expected and preedit[0] == ""
+    boundary = _hybrid_step(core, engine, client, preedit, "raw", 57)
+    assert client.text == expected + " " and core.current_word() == ""
+    assert not any(kind == "commit" for kind, _ in boundary["actions"])
+    assert sum(kind == "forward" for kind, _ in boundary["actions"]) == 1
 
 
 @pytest.mark.parametrize("context,expected", [(_TERMINAL_BG_CONTEXT, "но"), (None, "no")])
@@ -357,3 +359,158 @@ def test_native_no_known_bg_context_and_observational_control(context, expected)
     assert readings[-1] == expected
     if context is not None:
         assert readings[0] == "н"
+
+
+_HYBRID_SCENARIOS = {
+    "raw_suffix": ([("raw", 16), ("char", ord("a")), ("raw", 45)], "qax"),
+    "one_raw_backspace": ([("raw", 16), ("char", ord("a")), ("char", 0xFF08)], "q"),
+    "two_raw_backspace": ([("raw", 16), ("raw", 45), ("char", ord("a")), ("char", 0xFF08)], "qx"),
+    "direct_prefix": ([("char", ord("a")), ("raw", 16)], "aq"),
+    "immediate_space": ([("raw", 16), ("char", ord("a"))], "qa"),
+    "raw_only": ([("raw", 16), ("raw", 45), ("char", 0xFF08)], "q"),
+    "direct_only": ([("char", ord("q")), ("char", ord("a"))], "qa"),
+    "unicode_mixed": ([("char", ord("é")), ("char", ord("д")), ("char", 0xFF08), ("char", ord("я"))], "éя"),
+}
+
+
+def _hybrid_client(core):
+    # Actual dispatcher with fake IBus, audited native core and ORIGINAL keyvals.
+    from .test_space_accept import build_client_engine
+
+    engine, recorder, client = build_client_engine([])
+    engine._core = core
+    preedit = [""]
+
+    def show(text, _cursor, visible):
+        recorder.preedits.append((text.s, visible))
+        preedit[0] = text.s if visible else ""
+
+    engine.update_preedit_text = show
+    engine.hide_preedit_text = lambda: preedit.__setitem__(0, "")
+    return engine, client, preedit
+
+
+def _hybrid_step(core, engine, client, preedit, kind, code, original_keyval=None, modifiers=0):
+    actions = core.process_keycode(code, modifiers) if kind == "raw" else core.handle_key(code, modifiers)
+    assert not any(action == "replace" for action, _ in actions), actions
+    consumed = engine._execute_actions(actions)
+    if original_keyval is None:
+        original_keyval = {16: ord("q"), 17: ord("w"), 20: ord("t"), 23: ord("i"), 30: ord("a"), 31: ord("s"), 45: ord("x"), 57: 0x20}[code] if kind == "raw" else code
+        if kind == "char" and 0x80 <= code < 0xF000:
+            # Actual Unicode-encoded IBus originals normalize to native Char.
+            original_keyval = 0x01000000 | code
+    if not consumed:
+        client.apply_key(original_keyval, modifiers, "default")
+    return {"kind": kind, "key": code, "original_keyval": original_keyval,
+            "word": core.current_word(), "actions": actions,
+            "committed": client.text, "preedit": preedit[0]}
+
+
+def _hybrid_run(scenario):
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+    engine, client, preedit = _hybrid_client(core)
+    keys, expected = _HYBRID_SCENARIOS[scenario]
+    trace = []
+    before_boundary = None
+    for kind, code in [*keys, ("raw", 57)]:
+        word_before = core.current_word()
+        trace.append(_hybrid_step(core, engine, client, preedit, kind, code))
+        if (kind, code) == ("raw", 57):
+            before_boundary = word_before
+            assert core.current_word() == "" and preedit[0] == "", trace
+            assert sum(action == "forward" for action, _ in trace[-1]["actions"]) == 1, trace
+    print(json.dumps({"scenario": scenario, "trace": trace}, ensure_ascii=False))
+    return before_boundary, client.text, expected, trace
+
+
+@pytest.mark.parametrize("scenario", list(_HYBRID_SCENARIOS)[:4])
+def test_native_hybrid_canonical_conservation(scenario):
+    canonical, _delivered, expected, trace = _hybrid_run(scenario)
+    assert canonical == expected, trace
+
+
+@pytest.mark.parametrize("scenario", list(_HYBRID_SCENARIOS))
+def test_native_hybrid_client_delivery(scenario):
+    _canonical, delivered, expected, trace = _hybrid_run(scenario)
+    assert delivered == expected + " ", trace
+
+
+
+def test_native_hybrid_snapshot_and_semantic_prefix_default(tmp_path):
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+    core.load_word("яяя", 1000)
+    before = _profile(core, tmp_path, "snapshot-before.json")
+    engine, client, preedit = _hybrid_client(core)
+    _hybrid_step(core, engine, client, preedit, "raw", 16)
+    _hybrid_step(core, engine, client, preedit, "char", ord("a"))
+    engine._keys_since_content_type = 2
+    raw = _hybrid_step(core, engine, client, preedit, "raw", 26, original_keyval=ord("["), modifiers=2)
+    assert raw["actions"][0] == ("commit", "Ш") and ("forward", "") not in raw["actions"]
+    assert core.current_word() == client.text == "яaШ"
+    assert engine._keys_since_content_type == 2
+    assert _profile(core, tmp_path, "snapshot-mid.json") == before
+    _hybrid_step(core, engine, client, preedit, "raw", 57)
+    assert client.text == "яaШ "
+    assert _profile(core, tmp_path, "snapshot-after.json")["lang_prior"] == before["lang_prior"]
+
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+    engine, client, preedit = _hybrid_client(core)
+    _hybrid_step(core, engine, client, preedit, "char", ord("а"))
+    raw = _hybrid_step(core, engine, client, preedit, "raw", 16, original_keyval=ord("я"))
+    assert core.current_word() == client.text == "аq"
+    assert ("commit", "q") in raw["actions"] and ("forward", "") not in raw["actions"]
+
+
+def test_native_hybrid_handoff_hides_unshown_acceptance(tmp_path):
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": True, "space_accept": True}))
+    core.load_word("qabc", 1_000_000)
+    before = _profile(core, tmp_path, "hidden-before.json")
+    engine, client, preedit = _hybrid_client(core)
+    _hybrid_step(core, engine, client, preedit, "raw", 16)
+    engine._keys_since_content_type = 1
+    handoff = _hybrid_step(core, engine, client, preedit, "char", ord("a"))
+    assert client.text == core.current_word() == "qa" and preedit[0] == ""
+    assert not any(kind in {"ghost", "composing", "replace"} for kind, _ in handoff["actions"])
+    assert engine._keys_since_content_type == 1
+    assert _profile(core, tmp_path, "hidden-mid.json") == before
+    boundary = _hybrid_step(core, engine, client, preedit, "raw", 57)
+    assert client.text == "qa " and core.current_word() == ""
+    assert not any(kind == "commit" for kind, _ in boundary["actions"])
+    assert sum(kind == "forward" for kind, _ in boundary["actions"]) == 1
+
+
+def test_native_hybrid_partial_right_and_full_accept_deliver_suffix_once():
+    for partial in (False, True):
+        core = _native().PyInputMethodCore()
+        core.load_word("qaxyz", 1_000_000)
+        engine, client, preedit = _hybrid_client(core)
+        for kind, code in (("raw", 16), ("char", ord("a")), ("raw", 45)):
+            _hybrid_step(core, engine, client, preedit, kind, code)
+        assert core.current_word() == client.text == "qax"
+        if partial:
+            _hybrid_step(core, engine, client, preedit, "char", 0xFF53)
+            assert core.current_word() == client.text == "qaxy"
+        _hybrid_step(core, engine, client, preedit, "char", 0xFF53 if partial else 0xFF09)
+        assert core.current_word() == "" and client.text == "qaxyz"
+        boundary = _hybrid_step(core, engine, client, preedit, "raw", 57)
+        assert client.text == "qaxyz "
+        assert not any(kind == "commit" for kind, _ in boundary["actions"])
+
+
+def test_native_hybrid_cancel_focus_and_navigation_never_redeliver_prefix():
+    for exit_kind in ("reset", "focus", "navigation"):
+        core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+        engine, client, preedit = _hybrid_client(core)
+        _hybrid_step(core, engine, client, preedit, "raw", 16)
+        _hybrid_step(core, engine, client, preedit, "char", ord("a"))
+        if exit_kind == "reset":
+            actions = core.reset()
+        elif exit_kind == "focus":
+            actions = core.focus_lost()
+        else:
+            actions = core.handle_key(0xFF51, 0)
+        assert not any(kind == "commit" for kind, _ in actions)
+        engine._execute_actions(actions)
+        assert client.text == "qa" and core.current_word() == ""
+        restarted = _hybrid_step(core, engine, client, preedit, "raw", 16)
+        assert any(kind == "composing" for kind, _ in restarted["actions"])

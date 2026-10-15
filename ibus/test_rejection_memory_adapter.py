@@ -9,6 +9,8 @@ import sys
 import tempfile
 import types
 
+import pytest
+
 os.environ.setdefault(
     "SMARTKEY_PHASEA_DATA", tempfile.mkdtemp(prefix="smartkey-test-phasea-")
 )
@@ -218,3 +220,133 @@ def test_older_native_module_without_feedback_api_remains_compatible():
 
     core.queue([("forward", "")], "helx")
     engine.do_process_key_event(ord("x"), 45, 0)
+
+
+@pytest.mark.parametrize(
+    "letter,post_word,expected_feedback,expected_outcome",
+    [
+        ("l", "hell", [], ("completed", "completed_manually")),
+        ("x", "helx", [("hel", "hello")], ("rejected", "continued_typing")),
+    ],
+    ids=["matching-continuation", "diverging-continuation"],
+)
+def test_hybrid_delivery_commit_forward_letter_uses_continued_typing_outcome(
+    letter, post_word, expected_feedback, expected_outcome
+):
+    engine, core = build_engine()
+    events = capture_events(engine)
+    show_hello(engine, core)
+
+    # A semantic letter hands off the old preedit to client-owned text while
+    # extending the SAME canonical token. The letter itself is forwarded.
+    core.queue([("hide", ""), ("commit", "hel"), ("forward", "")], post_word)
+    assert engine.do_process_key_event(ord(letter), 0, 0) is False
+
+    assert core.recorded == expected_feedback
+    outcomes = [
+        (event, payload.get("reason"))
+        for event, payload in events
+        if event in {"completed", "rejected", "accepted"}
+    ]
+    assert outcomes == [expected_outcome]
+
+
+def test_hybrid_delivery_handoff_and_raw_fragment_notify_o1_at_final_space_only(
+    monkeypatch,
+):
+    engine, core = build_engine()
+    committed_words = []
+    engine._o1 = types.SimpleNamespace(on_word_commit=committed_words.append)
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    show_hello(engine, core)
+
+    core.queue([("hide", ""), ("commit", "hel"), ("forward", "")], "hell")
+    assert engine.do_process_key_event(ord("l"), 0, 0) is False
+    # The next Raw glyph is delivered by CommitText, not by forwarding an
+    # event whose keyval could disagree with the selected layout.
+    core.queue([("commit", "o")], "hello")
+    assert engine.do_process_key_event(ord("o"), 24, 0) is True
+    assert committed_words == [], "partial client delivery is not a word commit"
+
+    # The client already owns the complete token; the true boundary carries
+    # no CommitText. Its pre/post canonical transition must still feed O1 once.
+    core.queue([("hide", ""), ("forward", "")], "")
+    assert engine.do_process_key_event(ske.IBus.KEY_space, 57, 0) is False
+    assert committed_words == ["hello"]
+
+    core.queue([("hide", ""), ("forward", "")], "")
+    engine.do_process_key_event(ske.IBus.KEY_space, 57, 0)
+    assert committed_words == ["hello"], "empty Space must not duplicate the tap"
+
+
+def test_hybrid_delivery_semantic_partial_right_notifies_o1_on_true_boundary():
+    engine, core = build_engine()
+    committed_words = []
+    engine._o1 = types.SimpleNamespace(on_word_commit=committed_words.append)
+    for letter, word in [("h", "h"), ("e", "he"), ("l", "hel")]:
+        core.queue([("hide", ""), ("forward", "")], word)
+        assert engine.do_process_key_event(ord(letter), 0, 0) is False
+
+    core.queue([("commit", "l"), ("ghost", "o")], "hell")
+    engine.do_process_key_event(ske.IBus.KEY_Right, 0, 0)
+    core.queue([("hide", ""), ("forward", "")], "hello")
+    engine.do_process_key_event(ord("o"), 0, 0)
+    assert committed_words == []
+
+    core.queue([("hide", ""), ("forward", "")], "")
+    engine.do_process_key_event(ske.IBus.KEY_space, 0, 0)
+    assert committed_words == ["hello"]
+
+
+@pytest.mark.parametrize("accept_key", [ske.IBus.KEY_Tab, ske.IBus.KEY_Right])
+def test_hybrid_delivery_full_accept_still_notifies_o1_once(accept_key):
+    engine, core = build_engine()
+    committed_words = []
+    engine._o1 = types.SimpleNamespace(on_word_commit=committed_words.append)
+    show_hello(engine, core)
+
+    core.queue([("hide", ""), ("commit", "hello")], "")
+    engine.do_process_key_event(accept_key, 0, 0)
+    assert committed_words == ["hello"]
+    assert core.recorded == []
+
+    core.queue([("hide", ""), ("forward", "")], "")
+    engine.do_process_key_event(ske.IBus.KEY_space, 0, 0)
+    assert committed_words == ["hello"]
+
+
+def test_hybrid_delivery_bg_raw_bracket_is_continuation_until_real_space(monkeypatch):
+    engine, core = build_engine()
+    committed_words = []
+    engine._o1 = types.SimpleNamespace(on_word_commit=committed_words.append)
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    core._predictions = [("зашеметен", 1.0, 0.9)]
+    show_hello(engine, core, prefix="за", ghost="шеметен")
+
+    # A BG rendering layout delivers ш from Raw26 even though the original
+    # event's EN keyval is '['. That keyval causes the REAL caller to capture
+    # a nonempty O1 pre-word, so post-state must disambiguate the fragment.
+    core.queue([("commit", "ш")], "заш")
+    assert engine.do_process_key_event(ord("["), 26, 0) is True
+    assert core.recorded == [], "matching BG typing must not reject its ghost"
+    assert committed_words == [], "a raw letter fragment is not a word boundary"
+
+    core.queue([("hide", ""), ("forward", "")], "")
+    assert engine.do_process_key_event(ske.IBus.KEY_space, 57, 0) is False
+    assert committed_words == ["заш"]
+
+
+def test_hybrid_delivery_semantic_en_bracket_can_still_end_composed_word():
+    engine, core = build_engine()
+    committed_words = []
+    engine._o1 = types.SimpleNamespace(on_word_commit=committed_words.append)
+    core._predictions = [("query", 1.0, 0.9)]
+    show_hello(engine, core, prefix="q", ghost="uery")
+
+    # Pure Raw composition followed by a SEMANTIC '[' retains the existing
+    # punctuation guard: commit q, reset, forward the bracket. This differs
+    # from a consumed Raw26 append in word-local hybrid delivery mode.
+    core.queue([("hide", ""), ("commit", "q"), ("forward", "")], "")
+    assert engine.do_process_key_event(ord("["), 0, 0) is False
+    assert core.recorded == [("q", "query")]
+    assert committed_words == ["q"]
