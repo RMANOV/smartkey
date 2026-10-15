@@ -215,3 +215,36 @@ def test_native_profile_replacement_removes_previous_personal_confirmation(tmp_p
 
     assert not _has_novel_candidate(core)
     assert core.debug_state()[1] is False
+
+
+def test_native_profile_float_roundtrip_preserves_f64(tmp_path, private_paths):
+    _source, template = _seed(tmp_path)
+    values = [0.48475499919573045] + [n / 19.0 for n in range(1, 17)]
+    for index, value in enumerate(values):
+        case = tmp_path / f"float-{index}"
+        case.mkdir()
+        seed = json.loads(json.dumps(template))
+        seed["light_profile"] = {
+            "lang_prior": [value, (1.0 - value) * 0.6, (1.0 - value) * 0.4],
+            "ghost_accept_rate": value,
+            "suppress_after_reject": 1,
+            "confidence_floor": max(0.12, 0.35 - 0.25 * value),
+        }
+        source = case / "synthetic-profile.json"
+        source.write_text(json.dumps(seed))
+        private_paths.write_text(source.read_text())
+
+        default = _native().PyInputMethodCore("{}")
+        default.load_personal()
+        _assert_learning(seed, _export(default, case / "after-default-load.json"))
+        default.save_personal()
+        _assert_learning(seed, json.loads(private_paths.read_text()))
+
+        explicit = _native().PyInputMethodCore("{}")
+        explicit.import_personal(str(source))
+        exported = case / "after-explicit-import.json"
+        _assert_learning(seed, _export(explicit, exported))
+        restored = _native().PyInputMethodCore("{}")
+        restored.import_personal(str(exported))
+        _assert_learning(seed, _export(restored, case / "after-explicit-roundtrip.json"))
+        assert json.loads(source.read_text()) == seed

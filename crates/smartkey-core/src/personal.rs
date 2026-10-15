@@ -383,4 +383,44 @@ mod tests {
             .iter()
             .any(|(c, w, n)| c == "hello" && w == "world" && *n == 5));
     }
+
+    #[test]
+    fn personal_profile_float_roundtrip_preserves_f64_bits() {
+        let values =
+            std::iter::once(0.48475499919573045_f64).chain((1..=16).map(|n| f64::from(n) / 19.0));
+        for value in values {
+            let mut profile = PersonalProfile::new(
+                test_cvm_snapshot(),
+                PersonalMarkovSnapshot {
+                    bigrams: Vec::new(),
+                    trigrams: Vec::new(),
+                },
+                None,
+            );
+            profile.light_profile = Some(LightProfile {
+                lang_prior: [value, (1.0 - value) * 0.6, (1.0 - value) * 0.4],
+                ghost_accept_rate: value,
+                suppress_after_reject: 1,
+                confidence_floor: (0.35 - 0.25 * value).max(0.12),
+            });
+            let bits = |light: &LightProfile| {
+                (
+                    light.lang_prior.map(f64::to_bits),
+                    light.ghost_accept_rate.to_bits(),
+                    light.suppress_after_reject,
+                    light.confidence_floor.to_bits(),
+                )
+            };
+            let expected = bits(profile.light_profile.as_ref().unwrap());
+            for generation in 0..3 {
+                let json = serde_json::to_string_pretty(&profile).unwrap();
+                profile = load_personal_json(&json).unwrap();
+                assert_eq!(
+                    bits(profile.light_profile.as_ref().unwrap()),
+                    expected,
+                    "value={value:?}, generation={generation}"
+                );
+            }
+        }
+    }
 }
