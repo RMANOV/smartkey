@@ -786,3 +786,41 @@ def test_native_4c_erased_transliteration_then_new_preedit_keeps_literal_handoff
     final = _native_profile_fixture(core, tmp_path, "fresh-final.json")
     assert final["cvm"]["words"] == ["зa"] and not final.get("confirmed_words", [])
     assert final["light_profile"]["lang_prior"] == before["lang_prior"]
+
+
+@pytest.mark.parametrize(
+    "opt_in,previous,word,expected_replacement",
+    [
+        (True, (), "hello", "Hello"),
+        (True, ("seed",), "hello", None),
+        (True, ("seed.",), "hello", "Hello"),
+        (True, ("seed",), "hello.", None),
+        (False, (), "hello", None),
+    ],
+    ids=["first-word", "middle-word", "after-stored-punctuation",
+         "current-punctuation-is-not-previous", "default-off"],
+)
+def test_native_post_commit_caps_uses_preceding_word(
+    opt_in, previous, word, expected_replacement
+):
+    # Exercise real semantic input and the actual post-commit producer. No
+    # replacement action or private context is supplied by this fixture.
+    core = _native().PyInputMethodCore(json.dumps({
+        "ghost_text": False,
+        "lang_detection": False,
+        "post_commit_autocorrect": opt_in,
+    }))
+    trace = []
+    for token in (*previous, word):
+        for char in token:
+            trace.append(core.handle_key(ord(char), 0))
+        assert core.current_word() == token, trace
+        actions = core.handle_key(0x20, 0)
+        trace.append(actions)
+        assert core.current_word() == "", trace
+
+    replacements = [_native().ffi_decode_replace_payload(payload)
+                    for kind, payload in actions if kind == "replace"]
+    expected = [] if expected_replacement is None else [(len(word), expected_replacement)]
+    assert replacements == expected, trace
+    assert actions.count(("forward", "")) == 1, trace

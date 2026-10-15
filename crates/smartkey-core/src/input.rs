@@ -2065,8 +2065,9 @@ impl InputMethodCore {
             return None; // Already capitalized.
         }
 
-        // Check sentence-start: previous committed word ends with .!?\n
-        let needs_cap = if let Some(prev) = self.context.back() {
+        // The current word is already appended; inspect the preceding committed
+        // word for sentence-ending punctuation (.!?\n).
+        let needs_cap = if let Some(prev) = self.context.iter().rev().nth(1) {
             CapsEngine::requires_capitalization(prev)
         } else {
             true // Start of input.
@@ -3255,9 +3256,23 @@ mod tests {
             });
             core.current_word = typed.to_string();
             let actions = core.handle_key(press(Key::Space));
-            assert!(!actions
+            let replacements: Vec<_> = actions
                 .iter()
-                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+                .filter_map(|a| match a {
+                    Action::ReplaceWord { replace_len, text } => {
+                        Some((*replace_len, text.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            // The shared opt-in also enables first-word capitalization; it
+            // must not permit an unsupported language/layout substitution.
+            let expected = if typed == "шщчю" {
+                vec![(4, "Шщчю")]
+            } else {
+                vec![]
+            };
+            assert_eq!(replacements, expected);
         }
     }
 
@@ -3278,9 +3293,21 @@ mod tests {
             );
             core.current_word = typed.to_string();
             let actions = core.handle_key(press(Key::Space));
-            assert!(!actions
+            let replacements: Vec<_> = actions
                 .iter()
-                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+                .filter_map(|a| match a {
+                    Action::ReplaceWord { replace_len, text } => {
+                        Some((*replace_len, text.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let expected = if typed == "шщчю" {
+                vec![(4, "Шщчю")]
+            } else {
+                vec![]
+            };
+            assert_eq!(replacements, expected);
         }
     }
 
@@ -5682,21 +5709,32 @@ mod lang_prior_tests {
         core
     }
 
-    /// Desired: a typed word that exists (7) is not auto-corrected to a
+    /// Desired: a typed word that exists (7) is not language-corrected to a
     /// transliteration that is merely 20/7 ≈ 2.9× more frequent (below the
     /// 5× rule).  RED today: `word_frequency("stat")` is shadowed to 0.0, so
     /// the correction fires and a ReplaceWord("стат") follows the commit.
     #[test]
-    fn shadowed_typed_word_is_not_auto_corrected_on_the_public_path() {
+    fn shadowed_typed_word_is_not_language_corrected_on_the_public_path() {
         let mut core = shadowed_exact_core();
         type_word(&mut core, &STATIQ[..4]);
         assert_eq!(core.current_word(), "stat");
         assert_eq!(core.engine.score_exact_both("stat", "стат"), (7.0, 20.0));
 
-        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        let actions = core.handle_key(press_raw(57));
+        let (commits, forwards, replaces) = delimiter_shape(&actions);
         assert_eq!(commits, vec!["stat".to_string()]);
         assert_eq!(forwards, 1);
-        assert_eq!(replaces, 0);
+        assert_eq!(replaces, 1);
+        let replacements: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ReplaceWord { replace_len, text } => Some((*replace_len, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        // First-word capitalization is enabled by the same opt-in; the
+        // exact action must preserve the typed language and whole word.
+        assert_eq!(replacements, vec![(4, "Stat")]);
         assert_eq!(core.current_word(), "");
     }
 
@@ -7523,5 +7561,148 @@ mod hybrid_space_eligibility_tests {
             assert!(!batch.accepted_prediction);
             assert!(core.current_word().is_empty() && !core.has_ghost());
         }
+    }
+}
+
+#[cfg(test)]
+mod caps_context_followup_tests {
+    use super::*;
+
+    fn fresh(opt_in: bool) -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: opt_in,
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        for word in ["hello", "there", "london"] {
+            core.load_word_lang(word, 1_000, LangId::En);
+        }
+        core
+    }
+
+    fn press(core: &mut InputMethodCore, key: Key) -> Vec<Action> {
+        core.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn type_semantic(core: &mut InputMethodCore, word: &str) {
+        for ch in word.chars() {
+            let actions = press(core, Key::Char(ch));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::ForwardKey))
+                    .count(),
+                1,
+                "semantic character must reach the client once: {actions:?}"
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })),
+                "fixture must use literal semantic typing, not an injected rewrite: {actions:?}"
+            );
+        }
+        assert_eq!(core.current_word(), word);
+    }
+
+    fn boundary(core: &mut InputMethodCore) -> Vec<Action> {
+        let actions = press(core, Key::Space);
+        eprintln!("semantic Space: {actions:?}");
+        assert!(core.current_word().is_empty());
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions.iter().any(|a| matches!(a, Action::CommitText(_))));
+        actions
+    }
+
+    fn replacements(actions: &[Action]) -> Vec<(usize, String)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::ReplaceWord { replace_len, text } => Some((*replace_len, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn caps_context_followup_start_of_input_capitalizes_real_committed_word() {
+        let mut core = fresh(true);
+        type_semantic(&mut core, "hello");
+        assert_eq!(
+            replacements(&boundary(&mut core)),
+            vec![(5, "Hello".into())]
+        );
+    }
+
+    #[test]
+    fn caps_context_followup_previous_ordinary_word_keeps_middle_lowercase() {
+        let mut core = fresh(true);
+        type_semantic(&mut core, "there");
+        boundary(&mut core);
+        type_semantic(&mut core, "hello");
+        assert!(replacements(&boundary(&mut core)).is_empty());
+    }
+
+    #[test]
+    fn caps_context_followup_current_punctuation_does_not_capitalize_middle_word() {
+        let mut core = fresh(true);
+        type_semantic(&mut core, "there");
+        boundary(&mut core);
+        type_semantic(&mut core, "hello!");
+        assert!(replacements(&boundary(&mut core)).is_empty());
+    }
+
+    #[test]
+    fn caps_context_followup_previous_semantic_sentence_end_capitalizes_next_word() {
+        let mut core = fresh(true);
+        type_semantic(&mut core, "there!");
+        boundary(&mut core);
+        type_semantic(&mut core, "hello");
+        assert_eq!(
+            replacements(&boundary(&mut core)),
+            vec![(5, "Hello".into())]
+        );
+    }
+
+    #[test]
+    fn caps_context_followup_default_off_never_rewrites_these_boundaries() {
+        assert!(!InputConfig::default().post_commit_autocorrect);
+        let mut core = fresh(false);
+        for word in ["hello", "there!", "hello"] {
+            type_semantic(&mut core, word);
+            assert!(replacements(&boundary(&mut core)).is_empty());
+        }
+    }
+
+    #[test]
+    fn caps_context_followup_registered_proper_noun_capitalizes_in_middle() {
+        let mut core = fresh(true);
+        let dir =
+            std::env::temp_dir().join(format!("smartkey-caps-context-noun-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let corpus = dir.join("proper.json");
+        std::fs::write(
+            &corpus,
+            r#"{"unigrams":{"london":1000},"proper_nouns":["London"]}"#,
+        )
+        .unwrap();
+        core.load_corpus_file(&corpus).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        type_semantic(&mut core, "there");
+        boundary(&mut core);
+        type_semantic(&mut core, "london");
+        assert_eq!(
+            replacements(&boundary(&mut core)),
+            vec![(6, "London".into())]
+        );
     }
 }
