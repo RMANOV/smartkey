@@ -37,11 +37,16 @@ impl Default for LightProfile {
 impl LightProfile {
     /// Record a ghost text acceptance. Updates accept_rate and confidence_floor.
     pub fn record_accept(&mut self, lang: LangId) {
+        self.record_acceptance();
+        self.observe_lang(lang);
+    }
+
+    /// Positive acceptance feedback is independent of language eligibility.
+    pub fn record_acceptance(&mut self) {
         // EMA update for accept_rate (α = 0.05 for smooth decay).
         self.ghost_accept_rate = 0.95 * self.ghost_accept_rate + 0.05;
         self.suppress_after_reject = 0;
         self.update_confidence_floor();
-        self.observe_lang(lang);
     }
 
     /// Record a ghost text rejection. Temporarily suppresses ghosts.

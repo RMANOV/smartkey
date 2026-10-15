@@ -10,15 +10,18 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
 use crate::ensemble::Prediction;
+use crate::lang_detect::LangId;
 
 /// Maximum number of cached entries.
 const DEFAULT_CAPACITY: usize = 64;
 
-/// Key for a cache entry: (prefix, context_hash).
+/// Key for a cache entry, including every prediction request dimension.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     prefix: String,
     context_hash: u64,
+    limit: Option<usize>,
+    language: Option<LangId>,
 }
 
 /// A single cache entry storing predictions for a given key.
@@ -71,7 +74,17 @@ impl PredictionCache {
     /// Returns `Some(predictions)` on hit (and promotes the entry to MRU).
     /// Returns `None` on miss or stale generation.
     pub fn get(&mut self, prefix: &str, context: &[&str]) -> Option<Vec<Prediction>> {
-        let key = Self::make_key(prefix, context);
+        self.get_scoped(prefix, context, None, None)
+    }
+
+    pub(crate) fn get_scoped(
+        &mut self,
+        prefix: &str,
+        context: &[&str],
+        limit: Option<usize>,
+        language: Option<LangId>,
+    ) -> Option<Vec<Prediction>> {
+        let key = Self::make_key(prefix, context, limit, language);
 
         // Linear scan is fine for capacity ≤ 128.
         if let Some(idx) = self.entries.iter().position(|e| e.key == key) {
@@ -93,7 +106,18 @@ impl PredictionCache {
 
     /// Store predictions for the given prefix and context.
     pub fn put(&mut self, prefix: &str, context: &[&str], predictions: Vec<Prediction>) {
-        let key = Self::make_key(prefix, context);
+        self.put_scoped(prefix, context, None, None, predictions);
+    }
+
+    pub(crate) fn put_scoped(
+        &mut self,
+        prefix: &str,
+        context: &[&str],
+        limit: Option<usize>,
+        language: Option<LangId>,
+        predictions: Vec<Prediction>,
+    ) {
+        let key = Self::make_key(prefix, context, limit, language);
 
         // Remove existing entry for this key (if any).
         if let Some(idx) = self.entries.iter().position(|e| e.key == key) {
@@ -142,12 +166,19 @@ impl PredictionCache {
     }
 
     /// Build a cache key from prefix and context slice.
-    fn make_key(prefix: &str, context: &[&str]) -> CacheKey {
+    fn make_key(
+        prefix: &str,
+        context: &[&str],
+        limit: Option<usize>,
+        language: Option<LangId>,
+    ) -> CacheKey {
         let mut hasher = DefaultHasher::new();
         context.hash(&mut hasher);
         CacheKey {
             prefix: prefix.to_string(),
             context_hash: hasher.finish(),
+            limit,
+            language,
         }
     }
 }
