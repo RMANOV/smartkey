@@ -876,3 +876,91 @@ def test_native_unowned_boundary_without_rewrite_support_learns_literal(tmp_path
     profile = _native_profile_fixture(core, tmp_path, "literal.json")
     assert profile["cvm"]["words"] == [word]
     assert core.current_word() == ""
+
+
+def _sentence_boundary_core(tmp_path, *, post=None, ghost=False):
+    config = {"lang_detection": False, "ghost_text": ghost}
+    if post is not None:
+        config["post_commit_autocorrect"] = post
+    core = _native().PyInputMethodCore(json.dumps(config))
+    corpus = tmp_path / "sentence-corpus.json"
+    corpus.write_text(json.dumps({
+        "unigrams": {"hello": 1_000, "world": 1_000},
+        "bigrams": [],
+        "trigrams": [],
+    }))
+    core.load_corpus_file(str(corpus))
+    return core
+
+
+def _raw_sentence_prefix(core):
+    trace = []
+    for code in (35, 18, 38, 38, 24):  # hello
+        actions = core.process_keycode(code, 0)
+        trace.append(actions)
+        assert any(kind == "composing" for kind, _ in actions), trace
+        assert not any(kind in {"commit", "replace", "forward"} for kind, _ in actions), trace
+    assert core.current_word() == "hello", trace
+    punctuation = core.process_keycode(52, 0)  # .
+    assert [text for kind, text in punctuation if kind == "commit"] == ["hello"], punctuation
+    assert punctuation.count(("forward", "")) == 1, punctuation
+    assert core.current_word() == "", punctuation
+    space = core.process_keycode(57, 0)
+    assert space == [("hide", ""), ("forward", "")], space
+    assert core.current_word() == "", space
+
+
+@pytest.mark.parametrize("post", [False, True], ids=["opt-out", "opt-in"])
+@pytest.mark.parametrize("external", [False, True], ids=["no-surrounding", "surrounding"])
+def test_native_raw_sentence_boundary_caps_keeps_owned_delivery_and_learning(
+    tmp_path, post, external
+):
+    core = _sentence_boundary_core(tmp_path, post=post)
+    core.set_external_rewrite_supported(external)
+    _raw_sentence_prefix(core)
+    for code in (17, 24, 19, 38, 32):  # world
+        step = core.process_keycode(code, 0)
+        assert any(kind == "composing" for kind, _ in step), step
+        assert not any(kind in {"commit", "replace", "forward"} for kind, _ in step), step
+    assert core.current_word() == "world"
+    actions = core.process_keycode(57, 0)
+    assert [text for kind, text in actions if kind == "commit"] == ["world"], actions
+    replacements = [_native().ffi_decode_replace_payload(text)
+                    for kind, text in actions if kind == "replace"]
+    # The whole word still belongs to the preedit, so the existing ownership
+    # permission also applies when surrounding-text rewriting is unavailable.
+    assert replacements == ([(5, "World")] if post else []), actions
+    assert actions.count(("forward", "")) == 1, actions
+    assert core.current_word() == "", actions
+    profile = _native_profile_fixture(core, tmp_path, "sentence-profile.json")
+    assert set(profile["cvm"]["words"]) == {"hello", "world"}
+    assert profile["markov_bigrams"] == [["hello", "world", 1]]
+    assert profile["markov_trigrams"] == []
+
+
+def test_native_default_prediction_remembers_forwarded_sentence_boundary(tmp_path):
+    # Omit the post-commit option: ordinary suggestions use this evidence too.
+    core = _sentence_boundary_core(tmp_path, ghost=True)
+    _raw_sentence_prefix(core)
+    actions = core.process_keycode(17, 0)  # w
+    assert core.current_word() == "w", actions
+    assert any(kind == "composing" for kind, _ in actions), actions
+    assert core.predictions()[0][0] == "World", (actions, core.predictions())
+
+
+def test_native_default_tab_preserves_actual_displayed_pair_once(tmp_path):
+    core = _sentence_boundary_core(tmp_path, ghost=True)
+    _raw_sentence_prefix(core)
+    offer = core.process_keycode(17, 0)  # w
+    composing = [_native().ffi_decode_composing_payload(text)
+                 for kind, text in offer if kind == "composing"]
+    assert composing == [("w", "orld")], offer
+    actions = core.process_keycode(15, 0)  # Tab accepts this actual offer.
+    # The prediction table can carry sentence casing, but the displayed pair
+    # retains the typed prefix. Acceptance must conserve that actual offer.
+    assert [text for kind, text in actions if kind == "commit"] == ["world"], actions
+    assert not any(kind in {"replace", "forward"} for kind, _ in actions), actions
+    assert core.current_word() == "", actions
+    profile = _native_profile_fixture(core, tmp_path, "sentence-tab-profile.json")
+    assert set(profile["cvm"]["words"]) == {"hello", "world"}
+    assert profile["markov_bigrams"] == [["hello", "world", 1]]
