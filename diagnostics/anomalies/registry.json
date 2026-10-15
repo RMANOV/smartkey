@@ -78,7 +78,7 @@
           "note": "CURRENT_RECONSTRUCTED accepted artifact verification; copied inputs unchanged; original GUI not exercised."
         }
       ],
-      "status": "closed",
+      "status": "fixed",
       "suspected_layer": "dual_buffer_short_word",
       "reproducer": {
         "kind": "offline_probe",
@@ -101,11 +101,11 @@
           "sha256:1d20769205f7543b0c0bc7a211feb6e1c9c663e0c38249430d9c058ec1f892fd"
         ],
         "surface": "offline PyO3 current contract",
-        "summary": "CURRENT_RECONSTRUCTED accepted C replay passes BG preedit and commit; no-context Latin control unchanged. Exactly one commit and delimiter forward, no replace. Original GUI acceptance was not run."
+        "summary": "PARTIAL CURRENT_RECONSTRUCTED accepted C replay passes BG preedit and commit; no-context Latin control unchanged. Exactly one commit and delimiter forward, no replace. The original reported live surface remains unverified."
       },
-      "closure_reason": "Declared known-intent current offline PyO3 contract passes on accepted S. Historical corpus byte binding and original GUI surface remain unverified.",
+      "closure_reason": null,
       "privacy_classification": "public_token",
-      "notes": "CURRENT_RECONSTRUCTED closure applies to the declared offline core contract. Historical first-sighting environment and refs are preserved; no historical-byte or original-client acceptance claim."
+      "notes": "PARTIAL current offline PyO3 evidence for the implemented fix. The original reported live surface remains unverified; historical inputs and source refs are preserved."
     },
     {
       "id": "anom-658c49a8621c",
@@ -182,7 +182,7 @@
           "note": "CURRENT_RECONSTRUCTED accepted artifact verification; copied inputs unchanged; original GUI not exercised."
         }
       ],
-      "status": "closed",
+      "status": "fixed",
       "suspected_layer": "dual_buffer_short_word",
       "reproducer": {
         "kind": "offline_probe",
@@ -204,11 +204,11 @@
           "sha256:316183bb503292b1cbed57bf200bf2a92a074b1eef3d1283ea67940778c88dab"
         ],
         "surface": "offline PyO3 current contract",
-        "summary": "CURRENT_RECONSTRUCTED accepted C terminal replay: preboundary Latin remains; delimiter commits the intended BG token once with one forward and no replace. No-context observational Latin output is unchanged. Original GUI acceptance was not run."
+        "summary": "PARTIAL CURRENT_RECONSTRUCTED accepted C terminal replay with synthetic BG context: preboundary Latin remains; delimiter commits the intended BG token once with one forward and no replace. No-context output is an unchanged observational control. The original context is unknown and not bound by this probe; original GUI acceptance was not run."
       },
-      "closure_reason": "Declared known-intent current offline PyO3 terminal contract passes on accepted C. Preboundary Latin is preserved; historical input binding and original GUI replay remain unverified.",
+      "closure_reason": null,
       "privacy_classification": "public_token",
-      "notes": "CURRENT_RECONSTRUCTED terminal-only closure: current preboundary Latin remains; one delimiter commit is the intended BG token. Historical refs and unknown input custody remain; no original GUI claim."
+      "notes": "PARTIAL current offline terminal evidence for the implemented fix; preboundary Latin remains. The original context is unknown, and synthetic BG success does not bind that historical report. Historical refs are preserved."
     },
     {
       "id": "anom-36d659523143",

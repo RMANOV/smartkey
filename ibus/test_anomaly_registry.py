@@ -1342,21 +1342,47 @@ def test_fixed_b9_records_carry_fix_chain_but_no_verification():
 
 
 @pytest.mark.parametrize("status", ["verified", "closed"])
-@pytest.mark.parametrize("observed,expected", [("li", "ли"), ("wi", "ви")])
-def test_current_offline_contract_can_advance_with_complete_evidence(
-    status, observed, expected
-):
-    doc = _doc()
-    rec = _find(doc, observed, expected)
+def test_synthetic_context_bound_offline_record_can_advance_with_complete_evidence(status):
+    rec = _legacy_append("alpha")
+    surface = "synthetic offline probe"
+    rec["environment"] = {
+        "app_surface": surface, "os": "synthetic", "build_sha": "a" * 40,
+        "build_label": "synthetic lifecycle fixture", "flags": None,
+    }
+    rec["minimal_context"] = {"before": "syntheticbefore", "after": "syntheticafter"}
+    rec["source_refs"] = [{
+        "kind": "other", "ref": "synthetic:lifecycle:reported",
+        "observed_utc": None, "build_sha": "a" * 40, "surface": surface,
+        "note": "Synthetic report with explicitly bound preceding context.",
+    }]
+    rec["reproducer"] = {
+        "kind": "offline_probe", "ref": "synthetic:lifecycle:red",
+        "build_sha": "a" * 40,
+        "summary": "Synthetic failure on the declared offline surface and context.",
+    }
+    rec["red_test"] = {
+        "path": "synthetic/lifecycle.py", "name": "synthetic_lifecycle_red",
+        "commit": "a" * 40,
+    }
+    rec["fix_commit"] = "b" * 40
+    rec["verification"] = {
+        "build_sha": "b" * 40, "evidence_refs": ["synthetic:lifecycle:postfix"],
+        "surface": surface,
+        "summary": "Synthetic post-fix success on the same reported surface and context.",
+    }
     rec["status"] = status
-    assert rec["reproducer"]["kind"] == "offline_probe"
-    assert rec["red_test"] and rec["fix_commit"] and rec["verification"]
+    rec["closure_reason"] = "Synthetic reported surface and context verified." if status == "closed" else None
+    doc = {
+        "schema_version": 1, "registry": "smartkey-anomaly-registry",
+        "gate_ref": "af4d6969b2ad", "records": [rec],
+    }
     assert V.validate_document(doc, _schema()) == []
 
 
-def test_li_current_contract_closure_preserves_historical_surface_limits():
+def test_li_fixed_record_preserves_partial_evidence_and_reported_live_surface_gap():
     rec = _find(_doc(), "li", "ли")
-    assert rec["status"] == "closed"
+    assert rec["status"] == "fixed"
+    assert rec["closure_reason"] is None
     assert rec["environment"]["app_surface"] == "unknown (operator live text)"
     assert rec["environment"]["build_sha"] == "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2"
     assert {"7670aa00c53a", "f09e9917b91f"} <= {
@@ -1364,15 +1390,17 @@ def test_li_current_contract_closure_preserves_historical_surface_limits():
     }
     assert "CURRENT_RECONSTRUCTED" in rec["reproducer"]["summary"]
     assert "offline PyO3" in rec["verification"]["surface"]
-    assert "historical" in rec["closure_reason"].lower()
-    assert "GUI" in rec["closure_reason"]
+    assert "PARTIAL" in rec["verification"]["summary"]
+    assert "original reported live surface remains unverified" in rec["verification"]["summary"]
     assert rec["red_test_waiver"] is None
 
 
-def test_wi_current_closure_covers_terminal_output_without_a_preedit_claim():
+def test_wi_fixed_record_preserves_unknown_context_and_partial_terminal_evidence():
     rec = _find(_doc(), "wi", "ви")
-    assert rec["status"] == "closed"
+    assert rec["status"] == "fixed"
+    assert rec["closure_reason"] is None
     assert rec["environment"]["app_surface"] == "offline probe"
+    assert rec["minimal_context"] == {"before": None, "after": None}
     assert {
         source["build_sha"]
         for source in rec["source_refs"]
@@ -1384,8 +1412,8 @@ def test_wi_current_closure_covers_terminal_output_without_a_preedit_claim():
     assert "CURRENT_RECONSTRUCTED" in rec["reproducer"]["summary"]
     assert "terminal" in rec["verification"]["summary"].lower()
     assert "preboundary Latin remains" in rec["verification"]["summary"]
-    assert "historical" in rec["closure_reason"].lower()
-    assert "GUI" in rec["closure_reason"]
+    assert "PARTIAL" in rec["verification"]["summary"]
+    assert "original context is unknown and not bound" in rec["verification"]["summary"]
     assert rec["red_test_waiver"] is None
 
 
