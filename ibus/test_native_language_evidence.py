@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from ibus.test_native_space_accept import _compose, _native
+from .test_native_space_accept import _compose, _native
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("SMARTKEY_NATIVE_MODULE_DIR")
@@ -117,3 +117,74 @@ def test_native_full_acceptance_remains_independent_of_manual_evidence_policy(tm
     after = _profile(core, tmp_path, "after.json")
     assert after["ghost_accept_rate"] > before["ghost_accept_rate"]
     assert after["lang_prior"][0] > before["lang_prior"][0]
+
+
+@pytest.mark.parametrize("token,boundary", [("___", 0x20), ("123", 0xFF0D)])
+def test_native_observed_technical_token_retains_language_adaptation(tmp_path, token, boundary):
+    core = _core()
+    before = _profile(core, tmp_path, "before-tech.json")
+    for char in token:
+        core.handle_key(ord(char), 0)
+    assert core.current_word() == token
+
+    actions = core.handle_key(boundary, 0)
+
+    assert core.current_word() == ""
+    assert actions.count(("forward", "")) == 1
+    after = _profile(core, tmp_path, "after-tech.json")
+    assert after["lang_prior"][2] > before["lang_prior"][2]
+    assert after["ghost_accept_rate"] == before["ghost_accept_rate"]
+
+
+def test_native_nonzero_shared_hardware_digits_supply_direct_tech_evidence(tmp_path):
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+    before = _profile(core, tmp_path, "before-hardware-tech.json")
+    for code in (2, 3, 4):
+        core.process_keycode(code, 0)
+    assert core.current_word() == "123"
+
+    actions = core.process_keycode(57, 0)
+
+    assert core.current_word() == ""
+    assert actions.count(("forward", "")) == 1
+    after = _profile(core, tmp_path, "after-hardware-tech.json")
+    assert after["lang_prior"][2] == pytest.approx(0.3434)
+    assert after["lang_prior"][2] > before["lang_prior"][2]
+    assert after["ghost_accept_rate"] == before["ghost_accept_rate"]
+
+
+@pytest.mark.parametrize("case", ["deleted-inferred-raw", "deleted-script", "deleted-entire-prefix"])
+def test_native_backspace_restores_surviving_technical_evidence(tmp_path, case):
+    core = _native().PyInputMethodCore(json.dumps({
+        "ghost_text": False,
+        "dual_buffer": {"enabled": False},
+    }))
+    before = _profile(core, tmp_path, "before-retraction.json")
+    if case == "deleted-inferred-raw":
+        core.handle_key(ord("_"), 0)
+        core.process_keycode(26, 0)  # EN '[' / BG 'ш', inferred with composition off
+        core.handle_key(0xFF08, 0)
+        for _ in range(2):
+            core.handle_key(ord("_"), 0)
+        expected, boundary = "___", 0x20
+    elif case == "deleted-script":
+        for char in "123a":
+            core.handle_key(ord(char), 0)
+        core.handle_key(0xFF08, 0)
+        expected, boundary = "123", 0xFF0D
+    else:
+        core.handle_key(ord("a"), 0)
+        core.handle_key(0xFF08, 0)
+        for char in "123":
+            core.handle_key(ord(char), 0)
+        expected, boundary = "123", 0x20
+    assert core.current_word() == expected
+
+    actions = core.handle_key(boundary, 0)
+
+    assert core.current_word() == ""
+    assert actions.count(("forward", "")) == 1
+    after = _profile(core, tmp_path, "after-retraction.json")
+    assert after["lang_prior"][2] == pytest.approx(0.3434)
+    assert after["lang_prior"][2] > before["lang_prior"][2]
+    assert after["ghost_accept_rate"] == before["ghost_accept_rate"]

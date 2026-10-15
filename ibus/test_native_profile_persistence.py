@@ -131,3 +131,87 @@ def test_native_missing_default_profile_roundtrips_without_creation_on_load(tmp_
     assert saved["markov_bigrams"] == after["markov_bigrams"] == []
     assert saved["markov_trigrams"] == after["markov_trigrams"] == []
     assert saved["weights"]["commit_count"] == after["weights"]["commit_count"] == 0
+
+
+_NOVEL_WORD = "зориван"
+_NOVEL_CODES = (44, 24, 19, 23, 17, 30, 49)
+_NOVEL_CONFIG = json.dumps({
+    "ghost_text": True,
+    "ghost_text_separation_margin": 0.0,
+    "post_commit_autocorrect": False,
+})
+
+
+def _type_novel(core, codes=_NOVEL_CODES):
+    for code in codes:
+        core.process_keycode(code, 0)
+
+
+def _has_novel_candidate(core):
+    return any(word.casefold() == _NOVEL_WORD for word, *_ in core.predictions())
+
+
+def _confirmed_novel_core(tmp_path):
+    core = _native().PyInputMethodCore(_NOVEL_CONFIG)
+    seed_path = tmp_path / "novel-seed.json"
+    seed = _export(core, seed_path)
+    seed["light_profile"]["lang_prior"] = [0.8, 0.1, 0.1]
+    seed_path.write_text(json.dumps(seed))
+    core.import_personal(str(seed_path))
+    _type_novel(core)
+    assert core.current_word() == _NOVEL_WORD
+    core.handle_key(0x20, 0)
+    _type_novel(core, _NOVEL_CODES[:4])
+    assert _has_novel_candidate(core)
+    actions = core.handle_key(0xFF09, 0)
+    assert actions.count(("commit", _NOVEL_WORD)) == 1
+    assert core.current_word() == ""
+    return core
+
+
+def test_native_default_reload_retains_confirmed_word_evidence(tmp_path, private_paths):
+    core = _confirmed_novel_core(tmp_path)
+    core.save_personal()
+    restored = _native().PyInputMethodCore(_NOVEL_CONFIG)
+    restored.load_personal()
+    before = _export(restored, tmp_path / "confirmed-before.json")
+
+    _type_novel(restored)
+
+    assert restored.current_word() == _NOVEL_WORD
+    assert restored.debug_state()[1] is True
+    restored.handle_key(0x20, 0)
+    after = _export(restored, tmp_path / "confirmed-after.json")
+    assert after["light_profile"]["lang_prior"][0] > before["light_profile"]["lang_prior"][0]
+
+
+def test_native_legacy_profile_vocabulary_does_not_invent_confirmation(tmp_path, private_paths):
+    core = _confirmed_novel_core(tmp_path)
+    path = tmp_path / "legacy-novel.json"
+    legacy = _export(core, path)
+    legacy.pop("confirmed_words", None)
+    path.write_text(json.dumps(legacy))
+    restored = _native().PyInputMethodCore(_NOVEL_CONFIG)
+    restored.import_personal(str(path))
+    before = _export(restored, tmp_path / "legacy-before.json")
+    _type_novel(restored, _NOVEL_CODES[:4])
+    assert _has_novel_candidate(restored)
+    _type_novel(restored, _NOVEL_CODES[4:])
+
+    assert restored.current_word() == _NOVEL_WORD
+    assert restored.debug_state()[1] is False
+    restored.handle_key(0x20, 0)
+    after = _export(restored, tmp_path / "legacy-after.json")
+    assert after["light_profile"]["lang_prior"] == before["light_profile"]["lang_prior"]
+
+
+def test_native_profile_replacement_removes_previous_personal_confirmation(tmp_path, private_paths):
+    core = _confirmed_novel_core(tmp_path)
+    empty_path = tmp_path / "empty-replacement.json"
+    _export(_native().PyInputMethodCore(_NOVEL_CONFIG), empty_path)
+
+    core.import_personal(str(empty_path))
+    _type_novel(core, _NOVEL_CODES[:4])
+
+    assert not _has_novel_candidate(core)
+    assert core.debug_state()[1] is False

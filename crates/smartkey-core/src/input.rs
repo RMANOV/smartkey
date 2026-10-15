@@ -515,6 +515,26 @@ struct WordEvidence {
     confirmed_word: Option<LangId>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordCharOrigin {
+    Direct(char),
+    Derived(char),
+}
+
+impl WordCharOrigin {
+    fn character(self) -> char {
+        match self {
+            Self::Direct(ch) | Self::Derived(ch) => ch,
+        }
+    }
+}
+
+enum WordDetectorBaseline {
+    Unstarted,
+    Captured(LanguageDetector),
+    Invalid,
+}
+
 /// The core state machine shared by all platform adapters.
 ///
 /// Platform code feeds key events via [`handle_key`] and executes the
@@ -522,10 +542,10 @@ struct WordEvidence {
 pub struct InputMethodCore {
     engine: SmartKeyEngine,
     commit_learning: CommitLearningBatch,
-    /// Whether any character in this word came from an inferred reading.
-    word_has_derived_chars: bool,
-    /// Positive provenance: at least one unambiguous original Char was observed.
-    word_has_observed_script: bool,
+    /// Exact rendered characters and their retractable observation origins.
+    word_origins: Vec<WordCharOrigin>,
+    /// Editing-segment baseline, retained across deletion to an empty word.
+    word_detector_baseline: WordDetectorBaseline,
     config: InputConfig,
     current_word: String,
     ghost: String,
@@ -565,8 +585,8 @@ impl InputMethodCore {
         Self {
             engine: SmartKeyEngine::from_config(&config),
             commit_learning: CommitLearningBatch::default(),
-            word_has_derived_chars: false,
-            word_has_observed_script: false,
+            word_origins: Vec::new(),
+            word_detector_baseline: WordDetectorBaseline::Unstarted,
             lang_detector: LanguageDetector::new(),
             metrics: PredictionMetrics::new(),
             config,
@@ -750,6 +770,7 @@ impl InputMethodCore {
         // ── Resolve RawCode (v0.5.0) ─────────────────────────────────
         // Special identities were resolved above; remaining hardware codes
         // become either a dual-buffer operation or a regular character.
+        let mut inferred_raw_char = false;
         let event = if let Key::RawCode(code) = event.key {
             // Caps Lock inverts Shift, but only on letter keys — the lock latch
             // must never uppercase digits or punctuation.  Which keys are
@@ -764,7 +785,9 @@ impl InputMethodCore {
                     // Dual-interpretable character → handle via dual buffer.
                     return self.handle_dual_buffer_key(en_ch, bg_ch);
                 }
-                // Same char on both layouts → treat as regular Char.
+                // Shared glyphs are direct. With composition disabled, the
+                // EN fallback keeps its ambiguity for learning provenance.
+                inferred_raw_char = en_ch != bg_ch;
                 KeyEvent {
                     key: Key::Char(en_ch),
                     modifiers: event.modifiers,
@@ -823,14 +846,14 @@ impl InputMethodCore {
                         );
                     }
 
-                    self.word_has_derived_chars = true;
                     self.ghost.remove(0);
-                    self.current_word = self
+                    let word = self
                         .dual_buffer
                         .as_ref()
                         .expect("dual buffer accepted the character")
                         .winner_text()
                         .to_string();
+                    self.replace_word_with_derived(word);
                     vec![Action::ShowComposing {
                         typed: self.current_word.clone(),
                         ghost: self.ghost.clone(),
@@ -839,9 +862,8 @@ impl InputMethodCore {
                     if self.ghost.chars().count() == 1 {
                         return self.accept_ghost_completion();
                     }
-                    self.word_has_derived_chars = true;
                     let ch = self.ghost.remove(0);
-                    self.current_word.push(ch);
+                    self.push_word_char(ch, false);
                     if self.ghost.is_empty() {
                         vec![Action::CommitText(ch.to_string()), Action::HideGhost]
                     } else {
@@ -978,6 +1000,9 @@ impl InputMethodCore {
 
             // Backspace: trim the current word.
             Key::Backspace => {
+                if !self.current_word.is_empty() {
+                    self.begin_word_edit();
+                }
                 if let Some(ref mut db) = self.dual_buffer {
                     if !db.is_empty() {
                         db.pop();
@@ -985,8 +1010,7 @@ impl InputMethodCore {
                             // All chars deleted — clear preedit entirely.
                             self.dual_buffer = None;
                             self.current_word.clear();
-                            self.word_has_derived_chars = false;
-                            self.word_has_observed_script = false;
+                            self.word_origins.clear();
                             self.ghost.clear();
                             return vec![Action::HideGhost];
                         }
@@ -1002,7 +1026,8 @@ impl InputMethodCore {
                             let (ef, bf) = self.engine.score_both(db.en_text(), db.bg_text());
                             db.update_scores(ef, bf);
                         }
-                        self.current_word = db.winner_text().to_string();
+                        let word = db.winner_text().to_string();
+                        self.replace_word_with_derived(word);
                         let ghost = self.compute_ghost_suffix();
                         return vec![Action::ShowComposing {
                             typed: self.current_word.clone(),
@@ -1011,11 +1036,7 @@ impl InputMethodCore {
                     }
                 }
                 if !self.current_word.is_empty() {
-                    self.current_word.pop();
-                    if self.current_word.is_empty() {
-                        self.word_has_derived_chars = false;
-                        self.word_has_observed_script = false;
-                    }
+                    self.pop_word_char();
                 }
                 let ghost_action = self.update_predictions();
                 vec![ghost_action, Action::ForwardKey]
@@ -1051,21 +1072,19 @@ impl InputMethodCore {
                     self.anticipatory_ghost_active = false;
                     self.ghost.clear();
                 }
-                self.current_word.push(ch);
+                self.push_word_char(ch, !inferred_raw_char);
 
                 // v0.4.1: detection BEFORE prediction (instant classify).
                 if self.config.lang_detection {
                     self.lang_detector.feed_char_instant(ch);
-                    self.word_has_observed_script |=
-                        LanguageDetector::instant_classify(ch).is_some();
                 }
 
                 // v0.4.1: transliteration — auto-map Latin to Cyrillic when
                 // the user is on the wrong keyboard layout.
                 if self.transliteration_active {
                     if let Some(cyrillic) = lang_detect::phonetic_map(ch) {
-                        self.current_word.pop(); // Remove the Latin char
-                        self.current_word.push(cyrillic);
+                        self.pop_word_char(); // Remove the observed Latin char.
+                        self.push_word_char(cyrillic, false);
                         let ghost_action = self.update_predictions();
                         // The Latin key was consumed by SmartKey (not forwarded
                         // to the app), so just commit the Cyrillic char directly
@@ -1080,13 +1099,12 @@ impl InputMethodCore {
                     && self.check_wrong_layout()
                 {
                     self.transliteration_active = true;
-                    self.word_has_derived_chars = true;
                     let transliterated = lang_detect::transliterate(&self.current_word);
                     // Only previously-forwarded chars are in the application text.
                     // The current char that triggered detection was consumed (not forwarded),
                     // so subtract 1.
                     let replace_len = self.current_word.chars().count() - 1;
-                    self.current_word = transliterated;
+                    self.replace_word_with_derived(transliterated);
                     let ghost_action = self.update_predictions();
                     return vec![
                         Action::ReplaceWord {
@@ -1623,6 +1641,62 @@ impl InputMethodCore {
 
     // -- internal helpers -----------------------------------------------
 
+    fn begin_word_edit(&mut self) {
+        if !self
+            .word_origins
+            .iter()
+            .map(|origin| origin.character())
+            .eq(self.current_word.chars())
+        {
+            // Missing or externally replaced text cannot borrow observations
+            // from another spelling, even after subsequent suffix deletion.
+            self.word_origins = self
+                .current_word
+                .chars()
+                .map(WordCharOrigin::Derived)
+                .collect();
+            self.word_detector_baseline = WordDetectorBaseline::Invalid;
+        }
+        if matches!(
+            &self.word_detector_baseline,
+            WordDetectorBaseline::Unstarted
+        ) {
+            self.word_detector_baseline =
+                WordDetectorBaseline::Captured(self.lang_detector.clone());
+        }
+    }
+
+    fn push_word_char(&mut self, ch: char, direct: bool) {
+        self.begin_word_edit();
+        self.current_word.push(ch);
+        self.word_origins.push(if direct {
+            WordCharOrigin::Direct(ch)
+        } else {
+            WordCharOrigin::Derived(ch)
+        });
+    }
+
+    fn pop_word_char(&mut self) {
+        self.begin_word_edit();
+        self.current_word.pop();
+        self.word_origins.pop();
+    }
+
+    fn replace_word_with_derived(&mut self, word: String) {
+        self.begin_word_edit();
+        self.word_origins = word.chars().map(WordCharOrigin::Derived).collect();
+        self.current_word = word;
+    }
+
+    fn word_is_directly_observed(&self, word: &str) -> bool {
+        !word.is_empty()
+            && self
+                .word_origins
+                .iter()
+                .copied()
+                .eq(word.chars().map(WordCharOrigin::Direct))
+    }
+
     /// Script of the complete rendered word. This is evidence only when
     /// characters were directly observed or the full completion was accepted.
     fn word_script(word: &str) -> Option<LangId> {
@@ -1649,12 +1723,27 @@ impl InputMethodCore {
             return WordEvidence::default();
         }
         let script = Self::word_script(word);
-        if cause == CommitCause::AcceptedCompletion
-            || (self.word_has_observed_script && !self.word_has_derived_chars)
-        {
+        let directly_observed = self.word_is_directly_observed(word);
+        if cause == CommitCause::AcceptedCompletion || (directly_observed && script.is_some()) {
             return WordEvidence {
                 language: script,
                 confirmed_word: script,
+            };
+        }
+
+        // Direct digits/symbols carry real detector evidence without an
+        // unambiguous script. Priors, inferred text and partial accepts cannot
+        // attest a complete Tech token or promote it to a trusted word.
+        if directly_observed
+            && word
+                .chars()
+                .all(|ch| self.lang_detector.has_positive_tech_signal(ch))
+            && matches!(&self.word_detector_baseline, WordDetectorBaseline::Captured(start)
+                if start.replay_word_detection(word, &self.lang_detector).lang == LangId::Tech)
+        {
+            return WordEvidence {
+                language: Some(LangId::Tech),
+                confirmed_word: None,
             };
         }
 
@@ -2013,7 +2102,7 @@ impl InputMethodCore {
             LangId::En => db.en_text().to_string(),
             LangId::Bg | LangId::Tech => db.bg_text().to_string(),
         };
-        self.current_word = word.clone();
+        self.replace_word_with_derived(word.clone());
         self.current_word_had_flip = true;
         if self.config.lang_detection {
             // Normalised one-sided exact evidence, not a calibrated probability.
@@ -2047,8 +2136,8 @@ impl InputMethodCore {
 
     fn reset_word(&mut self) {
         self.current_word.clear();
-        self.word_has_derived_chars = false;
-        self.word_has_observed_script = false;
+        self.word_origins.clear();
+        self.word_detector_baseline = WordDetectorBaseline::Unstarted;
         self.ghost.clear();
         self.last_predictions.clear();
         self.last_prediction_language = None;
@@ -2066,7 +2155,7 @@ impl InputMethodCore {
     /// commits the winner character. On confidence flip, emits `ReplaceWord`
     /// to fix previously committed characters.
     fn handle_dual_buffer_key(&mut self, en_ch: char, bg_ch: char) -> Vec<Action> {
-        self.word_has_derived_chars = true;
+        self.begin_word_edit();
         // Initialize dual buffer on first dual-interpretable key in this word.
         if self.dual_buffer.is_none() {
             self.dual_buffer = Some(DualBuffer::from_config(&self.config.dual_buffer));
@@ -2096,7 +2185,7 @@ impl InputMethodCore {
             db.clear_flip();
         }
 
-        self.current_word = db.winner_text().to_string();
+        let word = db.winner_text().to_string();
 
         // The winner is derived from physical-key interpretations, never an
         // observed Unicode script. Only current corpus scoring may feed it
@@ -2109,6 +2198,7 @@ impl InputMethodCore {
             self.lang_detector
                 .feed_dual_result(db.winner_lang(), db.confidence());
         }
+        self.replace_word_with_derived(word);
 
         // ═══ FULL-WORD COMPOSING ═══
         // Keep the ENTIRE word in preedit until Space/Enter commits it.
@@ -5887,6 +5977,588 @@ mod lang_prior_tests {
         assert!(
             det.confidence.abs() < 1e-9,
             "an unsupported inherited winner must not manufacture confidence"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_tech_language_evidence_tests {
+    use super::*;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn fresh() -> InputMethodCore {
+        InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        })
+    }
+
+    fn assert_tech_commit(core: &mut InputMethodCore, word: &str, boundary: Key, confidence: f64) {
+        assert_eq!(core.current_word(), word);
+        let detected = core.detected_language();
+        assert_eq!(detected.lang, LangId::Tech);
+        assert!((detected.confidence - confidence).abs() < 1e-12);
+        let actions = core.handle_key(press(boundary));
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(core.current_word().is_empty());
+        let batch = core.take_commit_learning();
+        assert!(!batch.accepted_prediction);
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::Tech)
+            }],
+            "positive direct Tech input must retain its language observation"
+        );
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::Tech));
+        let tracks = core.export_personal_profile().lang_cvm.unwrap().tracks;
+        assert!(tracks
+            .iter()
+            .any(|(language, track)| language == "tech" && track.words.iter().any(|w| w == word)));
+        assert_eq!(
+            core.engine.word_frequency(word, LangId::Tech),
+            0.0,
+            "a Tech language observation does not confirm a new corpus terminal"
+        );
+    }
+
+    fn assert_unconfirmed_boundary(core: &mut InputMethodCore) {
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+        assert_eq!(core.lang_detector.momentum_lang(), None);
+        assert!(core
+            .export_personal_profile()
+            .lang_cvm
+            .unwrap()
+            .tracks
+            .is_empty());
+    }
+
+    // Break caught: instant_classify(None) discards independently observed
+    // positive Tech symbols before language CVM, momentum and receipt learning.
+    #[test]
+    fn review_tech_direct_symbols_keep_language_learning() {
+        let mut core = fresh();
+        for ch in "___".chars() {
+            assert!(core
+                .handle_key(press(Key::Char(ch)))
+                .contains(&Action::ForwardKey));
+        }
+        assert_tech_commit(&mut core, "___", Key::Space, 0.9);
+    }
+
+    #[test]
+    fn review_tech_direct_digits_keep_return_language_learning() {
+        let mut core = fresh();
+        for ch in "123".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_tech_commit(&mut core, "123", Key::Return, 0.9);
+    }
+
+    #[test]
+    fn review_tech_shared_physical_shift_key_keeps_language_learning() {
+        let mut core = fresh();
+        for _ in 0..3 {
+            core.handle_key(KeyEvent {
+                key: Key::RawCode(12),
+                modifiers: Modifiers::SHIFT,
+            });
+        }
+        assert_tech_commit(&mut core, "___", Key::RawCode(57), 0.9);
+    }
+
+    fn nondual() -> InputMethodCore {
+        let mut config = InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        };
+        config.dual_buffer.enabled = false;
+        InputMethodCore::new(config)
+    }
+
+    #[test]
+    fn review_tech_deleted_script_does_not_shadow_direct_tech_remainder() {
+        let mut core = fresh();
+        for key in [
+            Key::Char('_'),
+            Key::Char('a'),
+            Key::Backspace,
+            Key::Char('!'),
+            Key::Char('!'),
+        ] {
+            core.handle_key(press(key));
+        }
+        assert_tech_commit(&mut core, "_!!", Key::Space, 0.5335);
+    }
+
+    #[test]
+    fn review_tech_nondual_ambiguous_raw_symbols_are_not_direct_evidence() {
+        let mut core = nondual();
+        for _ in 0..3 {
+            assert!(core
+                .handle_key(press(Key::RawCode(26)))
+                .contains(&Action::ForwardKey));
+        }
+        assert_eq!(core.current_word(), "[[[");
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert!((core.detected_language().confidence - 0.95).abs() < 1e-12);
+        assert_unconfirmed_boundary(&mut core);
+        assert!(core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|w| w == "[[["));
+    }
+
+    #[test]
+    fn review_tech_nondual_inferred_suffix_invalidates_direct_tech_provenance() {
+        let mut core = nondual();
+        core.handle_key(press(Key::Char('_')));
+        core.handle_key(press(Key::RawCode(26)));
+        assert_eq!(core.current_word(), "_[");
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_nondual_raw_letters_do_not_manufacture_english_evidence() {
+        let mut core = nondual();
+        for code in [16, 45, 44] {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+        assert_eq!(core.current_word(), "qxz");
+        assert_eq!(core.detected_language().lang, LangId::En);
+        assert_eq!(core.detected_language().confidence, 1.0);
+        assert_unconfirmed_boundary(&mut core);
+        assert!(core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|w| w == "qxz"));
+        assert_eq!(core.engine.word_frequency("qxz", LangId::En), 0.0);
+    }
+
+    #[test]
+    fn review_tech_nondual_shared_glyph_retains_direct_evidence() {
+        let mut core = nondual();
+        for _ in 0..3 {
+            core.handle_key(KeyEvent {
+                key: Key::RawCode(12),
+                modifiers: Modifiers::SHIFT,
+            });
+        }
+        assert_tech_commit(&mut core, "___", Key::RawCode(57), 0.9);
+    }
+
+    #[test]
+    fn review_tech_prior_with_neutral_punctuation_is_not_evidence() {
+        let mut core = fresh();
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(LangId::Tech),
+            ..Default::default()
+        });
+        for ch in "???".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_unobserved_synthetic_word_is_not_evidence() {
+        let mut core = fresh();
+        core.lang_detector.feed_char_instant('_');
+        core.current_word = "___".into();
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_raw_unknown_fallback_is_not_evidence() {
+        let mut core = fresh();
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(LangId::Tech),
+            ..Default::default()
+        });
+        for code in [16, 45, 44] {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_partial_right_is_not_direct_character_evidence() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.handle_key(press(Key::Char('_')));
+        assert!(core.apply_prediction_override("___").is_some());
+        core.handle_key(press(Key::Right));
+        assert_eq!(core.current_word(), "__");
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_disabled_language_detection_is_not_evidence() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            lang_detection: false,
+            ..InputConfig::default()
+        });
+        for ch in "___".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_complete_token_must_have_only_positive_tech_characters() {
+        let mut core = fresh();
+        for ch in "_?".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_positive_character_needs_actual_tech_detection() {
+        let mut core = fresh();
+        core.lang_detector.feed_char_instant('a');
+        core.handle_key(press(Key::Char('_')));
+        assert_eq!(core.current_word(), "_");
+        assert_eq!(core.detected_language().lang, LangId::En);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_deleted_observation_does_not_attest_a_later_word() {
+        let mut core = fresh();
+        core.handle_key(press(Key::Char('_')));
+        core.handle_key(press(Key::Backspace));
+        assert!(core.current_word().is_empty());
+        core.current_word = "___".into();
+        assert_unconfirmed_boundary(&mut core);
+    }
+}
+
+#[cfg(test)]
+mod retraction_word_evidence_tests {
+    use super::*;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn fresh() -> InputMethodCore {
+        let mut config = InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        };
+        config.dual_buffer.enabled = false;
+        InputMethodCore::new(config)
+    }
+
+    fn assert_surviving_tech_commit(core: &mut InputMethodCore, word: &str, boundary: Key) {
+        assert_eq!(core.current_word(), word);
+        let before = core.detected_language();
+        let actions = core.handle_key(press(boundary));
+        assert!(actions.contains(&Action::ForwardKey));
+        let batch = core.take_commit_learning();
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::Tech)
+            }]
+        );
+        assert!(!batch.accepted_prediction);
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::Tech));
+        assert!(core
+            .export_personal_profile()
+            .lang_cvm
+            .unwrap()
+            .tracks
+            .iter()
+            .any(|(lang, track)| lang == "tech" && track.words.iter().any(|text| text == word)));
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence),
+            "word proof must not mutate the global detector used for display routing"
+        );
+    }
+
+    #[test]
+    fn retraction_deleted_inferred_raw_suffix_restores_direct_tech_evidence() {
+        let mut core = fresh();
+        for key in [
+            Key::Char('_'),
+            Key::RawCode(26),
+            Key::Backspace,
+            Key::Char('_'),
+            Key::Char('_'),
+        ] {
+            core.handle_key(press(key));
+        }
+        assert_surviving_tech_commit(&mut core, "___", Key::Space);
+    }
+
+    #[test]
+    fn retraction_deleted_script_replays_surviving_tech_from_word_start() {
+        let mut core = fresh();
+        for ch in "123a".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(
+            core.detected_language().lang,
+            LangId::En,
+            "the display detector still reflects the deleted character"
+        );
+        assert_surviving_tech_commit(&mut core, "123", Key::Return);
+    }
+
+    #[test]
+    fn retraction_deleted_entire_prefix_cannot_seed_the_next_direct_token() {
+        let mut core = fresh();
+        core.handle_key(press(Key::Char('a')));
+        core.handle_key(press(Key::Backspace));
+        assert!(core.current_word().is_empty());
+        for ch in "123".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_surviving_tech_commit(&mut core, "123", Key::Space);
+    }
+
+    #[test]
+    fn retraction_deleted_inferred_suffix_restores_direct_script_proof() {
+        for (word, language) in [("abc", LangId::En), ("зор", LangId::Bg)] {
+            let mut core = fresh();
+            for ch in word.chars() {
+                core.handle_key(press(Key::Char(ch)));
+            }
+            core.handle_key(press(Key::RawCode(26)));
+            core.handle_key(press(Key::Backspace));
+            assert_eq!(core.current_word(), word);
+            core.handle_key(press(Key::Space));
+            assert_eq!(
+                core.take_commit_learning().words,
+                vec![CommitObservation {
+                    language: Some(language)
+                }]
+            );
+            assert!(core.engine.word_frequency(word, language) > 0.0);
+        }
+    }
+
+    #[test]
+    fn retraction_surviving_inferred_prefix_cannot_borrow_deleted_observation() {
+        let mut core = fresh();
+        for _ in 0..3 {
+            core.handle_key(press(Key::RawCode(26)));
+        }
+        core.handle_key(press(Key::Char('_')));
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "[[[");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+        assert!(core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|word| word == "[[["));
+    }
+
+    #[test]
+    fn retraction_removing_all_partial_right_chars_restores_direct_prefix() {
+        let mut core = fresh();
+        core.config.ghost_text = true;
+        for _ in 0..3 {
+            core.handle_key(press(Key::Char('_')));
+        }
+        assert!(core.apply_prediction_override("_____").is_some());
+        core.handle_key(press(Key::Right));
+        assert_eq!(core.current_word(), "____");
+        core.handle_key(press(Key::Backspace));
+        assert_surviving_tech_commit(&mut core, "___", Key::Space);
+    }
+
+    #[test]
+    fn retraction_surviving_partial_right_char_still_blocks_direct_proof() {
+        let mut core = fresh();
+        core.config.ghost_text = true;
+        core.handle_key(press(Key::Char('_')));
+        assert!(core.apply_prediction_override("_____").is_some());
+        core.handle_key(press(Key::Right));
+        core.handle_key(press(Key::Right));
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "__");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+    }
+
+    #[test]
+    fn retraction_unicode_pop_retracts_one_scalar_observation() {
+        let mut core = fresh();
+        for ch in "здравей".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        for _ in 0..4 {
+            core.handle_key(press(Key::Backspace));
+        }
+        assert_eq!(core.current_word(), "здр");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Bg)
+            }]
+        );
+    }
+
+    #[test]
+    fn retraction_same_length_replacement_cannot_borrow_observations() {
+        let mut core = fresh();
+        for _ in 0..2 {
+            core.handle_key(press(Key::Char('_')));
+        }
+        core.current_word = "a_".into();
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "a");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+    }
+
+    #[test]
+    fn retraction_missing_trace_after_external_clear_does_not_recapture_history() {
+        let mut core = fresh();
+        core.handle_key(press(Key::Char('_')));
+        core.current_word.clear();
+        core.handle_key(press(Key::Char('1')));
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+    }
+
+    #[test]
+    fn retraction_supported_dual_to_empty_keeps_pre_dual_detector_baseline() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("hello", 1_000_000, LangId::En);
+        for code in [35, 18] {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+        assert_eq!(core.detected_language().lang, LangId::En);
+        for _ in 0..2 {
+            core.handle_key(press(Key::Backspace));
+        }
+        assert!(core.current_word().is_empty());
+        for ch in "123".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_surviving_tech_commit(&mut core, "123", Key::Space);
+    }
+
+    #[test]
+    fn retraction_dual_backspace_rebuild_does_not_create_direct_observations() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        for code in [16, 45, 44] {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "qx");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+    }
+
+    #[test]
+    fn retraction_true_boundary_starts_a_new_baseline_with_committed_context() {
+        let mut core = fresh();
+        for ch in "hello".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        core.handle_key(press(Key::Space));
+        core.take_commit_learning();
+        core.handle_key(press(Key::Char('_')));
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::En));
+    }
+
+    #[test]
+    fn retraction_focus_flush_uses_detached_word_observations() {
+        let mut core = fresh();
+        for ch in "123a".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        core.handle_key(press(Key::Backspace));
+        core.focus_lost();
+        assert!(core.current_word().is_empty());
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Tech)
+            }]
+        );
+    }
+
+    #[test]
+    fn retraction_transliterated_and_edited_rendering_stays_unconfirmed() {
+        let mut core = fresh();
+        core.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        for ch in "zdra".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(core.current_word(), "здра");
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "здр");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Bg)
+            }]
+        );
+        assert_eq!(
+            core.engine.word_frequency("здр", LangId::Bg),
+            0.0,
+            "corpus prefix evidence does not turn transliterated text into a confirmed exact word"
         );
     }
 }
