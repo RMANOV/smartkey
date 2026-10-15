@@ -14,7 +14,10 @@ use crate::ppm::PpmModel;
 /// A complete language model for one language.
 pub struct LanguageModel {
     pub lang: LangId,
+    /// Corpus and independently confirmed words used for language evidence.
     pub trie: NgramTrie,
+    /// Sparse, unconfirmed online vocabulary used only to propose predictions.
+    pub prediction_only_trie: NgramTrie,
     pub markov: MarkovChain,
     pub ppm: Option<PpmModel>,
     /// Interpolated Kneser-Ney scorer (built lazily after corpus load).
@@ -31,6 +34,7 @@ impl LanguageModel {
         Self {
             lang,
             trie: NgramTrie::new(),
+            prediction_only_trie: NgramTrie::new(),
             markov: MarkovChain::with_lambdas(markov_lambdas),
             ppm: if use_ppm {
                 Some(PpmModel::default_order())

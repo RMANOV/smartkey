@@ -82,8 +82,6 @@ pub struct MasterLoop {
     last_prediction_accept: Option<Instant>,
     /// The prediction most recently accepted via Tab or final Right.
     last_accepted_prediction: Option<String>,
-    /// Last known commit count from metrics (for change detection).
-    last_known_commits: usize,
     /// Whether anticipation was already run for the current word.
     anticipated: bool,
     /// Cached surrounding text from the platform adapter (Linux IBus path).
@@ -107,7 +105,6 @@ impl MasterLoop {
             suppress_countdown: 0,
             last_prediction_accept: None,
             last_accepted_prediction: None,
-            last_known_commits: 0,
             anticipated: false,
             surrounding_text: None,
             surrounding_cursor_pos: None,
@@ -186,7 +183,7 @@ impl MasterLoop {
             self.last_prediction_accept = None;
             self.last_shown_ghost = None;
         }
-        // Capture prediction and commit count BEFORE delegation. Terminal Tab
+        // Capture prediction BEFORE delegation. Terminal Tab
         // and Right clear last_predictions/current_word inside the core, while
         // a partial Right keeps both alive and must not count as acceptance.
         let pre_accept_prediction = if is_accept_key && self.core.has_ghost() {
@@ -194,13 +191,12 @@ impl MasterLoop {
         } else {
             None
         };
-        let pre_commit_count = self.core.metrics().commit_count();
         let mut actions = self.core.handle_key(event.clone());
+        let commit_learning = self.core.take_commit_learning();
         self.apply_correction_override(&mut actions);
         self.enforce_rejection_suppression(&mut actions);
-        let terminal_accept = pre_accept_prediction.is_some()
-            && self.core.current_word().is_empty()
-            && self.core.metrics().commit_count() > pre_commit_count;
+        let terminal_accept =
+            pre_accept_prediction.is_some() && commit_learning.accepted_prediction;
 
         if resets_context {
             self.anticipated = false;
@@ -257,9 +253,9 @@ impl MasterLoop {
         }
 
         // Word committed? → LEARNING phase.
-        if self.core.current_word().is_empty() && self.session_commits_changed() {
+        if !commit_learning.words.is_empty() {
             self.phase = Phase::Learning;
-            self.learn_from_commit();
+            self.learn_from_commit(commit_learning);
             self.phase = Phase::Anticipating;
             self.anticipated = false;
             self.core.clear_hints();
@@ -289,7 +285,10 @@ impl MasterLoop {
         self.surrounding_text = None;
         self.surrounding_cursor_pos = None;
         self.last_shown_ghost = None;
-        self.core.focus_lost()
+        let actions = self.core.focus_lost();
+        let commit_learning = self.core.take_commit_learning();
+        self.learn_from_commit(commit_learning);
+        actions
     }
 
     pub fn focus_gained(&mut self) {
@@ -748,23 +747,16 @@ impl MasterLoop {
     // Internal: Learning
     // ======================================================================
 
-    fn learn_from_commit(&mut self) {
-        self.last_known_commits = self.core.metrics().commit_count();
-
-        // Update language prior from detection.
-        let lang = self.core.detected_language().lang;
-        if self.last_accepted_prediction.is_some() {
-            self.light_profile.record_accept(lang);
-        } else {
-            self.light_profile.observe_lang(lang);
+    fn learn_from_commit(&mut self, batch: crate::input::CommitLearningBatch) {
+        if batch.accepted_prediction {
+            self.light_profile.record_acceptance();
         }
-
-        // Clear the accepted prediction tracker.
+        for word in batch.words {
+            if let Some(language) = word.language {
+                self.light_profile.observe_lang(language);
+            }
+        }
         self.last_accepted_prediction = None;
-    }
-
-    fn session_commits_changed(&self) -> bool {
-        self.core.metrics().commit_count() != self.last_known_commits
     }
 
     fn current_context_hash(&self) -> u64 {
@@ -1663,5 +1655,26 @@ mod commit_language_receipt_contract_tests {
             "an inherited unsupported winner is not new language evidence"
         );
         assert_eq!(ml.light_profile.ghost_accept_rate, before.ghost_accept_rate);
+    }
+
+    #[test]
+    fn accepted_mixed_script_has_positive_feedback_without_a_language_vote() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.handle_key(press(Key::Char('h')));
+        assert!(ml.core.apply_prediction_override("hеllo").is_some());
+        let before = ml.light_profile.clone();
+        ml.handle_key(press(Key::Tab));
+        assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+        assert_eq!(ml.light_profile.lang_prior, before.lang_prior);
+        assert_eq!(
+            ml.light_profile.ghost_accept_rate,
+            0.95 * before.ghost_accept_rate + 0.05
+        );
+        let accepted_prior = ml.light_profile.lang_prior;
+        let accepted_rate = ml.light_profile.ghost_accept_rate;
+        ml.handle_key(press(Key::Space));
+        ml.focus_lost();
+        assert_eq!(ml.light_profile.lang_prior, accepted_prior);
+        assert_eq!(ml.light_profile.ghost_accept_rate, accepted_rate);
     }
 }

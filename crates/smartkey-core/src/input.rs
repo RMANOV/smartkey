@@ -461,18 +461,79 @@ impl InputConfig {
 // InputMethodCore
 // ======================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitCause {
+    Boundary,
+    FocusFlush,
+    AcceptedCompletion,
+    PartialCompletionFallback,
+}
+
+impl CommitCause {
+    fn is_prediction_accept(self) -> bool {
+        matches!(
+            self,
+            Self::AcceptedCompletion | Self::PartialCompletionFallback
+        )
+    }
+}
+
+/// Language evidence is word-specific; it does not carry typed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitObservation {
+    pub language: Option<LangId>,
+}
+
+/// One public core operation's learning events. Replaced on the next operation
+/// even when a standalone consumer never drains it.
+#[derive(Debug, Default)]
+pub(crate) struct CommitLearningBatch {
+    pub words: Vec<CommitObservation>,
+    pub accepted_prediction: bool,
+}
+
+/// A correction carries the exact model which justified its target text.
+#[derive(Debug)]
+struct LanguageCorrection {
+    replace_len: usize,
+    text: String,
+    language: LangId,
+}
+
+impl LanguageCorrection {
+    fn into_action(self) -> Action {
+        Action::ReplaceWord {
+            replace_len: self.replace_len,
+            text: self.text,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct WordEvidence {
+    language: Option<LangId>,
+    confirmed_word: Option<LangId>,
+}
+
 /// The core state machine shared by all platform adapters.
 ///
 /// Platform code feeds key events via [`handle_key`] and executes the
 /// returned [`Action`]s (show ghost text, commit text, etc.).
 pub struct InputMethodCore {
     engine: SmartKeyEngine,
+    commit_learning: CommitLearningBatch,
+    /// Whether any character in this word came from an inferred reading.
+    word_has_derived_chars: bool,
+    /// Positive provenance: at least one unambiguous original Char was observed.
+    word_has_observed_script: bool,
     config: InputConfig,
     current_word: String,
     ghost: String,
     context: VecDeque<String>,
     enabled: bool,
     last_predictions: Vec<Prediction>,
+    /// Model selection used for the displayed prediction's scoring components.
+    last_prediction_language: Option<LangId>,
     /// Prediction quality and performance metrics (v0.4.0).
     metrics: PredictionMetrics,
     /// Character trigram language detector (v0.4.0).
@@ -503,6 +564,9 @@ impl InputMethodCore {
         let enabled = config.enabled;
         Self {
             engine: SmartKeyEngine::from_config(&config),
+            commit_learning: CommitLearningBatch::default(),
+            word_has_derived_chars: false,
+            word_has_observed_script: false,
             lang_detector: LanguageDetector::new(),
             metrics: PredictionMetrics::new(),
             config,
@@ -511,6 +575,7 @@ impl InputMethodCore {
             context: VecDeque::with_capacity(CONTEXT_SIZE),
             enabled,
             last_predictions: Vec::new(),
+            last_prediction_language: None,
             transliteration_active: false,
             dual_buffer: None,
             regime_detector: RegimeDetector::new(),
@@ -650,6 +715,7 @@ impl InputMethodCore {
 
     /// Process a key event and return actions for the platform to execute.
     pub fn handle_key(&mut self, event: KeyEvent) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
         let event = event.normalize_special_key();
         // The display attestation covers exactly this key event (one-shot).
         let display_attested = std::mem::take(&mut self.space_accept_display_attested);
@@ -720,7 +786,7 @@ impl InputMethodCore {
                     // so commit it before forwarding Tab — otherwise a locked
                     // dual buffer would forward Tab and abandon the typed word.
                     let prefix = self.current_word.clone();
-                    self.commit_word_internal(&prefix, true);
+                    self.commit_word_internal(&prefix, CommitCause::Boundary);
                     self.reset_word();
                     vec![Action::HideGhost, commit, Action::ForwardKey]
                 } else {
@@ -752,9 +818,12 @@ impl InputMethodCore {
                         // cannot remain synchronized.  Fail safely by accepting
                         // the already-visible word atomically, without a partial
                         // mutation.
-                        return self.accept_ghost_completion();
+                        return self.accept_ghost_completion_with_cause(
+                            CommitCause::PartialCompletionFallback,
+                        );
                     }
 
+                    self.word_has_derived_chars = true;
                     self.ghost.remove(0);
                     self.current_word = self
                         .dual_buffer
@@ -767,6 +836,10 @@ impl InputMethodCore {
                         ghost: self.ghost.clone(),
                     }]
                 } else if !self.ghost.is_empty() {
+                    if self.ghost.chars().count() == 1 {
+                        return self.accept_ghost_completion();
+                    }
+                    self.word_has_derived_chars = true;
                     let ch = self.ghost.remove(0);
                     self.current_word.push(ch);
                     if self.ghost.is_empty() {
@@ -815,6 +888,7 @@ impl InputMethodCore {
                     // cannot be re-committed by the aggressive unique-match
                     // Space path right after the user rejected it.
                     self.last_predictions.clear();
+                    self.last_prediction_language = None;
                     self.anticipatory_ghost_active = false;
                     if self.dual_buffer.is_some() && !self.current_word.is_empty() {
                         // Composing: re-show the preedit with the typed word only.
@@ -868,7 +942,7 @@ impl InputMethodCore {
                     // user sees the displayed script; the boundary resolves
                     // exact one-sided evidence before anything is learned.
                     let word = self.resolve_word_boundary();
-                    self.commit_word_internal(&word, true);
+                    let correction = self.commit_boundary_word(&word);
                     self.reset_word();
                     let mut actions = vec![
                         Action::HideGhost,
@@ -880,24 +954,24 @@ impl InputMethodCore {
                     // preedit in the same batch races that delimiter: GTK,
                     // Electron and browser clients can apply the Space/Return
                     // to the new ghost instead of to the committed word.
-                    actions.extend(self.post_commit_pipeline(&word, false));
+                    actions.extend(self.post_commit_pipeline(&word, false, correction));
                     return actions;
                 }
                 let committed = if !self.current_word.is_empty() {
                     let word = std::mem::take(&mut self.current_word);
-                    self.commit_word_internal(&word, true);
-                    Some(word)
+                    let correction = self.commit_boundary_word(&word);
+                    Some((word, correction))
                 } else {
                     None
                 };
                 self.reset_word();
                 let mut actions = vec![Action::HideGhost, Action::ForwardKey];
                 // Post-commit intelligence pipeline: auto-correct, auto-caps, next-word ghost.
-                if let Some(ref word) = committed {
+                if let Some((word, correction)) = committed {
                     // Same client-ordering rule as the composing branch above:
                     // never install a fresh preedit in front of the forwarded
                     // Space/Return.
-                    actions.extend(self.post_commit_pipeline(word, false));
+                    actions.extend(self.post_commit_pipeline(&word, false, correction));
                 }
                 actions
             }
@@ -911,6 +985,8 @@ impl InputMethodCore {
                             // All chars deleted — clear preedit entirely.
                             self.dual_buffer = None;
                             self.current_word.clear();
+                            self.word_has_derived_chars = false;
+                            self.word_has_observed_script = false;
                             self.ghost.clear();
                             return vec![Action::HideGhost];
                         }
@@ -936,6 +1012,10 @@ impl InputMethodCore {
                 }
                 if !self.current_word.is_empty() {
                     self.current_word.pop();
+                    if self.current_word.is_empty() {
+                        self.word_has_derived_chars = false;
+                        self.word_has_observed_script = false;
+                    }
                 }
                 let ghost_action = self.update_predictions();
                 vec![ghost_action, Action::ForwardKey]
@@ -954,14 +1034,14 @@ impl InputMethodCore {
                     && !ch.is_alphabetic()
                 {
                     let word = self.resolve_word_boundary();
-                    self.commit_word_internal(&word, true);
+                    let correction = self.commit_boundary_word(&word);
                     self.reset_word();
                     let mut actions = vec![Action::HideGhost, Action::CommitText(word.clone())];
                     // The punctuation key is forwarded only after the adapter
                     // finishes this batch.  Never install a fresh preedit in
                     // front of it; otherwise characters such as `!` can be
                     // consumed by the replacement preedit in some clients.
-                    actions.extend(self.post_commit_pipeline(&word, false));
+                    actions.extend(self.post_commit_pipeline(&word, false, correction));
                     actions.push(Action::ForwardKey);
                     return actions;
                 }
@@ -976,6 +1056,8 @@ impl InputMethodCore {
                 // v0.4.1: detection BEFORE prediction (instant classify).
                 if self.config.lang_detection {
                     self.lang_detector.feed_char_instant(ch);
+                    self.word_has_observed_script |=
+                        LanguageDetector::instant_classify(ch).is_some();
                 }
 
                 // v0.4.1: transliteration — auto-map Latin to Cyrillic when
@@ -998,6 +1080,7 @@ impl InputMethodCore {
                     && self.check_wrong_layout()
                 {
                     self.transliteration_active = true;
+                    self.word_has_derived_chars = true;
                     let transliterated = lang_detect::transliterate(&self.current_word);
                     // Only previously-forwarded chars are in the application text.
                     // The current char that triggered detection was consumed (not forwarded),
@@ -1213,6 +1296,10 @@ impl InputMethodCore {
     ///
     /// Caller precondition: `!self.ghost.is_empty()`.
     fn accept_ghost_completion(&mut self) -> Vec<Action> {
+        self.accept_ghost_completion_with_cause(CommitCause::AcceptedCompletion)
+    }
+
+    fn accept_ghost_completion_with_cause(&mut self, cause: CommitCause) -> Vec<Action> {
         let full_text = format!("{}{}", self.current_word, self.ghost);
         // F8: multi-word ghost may contain spaces — split into words.
         let words: Vec<&str> = full_text.split_whitespace().collect();
@@ -1231,7 +1318,11 @@ impl InputMethodCore {
         if let Some(top) = self.last_predictions.first() {
             self.engine.observe_calibration(top.confidence, true);
         }
-        self.engine.on_prediction_accepted(first_word, &ctx);
+        self.engine.on_prediction_accepted_with_lang(
+            first_word,
+            &ctx,
+            self.last_prediction_language,
+        );
         // Record acceptance metrics: find rank in last_predictions.
         let rank = self
             .last_predictions
@@ -1241,16 +1332,41 @@ impl InputMethodCore {
             .unwrap_or(1);
         self.metrics
             .record_acceptance(rank, self.ghost.chars().count(), full_text.chars().count());
-        // Commit each word separately for correct context/Markov tracking.
-        for word in &words {
-            self.commit_word_internal(word, false);
-        }
         let last_word = words.last().copied().unwrap_or("").to_string();
+        // A fully accepted word's dictionary confirmation precedes the
+        // accepted correction decision, while generic/profile learning occurs
+        // exactly once for the text that will actually remain in the client.
+        if cause == CommitCause::AcceptedCompletion && self.config.lang_detection {
+            for word in &words {
+                if word.chars().count() >= 3 {
+                    if let Some(language) = Self::word_script(word) {
+                        self.engine.confirm_word(&word.to_lowercase(), language);
+                    }
+                }
+            }
+        }
+        let correction = self
+            .config
+            .post_commit_autocorrect
+            .then(|| self.prepare_language_correction(&last_word))
+            .flatten();
+        for (index, word) in words.iter().enumerate() {
+            if index + 1 == words.len() {
+                if let Some(prepared) = correction.as_ref() {
+                    self.commit_corrected_word(prepared, cause);
+                    continue;
+                }
+            }
+            self.commit_word_internal(word, cause);
+        }
         self.reset_word();
-        // After accept: corrections still run, but NO anticipatory ghost —
-        // an instant re-arm turns repeated Tabs into a word machine gun (S4).
+        // Keep the existing accepted correction timing and no anticipatory rearm.
         let mut actions = actions;
-        actions.extend(self.post_commit_pipeline(&last_word, false));
+        actions.extend(self.post_commit_pipeline(
+            &last_word,
+            false,
+            correction.map(LanguageCorrection::into_action),
+        ));
         actions
     }
 
@@ -1258,13 +1374,14 @@ impl InputMethodCore {
 
     /// Called when the input field loses focus.
     pub fn focus_lost(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
         // Flush the preedit to the application BEFORE learning from it —
         // the lock gate that used to sit here made the engine learn a word
         // the application never received.
         let mut actions = Vec::from_iter(self.flush_preedit());
         if !self.current_word.is_empty() {
             let word = std::mem::take(&mut self.current_word);
-            self.commit_word_internal(&word, true);
+            self.commit_word_internal(&word, CommitCause::FocusFlush);
         }
         self.reset_word();
         actions.push(Action::HideGhost);
@@ -1273,7 +1390,7 @@ impl InputMethodCore {
 
     /// Called when the input field gains focus.
     pub fn focus_gained(&mut self) {
-        // Nothing to do — ready for new input.
+        self.commit_learning = CommitLearningBatch::default();
     }
 
     /// Called when the cursor moves away from the current typing location.
@@ -1282,6 +1399,7 @@ impl InputMethodCore {
     /// session cache so stale predictions do not bleed into the new cursor
     /// location after navigation.
     pub fn cursor_moved(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
         // The in-flight word lives ONLY in the preedit; clearing state without
         // flushing it destroys characters the application never received.
         let mut actions = Vec::from_iter(self.flush_preedit());
@@ -1314,8 +1432,13 @@ impl InputMethodCore {
     /// worktree alone, because the core change and the adapter that executes its
     /// actions live in different worktrees.
     pub fn reset(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
         self.reset_word();
         vec![Action::HideGhost]
+    }
+
+    pub(crate) fn take_commit_learning(&mut self) -> CommitLearningBatch {
+        std::mem::take(&mut self.commit_learning)
     }
 
     // -- read-only accessors --------------------------------------------
@@ -1500,12 +1623,117 @@ impl InputMethodCore {
 
     // -- internal helpers -----------------------------------------------
 
-    /// Shared commit logic. `record_commit_metric` is false for Tab-accepted
-    /// words (already recorded via `record_acceptance`).
-    fn commit_word_internal(&mut self, word: &str, record_commit_metric: bool) {
+    /// Script of the complete rendered word. This is evidence only when
+    /// characters were directly observed or the full completion was accepted.
+    fn word_script(word: &str) -> Option<LangId> {
+        let mut script = None;
+        for ch in word.chars().filter(|ch| ch.is_alphabetic()) {
+            let lang = LanguageDetector::instant_classify(ch)?;
+            match script {
+                None => script = Some(lang),
+                Some(previous) if previous == lang => {}
+                _ => return None,
+            }
+        }
+        script
+    }
+
+    /// Candidate routing is independent of learning eligibility. Inferred
+    /// display words remain suggestible without becoming language evidence.
+    fn candidate_language(&self, word: &str) -> LangId {
+        Self::word_script(word).unwrap_or_else(|| self.lang_detector.detected().lang)
+    }
+
+    fn word_language_evidence(&self, word: &str, cause: CommitCause) -> WordEvidence {
+        if !self.config.lang_detection {
+            return WordEvidence::default();
+        }
+        let script = Self::word_script(word);
+        if cause == CommitCause::AcceptedCompletion
+            || (self.word_has_observed_script && !self.word_has_derived_chars)
+        {
+            return WordEvidence {
+                language: script,
+                confirmed_word: script,
+            };
+        }
+
+        // Query the CURRENT rendered full word, never a stored prefix lock or
+        // derived winner. This also follows an exact boundary correction and
+        // an unmappable-character delivery fallback without fabricating an
+        // observed script for either one.
+        let (en_support, bg_support) = if cause == CommitCause::PartialCompletionFallback {
+            self.engine.score_exact_both(word, word)
+        } else {
+            self.engine.score_both(word, word)
+        };
+        let language = match script {
+            Some(LangId::En) if en_support > 0.0 => Some(LangId::En),
+            Some(LangId::Bg) if bg_support > 0.0 => Some(LangId::Bg),
+            _ => None,
+        };
+        WordEvidence {
+            language,
+            confirmed_word: None,
+        }
+    }
+
+    /// Generic learning applies to every delivered word; commit cause and
+    /// independently established language/word confirmation have separate roles.
+    fn commit_word_internal(&mut self, word: &str, cause: CommitCause) {
+        let evidence = self.word_language_evidence(word, cause);
+        self.commit_word_with_evidence(word, cause, evidence);
+    }
+
+    /// An ordinary boundary cannot change its correction decision by learning
+    /// from itself. A prepared replacement has its own exact corpus evidence;
+    /// the original character observation does not attest the replacement.
+    fn commit_boundary_word(&mut self, word: &str) -> Option<Action> {
+        let correction = self
+            .config
+            .post_commit_autocorrect
+            .then(|| self.prepare_language_correction(word))
+            .flatten();
+        if let Some(prepared) = correction.as_ref() {
+            self.commit_corrected_word(prepared, CommitCause::Boundary);
+        } else {
+            self.commit_word_internal(word, CommitCause::Boundary);
+        }
+        correction.map(LanguageCorrection::into_action)
+    }
+
+    fn commit_corrected_word(&mut self, correction: &LanguageCorrection, cause: CommitCause) {
+        let language = (self.config.lang_detection
+            && self
+                .engine
+                .word_frequency(&correction.text.to_lowercase(), correction.language)
+                > 0.0)
+            .then_some(correction.language);
+        if let Some(language) = language {
+            self.lang_detector.feed_dual_result(language, 1.0);
+        }
+        self.commit_word_with_evidence(
+            &correction.text,
+            cause,
+            WordEvidence {
+                language,
+                confirmed_word: None,
+            },
+        );
+    }
+
+    fn commit_word_with_evidence(
+        &mut self,
+        word: &str,
+        cause: CommitCause,
+        evidence: WordEvidence,
+    ) {
         if !word.is_empty() {
+            let candidate_route = self.candidate_language(word);
+            let word_lower = word.to_lowercase();
+            let is_oov = self.engine.word_frequency(&word_lower, candidate_route) == 0.0;
             let word_char_len = word.chars().count();
-            if record_commit_metric {
+            if !cause.is_prediction_accept() {
                 self.metrics.record_commit(word_char_len);
             }
 
@@ -1517,7 +1745,6 @@ impl InputMethodCore {
                 None
             };
 
-            let word_lower = word.to_lowercase();
             self.engine.learn(&word_lower);
             self.engine.learn_online_markov(prev1, prev2, &word_lower);
 
@@ -1533,35 +1760,33 @@ impl InputMethodCore {
                 }
             }
 
-            // Feed word to per-language CVM track + momentum.
-            let lang = if self.config.lang_detection {
-                let l = self.lang_detector.detected().lang;
-                self.engine.learn_with_lang(&word_lower, l);
-                self.lang_detector.record_commit(l);
-                l
-            } else {
-                crate::lang_detect::LangId::En // Default when lang detection disabled
-            };
+            if let Some(language) = evidence.language {
+                self.engine.learn_with_lang(&word_lower, language);
+                self.lang_detector.record_commit(language);
+            }
 
             // Feed word to session cache LM for burstiness tracking.
             if self.config.use_session_cache_lm {
                 self.engine.observe_session(&word_lower);
             }
 
-            // Feed word stats to regime detector (v0.5+).
-            // is_oov: word not found in the trie (zero prefix-search candidates).
-            let is_oov = self.engine.candidate_count(word, 1) == 0;
-
-            // F11: Online corpus expansion — add OOV words to the trie so they
-            // appear in future predictions. Only for words ≥ 3 chars to avoid
-            // noise from typos and abbreviations.
-            if is_oov && word_char_len >= 3 {
-                self.engine.learn_oov_word(&word_lower, lang);
+            // Prefix support can prove language without confirming a new
+            // exact word. Only direct/full acceptance promotes trusted words.
+            if word_char_len >= 3 {
+                if let Some(language) = evidence.confirmed_word {
+                    self.engine.confirm_word(&word_lower, language);
+                } else if is_oov {
+                    self.engine.learn_oov_word(&word_lower, candidate_route);
+                }
             }
 
             let is_flip = self.current_word_had_flip;
-            self.regime_detector
-                .observe_word(word_char_len, is_oov, is_flip, lang);
+            self.regime_detector.observe_word_with_evidence(
+                word_char_len,
+                is_oov,
+                is_flip,
+                evidence.language,
+            );
             // Propagate the current regime to the engine so predict() can gate δ.
             let (regime, _conf) = self.regime_detector.regime();
             self.engine.set_regime(regime);
@@ -1570,7 +1795,11 @@ impl InputMethodCore {
                 self.context.pop_front();
             }
             // Store lowercase for Markov context matching (corpus trained lowercase).
-            self.context.push_back(word.to_lowercase());
+            self.context.push_back(word_lower);
+            self.commit_learning.words.push(CommitObservation {
+                language: evidence.language,
+            });
+            self.commit_learning.accepted_prediction |= cause.is_prediction_accept();
         }
     }
 
@@ -1585,7 +1814,7 @@ impl InputMethodCore {
     ///
     /// Transliterates the word via phonetic map and compares corpus frequencies.
     /// If the transliterated version is 10x+ more frequent → auto-correct.
-    fn try_language_correction(&self, word: &str) -> Option<Action> {
+    fn prepare_language_correction(&self, word: &str) -> Option<LanguageCorrection> {
         use crate::lang_detect::{reverse_transliterate, transliterate, LangId};
 
         let typed_chars = word.chars().count();
@@ -1627,9 +1856,10 @@ impl InputMethodCore {
         // Only correct if the other language is overwhelmingly more likely.
         // Safety: if both exist, don't correct (ambiguous).
         if other_freq > 0.0 && (typed_freq < 1.0 || other_freq / typed_freq.max(1.0) >= 5.0) {
-            return Some(Action::ReplaceWord {
+            return Some(LanguageCorrection {
                 replace_len: typed_chars,
                 text: other_word,
+                language: other_lang,
             });
         }
 
@@ -1696,6 +1926,7 @@ impl InputMethodCore {
         if let Some(word) = show {
             self.ghost.clone_from(&word);
             self.last_predictions = preds;
+            self.last_prediction_language = lang;
             self.anticipatory_ghost_active = true;
             return Some(Action::ShowGhost(word));
         }
@@ -1725,6 +1956,7 @@ impl InputMethodCore {
         &mut self,
         committed_word: &str,
         show_anticipatory: bool,
+        language_correction: Option<Action>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut effective_word = committed_word.to_string();
@@ -1734,7 +1966,7 @@ impl InputMethodCore {
         // the raw word the user typed (live-falsified on Bulgarian ч/ш/щ).
         if self.config.post_commit_autocorrect {
             // Step 1: Language auto-correction.
-            if let Some(correction) = self.try_language_correction(&effective_word) {
+            if let Some(correction) = language_correction {
                 if let Action::ReplaceWord { ref text, .. } = correction {
                     effective_word = text.clone();
                 }
@@ -1815,8 +2047,11 @@ impl InputMethodCore {
 
     fn reset_word(&mut self) {
         self.current_word.clear();
+        self.word_has_derived_chars = false;
+        self.word_has_observed_script = false;
         self.ghost.clear();
         self.last_predictions.clear();
+        self.last_prediction_language = None;
         self.transliteration_active = false;
         self.dual_buffer = None;
         self.current_word_had_flip = false;
@@ -1831,6 +2066,7 @@ impl InputMethodCore {
     /// commits the winner character. On confidence flip, emits `ReplaceWord`
     /// to fix previously committed characters.
     fn handle_dual_buffer_key(&mut self, en_ch: char, bg_ch: char) -> Vec<Action> {
+        self.word_has_derived_chars = true;
         // Initialize dual buffer on first dual-interpretable key in this word.
         if self.dual_buffer.is_none() {
             self.dual_buffer = Some(DualBuffer::from_config(&self.config.dual_buffer));
@@ -1862,19 +2098,16 @@ impl InputMethodCore {
 
         self.current_word = db.winner_text().to_string();
 
-        // Compute winner char once — reused for lang detection and locked-phase commit.
-        let winner_char = match db.winner_lang() {
-            LangId::En => en_ch,
-            LangId::Bg | LangId::Tech => bg_ch,
-        };
-
-        // Feed language detection.
-        if self.config.lang_detection {
-            self.lang_detector.feed_char_instant(winner_char);
-            if !was_locked {
-                self.lang_detector
-                    .feed_dual_result(db.winner_lang(), db.confidence());
-            }
+        // The winner is derived from physical-key interpretations, never an
+        // observed Unicode script. Only current corpus scoring may feed it
+        // back as independent evidence; a prior/fallback or sticky display
+        // lock cannot attest a new character.
+        if self.config.lang_detection
+            && !was_locked
+            && db.evidence_origin() == crate::dual_buffer::EvidenceOrigin::Corpus
+        {
+            self.lang_detector
+                .feed_dual_result(db.winner_lang(), db.confidence());
         }
 
         // ═══ FULL-WORD COMPOSING ═══
@@ -1997,6 +2230,7 @@ impl InputMethodCore {
         if self.active_hints.as_ref().is_some_and(|h| h.suppress_ghost) {
             self.ghost.clear();
             self.last_predictions.clear();
+            self.last_prediction_language = None;
             return String::new();
         }
 
@@ -2008,6 +2242,7 @@ impl InputMethodCore {
         if self.current_word.chars().count() < effective_min {
             self.ghost.clear();
             self.last_predictions.clear();
+            self.last_prediction_language = None;
             return String::new();
         }
 
@@ -2045,6 +2280,7 @@ impl InputMethodCore {
         if !self.current_word.chars().any(char::is_alphabetic) {
             self.ghost.clear();
             self.last_predictions.clear();
+            self.last_prediction_language = None;
             return String::new();
         }
 
@@ -2071,6 +2307,7 @@ impl InputMethodCore {
         let search_prefix = self.current_word.to_lowercase();
 
         let t0 = Instant::now();
+        self.last_prediction_language = lang;
         self.last_predictions =
             self.engine
                 .predict(&search_prefix, &ctx_refs, self.config.max_candidates, lang);
@@ -2274,7 +2511,22 @@ mod tests {
         let actions = core.handle_key(press(Key::Right));
         assert!(has_action(&actions, &Action::HideGhost));
         assert!(has_action(&actions, &Action::CommitText("o".to_string())));
-        assert_eq!(core.current_word(), "hello");
+        assert!(
+            core.current_word().is_empty(),
+            "final Right completes and resets the word"
+        );
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        let batch = core.take_commit_learning();
+        assert!(batch.accepted_prediction);
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::En)
+            }]
+        );
+        core.handle_key(press(Key::Space));
+        assert!(core.take_commit_learning().words.is_empty());
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
     }
 
     #[test]
@@ -5248,7 +5500,8 @@ mod lang_prior_tests {
         // Physical phonetic spelling of the same supported BG word "ви".
         assert_eq!(crate::lang_detect::transliterate("wi"), "ви");
         assert_eq!(
-            core.try_language_correction("wi"),
+            core.prepare_language_correction("wi")
+                .map(LanguageCorrection::into_action),
             Some(Action::ReplaceWord {
                 replace_len: 2,
                 text: "ви".to_string(),
@@ -5621,12 +5874,10 @@ mod lang_prior_tests {
         assert_eq!(db.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
     }
 
-    /// R11 (test_gap, expected PASS today — U2 F6): the detector is fed the
-    /// inherited winner with confidence 0.5 as if it were corpus evidence
-    /// (`feed_dual_result` on every unlocked character).  Flips when D5
-    /// (skip Initial/UnsupportedBoth/PriorOnly) lands as its own phase.
+    /// R11: an unsupported inherited winner is a display fallback, not a
+    /// detector observation. The initial detector state must remain unchanged.
     #[test]
-    fn test_gap_detector_reads_an_unsupported_winner_as_half_confidence_evidence() {
+    fn unsupported_winner_does_not_feed_detector_evidence() {
         let mut core = InputMethodCore::new(no_ghost_config());
         assert!(core.config.lang_detection, "premise: detection on");
         core.handle_key(press_raw(16)); // q / я
@@ -5634,8 +5885,8 @@ mod lang_prior_tests {
         let det = core.lang_detector.detected();
         assert_eq!(det.lang, LangId::En);
         assert!(
-            (det.confidence - 0.5).abs() < 1e-9,
-            "today: feed_dual_result(En, 0.5) reports the inherited winner as evidence"
+            det.confidence.abs() < 1e-9,
+            "an unsupported inherited winner must not manufacture confidence"
         );
     }
 }
@@ -5852,6 +6103,57 @@ mod language_evidence_contract_tests {
         assert_no_language_words(&core);
     }
 
+    #[test]
+    fn unmappable_partial_right_keeps_delivery_without_full_word_confirmation() {
+        let mut core = fresh(true);
+        prior(&mut core, LangId::Bg);
+        raw(&mut core, &[16, 45]);
+        assert_eq!(core.current_word(), "яь");
+        assert!(core.apply_prediction_override("яьѝя").is_some());
+        let actions = core.handle_key(press(Key::Right));
+        assert!(
+            actions.contains(&Action::CommitText("яьѝя".into())),
+            "preserve the existing unmappable-character full delivery fallback"
+        );
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        assert_no_language_words(&core);
+        assert_eq!(
+            core.engine.word_frequency("яьѝя", LangId::Bg),
+            0.0,
+            "partial Right did not explicitly confirm the full visible completion"
+        );
+        let batch = core.take_commit_learning();
+        assert!(
+            batch.accepted_prediction,
+            "physical acceptance feedback remains positive"
+        );
+        assert_eq!(batch.words, vec![CommitObservation { language: None }]);
+    }
+
+    #[test]
+    fn unmappable_partial_right_requires_exact_trust_not_just_a_known_prefix() {
+        for exact in [false, true] {
+            let mut core = fresh(true);
+            core.load_word_lang(if exact { "яьѝя" } else { "яьѝяз" }, 100, LangId::Bg);
+            raw(&mut core, &[16, 45]);
+            assert_eq!(core.current_word(), "яь");
+            assert!(core.apply_prediction_override("яьѝя").is_some());
+            core.handle_key(press(Key::Right));
+            let batch = core.take_commit_learning();
+            assert!(batch.accepted_prediction);
+            assert_eq!(
+                batch.words,
+                vec![CommitObservation {
+                    language: if exact { Some(LangId::Bg) } else { None }
+                }]
+            );
+            assert_eq!(
+                core.engine.word_frequency("яьѝя", LangId::Bg),
+                if exact { 100.0 } else { 0.0 }
+            );
+        }
+    }
+
     // Guards protect useful learning and real evidence from a skip-everything fix.
     #[test]
     fn novel_bg_name_remains_available_for_prediction() {
@@ -5870,6 +6172,84 @@ mod language_evidence_contract_tests {
     }
 
     #[test]
+    fn corpus_prefix_language_does_not_confirm_a_new_exact_word() {
+        let mut core = fresh(false);
+        core.load_word_lang("зориван", 100_000, LangId::Bg);
+        raw(&mut core, &[44, 24, 19, 23]);
+        assert_eq!(core.current_word(), "зори");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.lang_detector.momentum_lang(),
+            Some(LangId::Bg),
+            "trusted prefix still supplies real language evidence"
+        );
+        assert!(
+            core.engine
+                .predict("зор", &[], 5, Some(LangId::Bg))
+                .iter()
+                .any(|p| p.word == "зори"),
+            "the newly typed shorter word must remain a prediction candidate"
+        );
+        assert_eq!(
+            core.engine.score_exact_both("zori", "зори"),
+            (0.0, 0.0),
+            "prefix language evidence must not manufacture exact word confirmation"
+        );
+    }
+
+    #[test]
+    fn direct_observed_script_can_confirm_a_new_exact_word_below_a_known_prefix() {
+        let mut core = fresh(false);
+        core.load_word_lang("зориван", 100_000, LangId::Bg);
+        for ch in "зори".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        core.handle_key(press(Key::Space));
+        assert!(core.engine.score_exact_both("zori", "зори").1 > 0.0,
+            "direct observed script confirms this exact new word independently of the corpus prefix");
+    }
+
+    #[test]
+    fn unobserved_current_word_state_cannot_confirm_an_exact_word() {
+        let mut core = fresh(false);
+        core.current_word = "qxz".into();
+        core.handle_key(press(Key::Space));
+        assert_eq!(core.engine.score_exact_both("qxz", "яьз"), (0.0, 0.0));
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn direct_observed_prefix_keeps_existing_opt_in_correction_output() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("шщчюха", 1, LangId::Bg);
+        core.load_word_lang("[]`\\", 20, LangId::En);
+        for ch in "шщчю".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(core.current_word(), "шщчю");
+        assert_eq!(core.engine.score_exact_both("[]`\\", "шщчю"), (20.0, 0.0));
+        let actions = core.handle_key(press(Key::Space));
+        assert!(actions.contains(&Action::ReplaceWord { replace_len: 4, text: "[]`\\".into() }),
+            "the existing opt-in pipeline replaces this exact-OOV trusted prefix before any new exact confirmation: {actions:?}");
+        let batch = core.take_commit_learning();
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::En)
+            }]
+        );
+        assert_eq!(core.context_words().0, Some("[]`\\"));
+        let profile = core.export_personal_profile();
+        assert!(profile.cvm.words.iter().any(|word| word == "[]`\\"));
+        assert!(!profile.cvm.words.iter().any(|word| word == "шщчю"));
+        assert_eq!(core.engine.score_exact_both("[]`\\", "шщчю"), (20.0, 0.0));
+    }
+
+    #[test]
     fn full_visible_accept_can_promote_word_specific_language_evidence() {
         let mut core = fresh(true);
         raw(&mut core, &[16, 45]);
@@ -5884,6 +6264,64 @@ mod language_evidence_contract_tests {
             core.metrics().commit_count(),
             before,
             "second Tab has no acceptance to learn"
+        );
+    }
+
+    #[test]
+    fn review_accepted_post_confirmation_correction_receipt_follows_effective_word() {
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("car", 100, LangId::En);
+        core.handle_key(press(Key::Char('ц')));
+        assert!(core.apply_prediction_override("цар").is_some());
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(actions.contains(&Action::ReplaceWord {
+            replace_len: 3,
+            text: "car".into()
+        }));
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        let batch = core.take_commit_learning();
+        assert!(batch.accepted_prediction);
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::En)
+            }]
+        );
+        assert_eq!(core.context_words().0, Some("car"));
+        let profile = core.export_personal_profile();
+        assert!(profile.cvm.words.iter().any(|word| word == "car"));
+        assert!(!profile.cvm.words.iter().any(|word| word == "цар"));
+        assert_eq!(
+            core.engine.word_frequency("цар", LangId::Bg),
+            5.0,
+            "full visible confirmation still precedes the accepted correction decision"
+        );
+    }
+
+    #[test]
+    fn accepted_two_character_word_keeps_existing_confirmation_threshold() {
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("ca", 20, LangId::En);
+        core.handle_key(press(Key::Char('ц')));
+        assert!(core.apply_prediction_override("ца").is_some());
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(actions.contains(&Action::ReplaceWord {
+            replace_len: 2,
+            text: "ca".into()
+        }));
+        assert_eq!(core.engine.word_frequency("ца", LangId::Bg), 0.0);
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::En)
+            }]
         );
     }
 
@@ -5942,5 +6380,78 @@ mod language_evidence_contract_tests {
         );
         let detected = core.detected_language();
         assert_eq!((detected.lang, detected.confidence), (LangId::En, 0.5));
+    }
+
+    #[test]
+    fn commit_batch_is_consumed_once_and_replaced_by_the_next_operation() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        let batch = core.take_commit_learning();
+        assert_eq!(batch.words, vec![CommitObservation { language: None }]);
+        assert!(!batch.accepted_prediction);
+        assert!(core.take_commit_learning().words.is_empty());
+
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        // A standalone core user deliberately leaves that batch undrained.
+        core.handle_key(press(Key::Space));
+        assert!(core.take_commit_learning().words.is_empty());
+        core.focus_lost();
+        assert!(core.take_commit_learning().words.is_empty());
+    }
+
+    #[test]
+    fn final_right_is_one_full_accept_for_dual_and_direct_semantic_and_raw_keys() {
+        for dual in [false, true] {
+            for right in [Key::Right, Key::RawCode(106)] {
+                let mut core = fresh(true);
+                if dual {
+                    raw(&mut core, &[16, 45]);
+                } else {
+                    for ch in "qx".chars() {
+                        core.handle_key(press(Key::Char(ch)));
+                    }
+                }
+                assert!(core.apply_prediction_override("qxzz").is_some());
+                let released = core.handle_key(KeyEvent {
+                    key: right.clone(),
+                    modifiers: Modifiers::RELEASE,
+                });
+                assert_eq!(released, vec![Action::ForwardKey]);
+                assert_eq!(core.ghost_text(), "zz");
+                assert!(core.take_commit_learning().words.is_empty());
+                let partial = core.handle_key(press(right.clone()));
+                assert_eq!(core.current_word(), "qxz");
+                assert_eq!(core.metrics().summary().accepted_predictions, 0);
+                assert!(core.take_commit_learning().words.is_empty());
+                if !dual {
+                    assert!(partial.contains(&Action::CommitText("z".into())));
+                }
+                let final_actions = core.handle_key(press(right));
+                let commits: Vec<&str> = final_actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        Action::CommitText(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(commits, if dual { vec!["qxzz"] } else { vec!["z"] });
+                assert!(core.current_word().is_empty());
+                assert_eq!(core.metrics().summary().accepted_predictions, 1);
+                let batch = core.take_commit_learning();
+                assert!(batch.accepted_prediction);
+                assert_eq!(
+                    batch.words,
+                    vec![CommitObservation {
+                        language: Some(LangId::En)
+                    }]
+                );
+                assert!(core.take_commit_learning().words.is_empty());
+                core.handle_key(press(Key::Space));
+                assert!(core.take_commit_learning().words.is_empty());
+                assert_eq!(core.metrics().summary().accepted_predictions, 1);
+            }
+        }
     }
 }
