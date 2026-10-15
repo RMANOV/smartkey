@@ -1816,3 +1816,83 @@ mod commit_language_receipt_contract_tests {
         assert_eq!(ml.light_profile.ghost_accept_rate, accepted_rate);
     }
 }
+
+#[cfg(test)]
+mod shortword_surrounding_routing_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn reduced(context: &str) -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.core.load_word_lang("like", 2_570_395, LangId::En);
+        ml.core.load_word_lang("li", 17_782, LangId::En);
+        ml.core.load_word_lang("ли", 2_511_886, LangId::Bg);
+        ml.set_surrounding_text(Some(context.to_string()), Some(context.chars().count()));
+        ml
+    }
+
+    #[test]
+    fn shortword_recorded_bg_intent_survives_surrounding_hint_to_literal_boundary() {
+        // Public synthetic BG context isolates the same actual surrounding-text
+        // hint path; the recorded private literal stays in the frozen packet.
+        for boundary in [57, 28] {
+            let mut ml = reduced("има ");
+            ml.handle_key(raw(38));
+            let actions = ml.handle_key(raw(23));
+            assert_eq!(ml.current_word(), "ли");
+            assert!(actions.iter().any(
+                |action| matches!(action, Action::ShowComposing { typed, .. } if typed == "ли")
+            ));
+            assert_eq!(ml.core.debug_state(), (true, false, true));
+            let actions = ml.handle_key(raw(boundary));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, Action::CommitText(word) if word == "ли"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, Action::ForwardKey))
+                    .count(),
+                1
+            );
+            assert!(!actions
+                .iter()
+                .any(|action| matches!(action, Action::ReplaceWord { .. })));
+            assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            assert_eq!(ml.light_profile().ghost_accept_rate, 0.5);
+            assert!((ml.light_profile().lang_prior[0] - 0.3434).abs() < 1e-12);
+            let prior = ml.light_profile().lang_prior;
+            ml.handle_key(raw(57));
+            assert_eq!(
+                ml.light_profile().lang_prior,
+                prior,
+                "one committed word supplies one independent observation"
+            );
+        }
+    }
+
+    #[test]
+    fn shortword_english_and_mixed_context_do_not_blanket_select_bg() {
+        for context in ["hello ", "има hello "] {
+            let mut ml = reduced(context);
+            ml.handle_key(raw(38));
+            ml.handle_key(raw(23));
+            assert_eq!(ml.current_word(), "li");
+            let actions = ml.handle_key(raw(57));
+            assert!(actions
+                .iter()
+                .any(|action| matches!(action, Action::CommitText(word) if word == "li")));
+        }
+    }
+}
