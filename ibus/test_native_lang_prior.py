@@ -58,7 +58,11 @@ def _type(core, codes):
     for code in codes:
         core.process_keycode(code, 0)
     word = core.current_word()
-    core.process_keycode(SPACE, 0)
+    actions = core.process_keycode(SPACE, 0)
+    assert [text for kind, text in actions if kind == "commit"] == [word], actions
+    assert sum(kind == "forward" for kind, _ in actions) == 1, actions
+    assert not any(kind == "replace" for kind, _ in actions), actions
+    assert core.current_word() == ""
     return word
 
 

@@ -188,3 +188,53 @@ def test_native_backspace_restores_surviving_technical_evidence(tmp_path, case):
     assert after["lang_prior"][2] == pytest.approx(0.3434)
     assert after["lang_prior"][2] > before["lang_prior"][2]
     assert after["ghost_accept_rate"] == before["ghost_accept_rate"]
+
+
+def _shortword_core(context):
+    core = _native().PyInputMethodCore()
+    core.load_word("like", 2_570_395)
+    core.load_word("li", 17_782)
+    core.load_word("ли", 2_511_886)
+    if context is not None:
+        core.set_surrounding_text(context, len(context))
+    return core
+
+
+@pytest.mark.parametrize("context,expected", [
+    ("има ", "ли"),
+    (None, "li"),
+    ("hello ", "li"),
+    ("има hello ", "li"),
+])
+def test_native_shortword_soft_context_selects_live_reading_before_literal_space(tmp_path, context, expected):
+    core = _shortword_core(context)
+    before = _profile(core, tmp_path, "before-shortword.json")
+    core.process_keycode(38, 0)
+    actions = core.process_keycode(23, 0)
+    assert core.current_word() == expected
+    assert list(core.debug_state()) == [True, False, True]
+    assert any(kind == "composing" for kind, _ in actions)
+
+    actions = core.process_keycode(57, 0)
+
+    assert actions.count(("commit", expected)) == 1
+    assert actions.count(("forward", "")) == 1
+    assert not any(kind == "replace" for kind, _ in actions)
+    assert core.current_word() == ""
+    after = _profile(core, tmp_path, "after-shortword.json")
+    assert after["ghost_accept_rate"] == before["ghost_accept_rate"]
+    core.process_keycode(57, 0)
+    assert _profile(core, tmp_path, "after-empty-boundary.json")["lang_prior"] == after["lang_prior"]
+
+
+def test_native_shortword_english_continuation_overcomes_bg_context():
+    core = _shortword_core("има ")
+    for code in (38, 23):
+        core.process_keycode(code, 0)
+    assert core.current_word() == "ли"
+    for code in (37, 18):
+        core.process_keycode(code, 0)
+    assert core.current_word() == "like"
+    actions = core.process_keycode(57, 0)
+    assert actions.count(("commit", "like")) == 1
+    assert actions.count(("forward", "")) == 1

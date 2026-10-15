@@ -1000,6 +1000,11 @@ impl InputMethodCore {
 
             // Backspace: trim the current word.
             Key::Backspace => {
+                let lang_prior = self
+                    .active_hints
+                    .as_ref()
+                    .and_then(|h| h.lang_prior)
+                    .or_else(|| self.lang_detector.momentum_lang());
                 if !self.current_word.is_empty() {
                     self.begin_word_edit();
                 }
@@ -1025,6 +1030,7 @@ impl InputMethodCore {
                         if !db.is_locked() {
                             let (ef, bf) = self.engine.score_both(db.en_text(), db.bg_text());
                             db.update_scores(ef, bf);
+                            db.apply_soft_context_prior(lang_prior);
                         }
                         let word = db.winner_text().to_string();
                         self.replace_word_with_derived(word);
@@ -2177,6 +2183,7 @@ impl InputMethodCore {
                 .and_then(|h| h.lang_prior)
                 .or_else(|| self.lang_detector.momentum_lang());
             db.apply_prior_lock_hint(lang_prior);
+            db.apply_soft_context_prior(lang_prior);
         }
 
         // Propagate flip detection from dual buffer to regime detector flag.
@@ -7125,5 +7132,187 @@ mod language_evidence_contract_tests {
                 assert_eq!(core.metrics().summary().accepted_predictions, 1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shortword_routing_contract_tests {
+    use super::*;
+    use crate::dual_buffer::EvidenceOrigin;
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn reduced(prior: Option<LangId>) -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        // Reduced from the frozen current corpus JSON facts. The native replay
+        // remains authoritative for the separately loaded binary corpus.
+        core.load_word_lang("like", 2_570_395, LangId::En);
+        core.load_word_lang("li", 17_782, LangId::En);
+        core.load_word_lang("ли", 2_511_886, LangId::Bg);
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: prior,
+            ..Default::default()
+        });
+        core
+    }
+
+    #[test]
+    fn shortword_bg_context_selects_live_supported_particle_without_lock() {
+        let mut core = reduced(Some(LangId::Bg));
+        core.handle_key(raw(38));
+        assert_eq!(core.current_word(), "л");
+        let actions = core.handle_key(raw(23));
+        assert_eq!(core.current_word(), "ли");
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, Action::ShowComposing { typed, .. } if typed == "ли")));
+        assert_eq!(core.debug_state(), (true, false, true));
+        let actions = core.handle_key(raw(57));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::CommitText(word) if word == "ли"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::ReplaceWord { .. })));
+    }
+
+    #[test]
+    fn shortword_context_selection_is_not_independent_detector_confidence() {
+        let mut core = reduced(Some(LangId::Bg));
+        let before = core.detected_language();
+        core.handle_key(raw(38));
+        core.handle_key(raw(23));
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::PriorOnly
+        );
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence)
+        );
+        core.handle_key(raw(57));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Bg)
+            }]
+        );
+        assert!(
+            core.export_personal_profile().confirmed_words.is_empty(),
+            "routing does not confirm a new exact word"
+        );
+        assert_eq!(core.engine.word_frequency("li", LangId::En), 17_782.0);
+        assert_eq!(core.engine.word_frequency("ли", LangId::Bg), 2_511_886.0);
+    }
+
+    #[test]
+    fn shortword_no_context_and_english_context_keep_english() {
+        for prior in [None, Some(LangId::En)] {
+            let mut core = reduced(prior);
+            core.handle_key(raw(38));
+            core.handle_key(raw(23));
+            assert_eq!(core.current_word(), "li");
+            assert_eq!(
+                core.dual_buffer.as_ref().unwrap().evidence_origin(),
+                EvidenceOrigin::Corpus
+            );
+            let actions = core.handle_key(raw(57));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, Action::CommitText(word) if word == "li"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn shortword_strong_english_recovers_after_bg_context_and_semantic_chars_stay_direct() {
+        let mut core = reduced(Some(LangId::Bg));
+        for code in [38, 23, 37, 18] {
+            core.handle_key(raw(code));
+        }
+        assert_eq!(core.current_word(), "like");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::Corpus
+        );
+
+        let mut core = reduced(Some(LangId::Bg));
+        for ch in "li".chars() {
+            core.handle_key(KeyEvent {
+                key: Key::Char(ch),
+                modifiers: Modifiers::empty(),
+            });
+        }
+        assert_eq!(core.current_word(), "li");
+        assert!(core.dual_buffer.is_none());
+    }
+
+    #[test]
+    fn shortword_backspace_rescores_fresh_without_compounding_prior() {
+        let mut core = reduced(Some(LangId::Bg));
+        core.handle_key(raw(38));
+        core.handle_key(raw(23));
+        assert_eq!(core.current_word(), "ли");
+        let confidence = core.dual_buffer.as_ref().unwrap().confidence();
+        for _ in 0..4 {
+            core.handle_key(raw(37));
+            assert_eq!(core.current_word(), "lik");
+            core.handle_key(raw(14));
+            assert_eq!(core.current_word(), "ли");
+            assert_eq!(core.dual_buffer.as_ref().unwrap().confidence(), confidence);
+            assert!(!core.dual_buffer.as_ref().unwrap().is_locked());
+        }
+    }
+
+    #[test]
+    fn shortword_unsupported_context_does_not_create_language_evidence() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            ..Default::default()
+        });
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(LangId::Bg),
+            ..Default::default()
+        });
+        let before = core.detected_language();
+        core.handle_key(raw(38));
+        core.handle_key(raw(23));
+        assert_eq!(core.current_word(), "ли");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::UnsupportedBoth
+        );
+        core.handle_key(raw(57));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence)
+        );
+        assert!(core.export_personal_profile().confirmed_words.is_empty());
+        assert_eq!(core.engine.word_frequency("ли", LangId::Bg), 0.0);
     }
 }

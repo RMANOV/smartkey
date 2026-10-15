@@ -44,8 +44,10 @@ impl Default for DualBufferConfig {
 /// cannot lock either, because confidence is 0.5 and the relaxed threshold
 /// is at least 0.55; a repeated hint at len 1 after an override is excluded
 /// by the caller's score-then-hint order, not by that threshold);
-/// `pop()` to empty → `Initial` via `clear()`.  The caller scores BEFORE it
-/// applies the hint, so on the first character the hint is the last writer.
+/// `apply_soft_context_prior` → `PriorOnly` when a fresh supported,
+/// unlocked multi-character reading changes under the contextual odds;
+/// `pop()` to empty → `Initial` via `clear()`. The caller scores BEFORE
+/// context is applied, preserving the independent raw corpus scores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceOrigin {
     /// Fresh or cleared buffer: nothing has been scored yet.
@@ -53,8 +55,8 @@ pub enum EvidenceOrigin {
     /// The last scoring found no corpus support for either reading
     /// (`total < MIN_CORPUS_SUPPORT`); the winner is inherited, not derived.
     UnsupportedBoth,
-    /// A surrounding/momentum prior biased the winner on the first
-    /// character; no word-level evidence exists yet.
+    /// Surrounding/committed context changed the raw corpus winner. Its
+    /// confidence is contextual and cannot establish independent detector proof.
     PriorOnly,
     /// At least one reading has prefix-corpus support; scores are normalised.
     Corpus,
@@ -65,6 +67,10 @@ pub enum EvidenceOrigin {
 /// tolerance.  A future `>=` or fractional scorer must revisit the R8 and R9b
 /// evidence-origin tests before changing this.
 pub const MIN_CORPUS_SUPPORT: f64 = 1.0;
+
+/// Existing first-character context strength, also used once as soft odds
+/// during a fresh, reversible multi-character corpus selection.
+const CONTEXT_PRIOR_WEIGHT: f64 = 0.65;
 
 /// Dual-interpretation buffer that tracks both EN and BG readings
 /// of the same physical keypress sequence.
@@ -77,7 +83,7 @@ pub struct DualBuffer {
     bg_score: f64,
     /// Currently winning language.
     winner: LangId,
-    /// Confidence of the winner (max of en_score, bg_score).
+    /// Raw corpus confidence, or contextual confidence for a PriorOnly winner.
     confidence: f64,
     /// Whether the language has been locked for this word.
     locked: bool,
@@ -244,7 +250,7 @@ impl DualBuffer {
         // matching prior can still early-lock through the branch below.
         if self.en_buf.len() == 1 && prior_lang != self.winner {
             self.winner = prior_lang;
-            self.confidence = 0.65;
+            self.confidence = CONTEXT_PRIOR_WEIGHT;
             self.origin = EvidenceOrigin::PriorOnly;
             return;
         }
@@ -258,6 +264,28 @@ impl DualBuffer {
         if self.confidence >= relaxed_threshold && self.en_buf.len() >= relaxed_min_chars {
             self.locked = true;
             self.locked_lang = Some(self.winner);
+        }
+    }
+
+    /// Apply a single soft context factor to fresh raw corpus likelihoods.
+    /// Raw scores are never overwritten, and contextual confidence cannot lock
+    /// the buffer or masquerade as independent corpus/detector evidence.
+    pub(crate) fn apply_soft_context_prior(&mut self, prior: Option<LangId>) {
+        if self.locked || self.len() < 2 || self.origin != EvidenceOrigin::Corpus {
+            return;
+        }
+        let (en_weight, bg_weight) = match prior {
+            Some(LangId::En) => (CONTEXT_PRIOR_WEIGHT, 1.0 - CONTEXT_PRIOR_WEIGHT),
+            Some(LangId::Bg) => (1.0 - CONTEXT_PRIOR_WEIGHT, CONTEXT_PRIOR_WEIGHT),
+            _ => return,
+        };
+        let en = self.en_score * en_weight;
+        let bg = self.bg_score * bg_weight;
+        let winner = if en >= bg { LangId::En } else { LangId::Bg };
+        if winner != self.winner {
+            self.winner = winner;
+            self.confidence = en.max(bg) / (en + bg);
+            self.origin = EvidenceOrigin::PriorOnly;
         }
     }
 
@@ -292,8 +320,8 @@ impl DualBuffer {
     }
 
     /// Provenance of the current winner (see the transition table on
-    /// `EvidenceOrigin`).  No production consumer reads this yet; the
-    /// detector-side policy (D5) is a separate, separately gated change.
+    /// `EvidenceOrigin`). Callers use this to keep contextual routing from
+    /// supplying independent detector evidence.
     pub fn evidence_origin(&self) -> EvidenceOrigin {
         self.origin
     }
@@ -905,5 +933,87 @@ mod tests {
         assert!(0.4 + 0.5 < MIN_CORPUS_SUPPORT, "premise");
         assert_eq!(b.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
         assert_eq!(b.confidence(), 0.5);
+    }
+}
+
+#[cfg(test)]
+mod shortword_soft_prior_tests {
+    use super::*;
+
+    fn two_chars() -> DualBuffer {
+        let mut buffer = DualBuffer::from_config(&DualBufferConfig::default());
+        buffer.push('l', 'л');
+        buffer.push('i', 'и');
+        buffer
+    }
+
+    #[test]
+    fn shortword_soft_context_uses_raw_scores_once_without_locking() {
+        let mut buffer = two_chars();
+        let raw_en = 2_570_395.0;
+        let raw_bg = 2_511_886.0;
+        buffer.update_scores(raw_en, raw_bg);
+        let raw = (buffer.en_score, buffer.bg_score);
+        buffer.apply_soft_context_prior(Some(LangId::Bg));
+        assert_eq!(buffer.winner_lang(), LangId::Bg);
+        assert_eq!(buffer.evidence_origin(), EvidenceOrigin::PriorOnly);
+        assert_eq!((buffer.en_score, buffer.bg_score), raw);
+        assert!(!buffer.is_locked());
+        let confidence = buffer.confidence();
+        for _ in 0..4 {
+            buffer.apply_soft_context_prior(Some(LangId::Bg));
+            assert_eq!(buffer.confidence(), confidence);
+            buffer.update_scores(raw_en, raw_bg);
+            buffer.apply_soft_context_prior(Some(LangId::Bg));
+            assert_eq!(buffer.confidence(), confidence);
+        }
+    }
+
+    #[test]
+    fn shortword_context_keeps_independent_raw_confidence_when_winner_agrees() {
+        let mut buffer = two_chars();
+        buffer.update_scores(1_000_000.0, 1.0);
+        let confidence = buffer.confidence();
+        buffer.apply_soft_context_prior(Some(LangId::Bg));
+        assert_eq!(buffer.winner_lang(), LangId::En);
+        assert_eq!(buffer.confidence(), confidence);
+        assert_eq!(buffer.evidence_origin(), EvidenceOrigin::Corpus);
+        buffer.apply_soft_context_prior(Some(LangId::En));
+        assert_eq!(buffer.confidence(), confidence);
+        assert_eq!(buffer.evidence_origin(), EvidenceOrigin::Corpus);
+    }
+
+    #[test]
+    fn shortword_true_corpus_tie_and_zero_support_remain_distinct() {
+        for (en, bg, origin) in [
+            (10.0, 10.0, EvidenceOrigin::Corpus),
+            (0.0, 0.0, EvidenceOrigin::UnsupportedBoth),
+        ] {
+            let mut buffer = two_chars();
+            buffer.update_scores(en, bg);
+            buffer.apply_soft_context_prior(None);
+            assert_eq!(buffer.evidence_origin(), origin);
+            assert_eq!(buffer.confidence(), 0.5);
+        }
+        let mut buffer = two_chars();
+        buffer.update_scores(0.0, 0.0);
+        buffer.apply_soft_context_prior(Some(LangId::Bg));
+        assert_eq!(buffer.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
+        assert_eq!(buffer.winner_lang(), LangId::En);
+    }
+
+    #[test]
+    fn shortword_context_cannot_create_a_lock_even_with_a_low_lock_threshold() {
+        let mut config = DualBufferConfig::default();
+        config.lock_threshold = 0.55;
+        config.min_lock_chars = 2;
+        let mut buffer = DualBuffer::from_config(&config);
+        buffer.push('l', 'л');
+        buffer.push('i', 'и');
+        buffer.update_scores(51.0, 49.0);
+        buffer.apply_soft_context_prior(Some(LangId::Bg));
+        assert!(buffer.confidence() > config.lock_threshold);
+        assert!(!buffer.is_locked());
+        assert_eq!(buffer.evidence_origin(), EvidenceOrigin::PriorOnly);
     }
 }
