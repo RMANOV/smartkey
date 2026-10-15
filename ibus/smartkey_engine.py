@@ -656,7 +656,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         return None
 
     def _sync_surrounding_text(self, text: str | None, cursor_pos: int | None) -> None:
-        self._surrounding_text = text if text else None
+        self._surrounding_text = text
         self._surrounding_cursor_pos = (
             cursor_pos if cursor_pos is not None and cursor_pos >= 0 else None
         )

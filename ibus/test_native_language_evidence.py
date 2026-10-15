@@ -1155,3 +1155,16 @@ def test_native_modifier_only_tap_preserves_sentence_hint(tmp_path, api, identit
     assert call(identity, mask | (1 << 30)) == [("forward", "")]
     assert core.current_word() == ""
     _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=True)
+
+
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_client_text_withdraws_stale_sentence_hint(tmp_path, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    _raw_sentence_prefix(core)
+    # A fresh client report after an editor-side insertion, with no paste key
+    # passing through Core. This updates context, never learned vocabulary.
+    context = "hello. seed "
+    core.set_surrounding_text(context, len(context))
+    assert core.current_word() == ""
+    _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=False)

@@ -582,6 +582,8 @@ pub struct InputMethodCore {
     context: VecDeque<String>,
     /// Presentation evidence for forwarded delimiters, never model context.
     sentence_boundary: SentenceBoundaryHint,
+    /// Current-position casing reconciliation, independent of lexical hints.
+    sentence_presentation_override: Option<bool>,
     enabled: bool,
     /// Whether the current host can replace text already delivered to its client.
     /// Ephemeral transport capability; never part of config or personal state.
@@ -633,6 +635,7 @@ impl InputMethodCore {
             ghost: String::new(),
             context: VecDeque::with_capacity(CONTEXT_SIZE),
             sentence_boundary: SentenceBoundaryHint::None,
+            sentence_presentation_override: None,
             enabled,
             external_rewrite_supported: true,
             last_predictions: Vec::new(),
@@ -672,6 +675,25 @@ impl InputMethodCore {
 
     pub(crate) fn set_terminal_context_lang(&mut self, lang: Option<LangId>) {
         self.terminal_context_lang = lang.filter(|lang| matches!(lang, LangId::En | LangId::Bg));
+    }
+
+    /// Local delimiter projection only, independent of a reconciliation veto.
+    pub(crate) fn has_sentence_boundary_hint(&self) -> bool {
+        self.sentence_boundary != SentenceBoundaryHint::None
+    }
+
+    /// A contradictory client report also vetoes stale lexical casing hints.
+    pub(crate) fn withdraw_sentence_boundary_hint(&mut self) {
+        self.sentence_boundary = SentenceBoundaryHint::None;
+        self.sentence_presentation_override = Some(false);
+    }
+
+    fn sentence_start_override(&self) -> Option<bool> {
+        // A genuine new local boundary supersedes an older external veto.
+        self.sentence_boundary
+            .is_sentence_start()
+            .then_some(true)
+            .or(self.sentence_presentation_override)
     }
 
     // -- passive calibration tap (delegates to the engine) --------------
@@ -1062,8 +1084,10 @@ impl InputMethodCore {
                     // preedit, nothing was committed. The client's preceding
                     // delimiter was not edited by this local cancellation.
                     let sentence_boundary = self.sentence_boundary;
+                    let sentence_presentation_override = self.sentence_presentation_override;
                     self.reset_word();
                     self.sentence_boundary = sentence_boundary;
+                    self.sentence_presentation_override = sentence_presentation_override;
                     vec![Action::HideGhost]
                 } else {
                     vec![Action::ForwardKey]
@@ -1099,7 +1123,17 @@ impl InputMethodCore {
                 }
                 // Capture whole-word ownership before taking/resetting the token.
                 let rewrite_allowed = self.external_rewrite_supported || self.dual_buffer.is_some();
-                let sentence_start = self.sentence_boundary.is_sentence_start();
+                let sentence_start = self.sentence_start_override();
+                // Empty Space does not finish a word; retain its current-position
+                // decision. Return instead establishes a new local boundary.
+                let next_presentation_override = if event.key == Key::Space
+                    && self.current_word.is_empty()
+                    && self.sentence_boundary == SentenceBoundaryHint::None
+                {
+                    self.sentence_presentation_override
+                } else {
+                    None
+                };
                 let next_boundary = if event.key == Key::Return {
                     SentenceBoundaryHint::SentenceStart {
                         spaces: 0,
@@ -1137,6 +1171,7 @@ impl InputMethodCore {
                     let correction = self.commit_boundary_word(&word, rewrite_allowed);
                     self.reset_word();
                     self.sentence_boundary = next_boundary;
+                    self.sentence_presentation_override = next_presentation_override;
                     let mut actions = vec![
                         Action::HideGhost,
                         Action::CommitText(word.clone()),
@@ -1165,6 +1200,7 @@ impl InputMethodCore {
                 };
                 self.reset_word();
                 self.sentence_boundary = next_boundary;
+                self.sentence_presentation_override = next_presentation_override;
                 let mut actions = vec![Action::HideGhost, Action::ForwardKey];
                 // Post-commit intelligence pipeline: auto-correct, auto-caps, next-word ghost.
                 if let Some((word, correction)) = committed {
@@ -1282,7 +1318,7 @@ impl InputMethodCore {
                 {
                     let rewrite_allowed =
                         self.external_rewrite_supported || self.dual_buffer.is_some();
-                    let sentence_start = self.sentence_boundary.is_sentence_start();
+                    let sentence_start = self.sentence_start_override();
                     let word = self.resolve_word_boundary();
                     let correction = self.commit_boundary_word(&word, rewrite_allowed);
                     self.reset_word();
@@ -1597,7 +1633,11 @@ impl InputMethodCore {
             self.external_rewrite_supported || (prefix_in_preedit && words.len() == 1);
         // Conserve the exact shown composition. First-word phrase casing belongs
         // in its pre-display producer, not this final-word post-commit pipeline.
-        let sentence_start = self.sentence_boundary.is_sentence_start() && words.len() == 1;
+        let sentence_start = if words.len() == 1 {
+            self.sentence_start_override()
+        } else {
+            None
+        };
         let commit_text = if prefix_in_preedit {
             full_text.clone()
         } else {
@@ -1684,6 +1724,7 @@ impl InputMethodCore {
     pub fn focus_gained(&mut self) {
         self.commit_learning = CommitLearningBatch::default();
         self.sentence_boundary = SentenceBoundaryHint::None;
+        self.sentence_presentation_override = None;
     }
 
     /// Called when the cursor moves away from the current typing location.
@@ -2256,7 +2297,7 @@ impl InputMethodCore {
     /// Step 2: Auto-capitalize if previous context requires it.
     ///
     /// Fires after sentence-ending punctuation (. ! ? \n) and for proper nouns.
-    fn try_auto_capitalize(&self, word: &str, sentence_start: bool) -> Option<Action> {
+    fn try_auto_capitalize(&self, word: &str, sentence_start: Option<bool>) -> Option<Action> {
         if word.is_empty() {
             return None;
         }
@@ -2268,12 +2309,13 @@ impl InputMethodCore {
 
         // The current word is already appended; inspect the preceding committed
         // word for sentence-ending punctuation (.!?\n).
-        let needs_cap = sentence_start
-            || if let Some(prev) = self.context.iter().rev().nth(1) {
+        let needs_cap = sentence_start.unwrap_or_else(|| {
+            if let Some(prev) = self.context.iter().rev().nth(1) {
                 CapsEngine::requires_capitalization(prev)
             } else {
                 true // Start of input.
-            };
+            }
+        });
 
         // Check proper noun.
         let is_proper = self.caps_engine.is_proper_noun(word);
@@ -2347,7 +2389,7 @@ impl InputMethodCore {
         show_anticipatory: bool,
         language_correction: Option<Action>,
         rewrite_allowed: bool,
-        sentence_start: bool,
+        sentence_start: Option<bool>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut effective_word = committed_word.to_string();
@@ -2456,6 +2498,7 @@ impl InputMethodCore {
 
     fn reset_word(&mut self) {
         self.sentence_boundary = SentenceBoundaryHint::None;
+        self.sentence_presentation_override = None;
         self.current_word.clear();
         self.terminal_context_lang = None;
         self.word_origins.clear();
@@ -2737,8 +2780,9 @@ impl InputMethodCore {
             .unwrap_or(false);
 
         let prev_token = ctx_refs.last().copied().unwrap_or("");
-        let force_sentence_start = self.sentence_boundary.is_sentence_start()
-            || CapsEngine::requires_capitalization(prev_token);
+        let force_sentence_start = self
+            .sentence_start_override()
+            .unwrap_or_else(|| CapsEngine::requires_capitalization(prev_token));
 
         for pred in &mut self.last_predictions {
             pred.word = CapsEngine::apply_caps(&pred.word, regime);
@@ -9430,5 +9474,72 @@ mod sentence_boundary_followup_tests {
         assert_eq!(core.handle_key(kill), vec![Action::HideGhost]);
         assert!(core.is_enabled());
         review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_reconciled_veto_keeps_explicit_uppercase_prefix() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        core.withdraw_sentence_boundary_hint();
+        let actions = core.handle_key(KeyEvent {
+            key: Key::RawCode(17),
+            modifiers: Modifiers::SHIFT,
+        });
+        assert_eq!(core.current_word(), "W");
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ShowComposing { typed, .. } if typed == "W")));
+        assert_eq!(core.predictions()[0].word, "World");
+        review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_reconciled_veto_keeps_registered_proper_noun() {
+        let mut core = fresh(true);
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey-sentence-reconciliation-noun-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let corpus = dir.join("proper.json");
+        std::fs::write(
+            &corpus,
+            r#"{"unigrams":{"london":1000},"proper_nouns":["London"]}"#,
+        )
+        .unwrap();
+        core.load_corpus_file(&corpus).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        sentence(&mut core);
+        core.withdraw_sentence_boundary_hint();
+        raw(&mut core, &[38]);
+        assert_eq!(core.current_word(), "l");
+        assert_eq!(core.predictions()[0].word, "London");
+        raw(&mut core, &[24, 49, 32, 24, 49]);
+        assert_eq!(core.current_word(), "london");
+        review_only_hello_learned(&core);
+        let actions = key(&mut core, Key::Space);
+        assert_eq!(
+            actions,
+            vec![
+                Action::HideGhost,
+                Action::CommitText("london".into()),
+                Action::ForwardKey,
+                Action::ReplaceWord {
+                    replace_len: 6,
+                    text: "London".into(),
+                },
+            ]
+        );
+        assert!(core.current_word().is_empty());
+        let profile = core.export_personal_profile();
+        let mut learned = profile.cvm.words;
+        learned.sort();
+        assert_eq!(learned, vec!["hello", "london"]);
+        assert_eq!(
+            profile.markov_bigrams,
+            vec![("hello".into(), "london".into(), 1)]
+        );
+        assert!(profile.markov_trigrams.is_empty());
+        assert!(profile.confirmed_words.is_empty());
     }
 }
