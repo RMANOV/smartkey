@@ -378,11 +378,11 @@ impl MasterLoop {
     }
 
     pub fn save_personal_default(&self) -> Result<(), String> {
-        self.core.save_personal_default()
+        self.save_personal(&crate::paths::personal_profile_path())
     }
 
     pub fn load_personal_default(&mut self) -> Result<(), String> {
-        self.core.load_personal_default()
+        self.load_personal(&crate::paths::personal_profile_path())
     }
 
     pub fn metrics(&self) -> &PredictionMetrics {

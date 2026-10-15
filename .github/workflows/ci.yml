@@ -61,7 +61,8 @@ jobs:
             PYTHONDONTWRITEBYTECODE=1 \
             python -m pytest -q -p no:cacheprovider \
               ibus/test_native_space_accept.py ibus/test_native_lang_prior.py \
-              ibus/test_native_privacy_boundaries.py ibus/test_native_key_contract.py
+              ibus/test_native_privacy_boundaries.py ibus/test_native_key_contract.py \
+              ibus/test_native_profile_persistence.py
           SMARTKEY_EXPECT_BUILD_GIT_SHA="$build_sha" \
             SMARTKEY_EXPECT_BUILD_GIT_DIRTY=0 \
             SMARTKEY_TEST_NATIVE_MODULE="$native_extension" \
@@ -70,7 +71,8 @@ jobs:
               --ignore=ibus/test_native_space_accept.py \
               --ignore=ibus/test_native_lang_prior.py \
               --ignore=ibus/test_native_privacy_boundaries.py \
-              --ignore=ibus/test_native_key_contract.py
+              --ignore=ibus/test_native_key_contract.py \
+              --ignore=ibus/test_native_profile_persistence.py
 
   s02-offline:
     name: S02 offline import safety
