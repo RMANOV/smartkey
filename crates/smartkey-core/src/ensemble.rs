@@ -1230,7 +1230,9 @@ impl SmartKeyEngine {
 
         // When PPM is active, borrow a share from β (markov) for short prefixes.
         // When FastCoding, tech gets δ = 0.15 borrowed proportionally from α, β, γ.
-        let has_ppm = models.iter().any(|m| m.ppm.is_some());
+        // Borrow only when the pool passes the same PPM contribution gate used
+        // below; an allocated model with a gated-zero score gets no budget.
+        let has_ppm = max_ppm > 1e-6;
         let (eff_alpha, eff_beta, eff_gamma, eff_delta, eff_tech) = if has_ppm && prefix.len() <= 1
         {
             // Short prefix: PPM gets 0.15 borrowed from markov.
