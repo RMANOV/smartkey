@@ -893,7 +893,7 @@ def _sentence_boundary_core(tmp_path, *, post=None, ghost=False):
     return core
 
 
-def _raw_sentence_prefix(core):
+def _raw_sentence_prefix(core, *, whitespace=True):
     trace = []
     for code in (35, 18, 38, 38, 24):  # hello
         actions = core.process_keycode(code, 0)
@@ -905,9 +905,10 @@ def _raw_sentence_prefix(core):
     assert [text for kind, text in punctuation if kind == "commit"] == ["hello"], punctuation
     assert punctuation.count(("forward", "")) == 1, punctuation
     assert core.current_word() == "", punctuation
-    space = core.process_keycode(57, 0)
-    assert space == [("hide", ""), ("forward", "")], space
-    assert core.current_word() == "", space
+    if whitespace:
+        space = core.process_keycode(57, 0)
+        assert space == [("hide", ""), ("forward", "")], space
+        assert core.current_word() == "", space
 
 
 @pytest.mark.parametrize("post", [False, True], ids=["opt-out", "opt-in"])
@@ -964,3 +965,54 @@ def test_native_default_tab_preserves_actual_displayed_pair_once(tmp_path):
     profile = _native_profile_fixture(core, tmp_path, "sentence-tab-profile.json")
     assert set(profile["cvm"]["words"]) == {"hello", "world"}
     assert profile["markov_bigrams"] == [["hello", "world", 1]]
+
+
+@pytest.mark.parametrize("case", ["cancel-local-preedit", "literal-tab", "trim-extra-space"])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_sentence_boundary_review_paths_preserve_actual_word_scope(tmp_path, case, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    _raw_sentence_prefix(core, whitespace=case != "literal-tab")
+    if case == "cancel-local-preedit":
+        offer = core.process_keycode(16, 0)  # Unsupported q: no eligible displayed suffix.
+        composing = [_native().ffi_decode_composing_payload(text)
+                     for kind, text in offer if kind == "composing"]
+        assert composing == [("q", "")], offer
+        assert not any(kind in {"commit", "replace", "forward"} for kind, _ in offer), offer
+        cancelled = core.process_keycode(1, 0)  # Escape cancels only this local preedit.
+        assert cancelled == [("hide", "")], cancelled
+    elif case == "literal-tab":
+        # This Core contract applies when the client inserts the forwarded Tab.
+        # A client focus change has its separate focus/reset invalidation path.
+        tab = core.process_keycode(15, 0)
+        assert tab == [("forward", "")], tab
+    else:
+        extra_space = core.process_keycode(57, 0)
+        assert extra_space == [("hide", ""), ("forward", "")], extra_space
+        backspace = core.process_keycode(14, 0)
+        assert backspace.count(("forward", "")) == 1, backspace
+        assert not any(kind in {"commit", "replace"} for kind, _ in backspace), backspace
+    assert core.current_word() == ""
+
+    codes = (17,) if prediction else (17, 24, 19, 38, 32)  # w / world
+    for code in codes:
+        step = core.process_keycode(code, 0)
+        assert any(kind == "composing" for kind, _ in step), step
+        assert not any(kind in {"commit", "replace", "forward"} for kind, _ in step), step
+    if prediction:
+        assert core.current_word() == "w"
+        assert core.predictions()[0][0] == "World", core.predictions()
+        profile = _native_profile_fixture(core, tmp_path, "sentence-review-prediction.json")
+        assert set(profile["cvm"]["words"]) == {"hello"}
+        assert profile["markov_bigrams"] == []
+    else:
+        boundary = core.process_keycode(57, 0)
+        assert [text for kind, text in boundary if kind == "commit"] == ["world"], boundary
+        replacements = [_native().ffi_decode_replace_payload(text)
+                        for kind, text in boundary if kind == "replace"]
+        assert replacements == [(5, "World")], boundary
+        assert boundary.count(("forward", "")) == 1, boundary
+        assert core.current_word() == "", boundary
+        profile = _native_profile_fixture(core, tmp_path, "sentence-review-postcommit.json")
+        assert set(profile["cvm"]["words"]) == {"hello", "world"}
+        assert profile["markov_bigrams"] == [["hello", "world", 1]]
