@@ -293,6 +293,10 @@ impl MasterLoop {
     // Delegated API (1:1 mirror of InputMethodCore)
     // ======================================================================
 
+    pub fn set_external_rewrite_supported(&mut self, supported: bool) {
+        self.core.set_external_rewrite_supported(supported);
+    }
+
     pub fn focus_lost(&mut self) -> Vec<Action> {
         self.anticipated = false;
         self.core.clear_hints();
@@ -3641,5 +3645,53 @@ mod hybrid_followup_tests {
         step(&mut ml, &mut client, &mut preedit, Key::Space);
         assert_eq!(client, "зa ");
         assert_eq!(ml.metrics().summary().total_commits, 1);
+    }
+}
+
+#[cfg(test)]
+mod external_rewrite_delegation_tests {
+    use super::*;
+    use crate::input::{Key, KeyEvent, Modifiers};
+
+    fn press(ml: &mut MasterLoop, ch: char) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key: Key::Char(ch),
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    #[test]
+    fn external_rewrite_master_loop_false_delegates_before_legacy_mutation() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        ml.set_external_rewrite_supported(false);
+        press(&mut ml, 'z');
+        let a = press(&mut ml, 'd');
+        eprintln!(
+            "MasterLoop unsupported legacy: {a:?}; word={:?}",
+            ml.current_word()
+        );
+        assert!(!a.iter().any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(ml.current_word(), "zd");
+    }
+
+    #[test]
+    fn external_rewrite_master_loop_true_preserves_legacy_producer() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        ml.set_external_rewrite_supported(true);
+        press(&mut ml, 'z');
+        let a = press(&mut ml, 'd');
+        assert!(a.contains(&Action::ReplaceWord {
+            replace_len: 1,
+            text: "зд".into()
+        }));
+        assert_eq!(ml.current_word(), "зд");
     }
 }
