@@ -75,6 +75,10 @@ class FakeO1Core:
     def o1_abandon(self) -> None:
         self.pending = None
 
+    def set_external_rewrite_supported(self, supported: bool) -> None:
+        assert isinstance(supported, bool)
+        self.external_rewrite_supported = supported
+
 
 class PreparingO1Core(FakeO1Core):
     """New-native fake that records startup cache preparation."""
@@ -727,7 +731,12 @@ def test_engine_init_starts_o1_only_after_corpus_load(
         def __init__(self):
             self.calls = []
 
+        def set_external_rewrite_supported(self, supported: bool) -> None:
+            assert isinstance(supported, bool)
+            self.external_rewrite_supported = supported
+
         def load_personal(self):
+            assert self.external_rewrite_supported is False
             self.calls.append("personal")
 
         def o1_prepare(self):
@@ -769,7 +778,8 @@ def test_collector_keeps_older_native_modules_without_prepare_compatible(tmp_pat
         collector.close()
 
 
-def test_engine_init_keeps_older_native_module_collector_active(tmp_path, monkeypatch):
+def test_engine_init_keeps_legacy_o1_snapshot_api_collector_active(tmp_path, monkeypatch):
+    """Optional O1 preparation may be absent; delivery capability is required."""
     ske = _load_engine_module()
     cfg = tmp_path / "smartkey.json"
     cfg.write_text(
@@ -780,8 +790,13 @@ def test_engine_init_keeps_older_native_module_collector_active(tmp_path, monkey
     )
     events = []
 
-    class _OldCore:
+    class _LegacyO1Core:
+        def set_external_rewrite_supported(self, supported: bool) -> None:
+            assert isinstance(supported, bool)
+            self.external_rewrite_supported = supported
+
         def load_personal(self):
+            assert self.external_rewrite_supported is False
             events.append("personal")
 
         def o1_snapshot(self, _ctx):
@@ -794,7 +809,7 @@ def test_engine_init_keeps_older_native_module_collector_active(tmp_path, monkey
     import ibus.o1_shim as engine_o1_shim
 
     monkeypatch.setattr(ske, "_CONFIG_FILE", cfg)
-    monkeypatch.setattr(ske, "PyInputMethodCore", lambda _config: _OldCore())
+    monkeypatch.setattr(ske, "PyInputMethodCore", lambda _config: _LegacyO1Core())
 
     def _fake_load_corpus(self):
         self._o1_corpus_loaded.append(str(_corpus_marker(tmp_path)))
@@ -821,6 +836,7 @@ def test_engine_init_does_not_start_o1_without_a_loaded_corpus(tmp_path, monkeyp
 
     class _Core(PreparingO1Core):
         def load_personal(self):
+            assert self.external_rewrite_supported is False
             events.append("personal")
 
     class _Collector:
@@ -854,6 +870,7 @@ def _engine_init_with_prepare_error(tmp_path, monkeypatch, error):
 
     class _Core(FakeO1Core):
         def load_personal(self):
+            assert self.external_rewrite_supported is False
             return None
 
         def o1_prepare(self):
