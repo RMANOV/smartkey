@@ -794,12 +794,18 @@ impl InputMethodCore {
             {
                 if en_ch != bg_ch && self.config.dual_buffer.enabled {
                     let layout = self.word_delivery_layout.or_else(|| {
-                        (self.dual_buffer.is_none() && !self.current_word.is_empty())
-                            .then_some(keymap::Layout::En)
+                        (self.dual_buffer.is_none() && !self.current_word.is_empty()).then_some(
+                            if self.transliteration_active {
+                                keymap::Layout::Bg
+                            } else {
+                                keymap::Layout::En
+                            },
+                        )
                     });
                     if let Some(layout) = layout {
                         // A semantic prefix is already in the client. Keep it
-                        // intact; the old nondual fallback uses EN by default.
+                        // intact and retain any active legacy transliteration.
+                        // Unconverted semantic prefixes keep the EN fallback.
                         self.word_delivery_layout = Some(layout);
                         let ch = match layout {
                             keymap::Layout::En => en_ch,

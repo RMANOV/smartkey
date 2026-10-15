@@ -604,3 +604,74 @@ def test_native_no_ghost_tab_ends_word_before_next_raw_key(tmp_path, mode):
     assert set(after_space["cvm"]["words"]) == ({"qa", "x"} if prefix else {"x"})
     assert after_space["markov_bigrams"] == ([["qa", "x", 1]] if prefix else [])
     assert after_space["weights"]["commit_count"] == 0
+
+
+@pytest.mark.parametrize("transliterated", [True, False], ids=["active-bg", "literal-en"])
+def test_native_active_transliteration_prefix_keeps_raw_rendering(tmp_path, transliterated):
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+    core.load_word("здравей" if transliterated else "zebra", 1_000_000)
+    engine, client, preedit = _hybrid_client(core)
+    trace = []
+
+    def step(kind, code, original):
+        actions = core.process_keycode(code, 0) if kind == "raw" else core.handle_key(code, 0)
+        if not engine._execute_actions(actions):
+            client.apply_key(original, 0, "default")
+        row = {"kind": kind, "key": code, "actions": actions,
+               "word": core.current_word(), "committed": client.text, "preedit": preedit[0]}
+        trace.append(row)
+        print(json.dumps(row, ensure_ascii=False))
+        return actions
+
+    def learned(name):
+        path = tmp_path / name
+        core.export_personal(str(path))
+        return json.loads(path.read_text())
+
+    before = learned("before.json")
+    step("char", ord("z"), ord("z"))
+    second = step("char", ord("d"), ord("d"))
+    prefix = "зд" if transliterated else "zd"
+    replacements = [_native().ffi_decode_replace_payload(payload)
+                    for kind, payload in second if kind == "replace"]
+    assert replacements == ([(1, "зд")] if transliterated else []), trace
+    assert core.current_word() == client.text == prefix and preedit[0] == "", trace
+    assert core.debug_state()[0] is False, trace
+
+    def append_raw(code, original, suffix):
+        actions = step("raw", code, original)
+        assert actions.count(("commit", suffix)) == 1, trace
+        assert [text for kind, text in actions if kind == "commit"] == [suffix], trace
+        assert not any(kind in {"forward", "replace", "composing"} for kind, _ in actions), trace
+        assert core.current_word() == client.text, trace
+        return actions
+
+    append_raw(19, ord("r"), "р" if transliterated else "r")
+    assert core.current_word() == prefix + ("р" if transliterated else "r"), trace
+    append_raw(30, ord("a"), "а" if transliterated else "a")
+    before_backspace = client.text
+    backspace = step("char", 0xFF08, 0xFF08)
+    assert sum(kind == "forward" for kind, _ in backspace) == 1, trace
+    assert not any(kind in {"commit", "replace"} for kind, _ in backspace), trace
+    assert core.current_word() == client.text == before_backspace[:-1], trace
+    append_raw(30, ord("a"), "а" if transliterated else "a")
+    expected = "здра" if transliterated else "zdra"
+    assert core.current_word() == client.text == expected, trace
+    mid = learned("mid.json")
+    assert mid["cvm"]["words"] == [] and mid["markov_bigrams"] == []
+    assert mid["light_profile"]["lang_prior"] == before["light_profile"]["lang_prior"]
+    assert not mid.get("confirmed_words", [])
+    boundary = step("raw", 57, 0x20)
+    assert [text for kind, text in boundary if kind == "commit"] == [], trace
+    assert sum(kind == "forward" for kind, _ in boundary) == 1, trace
+    assert not any(kind == "replace" for kind, _ in boundary), trace
+    assert core.current_word() == "" and client.text == expected + " " and preedit[0] == "", trace
+    after = learned("after.json")
+    assert after["cvm"]["words"] == [expected] and after["markov_bigrams"] == []
+    assert not after.get("confirmed_words", []), "derived rendering must not confirm an OOV terminal"
+    assert after["weights"]["commit_count"] == 0, "ordinary boundary is not prediction acceptance"
+    again = step("raw", 57, 0x20)
+    assert not any(kind in {"commit", "replace"} for kind, _ in again), trace
+    final = learned("after-empty-space.json")
+    assert final["cvm"]["words"] == [expected] and final["markov_bigrams"] == []
+    assert final["light_profile"]["lang_prior"] == after["light_profile"]["lang_prior"]
