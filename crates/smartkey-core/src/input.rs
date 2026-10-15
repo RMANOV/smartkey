@@ -1140,7 +1140,7 @@ impl InputMethodCore {
 
                 // v0.4.1: transliteration — auto-map Latin to Cyrillic when
                 // the user is on the wrong keyboard layout.
-                if self.word_delivery_layout.is_none() && self.transliteration_active {
+                if self.transliteration_active {
                     if let Some(cyrillic) = lang_detect::phonetic_map(ch) {
                         self.pop_word_char(); // Remove the observed Latin char.
                         self.push_word_char(cyrillic, false);
@@ -1717,6 +1717,9 @@ impl InputMethodCore {
         let Some(db) = self.dual_buffer.take() else {
             return Vec::new();
         };
+        // This raw preedit owns the literal semantic key. A legacy latch from
+        // an erased token must not map it or bypass delivery of the prefix.
+        self.transliteration_active = false;
         self.word_delivery_layout = Some(match db.winner_lang() {
             LangId::Bg => keymap::Layout::Bg,
             LangId::En | LangId::Tech => keymap::Layout::En,

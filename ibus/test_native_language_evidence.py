@@ -675,3 +675,114 @@ def test_native_active_transliteration_prefix_keeps_raw_rendering(tmp_path, tran
     final = learned("after-empty-space.json")
     assert final["cvm"]["words"] == [expected] and final["markov_bigrams"] == []
     assert final["light_profile"]["lang_prior"] == after["light_profile"]["lang_prior"]
+
+
+
+def _legacy_zd_client_prefix(core, engine, client, preedit):
+    trace = []
+    for ch in "zd":
+        actions = core.handle_key(ord(ch), 0)
+        if not engine._execute_actions(actions):
+            client.apply_key(ord(ch), 0, "default")
+        trace.append({"key": ch, "actions": actions, "word": core.current_word(), "client": client.text})
+    replaced = [_native().ffi_decode_replace_payload(text)
+                for kind, text in trace[-1]["actions"] if kind == "replace"]
+    assert replaced == [(1, "зд")], trace
+    assert core.current_word() == client.text == "зд" and preedit[0] == "", trace
+    return trace
+
+
+def _native_profile_fixture(core, tmp_path, name):
+    path = tmp_path / name
+    core.export_personal(str(path))
+    return json.loads(path.read_text())
+
+
+def test_native_4c_manual_completion_does_not_reject_hidden_ghost(tmp_path):
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": True}))
+    core.load_word("qaxyz", 1_000_000)
+    engine, client, preedit = _hybrid_client(core)
+    trace = []
+    for kind, code, original in (("raw", 16, ord("q")), ("char", ord("a"), ord("a")),
+                                 ("raw", 45, ord("x")), ("raw", 21, ord("y"))):
+        trace.append(_hybrid_step(core, engine, client, preedit, kind, code, original_keyval=original))
+    assert core.current_word() == client.text == "qaxy", trace
+    assert ("ghost", "z") in trace[-1]["actions"], trace
+    for _ in range(3):
+        finished = _hybrid_step(core, engine, client, preedit, "raw", 44, original_keyval=ord("z"))
+        trace.append(finished)
+        assert core.current_word() == client.text == "qaxyz", trace
+        assert [text for kind, text in finished["actions"] if kind == "commit"] == ["z"], trace
+        assert ("hide", "") in finished["actions"] and ("forward", "") not in finished["actions"], trace
+        edited = _hybrid_step(core, engine, client, preedit, "char", 0xFF08)
+        trace.append(edited)
+        assert core.current_word() == client.text == "qaxy", trace
+        assert ("ghost", "z") in edited["actions"], "editing a manually completed word is not rejection: " + repr(trace)
+    # Backspace over a genuinely visible ghost must still suppress after two
+    # actual rejections; the fix must not disable ordinary rejection learning.
+    for attempt in range(2):
+        _hybrid_step(core, engine, client, preedit, "char", 0xFF08)
+        assert core.current_word() == client.text == "qax"
+        shown = _hybrid_step(core, engine, client, preedit, "raw", 21, original_keyval=ord("y"))
+        assert core.current_word() == client.text == "qaxy"
+        assert (("ghost", "z") in shown["actions"]) is (attempt == 0), shown
+    mid = _native_profile_fixture(core, tmp_path, "manual-mid.json")
+    assert mid["cvm"]["words"] == [] and mid["markov_bigrams"] == []
+    boundary = _hybrid_step(core, engine, client, preedit, "raw", 57)
+    assert not any(kind == "commit" for kind, _ in boundary["actions"]), boundary
+    assert sum(kind == "forward" for kind, _ in boundary["actions"]) == 1
+    assert client.text == "qaxy " and core.current_word() == ""
+    final = _native_profile_fixture(core, tmp_path, "manual-final.json")
+    assert final["cvm"]["words"] == ["qaxy"] and not final.get("confirmed_words", [])
+    assert final["weights"]["commit_count"] == 0
+
+
+def test_native_4c_active_transliteration_keeps_semantic_letters(tmp_path):
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+    core.load_word("здравей", 1_000_000)
+    engine, client, preedit = _hybrid_client(core)
+    before = _profile(core, tmp_path, "semantic-before.json")
+    trace = _legacy_zd_client_prefix(core, engine, client, preedit)
+    raw = _hybrid_step(core, engine, client, preedit, "raw", 19, original_keyval=ord("r"))
+    assert core.current_word() == client.text == "здр" and ("commit", "р") in raw["actions"], [*trace, raw]
+    semantic = _hybrid_step(core, engine, client, preedit, "char", ord("a"))
+    assert [text for kind, text in semantic["actions"] if kind == "commit"] == ["а"], [*trace, raw, semantic]
+    assert not any(kind in {"forward", "replace", "composing"} for kind, _ in semantic["actions"]), semantic
+    assert core.current_word() == client.text == "здра" and preedit[0] == ""
+    mid = _native_profile_fixture(core, tmp_path, "semantic-mid.json")
+    assert mid["cvm"]["words"] == [] and mid["light_profile"]["lang_prior"] == before["lang_prior"]
+    boundary = _hybrid_step(core, engine, client, preedit, "raw", 57)
+    assert not any(kind == "commit" for kind, _ in boundary["actions"]), boundary
+    assert sum(kind == "forward" for kind, _ in boundary["actions"]) == 1
+    assert client.text == "здра " and core.current_word() == ""
+    final = _native_profile_fixture(core, tmp_path, "semantic-final.json")
+    assert final["cvm"]["words"] == ["здра"] and not final.get("confirmed_words", [])
+    _hybrid_step(core, engine, client, preedit, "raw", 57)
+    assert _profile(core, tmp_path, "semantic-empty-space.json")["lang_prior"] == final["light_profile"]["lang_prior"]
+
+
+def test_native_4c_erased_transliteration_then_new_preedit_keeps_literal_handoff(tmp_path):
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+    core.load_word("здравей", 1_000_000)
+    engine, client, preedit = _hybrid_client(core)
+    before = _profile(core, tmp_path, "fresh-before.json")
+    _legacy_zd_client_prefix(core, engine, client, preedit)
+    for _ in range(2):
+        _hybrid_step(core, engine, client, preedit, "char", 0xFF08)
+    assert core.current_word() == client.text == "" and preedit[0] == ""
+    fresh = _hybrid_step(core, engine, client, preedit, "raw", 44, original_keyval=ord("z"))
+    assert core.current_word() == preedit[0] == "з" and client.text == "", fresh
+    assert ("composing", "з\x00") in fresh["actions"], fresh
+    handoff = _hybrid_step(core, engine, client, preedit, "char", ord("a"))
+    assert [text for kind, text in handoff["actions"] if kind == "commit"] == ["з"], handoff
+    assert sum(kind == "forward" for kind, _ in handoff["actions"]) == 1
+    assert core.current_word() == client.text == "зa" and preedit[0] == "", handoff
+    mid = _native_profile_fixture(core, tmp_path, "fresh-mid.json")
+    assert mid["cvm"]["words"] == [] and mid["light_profile"]["lang_prior"] == before["lang_prior"]
+    boundary = _hybrid_step(core, engine, client, preedit, "raw", 57)
+    assert not any(kind == "commit" for kind, _ in boundary["actions"]), boundary
+    assert sum(kind == "forward" for kind, _ in boundary["actions"]) == 1
+    assert client.text == "зa " and core.current_word() == ""
+    final = _native_profile_fixture(core, tmp_path, "fresh-final.json")
+    assert final["cvm"]["words"] == ["зa"] and not final.get("confirmed_words", [])
+    assert final["light_profile"]["lang_prior"] == before["lang_prior"]
