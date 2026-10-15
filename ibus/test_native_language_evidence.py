@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from ibus.test_native_space_accept import _compose, _native
+from .test_native_space_accept import _compose, _native
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("SMARTKEY_NATIVE_MODULE_DIR")
@@ -117,3 +117,20 @@ def test_native_full_acceptance_remains_independent_of_manual_evidence_policy(tm
     after = _profile(core, tmp_path, "after.json")
     assert after["ghost_accept_rate"] > before["ghost_accept_rate"]
     assert after["lang_prior"][0] > before["lang_prior"][0]
+
+
+@pytest.mark.parametrize("token,boundary", [("___", 0x20), ("123", 0xFF0D)])
+def test_native_observed_technical_token_retains_language_adaptation(tmp_path, token, boundary):
+    core = _core()
+    before = _profile(core, tmp_path, "before-tech.json")
+    for char in token:
+        core.handle_key(ord(char), 0)
+    assert core.current_word() == token
+
+    actions = core.handle_key(boundary, 0)
+
+    assert core.current_word() == ""
+    assert actions.count(("forward", "")) == 1
+    after = _profile(core, tmp_path, "after-tech.json")
+    assert after["lang_prior"][2] > before["lang_prior"][2]
+    assert after["ghost_accept_rate"] == before["ghost_accept_rate"]

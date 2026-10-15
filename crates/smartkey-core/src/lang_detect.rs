@@ -283,6 +283,13 @@ impl LanguageDetector {
         }
     }
 
+    /// Whether this character independently scores most strongly for Tech.
+    /// This deliberately excludes prior/momentum fallback and script inference.
+    pub(crate) fn has_positive_tech_signal(&self, ch: char) -> bool {
+        let [bg, en, tech] = self.score_char(ch);
+        tech > bg && tech > en
+    }
+
     /// Score a character for each language model.
     ///
     /// Uses Unicode ranges as a fast proxy for trigram cross-entropy:

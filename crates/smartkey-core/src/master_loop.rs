@@ -1563,6 +1563,71 @@ mod tests {
 }
 
 #[cfg(test)]
+mod review_tech_prior_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn assert_tech_prior_once(keys: impl IntoIterator<Item = KeyEvent>, boundary: KeyEvent) {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        for key in keys {
+            ml.handle_key(key);
+        }
+        assert_eq!(ml.detected_language().lang, LangId::Tech);
+        assert!((ml.detected_language().confidence - 0.9).abs() < 1e-12);
+        assert_eq!(ml.light_profile().lang_prior, [0.33, 0.34, 0.33]);
+        ml.handle_key(boundary);
+        let observed = ml.light_profile().lang_prior;
+        for (actual, expected) in observed.iter().zip([0.3234, 0.3332, 0.3434]) {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "one direct Tech word must update its prior: {observed:?}"
+            );
+        }
+        assert_eq!(ml.light_profile().ghost_accept_rate, 0.5);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        ml.handle_key(press(Key::Space));
+        assert_eq!(ml.light_profile().lang_prior, observed);
+    }
+
+    #[test]
+    fn review_tech_direct_symbols_update_prior_without_acceptance() {
+        assert_tech_prior_once(
+            "___".chars().map(|ch| press(Key::Char(ch))),
+            press(Key::Space),
+        );
+    }
+
+    #[test]
+    fn review_tech_direct_digits_update_prior_on_return() {
+        assert_tech_prior_once(
+            "123".chars().map(|ch| press(Key::Char(ch))),
+            press(Key::Return),
+        );
+    }
+
+    #[test]
+    fn review_tech_shared_shift_key_updates_prior_without_acceptance() {
+        assert_tech_prior_once(
+            (0..3).map(|_| KeyEvent {
+                key: Key::RawCode(12),
+                modifiers: Modifiers::SHIFT,
+            }),
+            press(Key::RawCode(57)),
+        );
+    }
+}
+
+#[cfg(test)]
 mod commit_language_receipt_contract_tests {
     use super::*;
     use crate::input::Key;
