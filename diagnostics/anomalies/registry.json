@@ -22,11 +22,11 @@
         "before": "искаш",
         "after": null
       },
-      "recorded_utc": "2026-08-25T16:11Z",
+      "recorded_utc": "2026-10-15T08:57:46Z",
       "first_seen_utc": "2026-08-23T18:07Z",
-      "last_seen_utc": "2026-08-23T18:14Z",
+      "last_seen_utc": "2026-10-15T07:24:03Z",
       "repeat": true,
-      "occurrence_count": 2,
+      "occurrence_count": 3,
       "environment": {
         "app_surface": "unknown (operator live text)",
         "os": "linux",
@@ -52,23 +52,60 @@
           "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
           "surface": "offline probe",
           "note": "audit: ли renders as li in every probed context on 7b9901a; fix candidates F4-a / F4-c named"
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:73248b9dae2eac720fa6aa10b4077b52c02a04fbe7895b5854ae371e1e592fb2",
+          "observed_utc": "2026-10-15T07:24:03Z",
+          "build_sha": "8d4973698df7c8cc65be8caf80118a33c472e3cc",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED failed probe session; frozen current copies, not historical byte custody."
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:1d20769205f7543b0c0bc7a211feb6e1c9c663e0c38249430d9c058ec1f892fd",
+          "observed_utc": "2026-10-15T08:01:43Z",
+          "build_sha": "5813178ed4c303a27f1ab6f4c4d8c33e227739a6",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED post-fix probe passes before and at delimiter; original GUI not exercised."
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:abe7b18184b66f3d5e9e5d64458ffaf1cb02a7c0991106f386c02ca0a461af5c",
+          "observed_utc": "2026-10-15T08:55:39Z",
+          "build_sha": "ba3e8999e628cdb603c9579f2ef3c826eb86194e",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED accepted artifact verification; copied inputs unchanged; original GUI not exercised."
         }
       ],
-      "status": "reproduced",
+      "status": "closed",
       "suspected_layer": "dual_buffer_short_word",
       "reproducer": {
         "kind": "offline_probe",
-        "ref": "ledger f09e9917b91f",
-        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
-        "summary": "ли -> li in every probed context on 7b9901a"
+        "ref": "sha256:73248b9dae2eac720fa6aa10b4077b52c02a04fbe7895b5854ae371e1e592fb2",
+        "build_sha": "8d4973698df7c8cc65be8caf80118a33c472e3cc",
+        "summary": "CURRENT_RECONSTRUCTED offline PyO3 contract with fresh defaults, no personal data and frozen current inputs. Known BG-intent target remains Latin on N; original historical bytes and client state are unknown."
       },
-      "red_test": null,
+      "red_test": {
+        "path": "ibus/test_native_language_evidence.py",
+        "name": "test_native_shortword_soft_context_selects_live_reading_before_literal_space",
+        "commit": "6aa9727651ae79d053a8ce95a46820b0409f07dc"
+      },
       "red_test_waiver": null,
-      "fix_commit": null,
-      "verification": null,
-      "closure_reason": null,
+      "fix_commit": "6aa9727651ae79d053a8ce95a46820b0409f07dc",
+      "verification": {
+        "build_sha": "ba3e8999e628cdb603c9579f2ef3c826eb86194e",
+        "evidence_refs": [
+          "sha256:abe7b18184b66f3d5e9e5d64458ffaf1cb02a7c0991106f386c02ca0a461af5c",
+          "sha256:316183bb503292b1cbed57bf200bf2a92a074b1eef3d1283ea67940778c88dab",
+          "sha256:1d20769205f7543b0c0bc7a211feb6e1c9c663e0c38249430d9c058ec1f892fd"
+        ],
+        "surface": "offline PyO3 current contract",
+        "summary": "CURRENT_RECONSTRUCTED accepted C replay passes BG preedit and commit; no-context Latin control unchanged. Exactly one commit and delimiter forward, no replace. Original GUI acceptance was not run."
+      },
+      "closure_reason": "Declared known-intent current offline PyO3 contract passes on accepted S. Historical corpus byte binding and original GUI surface remain unverified.",
       "privacy_classification": "public_token",
-      "notes": "F1 exposes context-free short-word scoring. F4 remains RED-only: no fix has landed; this record must not be used to widen F4."
+      "notes": "CURRENT_RECONSTRUCTED closure applies to the declared offline core contract. Historical first-sighting environment and refs are preserved; no historical-byte or original-client acceptance claim."
     },
     {
       "id": "anom-658c49a8621c",
@@ -89,11 +126,11 @@
         "before": null,
         "after": null
       },
-      "recorded_utc": "2026-08-25T16:11Z",
+      "recorded_utc": "2026-10-15T08:57:46Z",
       "first_seen_utc": "2026-08-23T18:14Z",
-      "last_seen_utc": "2026-08-23T18:14Z",
+      "last_seen_utc": "2026-10-15T08:03:03Z",
       "repeat": true,
-      "occurrence_count": 2,
+      "occurrence_count": 4,
       "environment": {
         "app_surface": "offline probe",
         "os": "linux",
@@ -119,23 +156,59 @@
           "build_sha": "d8b01c076babc24881632739ebe4d4da763be86d",
           "surface": "offline probe",
           "note": "pre-existing: ви -> wi also on d8b01c0"
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:78ddb936caca35178a13ebbbf6b14fdec806c4e6264af119510360629b7700ed",
+          "observed_utc": "2026-10-15T07:57:01Z",
+          "build_sha": "8d4973698df7c8cc65be8caf80118a33c472e3cc",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED synthetic BG-intent probe fails; separate observational no-context arm."
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:7dacff09ca826c8b7a4a1711268a038e83ca22822a67e889708cd5ccb881fd6f",
+          "observed_utc": "2026-10-15T08:03:03Z",
+          "build_sha": "5813178ed4c303a27f1ab6f4c4d8c33e227739a6",
+          "surface": "offline PyO3 current contract",
+          "note": "Identical CURRENT_RECONSTRUCTED probe still fails on accepted S; no promotion or closure."
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:383ed443c0319c11671f493bbba77581a710d917856a90743e9ba9cb89cf9765",
+          "observed_utc": "2026-10-15T08:55:56Z",
+          "build_sha": "ba3e8999e628cdb603c9579f2ef3c826eb86194e",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED accepted artifact verification; copied inputs unchanged; original GUI not exercised."
         }
       ],
-      "status": "reproduced",
+      "status": "closed",
       "suspected_layer": "dual_buffer_short_word",
       "reproducer": {
         "kind": "offline_probe",
-        "ref": "ledger f09e9917b91f",
-        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
-        "summary": "ви -> wi reproduces on both 7b9901a and d8b01c0 (not introduced by F1)"
+        "ref": "sha256:7dacff09ca826c8b7a4a1711268a038e83ca22822a67e889708cd5ccb881fd6f",
+        "build_sha": "5813178ed4c303a27f1ab6f4c4d8c33e227739a6",
+        "summary": "CURRENT_RECONSTRUCTED offline PyO3 known BG-intent contract using public synthetic context, fresh defaults, no personal data and frozen copied corpus files. S retains and commits Latin. Original historical inputs are unknown."
       },
-      "red_test": null,
+      "red_test": {
+        "path": "ibus/test_native_language_evidence.py",
+        "name": "test_native_terminal_context_uses_exact_word_without_accepting_ghost",
+        "commit": "168bb187db9462142400e8d10622053cdbe8f764"
+      },
       "red_test_waiver": null,
-      "fix_commit": null,
-      "verification": null,
-      "closure_reason": null,
+      "fix_commit": "168bb187db9462142400e8d10622053cdbe8f764",
+      "verification": {
+        "build_sha": "ba3e8999e628cdb603c9579f2ef3c826eb86194e",
+        "evidence_refs": [
+          "sha256:383ed443c0319c11671f493bbba77581a710d917856a90743e9ba9cb89cf9765",
+          "sha256:316183bb503292b1cbed57bf200bf2a92a074b1eef3d1283ea67940778c88dab"
+        ],
+        "surface": "offline PyO3 current contract",
+        "summary": "CURRENT_RECONSTRUCTED accepted C terminal replay: preboundary Latin remains; delimiter commits the intended BG token once with one forward and no replace. No-context observational Latin output is unchanged. Original GUI acceptance was not run."
+      },
+      "closure_reason": "Declared known-intent current offline PyO3 terminal contract passes on accepted C. Preboundary Latin is preserved; historical input binding and original GUI replay remain unverified.",
       "privacy_classification": "public_token",
-      "notes": "Expected form ви recorded per audit instruction; confidence is low only in the sense that a genuine Latin wi is conceivable in mixed text. Not seen live yet; probe-only."
+      "notes": "CURRENT_RECONSTRUCTED terminal-only closure: current preboundary Latin remains; one delimiter commit is the intended BG token. Historical refs and unknown input custody remain; no original GUI claim."
     },
     {
       "id": "anom-36d659523143",

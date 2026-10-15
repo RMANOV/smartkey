@@ -1276,8 +1276,12 @@ def test_closure_without_evidence_rejected(status):
 
 def test_red_tested_requires_red_test():
     doc = _doc()
-    rec = _find(doc, "li", "ли")  # reproduced, no red test
+    rec = _find(doc, "li", "ли")
     rec["status"] = "red_tested"
+    for field in (
+        "red_test", "red_test_waiver", "fix_commit", "verification", "closure_reason"
+    ):
+        rec[field] = None
     assert any(
         "RED test" in e
         for e in V.validate_document(doc, _schema())
@@ -1289,6 +1293,10 @@ def test_fixed_requires_fix_commit_and_test_or_waiver():
     doc = _doc()
     rec = _find(doc, "li", "ли")
     rec["status"] = "fixed"
+    for field in (
+        "red_test", "red_test_waiver", "fix_commit", "verification", "closure_reason"
+    ):
+        rec[field] = None
     gate = [e for e in V.validate_document(doc, _schema()) if e.startswith("E_GATE")]
     assert any("fix_commit" in e for e in gate)
     assert any("regression test" in e for e in gate)
@@ -1331,7 +1339,54 @@ def test_fixed_b9_records_carry_fix_chain_but_no_verification():
         assert rec["reproducer"] and rec["red_test"] and rec["fix_commit"]
         assert rec["verification"] is None
         assert V.SHA_RE.match(rec["fix_commit"])
-    assert not [r for r in doc["records"] if r["status"] == "verified"]
+
+
+@pytest.mark.parametrize("status", ["verified", "closed"])
+@pytest.mark.parametrize("observed,expected", [("li", "ли"), ("wi", "ви")])
+def test_current_offline_contract_can_advance_with_complete_evidence(
+    status, observed, expected
+):
+    doc = _doc()
+    rec = _find(doc, observed, expected)
+    rec["status"] = status
+    assert rec["reproducer"]["kind"] == "offline_probe"
+    assert rec["red_test"] and rec["fix_commit"] and rec["verification"]
+    assert V.validate_document(doc, _schema()) == []
+
+
+def test_li_current_contract_closure_preserves_historical_surface_limits():
+    rec = _find(_doc(), "li", "ли")
+    assert rec["status"] == "closed"
+    assert rec["environment"]["app_surface"] == "unknown (operator live text)"
+    assert rec["environment"]["build_sha"] == "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2"
+    assert {"7670aa00c53a", "f09e9917b91f"} <= {
+        source["ref"] for source in rec["source_refs"] if source["kind"] == "ledger"
+    }
+    assert "CURRENT_RECONSTRUCTED" in rec["reproducer"]["summary"]
+    assert "offline PyO3" in rec["verification"]["surface"]
+    assert "historical" in rec["closure_reason"].lower()
+    assert "GUI" in rec["closure_reason"]
+    assert rec["red_test_waiver"] is None
+
+
+def test_wi_current_closure_covers_terminal_output_without_a_preedit_claim():
+    rec = _find(_doc(), "wi", "ви")
+    assert rec["status"] == "closed"
+    assert rec["environment"]["app_surface"] == "offline probe"
+    assert {
+        source["build_sha"]
+        for source in rec["source_refs"]
+        if source["kind"] == "ledger"
+    } == {
+        "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
+        "d8b01c076babc24881632739ebe4d4da763be86d",
+    }
+    assert "CURRENT_RECONSTRUCTED" in rec["reproducer"]["summary"]
+    assert "terminal" in rec["verification"]["summary"].lower()
+    assert "preboundary Latin remains" in rec["verification"]["summary"]
+    assert "historical" in rec["closure_reason"].lower()
+    assert "GUI" in rec["closure_reason"]
+    assert rec["red_test_waiver"] is None
 
 
 def test_promoting_fixed_to_verified_requires_verification_evidence():
