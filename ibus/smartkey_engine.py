@@ -238,9 +238,9 @@ def _loaded_native_version(native_module: object) -> str:
 
 try:
     # Keep the core import independent from optional protocol helpers.  A
-    # previously installed smartkey_py may expose PyInputMethodCore but predate
-    # ffi_decode_* and process_keycode; that core can still provide a safe,
-    # ordinary keyval path while the native extension is rebuilt.
+    # smartkey_py may predate ffi_decode_* or process_keycode and still provide
+    # the ordinary keyval path. Engine startup separately requires the external
+    # rewrite capability API before loading any personal profile or corpus.
     import smartkey_py as _native_module  # type: ignore[import-untyped]
     from smartkey_py import PyInputMethodCore  # type: ignore[import-untyped]
 
@@ -462,6 +462,21 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         # Create the Rust core with config.
         self._core = PyInputMethodCore(config_json)
+
+        # Client capabilities have not arrived yet. Do not let Core mutate or
+        # learn a correction that this client cannot safely deliver. This API
+        # is mandatory: silently accepting an older native module keeps its
+        # permissive default and defeats the delivery guard.
+        try:
+            set_rewrite = getattr(self._core, "set_external_rewrite_supported", None)
+            if not callable(set_rewrite):
+                raise TypeError("missing external rewrite capability API")
+            set_rewrite(False)
+        except Exception as exc:
+            raise RuntimeError(
+                "smartkey_py native extension cannot enforce external rewrite "
+                "delivery; rebuild the native module before starting SmartKey"
+            ) from exc
 
         # Load personal profile (learned words from previous sessions).
         try:
@@ -1432,6 +1447,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         return consumed
 
     def do_set_capabilities(self, caps: int) -> None:
+        self._core.set_external_rewrite_supported(bool(caps & 0x20))
         self._caps = caps
 
     # -----------------------------------------------------------------------
@@ -1878,9 +1894,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # GTK/Qt IBus clients already convert XKB codes to evdev before IPC.
         # Engine launch environment does not change that protocol; subtracting
         # 8 here again corrupts letters and special keys after early startup.
-        # Older installed native modules may not have the raw-scancode API.
-        # Keep those sessions usable by falling back to the ordinary keyval
-        # path instead of raising/consuming the browser's key event.
+        # A native module satisfying the mandatory rewrite-capability API may
+        # still lack the optional raw-scancode API. Keep its keyval path usable
+        # instead of raising/consuming the browser's key event.
         has_keycode_api = callable(getattr(self._core, "process_keycode", None))
         if keycode > 0 and _HAS_CORE and has_keycode_api:
             actions = self._core.process_keycode(keycode, state)

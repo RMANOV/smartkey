@@ -192,6 +192,11 @@ impl PyInputMethodCore {
             .set_surrounding_text(text.map(str::to_owned), cursor_pos);
     }
 
+    /// Set the current host's ability to replace already-delivered client text.
+    fn set_external_rewrite_supported(&mut self, supported: bool) {
+        self.inner.set_external_rewrite_supported(supported);
+    }
+
     /// Reset internal state.
     fn reset(&mut self) -> Vec<(String, String)> {
         self.inner.reset().iter().map(action_to_tuple).collect()

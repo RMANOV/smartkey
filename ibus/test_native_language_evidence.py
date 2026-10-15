@@ -824,3 +824,55 @@ def test_native_post_commit_caps_uses_preceding_word(
     expected = [] if expected_replacement is None else [(len(word), expected_replacement)]
     assert replacements == expected, trace
     assert actions.count(("forward", "")) == 1, trace
+
+
+@pytest.mark.parametrize("supported", [False, True], ids=["no-surrounding", "surrounding"])
+@pytest.mark.parametrize("lifecycle", ["none", "reset", "focus"])
+def test_native_external_rewrite_capability_reaches_real_legacy_producer(
+    tmp_path, supported, lifecycle
+):
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+    core.load_word("здравей", 1_000_000)
+    core.set_external_rewrite_supported(supported)
+    if lifecycle == "reset":
+        core.reset()
+    elif lifecycle == "focus":
+        core.focus_lost()
+        core.focus_gained()
+
+    first = core.handle_key(ord("z"), 0)
+    second = core.handle_key(ord("d"), 0)
+    replacements = [_native().ffi_decode_replace_payload(text)
+                    for kind, text in second if kind == "replace"]
+    expected_word = "зд" if supported else "zd"
+    assert replacements == ([(1, "зд")] if supported else []), (first, second)
+    assert core.current_word() == expected_word
+    if not supported:
+        assert second.count(("forward", "")) == 1
+        assert not any(kind in {"commit", "composing"} for kind, _ in second)
+    boundary = core.handle_key(0x20, 0)
+    assert boundary.count(("forward", "")) == 1
+    assert not any(kind == "replace" for kind, _ in boundary)
+    profile = _native_profile_fixture(core, tmp_path, "learned.json")
+    assert profile["cvm"]["words"] == [expected_word]
+    assert "external_rewrite_supported" not in json.dumps(profile)
+
+
+@pytest.mark.parametrize("word", ["цар", "hello"], ids=["language", "capitalization"])
+def test_native_unowned_boundary_without_rewrite_support_learns_literal(tmp_path, word):
+    core = _native().PyInputMethodCore(json.dumps({
+        "ghost_text": False,
+        "post_commit_autocorrect": True,
+    }))
+    core.load_word("car", 100)
+    core.load_word("hello", 1_000)
+    core.set_external_rewrite_supported(False)
+    for char in word:
+        core.handle_key(ord(char), 0)
+    assert core.current_word() == word
+    actions = core.handle_key(0x20, 0)
+    assert not any(kind == "replace" for kind, _ in actions), actions
+    assert actions.count(("forward", "")) == 1
+    profile = _native_profile_fixture(core, tmp_path, "literal.json")
+    assert profile["cvm"]["words"] == [word]
+    assert core.current_word() == ""
