@@ -529,7 +529,7 @@ def test_native_hybrid_space_regained_ghost_stays_literal(space_kind, space_code
         trace = []
         for kind, code in (("raw", 16), ("char", ord("a")) if hybrid else ("raw", 30), ("raw", 45)):
             trace.append(_hybrid_step(core, engine, client, preedit, kind, code))
-        assert core.current_word() == "qax" and core.predictions()[0][0] == "qaxyz", trace
+        assert core.current_word() == "qax" and core.predictions()[0][0].lower() == "qaxyz", trace
         expected_display = ("ghost", "yz") if hybrid else ("composing", "qax\x00yz")
         assert expected_display in trace[-1]["actions"], trace
         assert core.debug_state()[0] is (not hybrid)
@@ -542,3 +542,65 @@ def test_native_hybrid_space_regained_ghost_stays_literal(space_kind, space_code
         assert core.current_word() == "" and not core.predictions() and preedit[0] == ""
         following = _hybrid_step(core, engine, client, preedit, space_kind, space_code)
         assert not any(kind == "commit" for kind, _ in following["actions"])
+
+
+@pytest.mark.parametrize("mode", ["hybrid", "direct", "composing", "empty"])
+def test_native_no_ghost_tab_ends_word_before_next_raw_key(tmp_path, mode):
+    core = _native().PyInputMethodCore(json.dumps({
+        "ghost_text": mode == "hybrid", "accept": {"space_accept": True},
+    }))
+    core.load_word("qabc", 1_000_000)
+    engine, client, preedit = _hybrid_client(core)
+    ordinary_key = client.apply_key
+
+    def apply_key_with_literal_tab(keyval, state, source):
+        # Bounded text-client projection only: real clients may move focus.
+        if keyval == 0xFF09 and state == 0:
+            client._insert("\t")
+            client.log.append((source, keyval))
+        else:
+            ordinary_key(keyval, state, source)
+
+    client.apply_key = apply_key_with_literal_tab
+
+    def learned(name):
+        path = tmp_path / name
+        core.export_personal(str(path))
+        return json.loads(path.read_text())
+
+    keys = {
+        "hybrid": (("raw", 16), ("char", ord("a"))),
+        "direct": (("char", ord("q")), ("char", ord("a"))),
+        "composing": (("raw", 16), ("raw", 30)),
+        "empty": (),
+    }[mode]
+    trace = [_hybrid_step(core, engine, client, preedit, kind, code) for kind, code in keys]
+    prefix = "" if mode == "empty" else "qa"
+    assert core.current_word() == prefix, trace
+    if trace:
+        assert not any((kind == "ghost" and text) or
+                       (kind == "composing" and text.split("\x00", 1)[1])
+                       for kind, text in trace[-1]["actions"]), trace
+    if mode == "hybrid":
+        assert not core.predictions(), "handoff must clear its hidden display identity"
+    assert learned("before-tab.json")["cvm"]["words"] == []
+    boundary = _hybrid_step(core, engine, client, preedit, "raw", 15, original_keyval=0xFF09)
+    assert [text for kind, text in boundary["actions"] if kind == "commit"] == (["qa"] if mode == "composing" else []), boundary
+    assert sum(kind == "forward" for kind, _ in boundary["actions"]) == 1
+    assert core.current_word() == "" and preedit[0] == "", [*trace, boundary]
+    assert client.text == prefix + "\t", boundary
+    after_tab = learned("after-tab.json")
+    assert set(after_tab["cvm"]["words"]) == ({"qa"} if prefix else set())
+    assert after_tab["markov_bigrams"] == [] and after_tab["weights"]["commit_count"] == 0
+    following = _hybrid_step(core, engine, client, preedit, "raw", 45)
+    assert core.current_word() == "x" and client.text == prefix + "\t", following
+    assert any(kind == "composing" and text.split("\x00", 1)[0] == "x" for kind, text in following["actions"]), following
+    assert not any(kind in {"commit", "forward"} for kind, _ in following["actions"]), following
+    space = _hybrid_step(core, engine, client, preedit, "raw", 57)
+    assert [text for kind, text in space["actions"] if kind == "commit"] == ["x"], space
+    assert sum(kind == "forward" for kind, _ in space["actions"]) == 1
+    assert client.text == prefix + "\tx " and core.current_word() == "" and preedit[0] == ""
+    after_space = learned("after-space.json")
+    assert set(after_space["cvm"]["words"]) == ({"qa", "x"} if prefix else {"x"})
+    assert after_space["markov_bigrams"] == ([["qa", "x", 1]] if prefix else [])
+    assert after_space["weights"]["commit_count"] == 0

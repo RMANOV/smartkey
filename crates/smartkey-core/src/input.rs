@@ -837,6 +837,13 @@ impl InputMethodCore {
                     self.commit_word_internal(&prefix, CommitCause::Boundary);
                     self.reset_word();
                     vec![Action::HideGhost, commit, Action::ForwardKey]
+                } else if !self.current_word.is_empty() {
+                    // Semantic and handed-off text is already in the client.
+                    // Tab ends its token without inserting the prefix again.
+                    let word = self.current_word.clone();
+                    self.commit_word_internal(&word, CommitCause::Boundary);
+                    self.reset_word();
+                    vec![Action::HideGhost, Action::ForwardKey]
                 } else {
                     vec![Action::ForwardKey]
                 }

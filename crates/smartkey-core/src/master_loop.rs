@@ -2977,7 +2977,9 @@ mod hybrid_handoff_control_tests {
         assert!(!ml.has_ghost() && ml.predictions().is_empty());
         assert!(ml.last_shown_ghost.is_none());
         let tab = key(&mut ml, Key::Tab);
-        assert_eq!(tab, vec![Action::ForwardKey]);
+        assert_eq!(tab, vec![Action::HideGhost, Action::ForwardKey]);
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 1);
         let boundary = key(&mut ml, Key::Space);
         assert!(boundary.contains(&Action::ForwardKey));
         assert!(!boundary.iter().any(|a| matches!(a, Action::CommitText(_))));
@@ -3184,5 +3186,125 @@ mod hybrid_space_regained_ghost_tests {
     #[test]
     fn hybrid_space_regained_ghost_semantic_boundary_is_literal() {
         run(Key::Space);
+    }
+}
+
+#[cfg(test)]
+mod delivered_tab_boundary_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn run(prefix: &[Key], composed: bool) {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        let (mut client, mut preedit) = (String::new(), String::new());
+        for key in prefix {
+            let actions = press(&mut ml, key.clone());
+            super::hybrid_delivery_contract_tests::project(
+                &actions,
+                key,
+                &mut client,
+                &mut preedit,
+            );
+        }
+        assert_eq!(ml.current_word(), "qa");
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        let tab = press(&mut ml, Key::Tab);
+        // Bounded client projection: this text client inserts a forwarded Tab.
+        super::hybrid_delivery_contract_tests::project(
+            &tab,
+            &Key::Char('\t'),
+            &mut client,
+            &mut preedit,
+        );
+        let commits = tab
+            .iter()
+            .filter_map(|action| match action {
+                Action::CommitText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(commits, if composed { vec!["qa"] } else { vec![] });
+        assert_eq!(
+            tab.iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert_eq!(
+            client, "qa\t",
+            "Tab must never redeliver an owned prefix: {tab:?}"
+        );
+        assert!(preedit.is_empty());
+        assert_eq!(
+            ml.current_word(),
+            "",
+            "Tab ended the delivered token: {tab:?}"
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert_eq!(ml.core.context_words().0, Some("qa"));
+        assert_eq!(ml.core.export_personal_profile().cvm.words, ["qa"]);
+
+        let next = press(&mut ml, Key::RawCode(45));
+        super::hybrid_delivery_contract_tests::project(
+            &next,
+            &Key::RawCode(45),
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(
+            ml.current_word(),
+            "x",
+            "new raw input must start a fresh token"
+        );
+        assert_eq!(format!("{client}{preedit}"), "qa\tx");
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        let boundary = press(&mut ml, Key::Space);
+        super::hybrid_delivery_contract_tests::project(
+            &boundary,
+            &Key::Space,
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(client, "qa\tx ");
+        assert!(preedit.is_empty() && ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 2);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        let words = ml.core.export_personal_profile().cvm.words;
+        assert_eq!(words.iter().filter(|w| w.as_str() == "qa").count(), 1);
+        assert_eq!(words.iter().filter(|w| w.as_str() == "x").count(), 1);
+        eprintln!("prefix={prefix:?}; tab={tab:?}; next={next:?}; boundary={boundary:?}; client={client:?}");
+    }
+
+    #[test]
+    fn delivered_tab_boundary_hybrid_finishes_without_recommit() {
+        run(&[Key::RawCode(16), Key::Char('a')], false);
+    }
+
+    #[test]
+    fn delivered_tab_boundary_semantic_finishes_without_recommit() {
+        run(&[Key::Char('q'), Key::Char('a')], false);
+    }
+
+    #[test]
+    fn delivered_tab_boundary_raw_preedit_commits_once() {
+        run(&[Key::RawCode(16), Key::RawCode(30)], true);
+    }
+
+    #[test]
+    fn delivered_tab_boundary_empty_forwards_without_learning() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        assert_eq!(press(&mut ml, Key::Tab), [Action::ForwardKey]);
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        assert!(ml.current_word().is_empty());
     }
 }

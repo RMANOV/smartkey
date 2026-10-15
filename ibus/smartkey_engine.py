@@ -884,7 +884,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         word_state_available, post_word = self._core_word_state()
         if word_state_available and post_word is None:
-            # A failed query does not attest either acceptance or a boundary.
+            # Retire an unclassifiable interaction without inventing an
+            # outcome or leaking its prediction into the next word.
+            self._clear_active_prediction_if(int(pending_prediction["prediction_id"]))
             return
         continuing_word = word_state_available and bool(post_word)
         prediction_id = int(pending_prediction["prediction_id"])
@@ -1857,7 +1859,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if getattr(self, "_o1", None) is not None and not key_release:
             is_digit_boundary = 0x30 <= keyval <= 0x39
             if (
-                keyval in (IBus.KEY_space, IBus.KEY_Return)
+                keyval in (IBus.KEY_Tab, IBus.KEY_space, IBus.KEY_Return)
                 or self._is_punctuation_boundary(keyval)
                 or is_digit_boundary
             ):

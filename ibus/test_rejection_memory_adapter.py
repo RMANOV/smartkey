@@ -350,3 +350,148 @@ def test_hybrid_delivery_semantic_en_bracket_can_still_end_composed_word():
     assert engine.do_process_key_event(ord("["), 0, 0) is False
     assert core.recorded == [("q", "query")]
     assert committed_words == ["q"]
+
+
+@pytest.mark.parametrize("raw_dispatch", [False, True], ids=["keyval", "raw"])
+@pytest.mark.parametrize("query_failure", ["raises", "nonstring"])
+@pytest.mark.parametrize(
+    "accept_key,keycode,commit",
+    [
+        (ske.IBus.KEY_Tab, 15, "hello"),
+        (ske.IBus.KEY_Right, 106, "hello"),
+        (ske.IBus.KEY_space, 57, "hello "),
+    ],
+    ids=["tab", "final-right", "space-accept"],
+)
+def test_failed_postword_terminal_accept_does_not_reject_prior_prediction(
+    monkeypatch, raw_dispatch, query_failure, accept_key, keycode, commit
+):
+    engine, core = build_engine()
+    events = capture_events(engine)
+    committed_words = []
+    delivered = []
+    engine._o1 = types.SimpleNamespace(on_word_commit=committed_words.append)
+    engine.commit_text = lambda text: delivered.append(text.s)
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    show_hello(engine, core)
+    counter_before = engine._keys_since_content_type
+
+    def current_word():
+        if core._word == "":
+            if query_failure == "raises":
+                raise RuntimeError("post-state unavailable")
+            return 42
+        return core._word
+
+    monkeypatch.setattr(core, "current_word", current_word)
+    # The real dispatcher delivers a terminal accept, but querying its empty
+    # post-state fails. This cannot attest acceptance, O1 or privacy resolution.
+    core.queue([("hide", ""), ("commit", commit)], "")
+    assert engine.do_process_key_event(
+        accept_key, keycode if raw_dispatch else 0, 0
+    ) is True
+    pending_after_accept = engine._active_prediction
+    counter_after_accept = engine._keys_since_content_type
+    outcomes_after_accept = [
+        event for event, _payload in events
+        if event in {"accepted", "completed", "rejected"}
+    ]
+
+    # Execute a SECOND real event before asserting: the getter recovers when
+    # this new word starts, so a stale prediction would now teach rejection.
+    core.queue([("forward", "")], "x")
+    assert engine.do_process_key_event(ord("x"), 45 if raw_dispatch else 0, 0) is False
+
+    assert core.recorded == [], "accepted prior text must not teach stale rejection"
+    assert pending_after_accept is None, "unclassifiable interaction must retire"
+    assert outcomes_after_accept == []
+    assert not [
+        event for event, _payload in events
+        if event in {"accepted", "completed", "rejected"}
+    ]
+    assert committed_words == [], "failed post-state cannot invent an O1 commit"
+    assert counter_after_accept == counter_before + 1, "privacy guard stays armed"
+    assert delivered == [commit]
+
+
+@pytest.mark.parametrize("raw_dispatch", [False, True], ids=["keyval", "raw"])
+@pytest.mark.parametrize(
+    "accept_key,keycode,commit,reason",
+    [
+        (ske.IBus.KEY_Tab, 15, "hello", "tab"),
+        (ske.IBus.KEY_Right, 106, "hello", "right"),
+        (ske.IBus.KEY_space, 57, "hello ", "space"),
+    ],
+    ids=["tab", "final-right", "space-accept"],
+)
+def test_missing_postword_getter_preserves_legacy_terminal_accept(
+    monkeypatch, raw_dispatch, accept_key, keycode, commit, reason
+):
+    engine, core = build_engine()
+    events = capture_events(engine)
+    committed_words = []
+    engine._o1 = types.SimpleNamespace(on_word_commit=committed_words.append)
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    show_hello(engine, core)
+    # Missing capability is the established legacy action-based contract;
+    # an existing getter that fails is deliberately treated differently.
+    monkeypatch.setattr(core, "current_word", None)
+    core.queue([("hide", ""), ("commit", commit)], "")
+    engine.do_process_key_event(accept_key, keycode if raw_dispatch else 0, 0)
+    assert engine._active_prediction is None
+    assert engine._keys_since_content_type == 0
+    assert committed_words == ["hello"]
+    assert [
+        payload["reason"] for event, payload in events if event == "accepted"
+    ] == [reason]
+    core.queue([("forward", "")], "x")
+    engine.do_process_key_event(ord("x"), 45 if raw_dispatch else 0, 0)
+    assert core.recorded == []
+
+
+@pytest.mark.parametrize("raw_dispatch", [False, True], ids=["keyval", "raw"])
+@pytest.mark.parametrize("post_query", ["empty", "raises", "nonstring"])
+def test_delivered_no_ghost_tab_notifies_o1_once_only_for_known_boundary(
+    monkeypatch, raw_dispatch, post_query
+):
+    engine, core = build_engine()
+    committed_words = []
+    delivered = []
+    engine._o1 = types.SimpleNamespace(on_word_commit=committed_words.append)
+    engine.commit_text = lambda text: delivered.append(text.s)
+    core._predictions = []
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    # Both letters are already client-owned, with no ghost to accept.
+    for letter, word, code in [("q", "q", 16), ("a", "qa", 30)]:
+        core.queue([("hide", ""), ("forward", "")], word)
+        engine.do_process_key_event(ord(letter), code if raw_dispatch else 0, 0)
+    counter_before = engine._keys_since_content_type
+
+    def current_word():
+        if core._word == "":
+            if post_query == "raises":
+                raise RuntimeError("post-state unavailable")
+            if post_query == "nonstring":
+                return 42
+        return core._word
+
+    monkeypatch.setattr(core, "current_word", current_word)
+    # Producer contract: finalize/reset a fully delivered word, hide, then
+    # forward Tab. Never commit text already owned by the client a second time.
+    core.queue([("hide", ""), ("forward", "")], "")
+    assert engine.do_process_key_event(
+        ske.IBus.KEY_Tab, 15 if raw_dispatch else 0, 0
+    ) is False
+    assert core._word == ""
+    assert delivered == []
+    assert core.recorded == []
+    if post_query == "empty":
+        assert engine._keys_since_content_type == 0
+        assert committed_words == ["qa"]
+        # An empty forwarded Tab is not a second boundary for the same word.
+        core.queue([("forward", "")], "")
+        engine.do_process_key_event(ske.IBus.KEY_Tab, 15 if raw_dispatch else 0, 0)
+        assert committed_words == ["qa"]
+    else:
+        assert engine._keys_since_content_type == counter_before + 1
+        assert committed_words == [], "failed query cannot attest a boundary"
