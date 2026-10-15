@@ -876,3 +876,391 @@ def test_native_unowned_boundary_without_rewrite_support_learns_literal(tmp_path
     profile = _native_profile_fixture(core, tmp_path, "literal.json")
     assert profile["cvm"]["words"] == [word]
     assert core.current_word() == ""
+
+
+def _sentence_boundary_core(tmp_path, *, post=None, ghost=False):
+    config = {"lang_detection": False, "ghost_text": ghost}
+    if post is not None:
+        config["post_commit_autocorrect"] = post
+    core = _native().PyInputMethodCore(json.dumps(config))
+    corpus = tmp_path / "sentence-corpus.json"
+    corpus.write_text(json.dumps({
+        "unigrams": {"hello": 1_000, "world": 1_000},
+        "bigrams": [],
+        "trigrams": [],
+    }))
+    core.load_corpus_file(str(corpus))
+    return core
+
+
+def _raw_sentence_prefix(core, *, whitespace=True):
+    trace = []
+    for code in (35, 18, 38, 38, 24):  # hello
+        actions = core.process_keycode(code, 0)
+        trace.append(actions)
+        assert any(kind == "composing" for kind, _ in actions), trace
+        assert not any(kind in {"commit", "replace", "forward"} for kind, _ in actions), trace
+    assert core.current_word() == "hello", trace
+    punctuation = core.process_keycode(52, 0)  # .
+    assert [text for kind, text in punctuation if kind == "commit"] == ["hello"], punctuation
+    assert punctuation.count(("forward", "")) == 1, punctuation
+    assert core.current_word() == "", punctuation
+    if whitespace:
+        space = core.process_keycode(57, 0)
+        assert space == [("hide", ""), ("forward", "")], space
+        assert core.current_word() == "", space
+
+
+@pytest.mark.parametrize("post", [False, True], ids=["opt-out", "opt-in"])
+@pytest.mark.parametrize("external", [False, True], ids=["no-surrounding", "surrounding"])
+def test_native_raw_sentence_boundary_caps_keeps_owned_delivery_and_learning(
+    tmp_path, post, external
+):
+    core = _sentence_boundary_core(tmp_path, post=post)
+    core.set_external_rewrite_supported(external)
+    _raw_sentence_prefix(core)
+    for code in (17, 24, 19, 38, 32):  # world
+        step = core.process_keycode(code, 0)
+        assert any(kind == "composing" for kind, _ in step), step
+        assert not any(kind in {"commit", "replace", "forward"} for kind, _ in step), step
+    assert core.current_word() == "world"
+    actions = core.process_keycode(57, 0)
+    assert [text for kind, text in actions if kind == "commit"] == ["world"], actions
+    replacements = [_native().ffi_decode_replace_payload(text)
+                    for kind, text in actions if kind == "replace"]
+    # The whole word still belongs to the preedit, so the existing ownership
+    # permission also applies when surrounding-text rewriting is unavailable.
+    assert replacements == ([(5, "World")] if post else []), actions
+    assert actions.count(("forward", "")) == 1, actions
+    assert core.current_word() == "", actions
+    profile = _native_profile_fixture(core, tmp_path, "sentence-profile.json")
+    assert set(profile["cvm"]["words"]) == {"hello", "world"}
+    assert profile["markov_bigrams"] == [["hello", "world", 1]]
+    assert profile["markov_trigrams"] == []
+
+
+def test_native_default_prediction_remembers_forwarded_sentence_boundary(tmp_path):
+    # Omit the post-commit option: ordinary suggestions use this evidence too.
+    core = _sentence_boundary_core(tmp_path, ghost=True)
+    _raw_sentence_prefix(core)
+    actions = core.process_keycode(17, 0)  # w
+    assert core.current_word() == "w", actions
+    assert any(kind == "composing" for kind, _ in actions), actions
+    assert core.predictions()[0][0] == "World", (actions, core.predictions())
+
+
+def test_native_default_tab_preserves_actual_displayed_pair_once(tmp_path):
+    core = _sentence_boundary_core(tmp_path, ghost=True)
+    _raw_sentence_prefix(core)
+    offer = core.process_keycode(17, 0)  # w
+    composing = [_native().ffi_decode_composing_payload(text)
+                 for kind, text in offer if kind == "composing"]
+    assert composing == [("w", "orld")], offer
+    actions = core.process_keycode(15, 0)  # Tab accepts this actual offer.
+    # The prediction table can carry sentence casing, but the displayed pair
+    # retains the typed prefix. Acceptance must conserve that actual offer.
+    assert [text for kind, text in actions if kind == "commit"] == ["world"], actions
+    assert not any(kind in {"replace", "forward"} for kind, _ in actions), actions
+    assert core.current_word() == "", actions
+    profile = _native_profile_fixture(core, tmp_path, "sentence-tab-profile.json")
+    assert set(profile["cvm"]["words"]) == {"hello", "world"}
+    assert profile["markov_bigrams"] == [["hello", "world", 1]]
+
+
+@pytest.mark.parametrize("case", ["cancel-local-preedit", "literal-tab", "trim-extra-space"])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_sentence_boundary_review_paths_preserve_actual_word_scope(tmp_path, case, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    _raw_sentence_prefix(core, whitespace=case != "literal-tab")
+    if case == "cancel-local-preedit":
+        offer = core.process_keycode(16, 0)  # Unsupported q: no eligible displayed suffix.
+        composing = [_native().ffi_decode_composing_payload(text)
+                     for kind, text in offer if kind == "composing"]
+        assert composing == [("q", "")], offer
+        assert not any(kind in {"commit", "replace", "forward"} for kind, _ in offer), offer
+        cancelled = core.process_keycode(1, 0)  # Escape cancels only this local preedit.
+        assert cancelled == [("hide", "")], cancelled
+    elif case == "literal-tab":
+        # This Core contract applies when the client inserts the forwarded Tab.
+        # A client focus change has its separate focus/reset invalidation path.
+        tab = core.process_keycode(15, 0)
+        assert tab == [("forward", "")], tab
+    else:
+        extra_space = core.process_keycode(57, 0)
+        assert extra_space == [("hide", ""), ("forward", "")], extra_space
+        backspace = core.process_keycode(14, 0)
+        assert backspace.count(("forward", "")) == 1, backspace
+        assert not any(kind in {"commit", "replace"} for kind, _ in backspace), backspace
+    assert core.current_word() == ""
+
+    codes = (17,) if prediction else (17, 24, 19, 38, 32)  # w / world
+    for code in codes:
+        step = core.process_keycode(code, 0)
+        assert any(kind == "composing" for kind, _ in step), step
+        assert not any(kind in {"commit", "replace", "forward"} for kind, _ in step), step
+    if prediction:
+        assert core.current_word() == "w"
+        assert core.predictions()[0][0] == "World", core.predictions()
+        profile = _native_profile_fixture(core, tmp_path, "sentence-review-prediction.json")
+        assert set(profile["cvm"]["words"]) == {"hello"}
+        assert profile["markov_bigrams"] == []
+    else:
+        boundary = core.process_keycode(57, 0)
+        assert [text for kind, text in boundary if kind == "commit"] == ["world"], boundary
+        replacements = [_native().ffi_decode_replace_payload(text)
+                        for kind, text in boundary if kind == "replace"]
+        assert replacements == [(5, "World")], boundary
+        assert boundary.count(("forward", "")) == 1, boundary
+        assert core.current_word() == "", boundary
+        profile = _native_profile_fixture(core, tmp_path, "sentence-review-postcommit.json")
+        assert set(profile["cvm"]["words"]) == {"hello", "world"}
+        assert profile["markov_bigrams"] == [["hello", "world", 1]]
+
+
+def _assert_native_sentence_review_target(
+    core, tmp_path, *, prediction, capitalized, expected_previous="hello"
+):
+    before = _native_profile_fixture(core, tmp_path, "tail-before-target.json")
+    before_words = set(before["cvm"]["words"])
+    assert before_words == {expected_previous}, before_words
+    assert not before_words.intersection({'"', "”", ")", "]", "!", "seed"}), before_words
+    assert before["markov_bigrams"] == []
+    for code in ((17,) if prediction else (17, 24, 19, 38, 32)):
+        step = core.process_keycode(code, 0)
+        assert any(kind == "composing" for kind, _ in step), step
+        assert not any(kind in {"commit", "replace", "forward"} for kind, _ in step), step
+    if prediction:
+        assert core.current_word() == "w"
+        assert core.predictions()[0][0] == ("World" if capitalized else "world"), core.predictions()
+    else:
+        actions = core.process_keycode(57, 0)
+        assert [text for kind, text in actions if kind == "commit"] == ["world"], actions
+        replacements = [_native().ffi_decode_replace_payload(text)
+                        for kind, text in actions if kind == "replace"]
+        assert replacements == ([(5, "World")] if capitalized else []), actions
+        assert actions.count(("forward", "")) == 1 and core.current_word() == "", actions
+    after = _native_profile_fixture(core, tmp_path, "tail-after-target.json")
+    assert set(after["cvm"]["words"]) == before_words | (set() if prediction else {"world"})
+    if prediction:
+        assert after["markov_bigrams"] == []
+    else:
+        assert after["markov_bigrams"] == [[expected_previous, "world", 1]]
+    assert after["markov_trigrams"] == []
+
+
+@pytest.mark.parametrize("route", ["semantic-tail", "shared-raw-tail", "stored-semantic-token"])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_sentence_closers_preserve_boundary_and_lexical_scope(tmp_path, route, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    if route == "stored-semantic-token":
+        # Semantic input keeps punctuation in the existing whole-word token.
+        # The shared capitalization consumer must recognize its closing quote.
+        for char in "hello.”":
+            core.handle_key(ord(char), 0)  # Actual codepoints, as normalized by the adapter.
+        assert core.current_word() == "hello.”"
+        boundary = core.handle_key(0x20, 0)
+        assert boundary.count(("forward", "")) == 1 and core.current_word() == "", boundary
+    else:
+        _raw_sentence_prefix(core, whitespace=False)
+        if route == "semantic-tail":
+            for char in "”)]":
+                actions = core.handle_key(ord(char), 0)
+                assert actions == [("forward", "")] and core.current_word() == "", actions
+        else:
+            # Only actual shared EN/BG glyphs qualify. The Shift key itself and
+            # its release must retain the pending boundary without inserting text.
+            assert core.process_keycode(42, 1) == [("forward", "")]
+            for code in (40, 11, 2):  # Shift: double quote, closing parenthesis, !
+                actions = core.process_keycode(code, 1)
+                assert actions == [("forward", "")] and core.current_word() == "", actions
+            assert core.process_keycode(42, 1 | (1 << 30)) == [("forward", "")]
+        space = core.process_keycode(57, 0)
+        assert space == [("hide", ""), ("forward", "")], space
+    _assert_native_sentence_review_target(
+        core, tmp_path, prediction=prediction, capitalized=True,
+        expected_previous="hello.”" if route == "stored-semantic-token" else "hello",
+    )
+
+
+@pytest.mark.parametrize("api", ["raw", "keysym"])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_shift_insert_withdraws_stale_boundary_after_client_paste(tmp_path, api, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    _raw_sentence_prefix(core)
+    actions = (core.process_keycode(110, 1) if api == "raw"
+               else core.handle_key(0xFF63, 1))  # Actual Shift+Insert identities.
+    assert actions == [("forward", "")] and core.current_word() == "", actions
+    # Synthetic fresh client snapshot after the forwarded paste. No clipboard,
+    # widget mutation, Core text assignment or inferred-word training is involved.
+    context = "hello. seed "
+    core.set_surrounding_text(context, len(context))
+    _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=False)
+
+
+@pytest.mark.parametrize("route", ["semantic", "shared-raw"])
+@pytest.mark.parametrize("boundary", ["survives", "removed"])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_sentence_tail_deletion_preserves_only_surviving_boundary(
+    tmp_path, route, boundary, mode
+):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    _raw_sentence_prefix(core, whitespace=False)
+    if route == "semantic":
+        tails = [core.handle_key(ord(char), 0) for char in "”)]"]
+    else:
+        # Shared quote, repeated terminator, closing parenthesis: three glyphs.
+        tails = [core.process_keycode(code, mask) for code, mask in ((40, 1), (52, 0), (11, 1))]
+    assert tails == [[("forward", "")]] * 3, tails
+    assert core.current_word() == ""
+
+    def delete_literal():
+        actions = core.process_keycode(14, 0)
+        assert actions.count(("forward", "")) == 1 and core.current_word() == "", actions
+        assert not any(kind in {"commit", "replace", "composing"} for kind, _ in actions), actions
+
+    delete_literal()  # Two known tail glyphs remain after the original terminator.
+    for _ in range(2):
+        actions = core.process_keycode(57, 0)
+        assert actions == [("hide", ""), ("forward", "")], actions
+    for _ in range(2):
+        delete_literal()  # Delete both Spaces, restoring the same pending tail.
+    for _ in range(1 if boundary == "survives" else 3):
+        delete_literal()  # Remove a closer, or the whole tail plus original terminator.
+    actions = core.process_keycode(57, 0)
+    assert actions == [("hide", ""), ("forward", "")], actions
+    _assert_native_sentence_review_target(
+        core, tmp_path, prediction=prediction, capitalized=boundary == "survives"
+    )
+
+
+@pytest.mark.parametrize("api,identity,mask", [
+    ("raw", 29, 1 << 2),          # Left Ctrl, physical IBus control mask.
+    ("keysym", 0xFFE4, 1 << 2),  # Right Ctrl.
+    ("raw", 100, 1 << 3),        # Right Alt.
+    ("keysym", 0xFFE9, 1 << 3),  # Left Alt.
+    ("raw", 125, 1 << 6),        # Left Super, physical MOD4 mask.
+    ("keysym", 0xFFEC, 1 << 26), # Right Super, virtual SUPER mask.
+])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_modifier_only_tap_preserves_sentence_hint(tmp_path, api, identity, mask, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    _raw_sentence_prefix(core)
+    call = core.process_keycode if api == "raw" else core.handle_key
+    assert call(identity, mask) == [("forward", "")]
+    assert call(identity, mask | (1 << 30)) == [("forward", "")]
+    assert core.current_word() == ""
+    _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=True)
+
+
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_client_text_withdraws_stale_sentence_hint(tmp_path, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    _raw_sentence_prefix(core)
+    # A fresh client report after an editor-side insertion, with no paste key
+    # passing through Core. This updates context, never learned vocabulary.
+    context = "hello. seed "
+    core.set_surrounding_text(context, len(context))
+    assert core.current_word() == ""
+    _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=False)
+
+
+@pytest.mark.parametrize("prior_report", ["sentence", "ordinary-word"])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_sentence_start_revalidates_current_cursor(tmp_path, prior_report, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    # The observer has an actual known empty report before its own delivery.
+    core.set_surrounding_text("", 0)
+    _raw_sentence_prefix(core)
+    if prior_report == "ordinary-word":
+        context = "hello. seed "
+        core.set_surrounding_text(context, len(context))
+    # A second external edit can establish a new sentence after a prior veto.
+    context = "hello. seed. "
+    core.set_surrounding_text(context, len(context))
+    assert core.current_word() == ""
+    _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=True)
+
+
+@pytest.mark.parametrize("context,deletions,restore_space,capitalized", [
+    ("hello. seed.  ", 1, False, True),
+    ("hello. seed.  ", 2, False, False),
+    ("hello. seed.  ", 2, True, True),
+    ("hello. seed.!)]  ", 5, True, True),
+    ("hello. seed.!)]  ", 6, True, False),
+])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_literal_tail_deletion_preserves_surviving_separator(
+    tmp_path, context, deletions, restore_space, capitalized, mode
+):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    core.set_surrounding_text("", 0)
+    _raw_sentence_prefix(core)
+    core.set_surrounding_text(context, len(context))
+    for _ in range(deletions):
+        actions = core.process_keycode(14, 0)
+        assert actions.count(("forward", "")) == 1 and core.current_word() == "", actions
+        assert not any(kind in {"commit", "replace", "composing"} for kind, _ in actions), actions
+    if restore_space:
+        assert core.process_keycode(57, 0) == [("hide", ""), ("forward", "")]
+    _assert_native_sentence_review_target(
+        core, tmp_path, prediction=prediction, capitalized=capitalized
+    )
+
+
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_positive_extra_space_then_shortcut_keeps_stale_context_veto(tmp_path, mode):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    core.set_surrounding_text("", 0)
+    _raw_sentence_prefix(core, whitespace=False)
+    # Cache a real sentence-ending lexical hint before the following report
+    # changes the cursor context. No context, word or learning state is assigned.
+    core.set_surrounding_text("hello.", 6)
+    assert core.process_keycode(57, 0) == [("hide", ""), ("forward", "")]
+    context = "hello. seed.  "
+    core.set_surrounding_text(context, len(context))
+    assert core.process_keycode(57, 0) == [("hide", ""), ("forward", "")]
+    assert core.process_keycode(47, 1 << 2) == [("forward", "")]  # Ctrl+V.
+    assert core.current_word() == ""
+    _assert_native_sentence_review_target(core, tmp_path, prediction=prediction, capitalized=False)
+
+
+@pytest.mark.parametrize("context,deletions,restore_space,capitalized", [
+    ("hello.\n  ", 1, False, True),
+    ("hello.\n  ", 2, False, True),
+    ("hello.\n  ", 3, False, False),
+    ("hello.\n  ", 3, True, True),
+    ("hello.\n  ", 4, True, False),
+    ("hello.\r\n  ", 3, False, True),
+    ("  ", 1, False, True),
+    ("  ", 2, False, True),
+])
+@pytest.mark.parametrize("mode", ["default-prediction", "opt-in-postcommit"])
+def test_native_refreshed_line_indentation_deletion_reclassifies_exact_cursor(
+    tmp_path, context, deletions, restore_space, capitalized, mode
+):
+    prediction = mode == "default-prediction"
+    core = _sentence_boundary_core(tmp_path, post=None if prediction else True, ghost=prediction)
+    core.set_surrounding_text("", 0)
+    _raw_sentence_prefix(core)
+    # A real public client report supplies the layout. Subsequent Backspaces
+    # use the raw API; the test never assigns the projected text or caps state.
+    core.set_surrounding_text(context, len(context))
+    for _ in range(deletions):
+        assert core.current_word() == ""
+        actions = core.process_keycode(14, 0)
+        assert actions.count(("forward", "")) == 1 and core.current_word() == "", actions
+        assert not any(kind in {"commit", "replace", "composing"} for kind, _ in actions), actions
+    if restore_space:
+        assert core.process_keycode(57, 0) == [("hide", ""), ("forward", "")]
+    _assert_native_sentence_review_target(
+        core, tmp_path, prediction=prediction, capitalized=capitalized
+    )

@@ -75,3 +75,19 @@ def test_client_capability_updates_enable_only_surrounding_text_rewrites():
         engine.do_set_capabilities(caps)
         assert engine._caps == caps
     assert supported_values == [False, True, False, True, False]
+
+
+@pytest.mark.parametrize("text,cursor", [("", 0), (" \t\n", 3), (None, None), ("hello", 5)])
+def test_surrounding_report_preserves_known_empty_and_missing_distinction(text, cursor):
+    reports = []
+
+    class Core:
+        def set_surrounding_text(self, reported_text, reported_cursor):
+            reports.append((reported_text, reported_cursor))
+
+    engine = ske.SmartKeyEngine.__new__(ske.SmartKeyEngine)
+    engine._core = Core()
+    engine._sync_surrounding_text(text, cursor)
+    assert reports == [(text, cursor)]
+    assert engine._surrounding_text == text
+    assert engine._surrounding_cursor_pos == cursor

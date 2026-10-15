@@ -65,6 +65,16 @@ pub enum Key {
     Other(u32),
 }
 
+impl Key {
+    pub(crate) fn is_pure_modifier(&self) -> bool {
+        matches!(
+            self,
+            Self::RawCode(29 | 42 | 54 | 56 | 58 | 97 | 100 | 125 | 126)
+                | Self::Other(0xffe1..=0xffee)
+        )
+    }
+}
+
 /// A single key event delivered by the platform.
 #[derive(Debug, Clone)]
 pub struct KeyEvent {
@@ -535,6 +545,26 @@ enum WordDetectorBaseline {
     Invalid,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SentenceBoundaryHint {
+    None,
+    /// Literal closers/repeated terminators following the original terminator.
+    AwaitingWhitespace {
+        tail_count: usize,
+    },
+    /// Known trailing plain Spaces; zero means opaque Tab/Return whitespace.
+    SentenceStart {
+        spaces: usize,
+        tail_count: usize,
+    },
+}
+
+impl SentenceBoundaryHint {
+    fn is_sentence_start(self) -> bool {
+        matches!(self, Self::SentenceStart { .. })
+    }
+}
+
 /// The core state machine shared by all platform adapters.
 ///
 /// Platform code feeds key events via [`handle_key`] and executes the
@@ -550,6 +580,10 @@ pub struct InputMethodCore {
     current_word: String,
     ghost: String,
     context: VecDeque<String>,
+    /// Presentation evidence for forwarded delimiters, never model context.
+    sentence_boundary: SentenceBoundaryHint,
+    /// Current-position casing reconciliation, independent of lexical hints.
+    sentence_presentation_override: Option<bool>,
     enabled: bool,
     /// Whether the current host can replace text already delivered to its client.
     /// Ephemeral transport capability; never part of config or personal state.
@@ -600,6 +634,8 @@ impl InputMethodCore {
             current_word: String::new(),
             ghost: String::new(),
             context: VecDeque::with_capacity(CONTEXT_SIZE),
+            sentence_boundary: SentenceBoundaryHint::None,
+            sentence_presentation_override: None,
             enabled,
             external_rewrite_supported: true,
             last_predictions: Vec::new(),
@@ -639,6 +675,69 @@ impl InputMethodCore {
 
     pub(crate) fn set_terminal_context_lang(&mut self, lang: Option<LangId>) {
         self.terminal_context_lang = lang.filter(|lang| matches!(lang, LangId::En | LangId::Bg));
+    }
+
+    /// Local delimiter projection only, independent of a reconciliation veto.
+    pub(crate) fn has_sentence_boundary_hint(&self) -> bool {
+        self.sentence_boundary != SentenceBoundaryHint::None
+    }
+
+    /// A contradictory client report also vetoes stale lexical casing hints.
+    pub(crate) fn withdraw_sentence_boundary_hint(&mut self) {
+        self.sentence_boundary = SentenceBoundaryHint::None;
+        self.sentence_presentation_override = Some(false);
+    }
+
+    /// Reconcile a valid current-position report, never lexical context.
+    pub(crate) fn reconcile_sentence_boundary_hint(&mut self, before_cursor: &str) {
+        let trimmed = before_cursor.trim_end();
+        let whitespace = &before_cursor[trimmed.len()..];
+        self.sentence_boundary = if trimmed.is_empty() || whitespace.contains(['\r', '\n']) {
+            SentenceBoundaryHint::SentenceStart {
+                spaces: 0,
+                tail_count: 0,
+            }
+        } else if CapsEngine::requires_capitalization(trimmed) {
+            // Count characters after the earliest terminator in this literal suffix.
+            let mut tail_count = 0;
+            for (offset, ch) in trimmed
+                .chars()
+                .rev()
+                .take_while(|&ch| {
+                    CapsEngine::is_closing_punctuation(ch) || matches!(ch, '.' | '!' | '?')
+                })
+                .enumerate()
+            {
+                if matches!(ch, '.' | '!' | '?') {
+                    tail_count = offset;
+                }
+            }
+            if whitespace.is_empty() {
+                SentenceBoundaryHint::AwaitingWhitespace { tail_count }
+            } else {
+                SentenceBoundaryHint::SentenceStart {
+                    spaces: if whitespace.bytes().all(|byte| byte == b' ') {
+                        whitespace.len()
+                    } else {
+                        0
+                    },
+                    tail_count,
+                }
+            }
+        } else {
+            SentenceBoundaryHint::None
+        };
+        // A fresh positive lives in the enum. If an uncertain edit withdraws
+        // it, stale lexical casing must not reappear through the fallback.
+        self.sentence_presentation_override = Some(false);
+    }
+
+    fn sentence_start_override(&self) -> Option<bool> {
+        // A genuine new local boundary supersedes an older external veto.
+        self.sentence_boundary
+            .is_sentence_start()
+            .then_some(true)
+            .or(self.sentence_presentation_override)
     }
 
     // -- passive calibration tap (delegates to the engine) --------------
@@ -782,9 +881,55 @@ impl InputMethodCore {
             return vec![Action::HideGhost];
         }
 
-        // Ignore events with Ctrl or Alt held.
-        if event.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT) {
+        if event.key.is_pure_modifier() {
             return vec![Action::ForwardKey];
+        }
+
+        // Ignore shortcuts with Ctrl or Alt held, not the modifier key itself.
+        if event.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT) {
+            self.sentence_boundary = SentenceBoundaryHint::None;
+            return vec![Action::ForwardKey];
+        }
+
+        // A literal closing tail belongs to the forwarded terminator, not a
+        // new lexical token. Raw keys qualify only when both layouts agree.
+        if matches!(
+            self.sentence_boundary,
+            SentenceBoundaryHint::AwaitingWhitespace { .. }
+        ) && self.current_word.is_empty()
+            && self.dual_buffer.is_none()
+        {
+            let tail = match event.key {
+                Key::Char(ch) => Some(ch),
+                Key::RawCode(code) => keymap::scancode_to_both_with_caps(
+                    code,
+                    event.modifiers.contains(Modifiers::SHIFT),
+                    event.modifiers.contains(Modifiers::CAPS_LOCK),
+                )
+                .and_then(|(en, bg)| (en == bg).then_some(en)),
+                _ => None,
+            };
+            if tail.is_some_and(|ch| {
+                CapsEngine::is_closing_punctuation(ch) || matches!(ch, '.' | '!' | '?')
+            }) {
+                if let SentenceBoundaryHint::AwaitingWhitespace { tail_count } =
+                    &mut self.sentence_boundary
+                {
+                    *tail_count = tail_count.saturating_add(1);
+                }
+                return vec![Action::ForwardKey];
+            }
+        }
+
+        // An adjacent printable character is not the whitespace required after
+        // a forwarded terminator (decimal/technical tokens included). Withdraw
+        // the pending hint before any prediction for that character.
+        if matches!(
+            self.sentence_boundary,
+            SentenceBoundaryHint::AwaitingWhitespace { .. }
+        ) && matches!(event.key, Key::Char(_) | Key::RawCode(_))
+        {
+            self.sentence_boundary = SentenceBoundaryHint::None;
         }
 
         // ── Resolve RawCode (v0.5.0) ─────────────────────────────────
@@ -833,6 +978,7 @@ impl InputMethodCore {
                     modifiers: event.modifiers,
                 }
             } else {
+                self.sentence_boundary = SentenceBoundaryHint::None;
                 return vec![Action::ForwardKey];
             }
         } else {
@@ -860,6 +1006,15 @@ impl InputMethodCore {
                     self.reset_word();
                     vec![Action::HideGhost, Action::ForwardKey]
                 } else {
+                    // This empty-word branch forwards Tab without a word commit.
+                    // Tab may focus, complete, or insert nothing: later Backspace
+                    // cannot safely restore the preceding counted Space/tail.
+                    if self.sentence_boundary != SentenceBoundaryHint::None {
+                        self.sentence_boundary = SentenceBoundaryHint::SentenceStart {
+                            spaces: 0,
+                            tail_count: 0,
+                        };
+                    }
                     vec![Action::ForwardKey]
                 }
             }
@@ -970,8 +1125,13 @@ impl InputMethodCore {
                     }
                 } else if self.in_hypothesis_phase() {
                     // Hypothesis phase, no completion shown: cancel the
-                    // preedit, nothing was committed.
+                    // preedit, nothing was committed. The client's preceding
+                    // delimiter was not edited by this local cancellation.
+                    let sentence_boundary = self.sentence_boundary;
+                    let sentence_presentation_override = self.sentence_presentation_override;
                     self.reset_word();
+                    self.sentence_boundary = sentence_boundary;
+                    self.sentence_presentation_override = sentence_presentation_override;
                     vec![Action::HideGhost]
                 } else {
                     vec![Action::ForwardKey]
@@ -1007,6 +1167,43 @@ impl InputMethodCore {
                 }
                 // Capture whole-word ownership before taking/resetting the token.
                 let rewrite_allowed = self.external_rewrite_supported || self.dual_buffer.is_some();
+                let sentence_start = self.sentence_start_override();
+                // Empty Space does not finish a word; retain its current-position
+                // decision. Return instead establishes a new local boundary.
+                let next_presentation_override =
+                    if event.key == Key::Space && self.current_word.is_empty() {
+                        self.sentence_presentation_override
+                    } else {
+                        None
+                    };
+                let next_boundary = if event.key == Key::Return {
+                    SentenceBoundaryHint::SentenceStart {
+                        spaces: 0,
+                        tail_count: 0,
+                    }
+                } else if self.current_word.is_empty() {
+                    match self.sentence_boundary {
+                        SentenceBoundaryHint::AwaitingWhitespace { tail_count } => {
+                            SentenceBoundaryHint::SentenceStart {
+                                spaces: 1,
+                                tail_count,
+                            }
+                        }
+                        SentenceBoundaryHint::SentenceStart { spaces, tail_count } => {
+                            SentenceBoundaryHint::SentenceStart {
+                                spaces: if spaces > 0 {
+                                    spaces.saturating_add(1)
+                                } else {
+                                    0
+                                },
+                                tail_count,
+                            }
+                        }
+                        SentenceBoundaryHint::None => SentenceBoundaryHint::None,
+                    }
+                } else {
+                    SentenceBoundaryHint::None
+                };
                 if self.dual_buffer.is_some() && !self.current_word.is_empty() {
                     // Full-word composing: commit entire preedit word at once.
                     // The word has been in composing mode the whole time — the
@@ -1015,6 +1212,8 @@ impl InputMethodCore {
                     let word = self.resolve_word_boundary();
                     let correction = self.commit_boundary_word(&word, rewrite_allowed);
                     self.reset_word();
+                    self.sentence_boundary = next_boundary;
+                    self.sentence_presentation_override = next_presentation_override;
                     let mut actions = vec![
                         Action::HideGhost,
                         Action::CommitText(word.clone()),
@@ -1030,6 +1229,7 @@ impl InputMethodCore {
                         false,
                         correction,
                         rewrite_allowed,
+                        sentence_start,
                     ));
                     return actions;
                 }
@@ -1041,6 +1241,8 @@ impl InputMethodCore {
                     None
                 };
                 self.reset_word();
+                self.sentence_boundary = next_boundary;
+                self.sentence_presentation_override = next_presentation_override;
                 let mut actions = vec![Action::HideGhost, Action::ForwardKey];
                 // Post-commit intelligence pipeline: auto-correct, auto-caps, next-word ghost.
                 if let Some((word, correction)) = committed {
@@ -1052,6 +1254,7 @@ impl InputMethodCore {
                         false,
                         correction,
                         rewrite_allowed,
+                        sentence_start,
                     ));
                 }
                 actions
@@ -1102,6 +1305,36 @@ impl InputMethodCore {
                         }];
                     }
                 }
+                // Only an empty token lets this provisional event projection
+                // trim a known literal tail. A delivered word or opaque whitespace
+                // requires conservative invalidation. Local preedit deletion
+                // above, including to empty, retains the complete hint payload.
+                self.sentence_boundary = if self.current_word.is_empty() {
+                    match self.sentence_boundary {
+                        SentenceBoundaryHint::SentenceStart { spaces, tail_count }
+                            if spaces > 1 =>
+                        {
+                            SentenceBoundaryHint::SentenceStart {
+                                spaces: spaces - 1,
+                                tail_count,
+                            }
+                        }
+                        SentenceBoundaryHint::SentenceStart {
+                            spaces: 1,
+                            tail_count,
+                        } => SentenceBoundaryHint::AwaitingWhitespace { tail_count },
+                        SentenceBoundaryHint::AwaitingWhitespace { tail_count }
+                            if tail_count > 0 =>
+                        {
+                            SentenceBoundaryHint::AwaitingWhitespace {
+                                tail_count: tail_count - 1,
+                            }
+                        }
+                        _ => SentenceBoundaryHint::None,
+                    }
+                } else {
+                    SentenceBoundaryHint::None
+                };
                 if !self.current_word.is_empty() {
                     self.pop_word_char();
                 }
@@ -1127,6 +1360,7 @@ impl InputMethodCore {
                 {
                     let rewrite_allowed =
                         self.external_rewrite_supported || self.dual_buffer.is_some();
+                    let sentence_start = self.sentence_start_override();
                     let word = self.resolve_word_boundary();
                     let correction = self.commit_boundary_word(&word, rewrite_allowed);
                     self.reset_word();
@@ -1140,7 +1374,14 @@ impl InputMethodCore {
                         false,
                         correction,
                         rewrite_allowed,
+                        sentence_start,
                     ));
+                    // Record the delimiter only after processing the word it
+                    // terminates; punctuation never enters lexical learning.
+                    if matches!(ch, '.' | '!' | '?') {
+                        self.sentence_boundary =
+                            SentenceBoundaryHint::AwaitingWhitespace { tail_count: 0 };
+                    }
                     actions.push(Action::ForwardKey);
                     return actions;
                 }
@@ -1222,8 +1463,11 @@ impl InputMethodCore {
 
             // RawCode is resolved before this match — unreachable.
             Key::RawCode(_) => unreachable!("RawCode resolved before match"),
-            // Unknown key: pass through.
-            Key::Other(_) => vec![Action::ForwardKey],
+            // An unknown forwarded press may edit the client (e.g. paste).
+            Key::Other(_) => {
+                self.sentence_boundary = SentenceBoundaryHint::None;
+                vec![Action::ForwardKey]
+            }
         }
     }
 
@@ -1429,6 +1673,13 @@ impl InputMethodCore {
         // whole token. Capture this before confirmation, learning and reset.
         let rewrite_allowed =
             self.external_rewrite_supported || (prefix_in_preedit && words.len() == 1);
+        // Conserve the exact shown composition. First-word phrase casing belongs
+        // in its pre-display producer, not this final-word post-commit pipeline.
+        let sentence_start = if words.len() == 1 {
+            self.sentence_start_override()
+        } else {
+            None
+        };
         let commit_text = if prefix_in_preedit {
             full_text.clone()
         } else {
@@ -1488,6 +1739,7 @@ impl InputMethodCore {
             false,
             correction.map(LanguageCorrection::into_action),
             rewrite_allowed,
+            sentence_start,
         ));
         actions
     }
@@ -1513,6 +1765,8 @@ impl InputMethodCore {
     /// Called when the input field gains focus.
     pub fn focus_gained(&mut self) {
         self.commit_learning = CommitLearningBatch::default();
+        self.sentence_boundary = SentenceBoundaryHint::None;
+        self.sentence_presentation_override = None;
     }
 
     /// Called when the cursor moves away from the current typing location.
@@ -2085,7 +2339,7 @@ impl InputMethodCore {
     /// Step 2: Auto-capitalize if previous context requires it.
     ///
     /// Fires after sentence-ending punctuation (. ! ? \n) and for proper nouns.
-    fn try_auto_capitalize(&self, word: &str) -> Option<Action> {
+    fn try_auto_capitalize(&self, word: &str, sentence_start: Option<bool>) -> Option<Action> {
         if word.is_empty() {
             return None;
         }
@@ -2097,11 +2351,13 @@ impl InputMethodCore {
 
         // The current word is already appended; inspect the preceding committed
         // word for sentence-ending punctuation (.!?\n).
-        let needs_cap = if let Some(prev) = self.context.iter().rev().nth(1) {
-            CapsEngine::requires_capitalization(prev)
-        } else {
-            true // Start of input.
-        };
+        let needs_cap = sentence_start.unwrap_or_else(|| {
+            if let Some(prev) = self.context.iter().rev().nth(1) {
+                CapsEngine::requires_capitalization(prev)
+            } else {
+                true // Start of input.
+            }
+        });
 
         // Check proper noun.
         let is_proper = self.caps_engine.is_proper_noun(word);
@@ -2175,6 +2431,7 @@ impl InputMethodCore {
         show_anticipatory: bool,
         language_correction: Option<Action>,
         rewrite_allowed: bool,
+        sentence_start: Option<bool>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut effective_word = committed_word.to_string();
@@ -2192,7 +2449,7 @@ impl InputMethodCore {
             }
 
             // Step 2: Auto-capitalization.
-            if let Some(cap_action) = self.try_auto_capitalize(&effective_word) {
+            if let Some(cap_action) = self.try_auto_capitalize(&effective_word, sentence_start) {
                 actions.push(cap_action);
             }
         }
@@ -2282,6 +2539,8 @@ impl InputMethodCore {
     }
 
     fn reset_word(&mut self) {
+        self.sentence_boundary = SentenceBoundaryHint::None;
+        self.sentence_presentation_override = None;
         self.current_word.clear();
         self.terminal_context_lang = None;
         self.word_origins.clear();
@@ -2563,7 +2822,9 @@ impl InputMethodCore {
             .unwrap_or(false);
 
         let prev_token = ctx_refs.last().copied().unwrap_or("");
-        let force_sentence_start = CapsEngine::requires_capitalization(prev_token);
+        let force_sentence_start = self
+            .sentence_start_override()
+            .unwrap_or_else(|| CapsEngine::requires_capitalization(prev_token));
 
         for pred in &mut self.last_predictions {
             pred.word = CapsEngine::apply_caps(&pred.word, regime);
@@ -8053,5 +8314,1326 @@ mod external_rewrite_contract_tests {
         assert!(!core.external_rewrite_supported);
         core.set_external_rewrite_supported(true);
         assert!(core.external_rewrite_supported);
+    }
+}
+
+#[cfg(test)]
+mod sentence_boundary_followup_tests {
+    use super::*;
+
+    const HELLO: &[u16] = &[35, 18, 38, 38, 24];
+    const WORLD: &[u16] = &[17, 24, 19, 38, 32];
+
+    fn fresh(post: bool) -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: post,
+            lang_detection: false,
+            ..InputConfig::default()
+        });
+        for word in ["hello", "world", "seed"] {
+            core.load_word_lang(word, 1_000, LangId::En);
+        }
+        core
+    }
+
+    fn key(core: &mut InputMethodCore, key: Key) -> Vec<Action> {
+        core.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    // The adapter forwards the original key only after executing the batch.
+    // Composing/ghost actions never insert text into the client document.
+    fn project(document: &mut String, actions: &[Action], original: Option<char>) {
+        for action in actions {
+            match action {
+                Action::CommitText(text) => document.push_str(text),
+                Action::ReplaceWord { replace_len, text } => {
+                    for _ in 0..*replace_len {
+                        assert!(document.pop().is_some());
+                    }
+                    document.push_str(text);
+                }
+                _ => {}
+            }
+        }
+        if actions.iter().any(|a| matches!(a, Action::ForwardKey)) {
+            document.push(original.expect("modeled printable boundary"));
+        }
+    }
+
+    fn raw(core: &mut InputMethodCore, codes: &[u16]) {
+        for code in codes {
+            key(core, Key::RawCode(*code));
+        }
+    }
+
+    fn sentence(core: &mut InputMethodCore) {
+        raw(core, HELLO);
+        key(core, Key::RawCode(52));
+        key(core, Key::RawCode(57));
+    }
+
+    fn prediction(core: &mut InputMethodCore) -> String {
+        key(core, Key::RawCode(17));
+        core.predictions()
+            .first()
+            .expect("trusted world completion")
+            .word
+            .clone()
+    }
+
+    #[test]
+    fn sentence_boundary_raw_dot_owned_postcommit_caps() {
+        let mut core = fresh(true);
+        let mut client = String::new();
+        raw(&mut core, HELLO);
+        project(&mut client, &key(&mut core, Key::RawCode(52)), Some('.'));
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        raw(&mut core, WORLD);
+        let actions = key(&mut core, Key::Space);
+        eprintln!("raw-dot world boundary: {actions:?}");
+        project(&mut client, &actions, Some(' '));
+        assert_eq!(client, "Hello. World ");
+        assert_eq!(core.context_words().0, Some("world"));
+        let profile = core.export_personal_profile();
+        assert!(profile.cvm.words.iter().any(|w| w == "hello"));
+        assert!(!profile
+            .cvm
+            .words
+            .iter()
+            .any(|w| w == "." || w == "hello." || w.is_empty()));
+        assert!(profile
+            .markov_bigrams
+            .iter()
+            .any(|(p, w, n)| p == "hello" && w == "world" && *n == 1));
+        assert!(
+            profile.confirmed_words.is_empty(),
+            "caps supplies no language proof"
+        );
+    }
+
+    #[test]
+    fn sentence_boundary_raw_dot_default_prediction_caps() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_default_tab_accepts_actual_display_not_hidden_caps() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        let offer = key(&mut core, Key::RawCode(17));
+        assert!(offer.iter().any(|a| matches!(a, Action::ShowComposing { typed, ghost } if typed == "w" && ghost == "orld")));
+        let actions = key(&mut core, Key::Tab);
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| if let Action::CommitText(t) = a {
+                    Some(t.as_str())
+                } else {
+                    None
+                })
+                .collect::<Vec<_>>(),
+            vec!["world"]
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        assert!(core.current_word().is_empty());
+    }
+
+    fn boundary_prediction(boundary: Key, modifiers: Modifiers, whitespace: bool) {
+        let mut core = fresh(false);
+        raw(&mut core, HELLO);
+        let actions = core.handle_key(KeyEvent {
+            key: boundary.clone(),
+            modifiers,
+        });
+        assert!(actions.iter().any(|a| matches!(a, Action::ForwardKey)));
+        assert!(core.current_word().is_empty());
+        if whitespace {
+            key(&mut core, Key::Space);
+        }
+        assert_eq!(prediction(&mut core), "World", "boundary {boundary:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_raw_bang_prediction() {
+        boundary_prediction(Key::RawCode(2), Modifiers::SHIFT, true);
+    }
+
+    #[test]
+    fn sentence_boundary_raw_question_prediction() {
+        boundary_prediction(Key::RawCode(53), Modifiers::SHIFT, true);
+    }
+
+    #[test]
+    fn sentence_boundary_return_prediction() {
+        boundary_prediction(Key::Return, Modifiers::empty(), false);
+    }
+
+    #[test]
+    fn sentence_boundary_local_backspace_empty_retype_and_escape_keep_hint() {
+        for erase_all in [false, true] {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            raw(&mut core, &[17, 24]);
+            key(&mut core, Key::Backspace);
+            if erase_all {
+                key(&mut core, Key::Backspace);
+            }
+            let next = if erase_all { 17 } else { 24 };
+            key(&mut core, Key::RawCode(next));
+            assert_eq!(core.predictions()[0].word, "World");
+            assert!(core.has_ghost());
+            key(&mut core, Key::Escape); // Existing dismiss-only path retains preedit.
+            assert!(!core.current_word().is_empty());
+            key(&mut core, Key::RawCode(19));
+            // Escape rejected the previous candidate; preserve sentence casing,
+            // without requiring its now-rejected word to remain top-ranked.
+            assert!(core.predictions()[0]
+                .word
+                .chars()
+                .next()
+                .is_some_and(char::is_uppercase));
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_repeated_spaces_and_release_preserve_hint() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        key(&mut core, Key::Space);
+        core.handle_key(KeyEvent {
+            key: Key::Char('v'),
+            modifiers: Modifiers::CTRL | Modifiers::RELEASE,
+        });
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_forwarded_edits_reset_focus_and_shortcuts_withdraw_hint() {
+        for kind in 0..7 {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            match kind {
+                0 => {
+                    key(&mut core, Key::Backspace);
+                }
+                1 => {
+                    raw(&mut core, &[17]);
+                    key(&mut core, Key::Backspace);
+                    key(&mut core, Key::Backspace);
+                }
+                2 => {
+                    core.reset();
+                }
+                3 => {
+                    core.focus_lost();
+                    core.focus_gained();
+                }
+                4 | 5 => {
+                    core.handle_key(KeyEvent {
+                        key: Key::Char('v'),
+                        modifiers: if kind == 4 {
+                            Modifiers::CTRL
+                        } else {
+                            Modifiers::ALT
+                        },
+                    });
+                }
+                _ => {
+                    key(&mut core, Key::Left);
+                    // A real public external-context update distinguishes invalidation
+                    // from the existing no-context start-of-input capitalization.
+                    core.apply_hints(&crate::master_loop::Hints {
+                        context_words: vec!["seed".into()],
+                        ..Default::default()
+                    });
+                }
+            }
+            assert_eq!(prediction(&mut core), "world", "withdrawal {kind}");
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_completed_numeric_technical_and_mixed_tokens_consume_hint() {
+        for token in ["12", "foo.bar", "aБ"] {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            for ch in token.chars() {
+                key(&mut core, Key::Char(ch));
+            }
+            key(&mut core, Key::Space);
+            assert_eq!(prediction(&mut core), "world", "completed {token}");
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_multiword_accept_does_not_capitalize_phrase_final_word() {
+        let mut core = fresh(true);
+        sentence(&mut core);
+        raw(&mut core, &[17]);
+        // Existing public multiword producer, distinct from the natural Tab guard.
+        assert!(core.apply_prediction_override("world seed").is_some());
+        let actions = key(&mut core, Key::Tab);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })),
+            "{actions:?}"
+        );
+        assert_eq!(prediction(&mut core), "world");
+    }
+
+    #[test]
+    fn sentence_boundary_plain_space_adjacent_dot_and_decimal_keep_existing_casing() {
+        for sequence in [0, 1, 2] {
+            let mut core = fresh(false);
+            if sequence == 2 {
+                for ch in "1.2".chars() {
+                    key(&mut core, Key::Char(ch));
+                }
+                key(&mut core, Key::Space);
+            } else {
+                raw(&mut core, HELLO);
+                key(
+                    &mut core,
+                    if sequence == 0 {
+                        Key::Space
+                    } else {
+                        Key::RawCode(52)
+                    },
+                );
+            }
+            assert_eq!(prediction(&mut core), "world", "control {sequence}");
+        }
+    }
+
+    // Review follow-up: these hints describe provisional key delivery, never
+    // acknowledged client deletion, lexical punctuation, or language evidence.
+    fn review_dot(core: &mut InputMethodCore, client: &mut String, spaces: usize) {
+        raw(core, HELLO);
+        project(client, &key(core, Key::RawCode(52)), Some('.'));
+        for _ in 0..spaces {
+            project(client, &key(core, Key::Space), Some(' '));
+        }
+        assert_eq!(client.as_str(), format!("hello.{}", " ".repeat(spaces)));
+    }
+
+    fn review_forwarded_backspace(core: &mut InputMethodCore, client: &mut String) {
+        let actions = key(core, Key::Backspace);
+        assert!(actions.iter().any(|a| matches!(a, Action::ForwardKey)));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+        assert!(client.pop().is_some());
+    }
+
+    fn review_only_hello_learned(core: &InputMethodCore) {
+        let profile = core.export_personal_profile();
+        assert_eq!(profile.cvm.words, vec!["hello"]);
+        assert!(profile.markov_bigrams.is_empty());
+        assert!(profile.markov_trigrams.is_empty());
+        assert!(profile.confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn sentence_boundary_review_escape_cancels_local_prefix_not_client_boundary() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            lang_detection: false,
+            ..InputConfig::default()
+        });
+        for word in ["hello", "world"] {
+            core.load_word_lang(word, 1_000, LangId::En);
+        }
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 1);
+        let actions = key(&mut core, Key::RawCode(17));
+        assert!(actions.iter().any(|a| matches!(a, Action::ShowComposing { typed, ghost } if typed == "w" && ghost.is_empty())));
+        assert!(!core.has_ghost());
+        let cancelled = key(&mut core, Key::Escape);
+        assert!(matches!(cancelled.as_slice(), [Action::HideGhost]));
+        assert!(core.current_word().is_empty());
+        assert_eq!(client, "hello. ");
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_review_empty_tab_confirms_forwarded_terminator() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 0);
+        let actions = key(&mut core, Key::Tab);
+        assert!(matches!(actions.as_slice(), [Action::ForwardKey]));
+        project(&mut client, &actions, Some('\t'));
+        assert_eq!(client, "hello.\t");
+        assert!(core.current_word().is_empty());
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_review_trimming_extra_space_retains_known_separator() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 2);
+        review_forwarded_backspace(&mut core, &mut client);
+        assert_eq!(client, "hello. ");
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_review_last_space_delete_and_reinsert_restores_hint() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 1);
+        review_forwarded_backspace(&mut core, &mut client);
+        assert_eq!(client, "hello.");
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        assert_eq!(client, "hello. ");
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_review_repeated_separator_and_punctuation_deletions() {
+        // Exercise every arm even on RED; only capitalize with a surviving or
+        // reinserted separator after a terminator the model still tracks.
+        let mut mismatches = Vec::new();
+        for (spaces, deleted, reinsert, expected) in [
+            (3, 1, false, "World"),
+            (3, 2, false, "World"),
+            (3, 3, false, "world"),
+            (3, 3, true, "World"),
+            (3, 4, false, "world"),
+            (3, 4, true, "world"),
+        ] {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, spaces);
+            for _ in 0..deleted {
+                review_forwarded_backspace(&mut core, &mut client);
+            }
+            if reinsert {
+                project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            }
+            review_only_hello_learned(&core);
+            let actual = prediction(&mut core);
+            eprintln!("separator spaces={spaces} deleted={deleted} reinsert={reinsert} client={client:?} prediction={actual}");
+            if actual != expected {
+                mismatches.push((spaces, deleted, reinsert, actual, expected));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_review_opaque_tab_return_then_backspace_withdraws_hint() {
+        for (spaces, boundary, extra_space) in [
+            (0, Key::Tab, false),
+            (0, Key::Tab, true),
+            (1, Key::Tab, false),
+            (1, Key::Tab, true),
+            (0, Key::Return, false),
+            (1, Key::Return, true),
+        ] {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, spaces);
+            let glyph = if boundary == Key::Tab { '\t' } else { '\n' };
+            let actions = key(&mut core, boundary);
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::ForwardKey))
+                    .count(),
+                1
+            );
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+            project(&mut client, &actions, Some(glyph));
+            if extra_space {
+                project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            }
+            review_forwarded_backspace(&mut core, &mut client);
+            review_only_hello_learned(&core);
+            assert_eq!(prediction(&mut core), "world", "opaque client {client:?}");
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_review_space_release_cannot_inflate_separator_count() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 1);
+        let actions = core.handle_key(KeyEvent {
+            key: Key::Space,
+            modifiers: Modifiers::RELEASE,
+        });
+        assert!(matches!(actions.as_slice(), [Action::ForwardKey]));
+        // A release does not insert its key glyph into the client projection.
+        review_forwarded_backspace(&mut core, &mut client);
+        assert_eq!(client, "hello.");
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "world");
+    }
+
+    #[test]
+    fn sentence_boundary_review_forwarded_word_backspace_withdraws_hint() {
+        for handed_off in [false, true] {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 2);
+            if handed_off {
+                raw(&mut core, &[17]);
+            }
+            let actions = key(&mut core, Key::Char('a'));
+            project(&mut client, &actions, Some('a'));
+            assert_eq!(core.current_word(), if handed_off { "wa" } else { "a" });
+            assert_eq!(
+                client,
+                if handed_off {
+                    "hello.  wa"
+                } else {
+                    "hello.  a"
+                }
+            );
+            review_forwarded_backspace(&mut core, &mut client);
+            review_only_hello_learned(&core);
+            if handed_off {
+                assert_eq!(core.current_word(), "w");
+                assert_eq!(core.predictions()[0].word, "world");
+                assert_eq!(client, "hello.  w");
+            } else {
+                assert!(core.current_word().is_empty());
+                assert_eq!(prediction(&mut core), "world");
+                assert_eq!(client, "hello.  ");
+            }
+        }
+    }
+
+    const REVIEW_CLOSERS: &[char] = &[
+        '"', '\'', ')', ']', '}', '‘', '’', '“', '”', '«', '»', '‹', '›',
+    ];
+
+    fn tail_event(core: &mut InputMethodCore, event: KeyEvent, glyph: char, post: bool) -> bool {
+        let mut client = String::new();
+        raw(core, HELLO);
+        project(&mut client, &key(core, Key::RawCode(52)), Some('.'));
+        let tail = core.handle_key(event);
+        let tail_word = core.current_word().to_string();
+        project(&mut client, &tail, Some(glyph));
+        project(&mut client, &key(core, Key::Space), Some(' '));
+        if post {
+            raw(core, WORLD);
+            project(&mut client, &key(core, Key::Space), Some(' '));
+            let expected = format!("Hello.{glyph} World ");
+            eprintln!("tail={glyph:?} tailword={tail_word:?} actions={tail:?} client={client:?}");
+            // Snapshot words follow HashMap iteration, not commit order.
+            let mut learned = core.export_personal_profile().cvm.words;
+            learned.sort();
+            eprintln!("sorted learned words={learned:?}");
+            client == expected
+                && tail_word.is_empty()
+                && tail == vec![Action::ForwardKey]
+                && learned == vec!["hello", "world"]
+        } else {
+            let top = prediction(core);
+            eprintln!("tail={glyph:?} tailword={tail_word:?} actions={tail:?} prediction={top} client={client:?}");
+            let profile = core.export_personal_profile();
+            top == "World"
+                && tail_word.is_empty()
+                && tail == vec![Action::ForwardKey]
+                && profile.cvm.words == vec!["hello"]
+                && profile.markov_bigrams.is_empty()
+                && profile.markov_trigrams.is_empty()
+                && profile.confirmed_words.is_empty()
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_tail_semantic_closers_keep_pending_without_tokens() {
+        let mut failed = Vec::new();
+        for &ch in REVIEW_CLOSERS {
+            let mut core = fresh(false);
+            if !tail_event(
+                &mut core,
+                KeyEvent {
+                    key: Key::Char(ch),
+                    modifiers: Modifiers::empty(),
+                },
+                ch,
+                false,
+            ) {
+                failed.push(ch);
+            }
+        }
+        assert!(failed.is_empty(), "semantic tails: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_tail_shared_raw_closers_keep_pending_without_tokens() {
+        let mut failed = Vec::new();
+        for (code, modifiers, glyph) in [
+            (40, Modifiers::empty(), '\''),
+            (40, Modifiers::SHIFT, '"'),
+            (11, Modifiers::SHIFT, ')'),
+        ] {
+            assert_eq!(
+                keymap::scancode_to_both_with_caps(
+                    code,
+                    modifiers.contains(Modifiers::SHIFT),
+                    false
+                ),
+                Some((glyph, glyph))
+            );
+            let mut core = fresh(false);
+            if !tail_event(
+                &mut core,
+                KeyEvent {
+                    key: Key::RawCode(code),
+                    modifiers,
+                },
+                glyph,
+                false,
+            ) {
+                failed.push(glyph);
+            }
+        }
+        assert!(failed.is_empty(), "shared raw tails: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_tail_preserves_owned_postcommit_caps() {
+        let mut failed = Vec::new();
+        for (key, modifiers, glyph) in [
+            (Key::Char('”'), Modifiers::empty(), '”'),
+            (Key::RawCode(40), Modifiers::SHIFT, '"'),
+        ] {
+            let mut core = fresh(true);
+            if !tail_event(&mut core, KeyEvent { key, modifiers }, glyph, true) {
+                failed.push(glyph);
+            }
+        }
+        assert!(failed.is_empty(), "postcommit tails: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_tail_repeated_terminators_do_not_create_tokens() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 0);
+        let mut clean = true;
+        for (key, modifiers, glyph) in [
+            (Key::RawCode(52), Modifiers::empty(), '.'),
+            (Key::RawCode(2), Modifiers::SHIFT, '!'),
+            (Key::RawCode(53), Modifiers::SHIFT, '?'),
+            (Key::Char('”'), Modifiers::empty(), '”'),
+        ] {
+            let a = core.handle_key(KeyEvent { key, modifiers });
+            clean &= a == vec![Action::ForwardKey] && core.current_word().is_empty();
+            project(&mut client, &a, Some(glyph));
+        }
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        assert_eq!(client, "hello..!?” ");
+        let top = prediction(&mut core);
+        eprintln!("repeated tails prediction={top} clean={clean}");
+        assert!(clean && top == "World");
+        review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_tail_adjacent_word_or_digit_withdraws_pending() {
+        let mut failed = Vec::new();
+        for digit in [false, true] {
+            let mut core = fresh(false);
+            raw(&mut core, HELLO);
+            key(&mut core, Key::RawCode(52));
+            key(&mut core, Key::Char('"'));
+            if digit {
+                key(&mut core, Key::RawCode(2));
+                key(&mut core, Key::Space);
+            }
+            key(&mut core, Key::RawCode(17));
+            let actual = core.predictions().first().map(|p| p.word.clone());
+            eprintln!(
+                "adjacent digit={digit} word={:?} prediction={actual:?}",
+                core.current_word()
+            );
+            if actual.as_deref() != Some("world") {
+                failed.push(digit);
+            }
+        }
+        assert!(failed.is_empty(), "adjacent controls: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_tail_ambiguous_raw_bracket_keeps_bg_composition() {
+        for modifiers in [Modifiers::empty(), Modifiers::SHIFT] {
+            let mut core = fresh(false);
+            core.load_word_lang("щука", 1_000_000, LangId::Bg);
+            raw(&mut core, HELLO);
+            key(&mut core, Key::RawCode(52));
+            let a = core.handle_key(KeyEvent {
+                key: Key::RawCode(27),
+                modifiers,
+            });
+            assert!(core.debug_state().0);
+            assert_eq!(
+                core.current_word(),
+                if modifiers.is_empty() { "щ" } else { "Щ" }
+            );
+            assert!(a.iter().any(|a| matches!(a, Action::ShowComposing { .. })));
+            assert!(!a.iter().any(|a| matches!(
+                a,
+                Action::ForwardKey | Action::CommitText(_) | Action::ReplaceWord { .. }
+            )));
+            review_only_hello_learned(&core);
+        }
+    }
+
+    fn unknown_withdraws(event: KeyEvent) {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        let before = core.detected_language();
+        let a = core.handle_key(event);
+        assert_eq!(a, vec![Action::ForwardKey]);
+        assert!(core.current_word().is_empty());
+        assert_eq!(core.context_words().0, Some("hello"));
+        assert_eq!(core.detected_language().lang, before.lang);
+        assert_eq!(core.detected_language().confidence, before.confidence);
+        // Public refreshed surrounding context after the forwarded operation.
+        core.apply_hints(&crate::master_loop::Hints {
+            context_words: vec!["seed".into()],
+            ..Default::default()
+        });
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "world");
+    }
+
+    #[test]
+    fn sentence_boundary_unknown_shift_insert_raw_withdraws_hint() {
+        unknown_withdraws(KeyEvent {
+            key: Key::RawCode(110),
+            modifiers: Modifiers::SHIFT,
+        });
+    }
+
+    #[test]
+    fn sentence_boundary_unknown_shift_insert_keysym_withdraws_hint() {
+        unknown_withdraws(KeyEvent {
+            key: Key::Other(0xff63),
+            modifiers: Modifiers::SHIFT,
+        });
+    }
+
+    #[test]
+    fn sentence_boundary_unknown_keys_preserve_word_detector_and_context() {
+        let mut failed = Vec::new();
+        for key_id in [Key::Other(0xffbe), Key::RawCode(u16::MAX)] {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            raw(&mut core, &[17]);
+            let before = core.detected_language();
+            let a = key(&mut core, key_id.clone());
+            assert_eq!(a, vec![Action::ForwardKey]);
+            assert_eq!(core.current_word(), "w");
+            assert!(core.debug_state().0);
+            assert_eq!(core.context_words().0, Some("hello"));
+            assert_eq!(core.detected_language().lang, before.lang);
+            assert_eq!(core.detected_language().confidence, before.confidence);
+            raw(&mut core, &[24]);
+            if core.predictions()[0].word != "world" {
+                failed.push(key_id);
+            }
+            review_only_hello_learned(&core);
+        }
+        assert!(failed.is_empty(), "unknown forwarded keys: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_pure_modifier_identity_preserves_pending_and_confirmed() {
+        let mut failed = Vec::new();
+        for key_id in [
+            Key::RawCode(42),
+            Key::RawCode(54),
+            Key::RawCode(58),
+            Key::Other(0xffe1),
+            Key::Other(0xffe2),
+            Key::Other(0xffe5),
+        ] {
+            for confirmed in [false, true] {
+                for modifiers in [Modifiers::empty(), Modifiers::SHIFT] {
+                    let mut core = fresh(false);
+                    let mut client = String::new();
+                    review_dot(&mut core, &mut client, usize::from(confirmed));
+                    assert_eq!(
+                        core.handle_key(KeyEvent {
+                            key: key_id.clone(),
+                            modifiers
+                        }),
+                        vec![Action::ForwardKey]
+                    );
+                    if !confirmed {
+                        key(&mut core, Key::Space);
+                    }
+                    let actual = prediction(&mut core);
+                    if actual != "World" {
+                        failed.push((key_id.clone(), confirmed, modifiers, actual));
+                    }
+                    review_only_hello_learned(&core);
+                }
+            }
+        }
+        assert!(failed.is_empty(), "pure modifier controls: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_unknown_key_releases_preserve_pending_hint() {
+        for key_id in [
+            Key::RawCode(110),
+            Key::Other(0xff63),
+            Key::RawCode(42),
+            Key::Other(0xffe1),
+        ] {
+            let mut core = fresh(false);
+            raw(&mut core, HELLO);
+            key(&mut core, Key::RawCode(52));
+            assert_eq!(
+                core.handle_key(KeyEvent {
+                    key: key_id,
+                    modifiers: Modifiers::SHIFT | Modifiers::RELEASE
+                }),
+                vec![Action::ForwardKey]
+            );
+            key(&mut core, Key::Space);
+            assert_eq!(prediction(&mut core), "World");
+            review_only_hello_learned(&core);
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_stored_semantic_quote_context_prediction_caps() {
+        let mut failed = Vec::new();
+        for quote in ['"', '”', '“'] {
+            let mut core = fresh(false);
+            let stored = format!("hello.{quote}");
+            for ch in stored.chars() {
+                key(&mut core, Key::Char(ch));
+            }
+            key(&mut core, Key::Space);
+            assert_eq!(core.context_words().0, Some(stored.as_str()));
+            assert_eq!(core.export_personal_profile().cvm.words, vec![stored]);
+            let actual = prediction(&mut core);
+            eprintln!("stored quote={quote:?} prediction={actual}");
+            if actual != "World" {
+                failed.push(quote);
+            }
+        }
+        assert!(failed.is_empty(), "stored semantic context: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_stored_semantic_quote_context_owned_postcommit_caps() {
+        for quote in ['"', '”'] {
+            let mut core = fresh(true);
+            let mut client = String::new();
+            for ch in format!("hello.{quote}").chars() {
+                project(&mut client, &key(&mut core, Key::Char(ch)), Some(ch));
+            }
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            raw(&mut core, WORLD);
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            assert_eq!(client, format!("Hello.{quote} World "));
+        }
+    }
+
+    fn deletion_tail(core: &mut InputMethodCore, client: &mut String, shared_raw: bool) {
+        for (key, modifiers, glyph) in if shared_raw {
+            vec![
+                (Key::RawCode(40), Modifiers::SHIFT, '"'),
+                (Key::RawCode(11), Modifiers::SHIFT, ')'),
+            ]
+        } else {
+            vec![
+                (Key::Char('”'), Modifiers::empty(), '”'),
+                (Key::Char(')'), Modifiers::empty(), ')'),
+            ]
+        } {
+            let actions = core.handle_key(KeyEvent { key, modifiers });
+            assert_eq!(actions, vec![Action::ForwardKey]);
+            assert!(core.current_word().is_empty());
+            project(client, &actions, Some(glyph));
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_preserves_surviving_terminator() {
+        let mut failed = Vec::new();
+        for shared_raw in [false, true] {
+            for (deleted, expected) in [(1, "World"), (2, "World"), (3, "world")] {
+                let mut core = fresh(false);
+                let mut client = String::new();
+                review_dot(&mut core, &mut client, 0);
+                deletion_tail(&mut core, &mut client, shared_raw);
+                for _ in 0..deleted {
+                    review_forwarded_backspace(&mut core, &mut client);
+                }
+                project(&mut client, &key(&mut core, Key::Space), Some(' '));
+                let actual = prediction(&mut core);
+                eprintln!("closer sharedraw={shared_raw} deleted={deleted} client={client:?} prediction={actual}");
+                if actual != expected {
+                    failed.push((shared_raw, deleted, actual, expected));
+                }
+                review_only_hello_learned(&core);
+            }
+        }
+        assert!(failed.is_empty(), "closer deletion: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_after_spaces_retains_full_tail() {
+        let mut failed = Vec::new();
+        for deleted in 1..=5 {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            deletion_tail(&mut core, &mut client, false);
+            for _ in 0..2 {
+                project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            }
+            for _ in 0..deleted {
+                review_forwarded_backspace(&mut core, &mut client);
+            }
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            let expected = if deleted == 5 { "world" } else { "World" };
+            let actual = prediction(&mut core);
+            eprintln!("closer spaces deleted={deleted} client={client:?} prediction={actual}");
+            if actual != expected {
+                failed.push((deleted, actual, expected));
+            }
+            review_only_hello_learned(&core);
+        }
+        assert!(failed.is_empty(), "spaced closer deletion: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_repeated_terminators_are_counted() {
+        let mut failed = Vec::new();
+        for deleted in 1..=4 {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            for ch in ['!', '?', '”'] {
+                let actions = key(&mut core, Key::Char(ch));
+                assert_eq!(actions, vec![Action::ForwardKey]);
+                project(&mut client, &actions, Some(ch));
+            }
+            for _ in 0..deleted {
+                review_forwarded_backspace(&mut core, &mut client);
+            }
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            let expected = if deleted == 4 { "world" } else { "World" };
+            let actual = prediction(&mut core);
+            if actual != expected {
+                failed.push((deleted, client, actual, expected));
+            }
+            review_only_hello_learned(&core);
+        }
+        assert!(
+            failed.is_empty(),
+            "repeated terminator deletion: {failed:?}"
+        );
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_preserves_owned_postcommit_caps() {
+        let mut core = fresh(true);
+        let mut client = String::new();
+        raw(&mut core, HELLO);
+        project(&mut client, &key(&mut core, Key::RawCode(52)), Some('.'));
+        deletion_tail(&mut core, &mut client, false);
+        review_forwarded_backspace(&mut core, &mut client);
+        review_forwarded_backspace(&mut core, &mut client);
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        raw(&mut core, WORLD);
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        assert_eq!(client, "Hello. World ");
+        let profile = core.export_personal_profile();
+        let mut words = profile.cvm.words;
+        words.sort();
+        assert_eq!(words, vec!["hello", "world"]);
+        assert_eq!(
+            profile.markov_bigrams,
+            vec![("hello".into(), "world".into(), 1)]
+        );
+        assert!(profile.markov_trigrams.is_empty());
+        assert!(profile.confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_local_backspace_escape_preserve_payload() {
+        let mut failed = Vec::new();
+        for escape in [false, true] {
+            let mut core = InputMethodCore::new(InputConfig {
+                ghost_text: false,
+                lang_detection: false,
+                ..InputConfig::default()
+            });
+            for word in ["hello", "world"] {
+                core.load_word_lang(word, 1_000, LangId::En);
+            }
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            deletion_tail(&mut core, &mut client, false);
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            let typing = key(&mut core, Key::RawCode(17));
+            assert!(typing.iter().any(|a| matches!(a, Action::ShowComposing { typed, ghost } if typed == "w" && ghost.is_empty())));
+            let local = key(&mut core, if escape { Key::Escape } else { Key::Backspace });
+            assert_eq!(local, vec![Action::HideGhost]);
+            assert!(core.current_word().is_empty());
+            assert_eq!(client, "hello.”) ");
+            // Remove the known Space and both closers, leaving the terminator.
+            for _ in 0..3 {
+                review_forwarded_backspace(&mut core, &mut client);
+            }
+            assert_eq!(client, "hello.");
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            let actual = prediction(&mut core);
+            if actual != "World" {
+                failed.push((escape, actual));
+            }
+            review_only_hello_learned(&core);
+        }
+        assert!(failed.is_empty(), "local cancellation payload: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_unknown_navigation_focus_withdraw() {
+        for invalidation in 0..4 {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            deletion_tail(&mut core, &mut client, false);
+            match invalidation {
+                0 => assert_eq!(key(&mut core, Key::Other(0xff63)), vec![Action::ForwardKey]),
+                1 => {
+                    key(&mut core, Key::Left);
+                }
+                2 => core.focus_gained(),
+                _ => {
+                    core.focus_lost();
+                }
+            }
+            // An actual surrounding-context producer may refresh after the
+            // operation. This is not a claimed observation of our projection.
+            core.apply_hints(&crate::master_loop::Hints {
+                context_words: vec!["seed".into()],
+                ..Default::default()
+            });
+            review_forwarded_backspace(&mut core, &mut client);
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            assert_eq!(
+                prediction(&mut core),
+                "world",
+                "invalidation={invalidation}"
+            );
+            review_only_hello_learned(&core);
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_ambiguous_raw_is_not_a_literal_tail() {
+        let mut core = fresh(false);
+        core.load_word_lang("щука", 1_000_000, LangId::Bg);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 0);
+        deletion_tail(&mut core, &mut client, false);
+        let composing = key(&mut core, Key::RawCode(27));
+        assert_eq!(core.current_word(), "щ");
+        assert!(composing
+            .iter()
+            .any(|a| matches!(a, Action::ShowComposing { .. })));
+        assert!(!composing.iter().any(|a| matches!(
+            a,
+            Action::ForwardKey | Action::CommitText(_) | Action::ReplaceWord { .. }
+        )));
+        assert_eq!(key(&mut core, Key::Backspace), vec![Action::HideGhost]);
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        assert_eq!(client, "hello.”) ");
+        assert_eq!(prediction(&mut core), "world");
+        review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_all_identities_preserve_pending_and_confirmed() {
+        let mut identities = vec![
+            (Key::RawCode(29), Modifiers::CTRL),
+            (Key::RawCode(97), Modifiers::CTRL),
+            (Key::RawCode(56), Modifiers::ALT),
+            (Key::RawCode(100), Modifiers::ALT),
+            (Key::RawCode(125), Modifiers::SUPER),
+            (Key::RawCode(126), Modifiers::SUPER),
+        ];
+        identities.extend((0xffe1..=0xffee).map(|code| {
+            let held = match code {
+                0xffe1 | 0xffe2 => Modifiers::SHIFT,
+                0xffe3 | 0xffe4 => Modifiers::CTRL,
+                0xffe5 | 0xffe6 => Modifiers::CAPS_LOCK,
+                0xffe9 | 0xffea => Modifiers::ALT,
+                _ => Modifiers::SUPER,
+            };
+            (Key::Other(code), held)
+        }));
+        let mut failed = Vec::new();
+        for (identity, held) in identities {
+            for confirmed in [false, true] {
+                for modifiers in [Modifiers::empty(), held] {
+                    let mut core = fresh(false);
+                    let mut client = String::new();
+                    review_dot(&mut core, &mut client, usize::from(confirmed));
+                    let before = core.detected_language();
+                    let press = core.handle_key(KeyEvent {
+                        key: identity.clone(),
+                        modifiers,
+                    });
+                    let release = core.handle_key(KeyEvent {
+                        key: identity.clone(),
+                        modifiers: modifiers | Modifiers::RELEASE,
+                    });
+                    assert_eq!(press, vec![Action::ForwardKey]);
+                    assert_eq!(release, vec![Action::ForwardKey]);
+                    assert!(core.current_word().is_empty());
+                    assert_eq!(core.context_words().0, Some("hello"));
+                    assert_eq!(core.detected_language().lang, before.lang);
+                    assert_eq!(core.detected_language().confidence, before.confidence);
+                    if !confirmed {
+                        key(&mut core, Key::Space);
+                    }
+                    let actual = prediction(&mut core);
+                    if actual != "World" {
+                        failed.push((identity.clone(), confirmed, modifiers, actual));
+                    }
+                    review_only_hello_learned(&core);
+                }
+            }
+        }
+        assert!(failed.is_empty(), "modifier-only presses: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_actual_shortcuts_and_unknown_keys_withdraw() {
+        for (identity, modifiers) in [
+            (Key::RawCode(47), Modifiers::CTRL), // Ctrl+V, not Control itself.
+            (Key::Char('a'), Modifiers::ALT),
+            (Key::Other(0xffe0), Modifiers::empty()),
+            (Key::Other(0xffef), Modifiers::empty()),
+            (Key::RawCode(110), Modifiers::SHIFT),
+        ] {
+            for confirmed in [false, true] {
+                let mut core = fresh(false);
+                let mut client = String::new();
+                review_dot(&mut core, &mut client, usize::from(confirmed));
+                let before = core.detected_language();
+                assert_eq!(
+                    core.handle_key(KeyEvent {
+                        key: identity.clone(),
+                        modifiers,
+                    }),
+                    vec![Action::ForwardKey]
+                );
+                assert!(core.current_word().is_empty());
+                assert_eq!(core.context_words().0, Some("hello"));
+                assert_eq!(core.detected_language().lang, before.lang);
+                assert_eq!(core.detected_language().confidence, before.confidence);
+                key(&mut core, Key::Space);
+                assert_eq!(prediction(&mut core), "world", "{identity:?}");
+                review_only_hello_learned(&core);
+            }
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_releases_preserve_hint_and_enabled_state() {
+        for (identity, held) in [
+            (Key::RawCode(29), Modifiers::CTRL),
+            (Key::Other(0xffe9), Modifiers::ALT),
+            (Key::Char('v'), Modifiers::CTRL),
+            (Key::Escape, Modifiers::SUPER),
+        ] {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            assert_eq!(
+                core.handle_key(KeyEvent {
+                    key: identity,
+                    modifiers: held | Modifiers::RELEASE,
+                }),
+                vec![Action::ForwardKey]
+            );
+            assert!(core.is_enabled());
+            key(&mut core, Key::Space);
+            assert_eq!(prediction(&mut core), "World");
+            review_only_hello_learned(&core);
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_super_escape_kill_switch_still_precedes_guard() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        let kill = KeyEvent {
+            key: Key::Escape,
+            modifiers: Modifiers::SUPER,
+        };
+        assert_eq!(core.handle_key(kill.clone()), vec![Action::HideGhost]);
+        assert!(!core.is_enabled());
+        assert_eq!(
+            core.handle_key(KeyEvent {
+                key: Key::Escape,
+                modifiers: Modifiers::SUPER | Modifiers::RELEASE,
+            }),
+            vec![Action::ForwardKey]
+        );
+        assert!(!core.is_enabled());
+        assert_eq!(
+            core.handle_key(KeyEvent {
+                key: Key::RawCode(125),
+                modifiers: Modifiers::SUPER,
+            }),
+            vec![Action::ForwardKey]
+        );
+        assert!(!core.is_enabled());
+        assert_eq!(core.handle_key(kill), vec![Action::HideGhost]);
+        assert!(core.is_enabled());
+        review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_reconciled_veto_keeps_explicit_uppercase_prefix() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        core.withdraw_sentence_boundary_hint();
+        let actions = core.handle_key(KeyEvent {
+            key: Key::RawCode(17),
+            modifiers: Modifiers::SHIFT,
+        });
+        assert_eq!(core.current_word(), "W");
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ShowComposing { typed, .. } if typed == "W")));
+        assert_eq!(core.predictions()[0].word, "World");
+        review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_reconciled_veto_keeps_registered_proper_noun() {
+        let mut core = fresh(true);
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey-sentence-reconciliation-noun-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let corpus = dir.join("proper.json");
+        std::fs::write(
+            &corpus,
+            r#"{"unigrams":{"london":1000},"proper_nouns":["London"]}"#,
+        )
+        .unwrap();
+        core.load_corpus_file(&corpus).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        sentence(&mut core);
+        core.withdraw_sentence_boundary_hint();
+        raw(&mut core, &[38]);
+        assert_eq!(core.current_word(), "l");
+        assert_eq!(core.predictions()[0].word, "London");
+        raw(&mut core, &[24, 49, 32, 24, 49]);
+        assert_eq!(core.current_word(), "london");
+        review_only_hello_learned(&core);
+        let actions = key(&mut core, Key::Space);
+        assert_eq!(
+            actions,
+            vec![
+                Action::HideGhost,
+                Action::CommitText("london".into()),
+                Action::ForwardKey,
+                Action::ReplaceWord {
+                    replace_len: 6,
+                    text: "London".into(),
+                },
+            ]
+        );
+        assert!(core.current_word().is_empty());
+        let profile = core.export_personal_profile();
+        let mut learned = profile.cvm.words;
+        learned.sort();
+        assert_eq!(learned, vec!["hello", "london"]);
+        assert_eq!(
+            profile.markov_bigrams,
+            vec![("hello".into(), "london".into(), 1)]
+        );
+        assert!(profile.markov_trigrams.is_empty());
+        assert!(profile.confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn sentence_boundary_reconciled_positive_withdrawal_keeps_false_floor() {
+        for event in [
+            None,
+            Some(KeyEvent {
+                key: Key::Other(0xff63),
+                modifiers: Modifiers::SHIFT,
+            }),
+            Some(KeyEvent {
+                key: Key::RawCode(47),
+                modifiers: Modifiers::CTRL,
+            }),
+            Some(KeyEvent {
+                key: Key::RawCode(u16::MAX),
+                modifiers: Modifiers::empty(),
+            }),
+            Some(KeyEvent {
+                key: Key::Backspace,
+                modifiers: Modifiers::empty(),
+            }),
+        ] {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            // This stale lexical hint is independently overridden by the
+            // current-position decision, including after its positive expires.
+            core.apply_hints(&crate::master_loop::Hints {
+                context_words: vec!["hello.".into()],
+                ..Default::default()
+            });
+            core.reconcile_sentence_boundary_hint("hello. seed. ");
+            let expected = if let Some(event) = event {
+                let actions = core.handle_key(event);
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|a| matches!(a, Action::ForwardKey))
+                        .count(),
+                    1
+                );
+                assert!(!actions
+                    .iter()
+                    .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+                assert!(core.current_word().is_empty());
+                "world"
+            } else {
+                "World"
+            };
+            assert_eq!(prediction(&mut core), expected);
+            review_only_hello_learned(&core);
+        }
     }
 }
