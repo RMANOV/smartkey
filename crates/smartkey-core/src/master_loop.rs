@@ -16,7 +16,7 @@ use crate::correction_memory::CorrectionMemory;
 use crate::ensemble::Prediction;
 use crate::eval::PredictionMetrics;
 use crate::frustration::{FrustrationDetector, FrustrationSignal};
-use crate::input::{Action, InputConfig, InputMethodCore, KeyEvent};
+use crate::input::{Action, InputConfig, InputMethodCore, KeyEvent, Modifiers};
 use crate::lang_detect::{DetectedLanguage, LangId};
 use crate::light_profile::LightProfile;
 use crate::rejection_memory::RejectionMemory;
@@ -129,6 +129,19 @@ impl MasterLoop {
 
     /// Process a key event through the master loop state machine.
     pub fn handle_key(&mut self, event: KeyEvent) -> Vec<Action> {
+        let event = event.normalize_special_key();
+        // Key-up must preserve the attribution from its matching press.
+        if event.modifiers.contains(Modifiers::RELEASE) {
+            return self.core.handle_key(event);
+        }
+        // Forwarded shortcuts can edit client text. Invalidate attribution,
+        // but do not start anticipation or count them as adaptation events.
+        if event.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT) {
+            self.last_prediction_accept = None;
+            self.last_shown_ghost = None;
+            return self.core.handle_key(event);
+        }
+
         let resets_context = matches!(
             event.key,
             crate::input::Key::Left

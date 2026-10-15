@@ -95,9 +95,9 @@ fn raw_mods_to_modifiers(raw: u32) -> Modifiers {
     if raw & (1 << 3) != 0 {
         m |= Modifiers::ALT;
     } // MOD1_MASK (Alt)
-    if raw & (1 << 26) != 0 {
+    if raw & ((1 << 6) | (1 << 26)) != 0 {
         m |= Modifiers::SUPER;
-    } // MOD4_MASK / SUPER_MASK
+    } // MOD4_MASK (physical) or SUPER_MASK (virtual)
     if raw & (1 << 0) != 0 {
         m |= Modifiers::SHIFT;
     } // SHIFT_MASK

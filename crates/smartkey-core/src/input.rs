@@ -72,6 +72,33 @@ pub struct KeyEvent {
     pub modifiers: Modifiers,
 }
 
+impl KeyEvent {
+    /// Resolve physical special keys before either input layer classifies the
+    /// event. Letter codes stay raw so the dual buffer can interpret layouts.
+    pub(crate) fn normalize_special_key(mut self) -> Self {
+        if let Key::RawCode(code) = self.key {
+            if let Some(special) = keymap::scancode_to_special(code) {
+                self.key = match special {
+                    keymap::SpecialKey::Tab => Key::Tab,
+                    keymap::SpecialKey::Escape => Key::Escape,
+                    keymap::SpecialKey::Backspace => Key::Backspace,
+                    keymap::SpecialKey::Return => Key::Return,
+                    keymap::SpecialKey::Space => Key::Space,
+                    keymap::SpecialKey::Left => Key::Left,
+                    keymap::SpecialKey::Right => Key::Right,
+                    keymap::SpecialKey::Up => Key::Up,
+                    keymap::SpecialKey::Down => Key::Down,
+                    keymap::SpecialKey::Home => Key::Home,
+                    keymap::SpecialKey::End => Key::End,
+                    keymap::SpecialKey::PageUp => Key::PageUp,
+                    keymap::SpecialKey::PageDown => Key::PageDown,
+                };
+            }
+        }
+        self
+    }
+}
+
 // ======================================================================
 // Actions returned to the platform
 // ======================================================================
@@ -623,10 +650,16 @@ impl InputMethodCore {
 
     /// Process a key event and return actions for the platform to execute.
     pub fn handle_key(&mut self, event: KeyEvent) -> Vec<Action> {
-        let is_kill = event.key == Key::Escape && event.modifiers.contains(Modifiers::SUPER);
+        let event = event.normalize_special_key();
         // The display attestation covers exactly this key event (one-shot).
         let display_attested = std::mem::take(&mut self.space_accept_display_attested);
 
+        // A release cannot activate the kill switch, including while disabled.
+        if event.modifiers.contains(Modifiers::RELEASE) {
+            return vec![Action::ForwardKey];
+        }
+
+        let is_kill = event.key == Key::Escape && event.modifiers.contains(Modifiers::SUPER);
         // Disabled state — only the kill switch can re-enable.
         if !self.enabled {
             if is_kill {
@@ -643,19 +676,14 @@ impl InputMethodCore {
             return vec![Action::HideGhost];
         }
 
-        // Ignore key-release events.
-        if event.modifiers.contains(Modifiers::RELEASE) {
-            return vec![Action::ForwardKey];
-        }
-
         // Ignore events with Ctrl or Alt held.
         if event.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT) {
             return vec![Action::ForwardKey];
         }
 
         // ── Resolve RawCode (v0.5.0) ─────────────────────────────────
-        // Convert hardware scancode to either a dual-buffer operation or
-        // a regular Key before entering the main match.
+        // Special identities were resolved above; remaining hardware codes
+        // become either a dual-buffer operation or a regular character.
         let event = if let Key::RawCode(code) = event.key {
             // Caps Lock inverts Shift, but only on letter keys — the lock latch
             // must never uppercase digits or punctuation.  Which keys are
@@ -663,28 +691,7 @@ impl InputMethodCore {
             // Bulgarian), so the latch is applied per layout by the keymap.
             let shift_held = event.modifiers.contains(Modifiers::SHIFT);
             let caps_lock = event.modifiers.contains(Modifiers::CAPS_LOCK);
-            // Special keys (Tab, Space, etc.) → rewrite to their Key variant.
-            if let Some(special) = keymap::scancode_to_special(code) {
-                let key = match special {
-                    keymap::SpecialKey::Tab => Key::Tab,
-                    keymap::SpecialKey::Escape => Key::Escape,
-                    keymap::SpecialKey::Backspace => Key::Backspace,
-                    keymap::SpecialKey::Return => Key::Return,
-                    keymap::SpecialKey::Space => Key::Space,
-                    keymap::SpecialKey::Left => Key::Left,
-                    keymap::SpecialKey::Right => Key::Right,
-                    keymap::SpecialKey::Up => Key::Up,
-                    keymap::SpecialKey::Down => Key::Down,
-                    keymap::SpecialKey::Home => Key::Home,
-                    keymap::SpecialKey::End => Key::End,
-                    keymap::SpecialKey::PageUp => Key::PageUp,
-                    keymap::SpecialKey::PageDown => Key::PageDown,
-                };
-                KeyEvent {
-                    key,
-                    modifiers: event.modifiers,
-                }
-            } else if let Some((en_ch, bg_ch)) =
+            if let Some((en_ch, bg_ch)) =
                 keymap::scancode_to_both_with_caps(code, shift_held, caps_lock)
             {
                 if en_ch != bg_ch && self.config.dual_buffer.enabled {
