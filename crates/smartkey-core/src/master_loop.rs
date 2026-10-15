@@ -2492,3 +2492,78 @@ mod terminal_alignment_contract_tests {
         assert_full_token(&mut ml, "statiqx");
     }
 }
+
+#[cfg(test)]
+mod no_regression_contract_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn check(context: Option<&str>, expected: &str) {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        // Verified current JSON frequencies form a reduced fixture; the sealed
+        // copied-binary replay is separate evidence, not a historical replay.
+        ml.load_word_lang("no", 2_238_721, LangId::En);
+        ml.load_word_lang("not", 4_897_788, LangId::En);
+        ml.load_word_lang("но", 3_630_780, LangId::Bg);
+        if let Some(text) = context {
+            ml.set_surrounding_text(Some(text.to_string()), Some(text.chars().count()));
+        }
+        let mut readings = Vec::new();
+        let raw = |code| KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        };
+        for code in [49, 24] {
+            let actions = ml.handle_key(raw(code));
+            let word = ml.current_word().to_string();
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, Action::ShowComposing { typed, .. } if typed == &word)));
+            assert!(!actions.iter().any(|a| matches!(
+                a,
+                Action::CommitText(_) | Action::ForwardKey | Action::ReplaceWord { .. }
+            )));
+            readings.push(word);
+        }
+        let actions = ml.handle_key(raw(57));
+        let commits: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::CommitText(word) => Some(word.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            commits,
+            vec![expected],
+            "preedit={readings:?}; actions={actions:?}"
+        );
+        assert_eq!(readings.last().map(String::as_str), Some(expected));
+        if context.is_some() {
+            assert_eq!(readings[0], "н");
+        }
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(ml.current_word(), "");
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+    }
+
+    #[test]
+    fn no_regression_known_bg_context_commits_particle_once() {
+        check(Some("Искам да благодаря "), "но");
+    }
+
+    #[test]
+    fn no_regression_absent_context_keeps_observational_latin_control() {
+        check(None, "no");
+    }
+}
