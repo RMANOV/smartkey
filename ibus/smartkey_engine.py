@@ -491,6 +491,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         # IBus client capabilities (set by do_set_capabilities callback).
         self._caps: int = 0
+        self._language_choice_offer: dict[str, object] | None = None
+        self._language_choice_selected: int | None = None
+        self._language_choice_supported = False
+        self._language_choice_route_available = False
 
         # Sensitive-input state (see do_set_content_type).  ``_content_type_key``
         # is the decision-relevant projection of the last declared content type
@@ -1449,6 +1453,196 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_set_capabilities(self, caps: int) -> None:
         self._core.set_external_rewrite_supported(bool(caps & 0x20))
         self._caps = caps
+        self._clear_language_choice()
+        self._refresh_language_choice_route()
+        self._update_language_choice_support()
+
+    def _language_choice_ui_available(self) -> bool:
+        """A lookup-capable client or the ordinary IBus panel can render rows."""
+        if not _HAS_IBUS or not all(
+            callable(getattr(self, name, None))
+            for name in ("update_lookup_table", "hide_lookup_table")
+        ):
+            return False
+        if self._caps & 4:  # LOOKUP_TABLE: the client renders the table itself.
+            return True
+        try:
+            from gi.repository import Gio, GLib  # noqa: PLC0415
+
+            # Without LOOKUP_TABLE the daemon routes updates to its panel.
+            # NameHasOwner is supported by IBus' private D-Bus implementation;
+            # GetConnectionUnixProcessID is not required for availability.
+            reply = self.get_connection().call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                GLib.Variant("(s)", ("org.freedesktop.IBus.Panel",)),
+                GLib.VariantType.new("(b)"),
+                Gio.DBusCallFlags.NONE,
+                100,
+                None,
+            )
+            return bool(reply.unpack()[0])
+        except Exception:  # noqa: BLE001 -- unavailable UI must not swallow input
+            return False
+
+    def _clear_language_choice(self) -> None:
+        was_visible = getattr(self, "_language_choice_offer", None) is not None
+        self._language_choice_offer = None
+        self._language_choice_selected = None
+        if was_visible:
+            try:
+                self.hide_lookup_table()
+                hide_auxiliary = getattr(self, "hide_auxiliary_text", None)
+                if callable(hide_auxiliary):
+                    hide_auxiliary()
+            except Exception:  # noqa: BLE001 -- local state must still be retired
+                log.debug("smartkey: language choice takedown failed", exc_info=True)
+
+    def _refresh_language_choice_route(self) -> None:
+        # Focus/capability changes and explicit table keys refresh this cache.
+        # Ordinary typing never incurs a synchronous D-Bus owner query.
+        self._language_choice_route_available = self._language_choice_ui_available()
+
+    def _disable_language_choice(self) -> None:
+        self._language_choice_route_available = False
+        self._clear_language_choice()
+        setter = getattr(self._core, "set_language_choice_supported", None)
+        if callable(setter):
+            try:
+                setter(False)
+            except Exception:  # noqa: BLE001 -- optional UI remains locally disabled
+                log.debug("smartkey: language choice disable refused", exc_info=True)
+        self._language_choice_supported = False
+
+    def _update_language_choice_support(self) -> bool:
+        setter = getattr(self._core, "set_language_choice_supported", None)
+        supported = bool(
+            callable(setter)
+            and all(
+                callable(getattr(self._core, name, None))
+                for name in (
+                    "language_choice_offer",
+                    "dismiss_language_choice",
+                    "accept_language_choice",
+                )
+            )
+            and not getattr(self, "_sensitive", False)
+            and getattr(self, "_declared_ordinary", False)
+            and self._caps & 1  # Owned full-word preedit must be renderable too.
+            and getattr(self, "_language_choice_route_available", False)
+        )
+        if supported != getattr(self, "_language_choice_supported", False):
+            try:
+                setter(supported)
+            except Exception:  # noqa: BLE001 -- fail closed for this optional UI
+                supported = False
+                log.debug("smartkey: language choice capability refused", exc_info=True)
+        self._language_choice_supported = supported
+        if not supported:
+            self._clear_language_choice()
+        return supported
+
+    def _render_language_choice(self) -> None:
+        offer = self._language_choice_offer
+        if offer is None:
+            return
+        try:
+            current = str(offer["current_language"])
+            languages = (current, "bg" if current == "en" else "en")
+            selected = self._language_choice_selected
+            table = IBus.LookupTable.new(2, selected or 0, selected is not None, False)
+            for language in languages:
+                table.append_candidate(IBus.Text.new_from_string(str(offer[language])))
+            self.update_lookup_table(table, True)
+            auxiliary = getattr(self, "update_auxiliary_text", None)
+            if callable(auxiliary):
+                auxiliary(
+                    IBus.Text.new_from_string("↑/↓ избор · Tab приемане · Esc скриване"),
+                    True,
+                )
+        except Exception:  # noqa: BLE001 -- row navigation must not break input
+            self._disable_language_choice()
+            log.debug("smartkey: language choice rendering failed", exc_info=True)
+
+    def _refresh_language_choice(self) -> None:
+        if not self._update_language_choice_support():
+            return
+        try:
+            offer = self._core.language_choice_offer()
+            if not (
+                isinstance(offer, dict)
+                and type(offer.get("revision")) is int
+                and offer.get("current_language") in ("en", "bg")
+                and isinstance(offer.get("en"), str)
+                and isinstance(offer.get("bg"), str)
+                and offer["en"]
+                and offer["bg"]
+                and offer["en"] != offer["bg"]
+            ):
+                self._clear_language_choice()
+                return
+            if offer != getattr(self, "_language_choice_offer", None):
+                self._language_choice_selected = None
+            self._language_choice_offer = dict(offer)
+            self._render_language_choice()
+        except Exception:  # noqa: BLE001 -- no hidden choice after render failure
+            self._disable_language_choice()
+            log.debug("smartkey: language choice publication failed", exc_info=True)
+
+    def _language_choice_key(self, keyval: int, state: int) -> bool | None:
+        """Return a consumed decision only for an explicitly visible choice."""
+        if state & _MOD_RELEASE:
+            return None
+        offer = getattr(self, "_language_choice_offer", None)
+        selected = getattr(self, "_language_choice_selected", None)
+        plain = not state & (
+            (1 << 0) | _MOD_CONTROL | _MOD_ALT | (1 << 6) | (7 << 26)
+        )
+        selected_tab = plain and keyval == IBus.KEY_Tab and selected is not None
+        if offer is not None and plain and keyval in (
+            IBus.KEY_Up,
+            IBus.KEY_Down,
+            IBus.KEY_Tab,
+            IBus.KEY_Escape,
+        ):
+            self._refresh_language_choice_route()
+        if not self._update_language_choice_support():
+            # A selected Tab belongs to the retired table, never to a ghost.
+            return True if selected_tab else None
+        if offer is not None and plain:
+            if keyval in (IBus.KEY_Up, IBus.KEY_Down):
+                step = 1 if keyval == IBus.KEY_Down else -1
+                self._language_choice_selected = ((selected or 0) + step) % 2
+                self._render_language_choice()
+                return True
+            if keyval == IBus.KEY_Escape:
+                self._core.dismiss_language_choice(offer["revision"])
+                self._clear_language_choice()
+                return True
+            if selected_tab:
+                current = str(offer["current_language"])
+                languages = (current, "bg" if current == "en" else "en")
+                actions = self._core.accept_language_choice(
+                    offer["revision"], languages[selected]
+                )
+                self._clear_language_choice()
+                if actions is not None:
+                    # This is an explicit whole-reading choice, not a ghost
+                    # completion: do not calibrate/reject the old prediction.
+                    self._active_prediction = None
+                    self._execute_actions(actions)
+                    word = "".join(text for kind, text in actions if kind == "commit")
+                    collector = getattr(self, "_o1", None)
+                    if word and collector is not None:
+                        collector.on_word_commit(word)
+                return True
+        # Releases and pure modifiers do not edit the table's token. Every
+        # other ordinary key retires selection before the normal Core path.
+        if not 0xFFE1 <= keyval <= 0xFFEE:
+            self._clear_language_choice()
+        return None
 
     # -----------------------------------------------------------------------
     # Sensitive input (IBus content type).
@@ -1565,6 +1759,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         keystroke.
         """
         self._sensitive = True
+        self._clear_language_choice()
+        self._update_language_choice_support()
         try:
             self._core.reset()  # actions discarded on purpose — see docstring
         except _UNCATCHABLE:
@@ -1889,6 +2085,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             pending_prediction["pre_key_word"] = self._core_current_word()
         if not key_release:
             self._refresh_surrounding_text()
+        choice_result = self._language_choice_key(keyval, state)
+        if choice_result is not None:
+            return choice_result
 
         # v0.5.0: prefer raw scancode path for dual-buffer layout-agnostic input.
         # GTK/Qt IBus clients already convert XKB codes to evdev before IPC.
@@ -1908,6 +2107,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._o1_notify(
                 keyval, key_release, actions, pending_prediction, o1_pre_word
             )
+            if not key_release:
+                self._refresh_language_choice()
             if tracing:
                 self._trace_key_result(keyval, key_release, actions, result)
             # Honor the core's forward/consume decision uniformly.  ``result`` is
@@ -1947,6 +2148,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._o1_notify(
             keyval, key_release, actions, pending_prediction, o1_pre_word
         )
+        if not key_release:
+            self._refresh_language_choice()
         if tracing:
             self._trace_key_result(keyval, key_release, actions, result)
         # Honor the core's forward/consume decision uniformly (see the keycode
@@ -1958,6 +2161,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # IBus lifecycle callbacks.
     # -----------------------------------------------------------------------
     def do_focus_in(self) -> None:
+        self._clear_language_choice()
         self._core.focus_gained()
         if getattr(self, "_sensitive", False):
             # Never pull a sensitive field's contents into the core.  Nor is
@@ -1966,8 +2170,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             # the previous field's.
             return
         self._refresh_surrounding_text()
+        self._refresh_language_choice_route()
+        self._update_language_choice_support()
 
     def do_focus_out(self) -> None:
+        self._clear_language_choice()
         # The sensitivity declaration deliberately SURVIVES focus-out, because a
         # sticky flag is the correct mirror of how IBus actually delivers
         # ContentType.
@@ -2051,6 +2258,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         return [a for a in actions if a[0] not in ("commit", "replace")]
 
     def do_reset(self) -> None:
+        self._clear_language_choice()
         # Composition boundary, not a context boundary: the declared content
         # type survives (see do_focus_out).
         self._keys_since_content_type = 0
@@ -2069,6 +2277,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         pass  # Rust core handles enabled state via kill switch.
 
     def do_disable(self) -> None:
+        self._clear_language_choice()
         # Same asymmetry as do_reset: an IME switch inside a password box must
         # not drop that box's declaration — and, like do_reset, this is a cancel
         # path, so no text may be produced from it.

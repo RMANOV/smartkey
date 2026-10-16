@@ -35,6 +35,15 @@ pub enum Phase {
     Learning,
 }
 
+/// Whole-token readings offered without changing the composing preedit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageChoiceOffer {
+    pub revision: u64,
+    pub current_language: LangId,
+    pub en: String,
+    pub bg: String,
+}
+
 /// Hints passed from MasterLoop to InputMethodCore to bias predictions.
 #[derive(Debug, Clone)]
 pub struct Hints {
@@ -347,6 +356,9 @@ pub struct MasterLoop {
     sentence_echoes: Option<SentenceEchoes>,
     /// Most recently displayed `(typed prefix, full completion)` pair.
     last_shown_ghost: Option<(String, String)>,
+    language_choice_revision: u64,
+    language_choice_supported: bool,
+    language_choice_dismissed: bool,
 }
 
 impl MasterLoop {
@@ -367,6 +379,9 @@ impl MasterLoop {
             surrounding_cursor_pos: None,
             sentence_echoes: None,
             last_shown_ghost: None,
+            language_choice_revision: 0,
+            language_choice_supported: false,
+            language_choice_dismissed: false,
         }
     }
 
@@ -388,6 +403,10 @@ impl MasterLoop {
         // Key-up must preserve the attribution from its matching press.
         if event.modifiers.contains(Modifiers::RELEASE) {
             return self.core.handle_key(event);
+        }
+        self.invalidate_language_choice();
+        if self.core.current_word().is_empty() {
+            self.language_choice_dismissed = false;
         }
         // Forwarded shortcuts can edit client text. Invalidate attribution,
         // but do not start anticipation or count them as adaptation events.
@@ -461,6 +480,7 @@ impl MasterLoop {
         let was_composing = self.core.debug_state().0;
         let word_was_empty = self.core.current_word().is_empty();
         let mut actions = self.core.handle_key(event.clone());
+        self.core.latch_language_choice_policy();
         let commit_learning = self.core.take_commit_learning();
         let word_committed = !commit_learning.words.is_empty();
         self.apply_correction_override(&mut actions);
@@ -566,11 +586,79 @@ impl MasterLoop {
     // Delegated API (1:1 mirror of InputMethodCore)
     // ======================================================================
 
+    pub fn set_language_choice_supported(&mut self, supported: bool) {
+        if self.language_choice_supported != supported {
+            self.invalidate_language_choice();
+            self.language_choice_supported = supported;
+            self.core.set_language_choice_supported(supported);
+        }
+    }
+
+    pub fn language_choice_offer(&self) -> Option<LanguageChoiceOffer> {
+        if !self.language_choice_supported || self.language_choice_dismissed {
+            return None;
+        }
+        let (current_language, en, bg) = self.core.language_choice_readings()?;
+        Some(LanguageChoiceOffer {
+            revision: self.language_choice_revision,
+            current_language,
+            en: en.to_owned(),
+            bg: bg.to_owned(),
+        })
+    }
+
+    pub fn dismiss_language_choice(&mut self, revision: u64) -> bool {
+        if self
+            .language_choice_offer()
+            .is_none_or(|offer| offer.revision != revision)
+        {
+            return false;
+        }
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = true;
+        true
+    }
+
+    pub fn accept_language_choice(
+        &mut self,
+        revision: u64,
+        language: LangId,
+    ) -> Option<Vec<Action>> {
+        if self
+            .language_choice_offer()
+            .is_none_or(|offer| offer.revision != revision)
+        {
+            return None;
+        }
+        let actions = self.core.accept_language_choice(language)?;
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
+        let batch = self.core.take_commit_learning();
+        self.phase = Phase::Learning;
+        self.learn_from_commit(batch);
+        self.phase = Phase::Anticipating;
+        self.anticipated = false;
+        self.core.clear_hints();
+        self.frustration.reset_word();
+        self.last_prediction_accept = None;
+        self.last_accepted_prediction = None;
+        self.last_shown_ghost = None;
+        self.sentence_echoes = None;
+        Some(actions)
+    }
+
+    fn invalidate_language_choice(&mut self) {
+        self.language_choice_revision = self.language_choice_revision.wrapping_add(1);
+    }
+
     pub fn set_external_rewrite_supported(&mut self, supported: bool) {
+        self.invalidate_language_choice();
         self.core.set_external_rewrite_supported(supported);
     }
 
     pub fn focus_lost(&mut self) -> Vec<Action> {
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
         self.sentence_echoes = None;
         self.anticipated = false;
         self.core.clear_hints();
@@ -585,11 +673,15 @@ impl MasterLoop {
     }
 
     pub fn focus_gained(&mut self) {
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
         self.sentence_echoes = None;
         self.core.focus_gained();
     }
 
     pub fn reset(&mut self) -> Vec<Action> {
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
         self.sentence_echoes = None;
         self.anticipated = false;
         self.core.clear_hints();
@@ -660,6 +752,7 @@ impl MasterLoop {
         let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let profile = crate::personal::load_personal_json(&data)?;
 
+        self.invalidate_language_choice();
         self.core.import_personal_profile(&profile);
         self.corrections = profile
             .corrections
@@ -689,30 +782,37 @@ impl MasterLoop {
 
     // Corpus loading (delegated).
     pub fn load_word(&mut self, word: &str, freq: u32) {
+        self.invalidate_language_choice();
         self.core.load_word(word, freq);
     }
 
     pub fn load_bigram(&mut self, ctx: &str, word: &str, count: u32) {
+        self.invalidate_language_choice();
         self.core.load_bigram(ctx, word, count);
     }
 
     pub fn load_trigram(&mut self, w1: &str, w2: &str, word: &str, count: u32) {
+        self.invalidate_language_choice();
         self.core.load_trigram(w1, w2, word, count);
     }
 
     pub fn load_word_lang(&mut self, word: &str, freq: u32, lang: LangId) {
+        self.invalidate_language_choice();
         self.core.load_word_lang(word, freq, lang);
     }
 
     pub fn load_bigram_lang(&mut self, ctx: &str, word: &str, count: u32, lang: LangId) {
+        self.invalidate_language_choice();
         self.core.load_bigram_lang(ctx, word, count, lang);
     }
 
     pub fn load_trigram_lang(&mut self, w1: &str, w2: &str, word: &str, count: u32, lang: LangId) {
+        self.invalidate_language_choice();
         self.core.load_trigram_lang(w1, w2, word, count, lang);
     }
 
     pub fn load_corpus_file(&mut self, path: &Path) -> Result<(), String> {
+        self.invalidate_language_choice();
         self.core.load_corpus_file(path)
     }
 
@@ -721,6 +821,9 @@ impl MasterLoop {
     /// Linux IBus adapters can push live surrounding text here so the
     /// anticipation phase uses real document context instead of the null sampler.
     pub fn set_surrounding_text(&mut self, text: Option<String>, cursor_pos: Option<usize>) {
+        if self.surrounding_text != text || self.surrounding_cursor_pos != cursor_pos {
+            self.invalidate_language_choice();
+        }
         self.surrounding_text = text;
         self.surrounding_cursor_pos = cursor_pos;
         self.reconcile_sentence_report();
