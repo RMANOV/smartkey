@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use smartkey_core::ffi_protocol::{
     decode_composing_payload, decode_replace_payload, encode_composing_payload,
     encode_replace_payload,
@@ -195,6 +196,53 @@ impl PyInputMethodCore {
     /// Set the current host's ability to replace already-delivered client text.
     fn set_external_rewrite_supported(&mut self, supported: bool) {
         self.inner.set_external_rewrite_supported(supported);
+    }
+
+    /// Enable whole-word language choices only when the adapter can render them.
+    fn set_language_choice_supported(&mut self, supported: bool) {
+        self.inner.set_language_choice_supported(supported);
+    }
+
+    /// Read the exact current offer; repeated reads do not change its revision.
+    fn language_choice_offer<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(offer) = self.inner.language_choice_offer() else {
+            return Ok(None);
+        };
+        let result = PyDict::new(py);
+        result.set_item("revision", offer.revision)?;
+        result.set_item(
+            "current_language",
+            match offer.current_language {
+                smartkey_core::lang_detect::LangId::Bg => "bg",
+                smartkey_core::lang_detect::LangId::En => "en",
+                smartkey_core::lang_detect::LangId::Tech => return Ok(None),
+            },
+        )?;
+        result.set_item("en", offer.en)?;
+        result.set_item("bg", offer.bg)?;
+        Ok(Some(result))
+    }
+
+    /// Dismiss only the displayed offer, retaining the current token's policy.
+    fn dismiss_language_choice(&mut self, revision: u64) -> bool {
+        self.inner.dismiss_language_choice(revision)
+    }
+
+    /// Commit the exact selected whole reading through MasterLoop's learning path.
+    /// None means stale or invalid; callers must not retry another acceptance.
+    fn accept_language_choice(
+        &mut self,
+        revision: u64,
+        language: &str,
+    ) -> Option<Vec<(String, String)>> {
+        let language = match language {
+            "en" => smartkey_core::lang_detect::LangId::En,
+            "bg" => smartkey_core::lang_detect::LangId::Bg,
+            _ => return None,
+        };
+        self.inner
+            .accept_language_choice(revision, language)
+            .map(|actions| actions.iter().map(action_to_tuple).collect())
     }
 
     /// Reset internal state.

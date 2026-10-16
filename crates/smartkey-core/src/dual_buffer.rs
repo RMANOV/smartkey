@@ -89,6 +89,9 @@ pub struct DualBuffer {
     locked: bool,
     /// The language that was locked (if any).
     locked_lang: Option<LangId>,
+    /// Prefix length which acquired an inferred lock. `None` while unlocked
+    /// or explicitly pinned by completion acceptance.
+    inferred_lock_len: Option<usize>,
     /// True when the winner changed after a lock (triggers ReplaceWord).
     flip_detected: bool,
     /// Lock threshold from config.
@@ -111,6 +114,7 @@ impl DualBuffer {
             confidence: 0.5,
             locked: false,
             locked_lang: None,
+            inferred_lock_len: None,
             flip_detected: false,
             lock_threshold,
             min_lock_chars,
@@ -159,6 +163,7 @@ impl DualBuffer {
         self.push(en_ch, bg_ch);
         self.locked = true;
         self.locked_lang = Some(self.winner);
+        self.inferred_lock_len = None;
         true
     }
 
@@ -172,9 +177,16 @@ impl DualBuffer {
         if self.is_empty() {
             self.clear();
         }
-        // Above len 0 the lock is sticky — once locked, stays locked until
-        // clear().  This prevents re-entering hypothesis phase after chars
-        // were committed to the application during the lock transition.
+        // Deleting the deciding prefix retracts its statistical evidence.
+        // Explicit completion acceptance keeps its existing pin until clear().
+        if self
+            .inferred_lock_len
+            .is_some_and(|lock_len| self.len() < lock_len)
+        {
+            self.locked = false;
+            self.locked_lang = None;
+            self.inferred_lock_len = None;
+        }
     }
 
     /// Update scores from corpus frequency data and determine the winner.
@@ -219,6 +231,7 @@ impl DualBuffer {
         {
             self.locked = true;
             self.locked_lang = Some(self.winner);
+            self.inferred_lock_len = Some(self.len());
         }
     }
 
@@ -264,6 +277,7 @@ impl DualBuffer {
         if self.confidence >= relaxed_threshold && self.en_buf.len() >= relaxed_min_chars {
             self.locked = true;
             self.locked_lang = Some(self.winner);
+            self.inferred_lock_len = Some(self.len());
         }
     }
 
@@ -319,6 +333,11 @@ impl DualBuffer {
         self.locked
     }
 
+    /// A displayed completion character was explicitly accepted for this token.
+    pub(crate) fn is_explicitly_locked(&self) -> bool {
+        self.locked && self.inferred_lock_len.is_none()
+    }
+
     /// Provenance of the current winner (see the transition table on
     /// `EvidenceOrigin`). Callers use this to keep contextual routing from
     /// supplying independent detector evidence.
@@ -372,6 +391,7 @@ impl DualBuffer {
         self.confidence = 0.5;
         self.locked = false;
         self.locked_lang = None;
+        self.inferred_lock_len = None;
         self.flip_detected = false;
         self.origin = EvidenceOrigin::Initial;
     }
@@ -564,16 +584,54 @@ mod tests {
     }
 
     #[test]
-    fn test_pop_keeps_lock_sticky() {
+    fn test_pop_keeps_explicit_lock_sticky() {
         let mut b = db();
         b.push('h', 'х');
-        b.push('e', 'е');
         b.update_scores(4_897_788.0, 43_651.0);
+        assert!(b.push_winner_char('e'));
         assert!(b.is_locked());
 
         // Pop to 1 char — lock stays (sticky, not reset on pop).
         b.pop();
         assert!(b.is_locked());
+    }
+
+    #[test]
+    fn inferred_lock_releases_only_when_its_deciding_prefix_is_erased() {
+        for prior_assisted in [false, true] {
+            let mut b = DualBuffer::new(0.85, 4);
+            let prefix: &[u16] = if prior_assisted {
+                &[17, 23, 20]
+            } else {
+                &[17, 23, 20, 35]
+            };
+            for &code in prefix {
+                assert!(b.push_keycode(code, false).is_some());
+            }
+            b.update_scores(100.0, 1.0);
+            if prior_assisted {
+                assert!(!b.is_locked());
+                b.apply_prior_lock_hint(Some(LangId::En));
+            }
+            assert!(b.is_locked(), "automatic lock premise: {prior_assisted}");
+
+            assert!(b.push_keycode(45, false).is_some());
+            b.pop();
+            assert!(b.is_locked(), "the deciding prefix still survives");
+            b.pop();
+            assert!(!b.is_locked(), "the deciding prefix was retracted");
+
+            b.update_scores(1.0, 100.0);
+            assert_eq!(b.winner_lang(), LangId::Bg);
+            assert!(!b.is_locked(), "shorter prefix remains revisable");
+
+            while !b.is_empty() {
+                b.pop();
+            }
+            assert_eq!(b.evidence_origin(), EvidenceOrigin::Initial);
+            assert!(!b.is_locked(), "empty inferred buffer clears the lock");
+            assert_eq!(b.locked_lang, None);
+        }
     }
 
     #[test]
@@ -879,14 +937,14 @@ mod tests {
     /// R7b: a pop() that empties the buffer performs the full clear() —
     /// origin Initial AND lock/locked_lang/flip cleared.  Unreachable from the
     /// core (the input.rs Backspace arm drops an emptied buffer, see the
-    /// core-level R7c); defence in depth.  Pop above len 0 keeps the lock
-    /// sticky (R7, test_pop_keeps_lock_sticky).
+    /// core-level R7c); defence in depth. Pop above len 0 keeps an explicit
+    /// acceptance lock sticky (R7, test_pop_keeps_explicit_lock_sticky).
     #[test]
     fn pop_to_empty_clears_origin_and_lock() {
         let mut b = DualBuffer::new(0.85, 2);
         b.push('h', 'х');
-        b.push('e', 'е');
         b.update_scores(4_897_788.0, 43_651.0);
+        assert!(b.push_winner_char('e'));
         assert!(b.is_locked(), "premise");
         b.pop();
         assert!(b.is_locked(), "pop above len 0 keeps the lock sticky");

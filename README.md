@@ -211,6 +211,14 @@ cannot be replaced underneath a live process.
                   │ Esc = dismiss
 ```
 
+**Language choices on Linux (IBus)** — when both whole-word readings are
+ambiguous, the client or IBus panel offers the current reading first and the
+alternate reading second. Use `↑`/`↓`, then `Tab`, to commit the selected word.
+`Space` keeps the current reading; `Esc` hides the choices for that word.
+Without an explicit row selection, `Tab` continues to accept the inline ghost
+completion. This chooser uses keyboard selection and requires a usable lookup
+panel and an ordinary text field.
+
 **Alt-hold popup** (planned) — alternatives with confidence scores:
 
 ```

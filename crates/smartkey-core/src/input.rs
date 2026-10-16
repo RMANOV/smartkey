@@ -477,6 +477,7 @@ enum CommitCause {
     FocusFlush,
     AcceptedCompletion,
     PartialCompletionFallback,
+    AcceptedLanguageChoice,
 }
 
 impl CommitCause {
@@ -588,6 +589,10 @@ pub struct InputMethodCore {
     /// Whether the current host can replace text already delivered to its client.
     /// Ephemeral transport capability; never part of config or personal state.
     external_rewrite_supported: bool,
+    /// Ephemeral host UI capability, independent of language configuration.
+    language_choice_supported: bool,
+    /// Keep ambiguous boundary policy after the offer is dismissed or hidden.
+    language_choice_token_policy: bool,
     last_predictions: Vec<Prediction>,
     /// Model selection used for the displayed prediction's scoring components.
     last_prediction_language: Option<LangId>,
@@ -638,6 +643,8 @@ impl InputMethodCore {
             sentence_presentation_override: None,
             enabled,
             external_rewrite_supported: true,
+            language_choice_supported: false,
+            language_choice_token_policy: false,
             last_predictions: Vec::new(),
             last_prediction_language: None,
             transliteration_active: false,
@@ -671,6 +678,59 @@ impl InputMethodCore {
     /// Update the host's ability to replace already-delivered client text.
     pub fn set_external_rewrite_supported(&mut self, supported: bool) {
         self.external_rewrite_supported = supported;
+    }
+
+    pub(crate) fn set_language_choice_supported(&mut self, supported: bool) {
+        self.latch_language_choice_policy();
+        self.language_choice_supported = supported;
+        self.latch_language_choice_policy();
+    }
+
+    /// Read the current complete physical alternatives without selecting one.
+    pub(crate) fn language_choice_readings(&self) -> Option<(LangId, &str, &str)> {
+        let db = self.dual_buffer.as_ref()?;
+        if !self.enabled
+            || self.current_word.is_empty()
+            || db.is_explicitly_locked()
+            || db.len() < self.config.min_prefix_length
+            || self.current_word != db.winner_text()
+            || db.en_text() == db.bg_text()
+            || !db.en_text().chars().all(char::is_alphabetic)
+            || !db.bg_text().chars().all(char::is_alphabetic)
+        {
+            return None;
+        }
+        let (en, bg) = self.engine.score_exact_both(db.en_text(), db.bg_text());
+        if (en > 0.0) != (bg > 0.0) {
+            return None;
+        }
+        Some((db.winner_lang(), db.en_text(), db.bg_text()))
+    }
+
+    pub(crate) fn latch_language_choice_policy(&mut self) {
+        if self.language_choice_supported && self.language_choice_readings().is_some() {
+            self.language_choice_token_policy = true;
+        }
+    }
+
+    fn language_choice_policy_active(&self) -> bool {
+        (self.language_choice_supported || self.language_choice_token_policy)
+            && self.language_choice_readings().is_some()
+    }
+
+    /// Commit exactly the selected whole reading, without accepting a ghost
+    /// or running a later automatic replacement over the explicit choice.
+    pub(crate) fn accept_language_choice(&mut self, language: LangId) -> Option<Vec<Action>> {
+        let (_, en, bg) = self.language_choice_readings()?;
+        let selected = match language {
+            LangId::En => en.to_owned(),
+            LangId::Bg => bg.to_owned(),
+            LangId::Tech => return None,
+        };
+        self.commit_learning = CommitLearningBatch::default();
+        self.commit_word_internal(&selected, CommitCause::AcceptedLanguageChoice);
+        self.reset_word();
+        Some(vec![Action::HideGhost, Action::CommitText(selected)])
     }
 
     pub(crate) fn set_terminal_context_lang(&mut self, lang: Option<LangId>) {
@@ -1280,6 +1340,7 @@ impl InputMethodCore {
                             self.word_origins.clear();
                             self.terminal_context_lang = None;
                             self.word_delivery_layout = None;
+                            self.language_choice_token_policy = false;
                             self.ghost.clear();
                             return vec![Action::HideGhost];
                         }
@@ -1513,6 +1574,7 @@ impl InputMethodCore {
             || self.ghost.is_empty()
             || self.anticipatory_ghost_active
             || self.transliteration_active
+            || self.language_choice_policy_active()
         {
             return false;
         }
@@ -2063,6 +2125,9 @@ impl InputMethodCore {
         self.begin_word_edit();
         self.current_word.pop();
         self.word_origins.pop();
+        if self.current_word.is_empty() {
+            self.language_choice_token_policy = false;
+        }
     }
 
     fn replace_word_with_derived(&mut self, word: String) {
@@ -2107,7 +2172,11 @@ impl InputMethodCore {
         }
         let script = Self::word_script(word);
         let directly_observed = self.word_is_directly_observed(word);
-        if cause == CommitCause::AcceptedCompletion || (directly_observed && script.is_some()) {
+        if matches!(
+            cause,
+            CommitCause::AcceptedCompletion | CommitCause::AcceptedLanguageChoice
+        ) || (directly_observed && script.is_some())
+        {
             return WordEvidence {
                 language: script,
                 confirmed_word: script,
@@ -2161,9 +2230,11 @@ impl InputMethodCore {
     /// from itself. A prepared replacement has its own exact corpus evidence;
     /// the original character observation does not attest the replacement.
     fn commit_boundary_word(&mut self, word: &str, rewrite_allowed: bool) -> Option<Action> {
-        let correction = (self.config.post_commit_autocorrect && rewrite_allowed)
-            .then(|| self.prepare_language_correction(word))
-            .flatten();
+        let correction = (self.config.post_commit_autocorrect
+            && rewrite_allowed
+            && !self.language_choice_policy_active())
+        .then(|| self.prepare_language_correction(word))
+        .flatten();
         if let Some(prepared) = correction.as_ref() {
             self.commit_corrected_word(prepared, CommitCause::Boundary);
         } else {
@@ -2474,6 +2545,12 @@ impl InputMethodCore {
     /// Only one-sided evidence realigns the detector here; client context
     /// never supplies detector confidence or confirms a new trusted word.
     fn resolve_word_boundary(&mut self) -> String {
+        // A visible choice leaves genuinely ambiguous readings to the user.
+        // Re-check the full token: an early unsupported offer must not block
+        // the existing one-sided completed-word correction.
+        if self.language_choice_policy_active() {
+            return self.current_word.clone();
+        }
         let Some(db) = self.dual_buffer.as_ref() else {
             return self.current_word.clone();
         };
@@ -2551,6 +2628,7 @@ impl InputMethodCore {
         self.transliteration_active = false;
         self.dual_buffer = None;
         self.word_delivery_layout = None;
+        self.language_choice_token_policy = false;
         self.current_word_had_flip = false;
         self.anticipatory_ghost_active = false;
     }
@@ -4361,14 +4439,11 @@ mod tests {
 
     // ── Backspace vs the dual-buffer lock (FIX 2) ────────────────────
 
-    /// A LOCKED buffer must never be re-scored on Backspace.  `update_scores`
-    /// rewrites `locked_lang` when the shorter prefix has a different winner,
-    /// so one deletion flipped the alphabet of the entire word.  Live trace:
-    /// 15 mid-word script flips on BackSpace, 9 of them locked→locked.
-    /// `handle_dual_buffer_key` already gates the identical call on
-    /// `!was_locked`; the Backspace arm did not.
+    /// An explicitly accepted buffer keeps its selected alphabet on Backspace.
+    /// Unlike inferred prefix confidence, this pin comes from a user accepting
+    /// a displayed character; it remains sticky until the token is cleared.
     #[test]
-    fn test_backspace_under_lock_keeps_locked_alphabet() {
+    fn test_backspace_under_explicit_lock_keeps_locked_alphabet() {
         let mut core = InputMethodCore::new(InputConfig::default());
         // 4-char prefix: BG-only.  3-char prefix: EN too — so deleting one
         // character is exactly the case that used to flip the word.
@@ -4376,10 +4451,11 @@ mod tests {
         core.load_word_lang("zdn", 5_000_000, LangId::En);
 
         let mut db = DualBuffer::from_config(&core.config.dual_buffer);
-        for (en, bg) in [('z', 'з'), ('d', 'д'), ('n', 'н'), ('k', 'к')] {
+        for (en, bg) in [('z', 'з'), ('d', 'д'), ('n', 'н')] {
             db.push(en, bg);
         }
         db.update_scores(0.0, 5_000_000.0);
+        assert!(db.push_winner_char('к'));
         assert!(db.is_locked(), "precondition: buffer must lock");
         assert_eq!(
             db.winner_text(),
