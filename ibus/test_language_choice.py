@@ -369,3 +369,30 @@ def test_language_choice_renderer_failure_is_consumed_without_losing_the_word(
     assert eng._core.key_calls == before and eng._core.current_word() == "draftyt"
     assert eng._core.accept_calls == [] and rec.commits == []
     assert not eng._core.supported and rec.lookup_hides > 0
+
+
+@pytest.mark.parametrize(
+    "sensitive, decision_key, expected_choice",
+    [(False, None, True), (True, None, False), (False, (0, 0), False)],
+    ids=["default-never-declared", "strict-never-declared", "inconsistent-declaration"],
+)
+def test_language_choice_never_declared_context_follows_existing_privacy_policy(
+    monkeypatch, sensitive, decision_key, expected_choice
+):
+    eng, rec = _engine(monkeypatch)
+    eng._sensitive = sensitive
+    eng._declared_ordinary = False
+    eng._content_type_key = decision_key
+    eng.do_set_capabilities(41)
+    consumed = eng.do_process_key_event(ord("t"), 20, 0)
+    assert consumed is (not sensitive)
+    assert eng._core.supported is expected_choice
+    if expected_choice:
+        assert rec.lookups == [(("draftyt", "драфтът"), 0, False, True)]
+        assert eng._core.offer_calls == 1
+        assert eng._core.current_word() == "draftyt"
+    else:
+        assert rec.lookups == [] and eng._core.offer_calls == 0
+    if sensitive:
+        assert eng._core.key_calls == [] and eng._core.current_word() == ""
+    assert rec.commits == [] and eng._core.accept_calls == []

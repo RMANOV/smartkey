@@ -1529,7 +1529,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 )
             )
             and not getattr(self, "_sensitive", False)
-            and getattr(self, "_declared_ordinary", False)
+            and (
+                getattr(self, "_declared_ordinary", False)
+                or getattr(self, "_content_type_key", None) is None
+            )
             and self._caps & 1  # Owned full-word preedit must be renderable too.
             and getattr(self, "_language_choice_route_available", False)
         )
