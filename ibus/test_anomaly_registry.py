@@ -1263,7 +1263,13 @@ def test_first_seen_after_last_seen_rejected():
 @pytest.mark.parametrize("status", ["verified", "closed"])
 def test_closure_without_evidence_rejected(status):
     doc = _doc()
-    rec = _find(doc, "draftyt", "драфтът")  # open, no evidence at all
+    rec = _find(doc, "draftyt", "драфтът")
+    # The canonical record may gain evidence; this negative fixture must not.
+    for field in (
+        "reproducer", "red_test", "red_test_waiver", "fix_commit",
+        "verification", "closure_reason"
+    ):
+        rec[field] = None
     rec["status"] = status
     errors = V.validate_document(doc, _schema())
     gate = [e for e in errors if e.startswith("E_GATE")]
@@ -1305,6 +1311,8 @@ def test_fixed_requires_fix_commit_and_test_or_waiver():
 def test_not_smartkey_requires_closure_reason_and_evidence():
     doc = _doc()
     rec = _find(doc, "draftyt", "драфтът")
+    rec["reproducer"] = None
+    rec["closure_reason"] = None
     rec["status"] = "not_smartkey"
     gate = [e for e in V.validate_document(doc, _schema()) if e.startswith("E_GATE")]
     assert any("closure_reason" in e for e in gate)
@@ -1314,6 +1322,8 @@ def test_not_smartkey_requires_closure_reason_and_evidence():
 def test_open_record_cannot_carry_a_fix_commit():
     doc = _doc()
     rec = _find(doc, "draftyt", "драфтът")
+    rec["status"] = "open_suspected_smartkey"
+    rec["verification"] = None
     rec["fix_commit"] = "0" * 40
     assert "E_STATE" in _codes(V.validate_document(doc, _schema()))
 
