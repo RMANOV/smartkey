@@ -478,6 +478,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 "delivery; rebuild the native module before starting SmartKey"
             ) from exc
 
+        if not callable(getattr(self._core, "flush_preedit_for_layout", None)):
+            raise RuntimeError(
+                "smartkey_py native extension cannot enforce layout handoff; "
+                "rebuild the native module before starting SmartKey"
+            )
+
         # KDE's explicit BG layout is ordinary keyboard input. Its metadata
         # observer never changes an engine, layout, or client text.
         self._kde_layout = None
@@ -1993,7 +1999,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 observer.refresh()
             return
         try:
-            from ibus.kde_layout import create_kde_layout_observer
+            try:
+                from ibus.kde_layout import create_kde_layout_observer
+            except ImportError:
+                from kde_layout import create_kde_layout_observer
 
             self._kde_layout = create_kde_layout_observer()
         except (ImportError, OSError):

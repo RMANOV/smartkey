@@ -35,10 +35,31 @@ def test_constructor_disables_external_rewrite_before_profile_or_corpus(monkeypa
         def set_external_rewrite_supported(self, supported):
             events.append(("external_rewrite", supported))
 
+        def flush_preedit_for_layout(self):
+            raise AssertionError("startup must validate layout handoff without flushing")
+
     events = _constructor_fixture(monkeypatch, Core())
     engine = ske.SmartKeyEngine()
     assert engine._caps == 0
     assert events == ["create", ("external_rewrite", False), "personal", "corpus"]
+
+
+@pytest.mark.parametrize("api", ["missing", "noncallable"])
+def test_incompatible_layout_handoff_refuses_startup_before_loading_profile(
+    monkeypatch, api
+):
+    class Core:
+        def set_external_rewrite_supported(self, supported):
+            events.append(("external_rewrite", supported))
+
+    core = Core()
+    if api == "noncallable":
+        core.flush_preedit_for_layout = None
+    events = _constructor_fixture(monkeypatch, core)
+
+    with pytest.raises(RuntimeError, match="layout handoff"):
+        ske.SmartKeyEngine()
+    assert events == ["create", ("external_rewrite", False)]
 
 
 @pytest.mark.parametrize("api", ["missing", "noncallable", "raising"])

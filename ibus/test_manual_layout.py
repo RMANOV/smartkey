@@ -148,3 +148,45 @@ def test_missing_kde_or_us_selection_preserves_existing_auto_route(monkeypatch, 
     assert obj._core.names().count("focus_lost") == 0
     assert obj._core.names().count("focus_gained") == 0
     assert len(obj._core.key_calls()) == 1
+
+
+@pytest.mark.parametrize("mode", ["package", "flat"])
+def test_layout_observer_supports_both_engine_import_modes(tmp_path, mode):
+    import json
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    script = '''
+import importlib, json, sys
+from types import SimpleNamespace
+from pathlib import Path
+directory, mode = Path(sys.argv[1]), sys.argv[2]
+sys.modules["gi"] = None
+sys.modules["smartkey_py"] = None
+if mode == "flat":
+    sys.path.insert(0, str(directory))
+    sys.modules["ibus"] = None
+    engine = importlib.import_module("smartkey_engine")
+    layout = importlib.import_module("kde_layout")
+    assert not engine.__package__
+else:
+    sys.path.insert(0, str(directory.parent))
+    engine = importlib.import_module("ibus.smartkey_engine")
+    layout = importlib.import_module("ibus.kde_layout")
+    assert engine.__package__ == "ibus"
+observer = SimpleNamespace(manual_bg=True, verified=True)
+layout.create_kde_layout_observer = lambda: observer
+engine._HAS_IBUS = True
+obj = engine.SmartKeyEngine.__new__(engine.SmartKeyEngine)
+obj._kde_layout = None
+obj._init_kde_layout_observer()
+assert obj._kde_layout is observer, "layout observer silently disabled"
+print(json.dumps({"mode": mode, "manual_bg": obj._kde_layout.manual_bg}))
+'''
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, str(Path(__file__).parent), mode],
+        cwd=tmp_path, capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"mode": mode, "manual_bg": True}
