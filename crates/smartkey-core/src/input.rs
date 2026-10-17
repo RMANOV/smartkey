@@ -1808,6 +1808,23 @@ impl InputMethodCore {
 
     // -- focus / reset --------------------------------------------------
 
+    /// Deliver owned preedit before handing input to a manually selected layout.
+    ///
+    /// A layout switch is not a word boundary: the user may continue the same
+    /// word outside this core. Keep previously learned state, but discard the
+    /// old composition and context without accepting or learning a completion.
+    pub fn flush_preedit_for_layout(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
+        let mut actions = Vec::from_iter(self.flush_preedit());
+        self.reset_word();
+        self.context.clear();
+        self.lang_detector.reset();
+        self.clear_hints();
+        self.space_accept_display_attested = false;
+        actions.push(Action::HideGhost);
+        actions
+    }
+
     /// Called when the input field loses focus.
     pub fn focus_lost(&mut self) -> Vec<Action> {
         self.commit_learning = CommitLearningBatch::default();
@@ -9724,5 +9741,135 @@ mod sentence_boundary_followup_tests {
             assert_eq!(prediction(&mut core), expected);
             review_only_hello_learned(&core);
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_handoff_tests {
+    use super::*;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn raw(core: &mut InputMethodCore, text: &str) {
+        for ch in text.chars() {
+            let code = (2..=53)
+                .find(|code| {
+                    keymap::scancode_to_both(*code, false).is_some_and(|pair| pair.0 == ch)
+                })
+                .unwrap();
+            core.handle_key(press(Key::RawCode(code)));
+        }
+    }
+
+    fn seeded_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("hello", 1_000_000, LangId::En);
+        // Real committed history populates CVM, Markov (including higher
+        // n-grams), OOV vocabulary and session cache before the handoff.
+        for word in ["one", "two", "three", "four", "five"] {
+            for ch in word.chars() {
+                core.handle_key(press(Key::Char(ch)));
+            }
+            core.handle_key(press(Key::Space));
+        }
+        core
+    }
+
+    fn metrics(core: &InputMethodCore) -> serde_json::Value {
+        serde_json::to_value(core.metrics().summary()).unwrap()
+    }
+
+    #[test]
+    fn layout_handoff_delivers_only_owned_prefix_without_learning_any_word() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        assert_eq!(core.current_word(), "hel");
+        assert_eq!(core.ghost_text(), "lo");
+        let learned = core.engine.learned_state_for_test();
+        let metrics = metrics(&core);
+        assert_eq!(
+            core.flush_preedit_for_layout(),
+            [Action::CommitText("hel".into()), Action::HideGhost]
+        );
+        assert_eq!(
+            core.engine.learned_state_for_test(),
+            learned,
+            "delivery alone must not train profile, session, n-grams or OOV words"
+        );
+        assert_eq!(self::metrics(&core), metrics);
+        assert!(core.current_word().is_empty() && !core.has_ghost());
+        assert!(core.predictions().is_empty());
+        assert_eq!(core.context_words(), (None, None));
+        assert!(core.take_commit_learning().words.is_empty());
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+        assert_eq!(core.engine.learned_state_for_test(), learned);
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.engine.learned_state_for_test(),
+            learned,
+            "next empty boundary must not lazily learn the flushed prefix"
+        );
+    }
+
+    #[test]
+    fn layout_handoff_keeps_explicitly_accepted_character_but_not_the_rest() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        let right = core.handle_key(press(Key::Right));
+        assert_eq!(
+            right,
+            [Action::ShowComposing {
+                typed: "hell".into(),
+                ghost: "o".into()
+            }]
+        );
+        let learned = core.engine.learned_state_for_test();
+        let metrics = metrics(&core);
+        assert_eq!(
+            core.flush_preedit_for_layout(),
+            [Action::CommitText("hell".into()), Action::HideGhost]
+        );
+        assert_eq!(core.engine.learned_state_for_test(), learned);
+        assert_eq!(self::metrics(&core), metrics);
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+    }
+
+    #[test]
+    fn layout_handoff_does_not_redeliver_semantic_input_already_in_client() {
+        let mut core = seeded_core();
+        for ch in "hel".chars() {
+            assert!(core
+                .handle_key(press(Key::Char(ch)))
+                .contains(&Action::ForwardKey));
+        }
+        assert_eq!(core.current_word(), "hel");
+        let learned = core.engine.learned_state_for_test();
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+        assert_eq!(core.engine.learned_state_for_test(), learned);
+        assert!(core.current_word().is_empty());
+    }
+
+    #[test]
+    fn layout_handoff_after_full_accept_does_not_recommit_or_relearn() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        assert_eq!(
+            core.handle_key(press(Key::Tab)),
+            [Action::HideGhost, Action::CommitText("hello".into())]
+        );
+        let learned = core.engine.learned_state_for_test();
+        let metrics = metrics(&core);
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+        assert_eq!(core.engine.learned_state_for_test(), learned);
+        assert_eq!(self::metrics(&core), metrics);
     }
 }

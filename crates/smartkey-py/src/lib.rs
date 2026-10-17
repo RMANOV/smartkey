@@ -187,6 +187,15 @@ impl PyInputMethodCore {
         self.inner.focus_gained();
     }
 
+    /// Deliver owned preedit for a manual layout without learning a word.
+    fn flush_preedit_for_layout(&mut self) -> Vec<(String, String)> {
+        self.inner
+            .flush_preedit_for_layout()
+            .iter()
+            .map(action_to_tuple)
+            .collect()
+    }
+
     /// Update surrounding text from the platform adapter.
     fn set_surrounding_text(&mut self, text: Option<&str>, cursor_pos: Option<usize>) {
         self.inner

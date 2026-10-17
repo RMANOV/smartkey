@@ -106,6 +106,81 @@ def test_optional_factory_returns_none_when_backend_cannot_start(monkeypatch):
     assert kde.create_kde_layout_observer() is None
 
 
+def test_factory_retains_subscribed_observer_for_later_owner_without_focus(monkeypatch):
+    from types import SimpleNamespace
+
+    class Variant:
+        def __init__(self, value):
+            self.value = value
+
+        def unpack(self):
+            return self.value
+
+    class Connection:
+        def __init__(self):
+            self.available = False
+            self.callbacks = {}
+            self.calls = []
+
+        def signal_subscribe(self, sender, interface, member, path, arg0,
+                             flags, callback):
+            handle = len(self.callbacks) + 1
+            self.callbacks[handle] = callback
+            return handle
+
+        def signal_unsubscribe(self, handle):
+            del self.callbacks[handle]
+
+        def call_sync(self, name, path, interface, method, params, result_type,
+                      flags, timeout, cancellable):
+            assert (name, path, interface) == (
+                "org.kde.keyboard", "/Layouts", "org.kde.KeyboardLayouts")
+            assert flags == 1 and timeout == 250
+            self.calls.append(method)
+            if not self.available:
+                raise RuntimeError("KDE owner unavailable during initial read")
+            assert method in ("getLayoutsList", "getLayout")
+            return Variant((LAYOUTS,) if method == "getLayoutsList" else (1,))
+
+    gio = SimpleNamespace(DBusCallFlags=SimpleNamespace(NO_AUTO_START=1),
+                          DBusSignalFlags=SimpleNamespace(NONE=0))
+    connection = Connection()
+    backend = kde._GioBackend(gio, connection)
+    monkeypatch.setattr(kde, "_GioBackend", lambda: backend)
+    observer = kde.create_kde_layout_observer()
+    assert observer is not None
+    assert observer.manual_bg is False and observer._verified is False
+
+    connection.available = True
+    connection.callbacks[2](connection, ":1.0", "/org/freedesktop/DBus",
+                            "org.freedesktop.DBus", "NameOwnerChanged",
+                            Variant(("org.kde.keyboard", "", ":1.42")))
+    assert observer.manual_bg is True and observer._verified is True
+    calls = list(connection.calls)
+    connection.callbacks[1](connection, ":1.42", "/Layouts",
+                            "org.kde.KeyboardLayouts", "layoutChanged",
+                            Variant((0,)))
+    assert observer.manual_bg is False
+    assert connection.calls == calls  # Cached layout signal needs no focus/query.
+    observer.close()
+    assert connection.callbacks == {}
+
+
+def test_unverified_factory_observer_can_refresh_with_same_owner(monkeypatch):
+    backend = Backend(1)
+    backend.error = RuntimeError("temporary initial read failure")
+    monkeypatch.setattr(kde, "_GioBackend", lambda: backend)
+    observer = kde.create_kde_layout_observer()
+    assert observer is not None
+    assert getattr(observer, "verified", None) is False
+    assert observer.manual_bg is False
+    backend.error = None  # Owner did not change and emitted no layout signal.
+    observer.refresh()
+    assert observer.verified is True and observer.manual_bg is True
+    with pytest.raises(AttributeError):
+        observer.verified = False
+
+
 def test_partial_subscription_failure_releases_owned_handler(monkeypatch):
     from types import SimpleNamespace
 

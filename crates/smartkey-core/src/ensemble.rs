@@ -144,7 +144,59 @@ pub struct SmartKeyEngine {
     use_reranker: bool,
 }
 
+/// Includes transient learned state omitted by the persisted profile.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct LearnedStateSnapshot {
+    profile: serde_json::Value,
+    session: crate::session_cache::SessionCacheSnapshot,
+    higher_ngrams: crate::markov::HigherNgramData,
+    unconfirmed_words: Vec<(LangId, Vec<crate::ngram::WordEntry>)>,
+}
+
+#[cfg(test)]
+pub(crate) fn learned_profile_for_test(mut profile: PersonalProfile) -> serde_json::Value {
+    // Export time and elapsed ages advance without learning. Compare all
+    // model fields, with the unordered vocabulary/Markov collections sorted.
+    profile.cvm.words.sort_unstable();
+    profile.cvm.age_secs.clear();
+    profile.cvm.saved_at_unix = 0.0;
+    if let Some(tracks) = profile.lang_cvm.as_mut() {
+        for (_, snapshot) in &mut tracks.tracks {
+            snapshot.words.sort_unstable();
+            snapshot.age_secs.clear();
+            snapshot.saved_at_unix = 0.0;
+        }
+    }
+    profile.markov_bigrams.sort_unstable();
+    profile.markov_trigrams.sort_unstable();
+    serde_json::to_value(profile).unwrap()
+}
+
 impl SmartKeyEngine {
+    #[cfg(test)]
+    pub(crate) fn learned_state_for_test(&self) -> LearnedStateSnapshot {
+        let mut unconfirmed_words: Vec<_> = self
+            .lang_models
+            .all_models()
+            .map(|model| {
+                (
+                    model.lang,
+                    model
+                        .prediction_only_trie
+                        .prefix_search("", model.prediction_only_trie.len()),
+                )
+            })
+            .collect();
+        unconfirmed_words.sort_unstable_by_key(|(lang, _)| *lang as u8);
+        LearnedStateSnapshot {
+            profile: learned_profile_for_test(self.export_personal_profile()),
+            session: self.session_cache.snapshot_for_test(),
+            higher_ngrams: self.personal_markov.higher_ngrams_raw().clone(),
+            unconfirmed_words,
+        }
+    }
+
     /// Create a new engine with default weights `(0.50, 0.30, 0.20)` and a
     /// CVM counter sized `(500, 5000)`.
     pub fn new() -> Self {

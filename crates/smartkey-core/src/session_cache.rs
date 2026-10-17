@@ -22,7 +22,22 @@ pub struct SessionCacheLM {
     max_entries: usize,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct SessionCacheSnapshot {
+    cache: HashMap<String, (u64, u32)>,
+    position: u64,
+}
+
 impl SessionCacheLM {
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_test(&self) -> SessionCacheSnapshot {
+        SessionCacheSnapshot {
+            cache: self.cache.clone(),
+            position: self.position,
+        }
+    }
+
     /// Create a new session cache with default parameters.
     pub fn new() -> Self {
         Self {

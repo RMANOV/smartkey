@@ -133,6 +133,58 @@ def test_native_missing_default_profile_roundtrips_without_creation_on_load(tmp_
     assert saved["weights"]["commit_count"] == after["weights"]["commit_count"] == 0
 
 
+def test_native_manual_layout_handoff_does_not_learn_an_unfinished_word(
+    tmp_path, private_paths, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    core = _native().PyInputMethodCore(json.dumps({
+        "ghost_text_separation_margin": 0.0,
+        "post_commit_autocorrect": False,
+        "use_ppm": False,
+        "use_reranker": False,
+    }))
+    core.load_word("неделя", 1_000_000)
+    # Audit/import the native artifact before the adapter can import it.
+    from .test_input_safety import build_engine, ske
+
+    obj, recording = build_engine()
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    obj._core = core
+    obj._kde_layout = SimpleNamespace(manual_bg=False)
+    obj._manual_layout_passthrough = False
+    for value, code in ((ord("n"), 49), (ord("e"), 18), (ord("d"), 32)):
+        assert obj.do_process_key_event(value, code, 0) is True
+    assert core.current_word() == "нед"
+    assert recording.preedits[-1] == ("неделя", True)
+    def learning_snapshot(name):
+        profile = _export(core, tmp_path / name)
+        # Export records the current wall clock even for an empty CVM. Keep
+        # every learned field, including any newly introduced word/age entry.
+        profile["cvm"]["saved_at_unix"] = 0.0
+        return profile
+
+    before = learning_snapshot("before-handoff.json")
+    assert before["cvm"]["words"] == []
+    assert before["lang_cvm"]["tracks"] == []
+
+    obj._kde_layout.manual_bg = True
+    assert obj.do_process_key_event(ord("е"), 18, 0) is False
+
+    assert recording.commits == ["нед"]
+    assert recording.preedits[-1] == ("", False)
+    assert core.current_word() == ""
+    assert learning_snapshot("after-handoff.json") == before
+    # The following manual keys and empty automatic boundary cannot lazily
+    # attribute this delivered fragment as a completed word either.
+    assert obj.do_process_key_event(ord("л"), 38, 0) is False
+    obj._kde_layout.manual_bg = False
+    assert obj.do_process_key_event(0x20, 57, 0) is False
+    assert learning_snapshot("after-resume.json") == before
+    assert recording.commits == ["нед"]
+    assert not private_paths.exists()
+
+
 _NOVEL_WORD = "зориван"
 _NOVEL_CODES = (44, 24, 19, 23, 17, 30, 49)
 _NOVEL_CONFIG = json.dumps({

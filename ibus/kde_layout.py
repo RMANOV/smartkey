@@ -66,6 +66,10 @@ class KdeLayoutObserver:
             self.close()
             raise
 
+    @property
+    def verified(self):
+        return self._verified
+
     def refresh(self, snapshot=None):
         if self._closed:
             return
@@ -91,10 +95,9 @@ class KdeLayoutObserver:
 
 def create_kde_layout_observer():
     try:
-        observer = KdeLayoutObserver()
-        if observer._verified:
-            return observer
-        observer.close()
+        # Keep successful subscriptions even when the first read is unavailable;
+        # owner/layout signals can verify metadata without another focus event.
+        return KdeLayoutObserver()
     except Exception:
         pass
     return None

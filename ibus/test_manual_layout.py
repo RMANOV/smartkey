@@ -23,8 +23,8 @@ class Core(SpyCore):
         self.word = "по"
         return [("composing", "по\0дай")]
 
-    def focus_lost(self):
-        self.calls.append(("focus_lost", ()))
+    def flush_preedit_for_layout(self):
+        self.calls.append(("flush_preedit_for_layout", ()))
         word, self.word = self.word, ""
         return [("hide", "")] + ([("commit", word)] if word else [])
 
@@ -68,7 +68,8 @@ def test_entering_manual_bg_delivers_only_owned_typed_prefix_once(monkeypatch):
     for value, code in [(ord("б"), 48), (0x20, 57)]:
         assert obj.do_process_key_event(value, code, 0) is False
     assert rec.commits == ["по"]
-    assert obj._core.names().count("focus_lost") == 1
+    assert obj._core.names().count("flush_preedit_for_layout") == 1
+    assert "focus_lost" not in obj._core.names()
 
 
 def test_us_selection_resumes_automatic_input_at_next_press(monkeypatch):
@@ -107,6 +108,27 @@ def test_kde_becoming_available_on_focus_preserves_first_bg_key(monkeypatch):
     assert obj._core.key_calls() == [] and rec.commits == []
 
 
+@pytest.mark.parametrize("verified", [False, True])
+def test_focus_retries_only_unverified_kde_metadata(monkeypatch, verified):
+    obj, rec = engine(monkeypatch)
+    reads = []
+    observer = SimpleNamespace(verified=verified, manual_bg=False)
+
+    def refresh():
+        reads.append(True)
+        observer.verified = True
+        observer.manual_bg = True
+
+    observer.refresh = refresh
+    obj._kde_layout = observer
+    monkeypatch.setattr(ske, "_HAS_IBUS", True)
+    obj.do_focus_in()
+    assert reads == ([] if verified else [True])
+    if not verified:
+        assert obj.do_process_key_event(ord("а"), 30, 0) is False
+        assert obj._core.key_calls() == [] and rec.commits == []
+
+
 def test_destroy_releases_layout_subscription_without_client_text(monkeypatch):
     obj, rec = engine(monkeypatch)
     closed = []
@@ -122,6 +144,7 @@ def test_missing_kde_or_us_selection_preserves_existing_auto_route(monkeypatch, 
     obj, rec = engine(monkeypatch)
     obj._kde_layout = observer
     assert obj.do_process_key_event(ord("p"), 25, 0) is True
+    assert obj._core.names().count("flush_preedit_for_layout") == 0
     assert obj._core.names().count("focus_lost") == 0
     assert obj._core.names().count("focus_gained") == 0
     assert len(obj._core.key_calls()) == 1

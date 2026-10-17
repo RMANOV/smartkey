@@ -1985,7 +1985,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         )
 
     def _init_kde_layout_observer(self) -> None:
-        if not _HAS_IBUS or getattr(self, "_kde_layout", None) is not None:
+        if not _HAS_IBUS:
+            return
+        observer = getattr(self, "_kde_layout", None)
+        if observer is not None:
+            if not observer.verified:
+                observer.refresh()
             return
         try:
             from ibus.kde_layout import create_kde_layout_observer
@@ -2004,7 +2009,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         manual = observer is not None and observer.manual_bg
         if manual != current:
             if manual:
-                actions = self._core.focus_lost()
+                actions = self._core.flush_preedit_for_layout()
                 self._clear_language_choice()
                 self._execute_actions(actions)
                 self._active_prediction = None

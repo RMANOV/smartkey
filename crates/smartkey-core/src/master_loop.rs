@@ -672,6 +672,22 @@ impl MasterLoop {
         actions
     }
 
+    /// Deliver owned preedit without treating a manual layout switch as a word.
+    pub fn flush_preedit_for_layout(&mut self) -> Vec<Action> {
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
+        self.phase = Phase::Anticipating;
+        self.sentence_echoes = None;
+        self.anticipated = false;
+        self.frustration.reset_word();
+        self.surrounding_text = None;
+        self.surrounding_cursor_pos = None;
+        self.last_shown_ghost = None;
+        self.last_prediction_accept = None;
+        self.last_accepted_prediction = None;
+        self.core.flush_preedit_for_layout()
+    }
+
     pub fn focus_gained(&mut self) {
         self.invalidate_language_choice();
         self.language_choice_dismissed = false;
@@ -5478,5 +5494,72 @@ mod sentence_modifier_review_tests {
                 assert_eq!(ml.metrics().summary().accepted_predictions, 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_handoff_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn layout_handoff_invalidates_choice_without_profile_or_acceptance_learning() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("top", 1_000_000, LangId::En);
+        ml.load_word_lang("топ", 1_000_000, LangId::Bg);
+        ml.set_language_choice_supported(true);
+        ml.set_surrounding_text(Some("earlier client context ".into()), Some(23));
+        for code in [20, 24, 25] {
+            ml.handle_key(press(Key::RawCode(code)));
+        }
+        let choice = ml
+            .language_choice_offer()
+            .expect("real ambiguous whole word");
+        let typed = ml.current_word().to_string();
+        let profile = crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+        let light_profile = serde_json::to_value(&ml.light_profile).unwrap();
+        let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+        assert_eq!(
+            ml.flush_preedit_for_layout(),
+            [Action::CommitText(typed), Action::HideGhost]
+        );
+        assert_eq!(
+            crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+            profile
+        );
+        assert_eq!(
+            serde_json::to_value(&ml.light_profile).unwrap(),
+            light_profile
+        );
+        assert_eq!(
+            serde_json::to_value(ml.metrics().summary()).unwrap(),
+            metrics
+        );
+        assert!(ml.language_choice_offer().is_none());
+        assert!(ml
+            .accept_language_choice(choice.revision, LangId::Bg)
+            .is_none());
+        assert!(ml.surrounding_text.is_none() && ml.surrounding_cursor_pos.is_none());
+        assert!(ml.last_shown_ghost.is_none() && ml.sentence_echoes.is_none());
+        assert!(!ml.anticipated);
+        assert_eq!(ml.flush_preedit_for_layout(), [Action::HideGhost]);
+        ml.focus_gained();
+        ml.handle_key(press(Key::Space));
+        assert_eq!(
+            serde_json::to_value(&ml.light_profile).unwrap(),
+            light_profile,
+            "resuming must not consume the partial word as stale commit evidence"
+        );
+        assert_eq!(
+            serde_json::to_value(ml.metrics().summary()).unwrap(),
+            metrics
+        );
     }
 }
