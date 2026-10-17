@@ -1356,6 +1356,15 @@ impl InputMethodCore {
                             let (ef, bf) = self.engine.score_both(db.en_text(), db.bg_text());
                             db.update_scores(ef, bf);
                             db.apply_soft_context_prior(lang_prior);
+                            // The surviving corpus rescore replaces deleted
+                            // detector evidence before choosing a ghost model.
+                            if self.config.lang_detection
+                                && db.evidence_origin()
+                                    == crate::dual_buffer::EvidenceOrigin::Corpus
+                            {
+                                self.lang_detector
+                                    .feed_dual_result(db.winner_lang(), db.confidence());
+                            }
                         }
                         let word = db.winner_text().to_string();
                         self.replace_word_with_derived(word);
@@ -9871,5 +9880,101 @@ mod layout_handoff_tests {
         assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
         assert_eq!(core.engine.learned_state_for_test(), learned);
         assert_eq!(self::metrics(&core), metrics);
+    }
+}
+
+#[cfg(test)]
+mod backspace_recovered_detector_tests {
+    use super::*;
+
+    fn raw(core: &mut InputMethodCore, code: u16) {
+        let actions = core.handle_key(KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        });
+        assert!(actions.iter().any(|action| matches!(
+            action, Action::ShowComposing { typed, .. } if typed == core.current_word()
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            Action::CommitText(_) | Action::ReplaceWord { .. } | Action::ForwardKey
+        )));
+        assert_eq!(core.metrics().summary().total_commits, 0);
+    }
+
+    fn fixture(prior: LangId) -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        if prior == LangId::En {
+            core.load_word_lang("list", 190_546, LangId::En);
+            core.load_word_lang("листа", 47_863, LangId::Bg);
+            core.load_word_lang("листовете", 95, LangId::Bg);
+        }
+        core.load_word_lang("liston", 457, LangId::En);
+        core.load_word_lang("листове", 4_466, LangId::Bg);
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(prior),
+            context_words: vec![match prior {
+                LangId::En => "thank".into(),
+                _ => "благодаря".into(),
+            }],
+            ..Default::default()
+        });
+        core
+    }
+
+    #[test]
+    fn deleting_recovered_bg_suffix_restores_english_detector_and_ghost() {
+        let mut fresh = fixture(LangId::En);
+        for code in [38, 23, 31] {
+            raw(&mut fresh, code);
+        }
+        assert_eq!(fresh.current_word(), "lis");
+        assert_eq!(fresh.ghost_text(), "t");
+        assert_eq!(fresh.detected_language().lang, LangId::En);
+
+        let mut edited = fixture(LangId::En);
+        for code in [38, 23, 31, 20, 24, 17] {
+            raw(&mut edited, code);
+        }
+        assert_eq!(edited.current_word(), "листов");
+        assert_eq!(edited.detected_language().lang, LangId::Bg);
+        assert!(edited.detected_language().confidence >= 0.6);
+        for _ in 0..3 {
+            raw(&mut edited, 14);
+        }
+        assert_eq!(edited.current_word(), "lis");
+        assert_eq!(
+            (edited.detected_language().lang, edited.ghost_text()),
+            (LangId::En, fresh.ghost_text())
+        );
+        assert!(edited.predictions().iter().any(|p| p.word == "list"));
+    }
+
+    #[test]
+    fn deleting_recovered_en_suffix_restores_bulgarian_detector_and_ghost() {
+        let mut fresh = fixture(LangId::Bg);
+        for code in [38, 23, 31] {
+            raw(&mut fresh, code);
+        }
+        assert_eq!(fresh.current_word(), "лис");
+        assert_eq!(fresh.ghost_text(), "тове");
+        assert_eq!(fresh.detected_language().lang, LangId::Bg);
+
+        let mut edited = fixture(LangId::Bg);
+        for code in [38, 23, 31, 20, 24, 49] {
+            raw(&mut edited, code);
+        }
+        assert_eq!(edited.current_word(), "liston");
+        assert_eq!(edited.detected_language().lang, LangId::En);
+        assert!(edited.detected_language().confidence >= 0.6);
+        for _ in 0..3 {
+            raw(&mut edited, 14);
+        }
+        assert_eq!(edited.current_word(), "лис");
+        assert_eq!(
+            (edited.detected_language().lang, edited.ghost_text()),
+            (LangId::Bg, fresh.ghost_text())
+        );
+        assert!(edited.predictions().iter().any(|p| p.word == "листове"));
     }
 }

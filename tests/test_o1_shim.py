@@ -79,6 +79,9 @@ class FakeO1Core:
         assert isinstance(supported, bool)
         self.external_rewrite_supported = supported
 
+    def flush_preedit_for_layout(self):
+        raise AssertionError("startup must validate layout handoff without flushing")
+
 
 class PreparingO1Core(FakeO1Core):
     """New-native fake that records startup cache preparation."""
@@ -735,6 +738,9 @@ def test_engine_init_starts_o1_only_after_corpus_load(
             assert isinstance(supported, bool)
             self.external_rewrite_supported = supported
 
+        def flush_preedit_for_layout(self):
+            raise AssertionError("startup must validate layout handoff without flushing")
+
         def load_personal(self):
             assert self.external_rewrite_supported is False
             self.calls.append("personal")
@@ -794,6 +800,9 @@ def test_engine_init_keeps_legacy_o1_snapshot_api_collector_active(tmp_path, mon
         def set_external_rewrite_supported(self, supported: bool) -> None:
             assert isinstance(supported, bool)
             self.external_rewrite_supported = supported
+
+        def flush_preedit_for_layout(self):
+            raise AssertionError("startup must validate layout handoff without flushing")
 
         def load_personal(self):
             assert self.external_rewrite_supported is False

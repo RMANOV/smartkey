@@ -258,3 +258,75 @@ def test_direct_dbus_is_readonly_bounded_and_layout_signal_needs_no_query():
     assert observer.manual_bg is False
     assert connection.calls == ["getLayoutsList", "getLayout"]
     observer.close()
+
+
+@pytest.mark.parametrize("initial_index", [0, 1])
+@pytest.mark.parametrize("failed_method", ["getLayoutsList", "getLayout"])
+def test_list_change_read_failure_never_routes_new_index_through_old_list(
+    initial_index, failed_method
+):
+    from types import SimpleNamespace
+
+    class Variant:
+        def __init__(self, value):
+            self.value = value
+
+        def unpack(self):
+            return self.value
+
+    class Connection:
+        def __init__(self):
+            self.layouts = LAYOUTS
+            self.index = initial_index
+            self.failed_method = None
+            self.calls = []
+            self.callbacks = {}
+
+        def signal_subscribe(self, *args):
+            handle = len(self.callbacks) + 1
+            self.callbacks[handle] = args[-1]
+            return handle
+
+        def signal_unsubscribe(self, handle):
+            del self.callbacks[handle]
+
+        def call_sync(self, _name, _path, _interface, method, *_args):
+            self.calls.append(method)
+            if method == self.failed_method:
+                raise RuntimeError("temporary layout metadata read failure")
+            assert method in ("getLayoutsList", "getLayout")
+            return Variant((self.layouts,) if method == "getLayoutsList"
+                           else (self.index,))
+
+        def emit(self, name, value=()):
+            self.callbacks[1](self, ":1.42", "/Layouts",
+                              "org.kde.KeyboardLayouts", name, Variant(value))
+
+    gio = SimpleNamespace(DBusCallFlags=SimpleNamespace(NO_AUTO_START=1),
+                          DBusSignalFlags=SimpleNamespace(NONE=0))
+    connection = Connection()
+    observer = kde.KdeLayoutObserver(kde._GioBackend(gio, connection))
+    manual_before = initial_index == 1
+    assert observer.verified and observer.manual_bg is manual_before
+
+    connection.layouts = list(reversed(LAYOUTS))
+    connection.index = 1 - initial_index  # Same language, new list position.
+    connection.failed_method = failed_method
+    connection.emit("layoutListChanged")
+    assert observer.manual_bg is manual_before
+    calls = len(connection.calls)
+    connection.emit("layoutChanged", (connection.index,))
+    assert observer.manual_bg is manual_before, "new index used a stale layout list"
+    assert len(connection.calls) > calls, "unverified list requires a fresh read"
+
+    connection.failed_method = None
+    connection.emit("layoutChanged", (connection.index,))
+    assert observer.manual_bg is manual_before
+    assert connection.calls[-2:] == ["getLayoutsList", "getLayout"]
+    calls = list(connection.calls)
+    connection.index = initial_index  # Select the other language in the new list.
+    connection.emit("layoutChanged", (connection.index,))
+    assert observer.manual_bg is not manual_before
+    assert connection.calls == calls  # Verified cached metadata stays inexpensive.
+    observer.close()
+    assert connection.callbacks == {}

@@ -36,6 +36,8 @@ class _GioBackend:
         return index, layouts
 
     def _signal(self, _connection, _sender, _path, _interface, name, parameters):
+        if name == "layoutListChanged":
+            self.layouts = None  # New indices cannot use the previous list.
         if name == "layoutChanged" and self.layouts is not None:
             try:
                 self.changed((parameters.unpack()[0], self.layouts))
