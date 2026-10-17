@@ -982,7 +982,9 @@ impl InputMethodCore {
             match event.key {
                 // Native popup navigation does not imply a moved text caret.
                 // A later surrounding report reconciles any actual movement.
-                Key::Up | Key::Down => return vec![Action::ForwardKey],
+                Key::Up | Key::Down | Key::PageUp | Key::PageDown => {
+                    return vec![Action::ForwardKey]
+                }
                 Key::Escape => {
                     self.native_completion_owned = false;
                     return vec![Action::ForwardKey];
@@ -10339,7 +10341,16 @@ mod layout_handoff_tests {
 
     #[test]
     fn native_popup_vertical_navigation_preserves_delivered_word_and_learning() {
-        for key in [Key::Up, Key::Down, Key::RawCode(103), Key::RawCode(108)] {
+        for key in [
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::RawCode(103),
+            Key::RawCode(108),
+            Key::RawCode(104),
+            Key::RawCode(109),
+        ] {
             let mut core = seeded_core();
             raw(&mut core, "hel");
             core.handoff_preedit_for_native_completion();
@@ -10348,6 +10359,7 @@ mod layout_handoff_tests {
             assert_eq!(core.handle_key(press(key)), [Action::ForwardKey]);
             assert!(core.native_completion_owned());
             assert_eq!(core.current_word(), "hel");
+            assert!(core.predictions().is_empty() && !core.has_ghost());
             assert_eq!(core.engine.learned_state_for_test(), learned);
             assert_eq!(self::metrics(&core), metrics);
             assert!(core.take_commit_learning().words.is_empty());
@@ -10356,6 +10368,7 @@ mod layout_handoff_tests {
                 [Action::CommitText("l".into()), Action::HideGhost]
             );
             assert_eq!(core.current_word(), "hell");
+            assert!(core.predictions().is_empty() && !core.has_ghost());
             assert_eq!(core.engine.learned_state_for_test(), learned);
         }
     }

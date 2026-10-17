@@ -601,6 +601,55 @@ def test_native_adapter_completion_handoff_trace_records_forwarded_delivery(tmp_
 
 
 @pytest.mark.parametrize("level", [1, 2], ids=["structural", "full"])
+@pytest.mark.parametrize("raw", [True, False], ids=["raw", "semantic"])
+def test_native_adapter_refinement_trace_records_delivery_without_acceptance(
+    tmp_path, monkeypatch, level, raw,
+):
+    from .smartkey_debug import KeystrokeTrace
+
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+    trace = KeystrokeTrace(level=level, directory=tmp_path / "trace")
+    engine._trace = trace
+    assert engine.do_process_key_event(0x20, 57, 4) is False
+    engine.do_set_surrounding_text("здра", 4, 4)
+    for keyval, code, report in (
+        (ord("w") if raw else ord("в"), 17 if raw else 0, "здрав"),
+        (ord("e") if raw else ord("е"), 18 if raw else 0, "здраве"),
+    ):
+        assert engine.do_process_key_event(keyval, code, 0) is raw
+        engine.do_set_surrounding_text(report, len(report), len(report))
+    assert engine._core.current_word() == "здраве"
+    assert engine._core.native_completion_owned() is True
+    assert rec.commits == (["здра", "в", "е"] if raw else ["здра"])
+    trace.flush()
+    text = trace._file.read_text()
+    events = [json.loads(line) for line in text.splitlines()]
+    assert not any(event["event"] == "accept" for event in events)
+    assert {event["seq"] for event in events} == {1, 2, 3}
+    for sequence, length, glyph in ((1, 4, "здра"), (2, 1, "в"), (3, 1, "е")):
+        if sequence > 1 and not raw:
+            length, glyph = 0, ""
+        batch = [event for event in events if event["seq"] == sequence]
+        assert {"key_in", "core", "action", "outcome"} <= {event["event"] for event in batch}
+        outcome = [event for event in batch if event["event"] == "outcome"]
+        assert len(outcome) == 1 and outcome[0]["committed_to_app_len"] == length
+        commits = [event for event in batch if event["event"] == "action" and event["action_name"] == "commit"]
+        if not length:
+            assert commits == []
+            assert any(event.get("action_name") == "forward" for event in batch)
+            continue
+        assert len(commits) == 1 and commits[0]["payload_len"] == length
+        if level == 2:
+            assert commits[0]["payload_text"] == outcome[0]["committed_to_app"] == glyph
+        else:
+            assert "payload_text" not in commits[0]
+            assert "committed_to_app" not in outcome[0]
+    if level == 1:
+        assert all(word not in text for word in ("здра", "здраве", "здравей"))
+
+
+@pytest.mark.parametrize("level", [1, 2], ids=["structural", "full"])
 def test_native_adapter_explicit_completion_trace_keeps_accept_event(tmp_path, monkeypatch, level):
     from .smartkey_debug import KeystrokeTrace
 

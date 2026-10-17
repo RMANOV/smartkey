@@ -429,10 +429,13 @@ impl MasterLoop {
             && self.core.native_completion_boundary_event(&event);
         if native_boundary
             || (self.core.native_completion_owned()
-                && matches!(event.key, Key::Escape | Key::Up | Key::Down))
+                && matches!(
+                    event.key,
+                    Key::Escape | Key::Up | Key::Down | Key::PageUp | Key::PageDown
+                ))
         {
             let actions = self.core.handle_key(event.clone());
-            if !matches!(event.key, Key::Up | Key::Down) {
+            if !matches!(event.key, Key::Up | Key::Down | Key::PageUp | Key::PageDown) {
                 self.clear_native_completion_tracking();
             }
             if native_boundary {
@@ -5804,7 +5807,16 @@ mod layout_handoff_tests {
 
     #[test]
     fn native_popup_vertical_navigation_waits_for_matching_or_moved_report() {
-        for key in [Key::Up, Key::Down, Key::RawCode(103), Key::RawCode(108)] {
+        for key in [
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::RawCode(103),
+            Key::RawCode(108),
+            Key::RawCode(104),
+            Key::RawCode(109),
+        ] {
             let mut ml = native_popup_fixture();
             let all_learned = ml.core.learned_state_for_test();
             let learned =
@@ -5814,6 +5826,7 @@ mod layout_handoff_tests {
             assert_eq!(ml.handle_key(press(key)), [Action::ForwardKey]);
             assert_eq!(ml.current_word(), "hel");
             assert!(ml.core.native_completion_owned());
+            assert!(ml.predictions().is_empty() && !ml.has_ghost());
             assert_eq!(
                 crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
                 learned
@@ -5831,6 +5844,7 @@ mod layout_handoff_tests {
                 [Action::CommitText("l".into()), Action::HideGhost]
             );
             assert_eq!(ml.current_word(), "hell");
+            assert!(ml.predictions().is_empty() && !ml.has_ghost());
             ml.set_surrounding_text(Some("😀 seed hell".into()), Some(2));
             assert!(ml.reconcile_native_completion_word(true));
             assert!(ml.current_word().is_empty());
@@ -5844,7 +5858,16 @@ mod layout_handoff_tests {
 
     #[test]
     fn native_popup_observed_caret_move_clears_context_like_ordinary_navigation() {
-        for key in [Key::Up, Key::Down, Key::RawCode(103), Key::RawCode(108)] {
+        for key in [
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::RawCode(103),
+            Key::RawCode(108),
+            Key::RawCode(104),
+            Key::RawCode(109),
+        ] {
             let mut deferred = native_popup_fixture();
             let mut direct = native_popup_fixture();
             let learned =

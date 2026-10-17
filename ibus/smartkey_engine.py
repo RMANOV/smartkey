@@ -2315,7 +2315,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             if not key_release:
                 self._refresh_language_choice()
             if tracing:
-                self._trace_key_result(keyval, key_release, actions, result)
+                self._trace_key_result(
+                    keyval, key_release, actions, result,
+                    delivery_only=native_owned_before is not False,
+                )
             # Honor the core's forward/consume decision uniformly.  ``result`` is
             # False exactly when the core emitted a ForwardKey (key not
             # consumed).  A composing-edit backspace already returns no
@@ -2358,7 +2361,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if not key_release:
             self._refresh_language_choice()
         if tracing:
-            self._trace_key_result(keyval, key_release, actions, result)
+            self._trace_key_result(
+                keyval, key_release, actions, result,
+                delivery_only=native_owned_before is not False,
+            )
         # Honor the core's forward/consume decision uniformly (see the keycode
         # path above): return ``result`` rather than swallowing a
         # core-forwarded backspace on mere ``preedit_was_active``.
