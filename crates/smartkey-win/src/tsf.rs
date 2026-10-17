@@ -72,6 +72,44 @@ impl SmartKeyTextService {
         }
     }
 
+    /// Respect the application's TSF eligibility flags before inspecting keys.
+    /// Unset compartments are normal; unavailable or malformed state is not.
+    fn context_accepts_input(context: Option<&ITfContext>) -> bool {
+        let Some(context) = context else {
+            return false;
+        };
+        let allowed = (|| -> Result<bool> {
+            let status = unsafe { context.GetStatus()? };
+            if status.dwDynamicFlags & TF_SD_READONLY != 0 {
+                return Ok(false);
+            }
+            let compartments: ITfCompartmentMgr = context.cast()?;
+            for guid in [
+                GUID_COMPARTMENT_KEYBOARD_DISABLED,
+                GUID_COMPARTMENT_EMPTYCONTEXT,
+            ] {
+                let value = unsafe { compartments.GetCompartment(&guid)?.GetValue()? };
+                if !compartment_allows_input(&value) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        allowed.unwrap_or(false)
+    }
+
+    fn admit_context(&self, context: Option<&ITfContext>) -> bool {
+        if Self::context_accepts_input(context) {
+            return true;
+        }
+        // reset discards pending text; focus_lost would commit and learn it.
+        // Do not dispatch an edit through a missing/disabled/new context.
+        let _ = self.core.borrow_mut().reset();
+        let stale_composition = self.composition.borrow_mut().take();
+        drop(stale_composition);
+        false
+    }
+
     /// Translate a Windows virtual key code to our platform-neutral Key.
     ///
     /// Uses `ToUnicodeEx` for layout-aware character resolution — supports
@@ -82,6 +120,13 @@ impl SmartKeyTextService {
             VK_TAB => return Key::Tab,
             VK_ESCAPE => return Key::Escape,
             VK_RIGHT => return Key::Right,
+            VK_LEFT => return Key::Left,
+            VK_UP => return Key::Up,
+            VK_DOWN => return Key::Down,
+            VK_HOME => return Key::Home,
+            VK_END => return Key::End,
+            VK_PRIOR => return Key::PageUp,
+            VK_NEXT => return Key::PageDown,
             VK_BACK => return Key::Backspace,
             VK_SPACE => return Key::Space,
             VK_RETURN => return Key::Return,
@@ -133,101 +178,66 @@ impl SmartKeyTextService {
 
     /// Execute actions returned by InputMethodCore.
     fn execute_actions(&self, actions: &[Action], context: &ITfContext) -> bool {
-        let mut consumed = false;
+        let consumed = crate::text_contract::consumes_key(actions);
         let cid = self.client_id.get();
-
         for action in actions {
-            match action {
-                Action::ShowGhost(text) => {
+            let op = match action {
+                Action::ForwardKey => continue,
+                Action::ShowGhost(text) | Action::ShowComposing { typed: text, .. } => {
                     let sink: Result<ITfCompositionSink> = unsafe { self.cast() };
-                    match sink {
-                        Ok(comp_sink) => {
-                            let op = EditOp::ShowGhost {
-                                text: text.clone(),
-                                composition: self.composition.clone(),
-                                comp_sink,
-                                ghost_attr_atom: self.ghost_attr_atom.get(),
-                            };
-                            if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                                log::error!("smartkey: ShowGhost failed: {e}");
-                            }
+                    let comp_sink = match sink {
+                        Ok(sink) => sink,
+                        Err(error) => {
+                            log::error!("smartkey: composition sink failed: {error}");
+                            let _ = self.core.borrow_mut().reset();
+                            return true;
                         }
-                        Err(e) => log::error!("smartkey: failed to get composition sink: {e}"),
-                    }
-                    consumed = true;
-                }
-                Action::HideGhost => {
-                    let op = EditOp::HideGhost {
-                        composition: self.composition.clone(),
                     };
-                    if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                        log::error!("smartkey: HideGhost failed: {e}");
-                    }
-                    consumed = true;
-                }
-                Action::CommitText(text) => {
-                    let op = EditOp::CommitText {
-                        text: text.clone(),
-                        composition: self.composition.clone(),
-                    };
-                    if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                        log::error!("smartkey: CommitText failed: {e}");
-                    }
-                    consumed = true;
-                }
-                Action::ForwardKey => {
-                    // Key must reach the application — override any prior consumption.
-                    consumed = false;
-                }
-                Action::ReplaceWord {
-                    replace_len: _,
-                    text,
-                } => {
-                    // LIMITATION: Proper ITfRange-based replacement not yet implemented.
-                    // This falls back to CommitText which replaces the entire composition
-                    // rather than just the last `replace_len` characters. As a result,
-                    // transliteration on Windows may produce incorrect behavior when
-                    // partially through a word. Full implementation requires:
-                    //   1. Get composition range via ITfComposition::GetRange
-                    //   2. Create a sub-range covering the last `replace_len` chars
-                    //   3. Set text on that sub-range via ITfRange::SetText
-                    let op = EditOp::CommitText {
-                        text: text.clone(),
-                        composition: self.composition.clone(),
-                    };
-                    if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                        log::error!("smartkey: ReplaceWord failed: {e}");
-                    }
-                    consumed = true;
-                }
-                Action::ShowComposing {
-                    ref typed,
-                    ref ghost,
-                } => {
-                    // Fallback: treat as regular ghost with full text.
-                    // TODO: implement styled composing for Windows TSF.
-                    let full = format!("{}{}", typed, ghost);
-                    let sink: Result<ITfCompositionSink> = unsafe { self.cast() };
-                    match sink {
-                        Ok(comp_sink) => {
-                            let op = EditOp::ShowGhost {
-                                text: full,
-                                composition: self.composition.clone(),
-                                comp_sink,
-                                ghost_attr_atom: self.ghost_attr_atom.get(),
-                            };
-                            if let Err(e) = edit_session::request_edit_session(context, cid, op) {
-                                log::error!("smartkey: ShowComposing failed: {e}");
-                            }
+                    let (full, typed_units) = match action {
+                        Action::ShowComposing { typed, ghost } => {
+                            (format!("{typed}{ghost}"), typed.encode_utf16().count())
                         }
-                        Err(e) => log::error!("smartkey: failed to get composition sink: {e}"),
+                        _ => (text.clone(), 0),
+                    };
+                    EditOp::ShowGhost {
+                        text: full,
+                        typed_units,
+                        composition: self.composition.clone(),
+                        comp_sink,
+                        ghost_attr_atom: self.ghost_attr_atom.get(),
                     }
-                    consumed = true;
                 }
+                Action::HideGhost => EditOp::HideGhost {
+                    composition: self.composition.clone(),
+                },
+                Action::CommitText(text) => EditOp::CommitText {
+                    text: text.clone(),
+                    composition: self.composition.clone(),
+                },
+                Action::ReplaceWord { replace_len, text } => EditOp::ReplaceWord {
+                    replace_len: *replace_len,
+                    text: text.clone(),
+                    composition: self.composition.clone(),
+                },
+            };
+            if let Err(error) = edit_session::request_edit_session(context, cid, op) {
+                log::error!("smartkey: text edit failed; stopping dependent actions: {error}");
+                let _ = self.core.borrow_mut().reset();
+                // Some edits may already have succeeded. Replaying the raw key can
+                // duplicate committed text, so do not forward a partially applied batch.
+                return true;
             }
         }
         consumed
     }
+}
+
+fn compartment_allows_input(value: &VARIANT) -> bool {
+    // The TSF compartments are VT_I4 flags. Do not coerce strings or booleans.
+    const VT_I4: u16 = 3;
+    value.is_empty()
+        || (unsafe { value.as_raw().Anonymous.Anonymous.vt } == VT_I4
+            && i32::try_from(value).is_ok_and(|flag| flag == 0))
 }
 
 // -- ITfTextInputProcessor implementation (base trait: Activate + Deactivate) --
@@ -331,37 +341,26 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
 
     fn OnTestKeyDown(
         &self,
-        _pic: Option<&ITfContext>,
+        pic: Option<&ITfContext>,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
+        if !self.admit_context(pic) {
+            return Ok(BOOL::from(false));
+        }
         let scan_code = ((lparam.0 >> 16) & 0xFF) as u32;
         let key = SmartKeyTextService::vk_to_key(wparam.0 as u32, scan_code);
         let core = self.core.borrow();
 
-        if !core.is_enabled() {
-            // Only claim Super+Escape (kill switch to re-enable).
-            if matches!(key, Key::Escape)
-                && SmartKeyTextService::get_modifiers().contains(Modifiers::SUPER)
-            {
-                return Ok(BOOL::from(true));
-            }
-            return Ok(BOOL::from(false));
-        }
-
-        let has_ghost = core.has_ghost();
-        let should_claim = match &key {
-            Key::Tab | Key::Right | Key::Escape => has_ghost,
-            Key::Left
-            | Key::Up
-            | Key::Down
-            | Key::Home
-            | Key::End
-            | Key::PageUp
-            | Key::PageDown => false,
-            Key::Space | Key::Return | Key::Backspace | Key::Char(_) | Key::RawCode(_) => true,
-            Key::Other(_) => false,
-        };
+        let pending = core.has_ghost()
+            || !core.current_word().is_empty()
+            || self.composition.borrow().is_some();
+        let should_claim = crate::text_contract::claims_key(
+            &key,
+            SmartKeyTextService::get_modifiers(),
+            core.is_enabled(),
+            pending,
+        );
         Ok(BOOL::from(should_claim))
     }
 
@@ -375,6 +374,9 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
     }
 
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
+        if !self.admit_context(pic) {
+            return Ok(BOOL::from(false));
+        }
         let vk = wparam.0 as u32;
         let scan_code = ((lparam.0 >> 16) & 0xFF) as u32;
         let key = SmartKeyTextService::vk_to_key(vk, scan_code);
@@ -425,11 +427,50 @@ impl ITfCompositionSink_Impl for SmartKeyTextService_Impl {
     fn OnCompositionTerminated(
         &self,
         _ecwrite: u32,
-        _pcomposition: Option<&ITfComposition>,
+        pcomposition: Option<&ITfComposition>,
     ) -> Result<()> {
-        // External termination (e.g. application or another TIP ended our composition).
-        // Clean up our state to stay in sync.
-        *self.composition.borrow_mut() = None;
+        let matches_active = {
+            let active = self.composition.borrow();
+            active
+                .as_ref()
+                .is_some_and(|current| Some(current) == pcomposition)
+        };
+        if matches_active {
+            self.composition.borrow_mut().take();
+            // An external termination finalized the range; discard stale predictions.
+            // Own Hide/Commit removes the slot before its termination callback.
+            let _ = self.core.borrow_mut().reset();
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn unset_and_zero_compartments_allow_input_but_other_values_do_not() {
+        assert!(compartment_allows_input(&VARIANT::new()));
+        assert!(compartment_allows_input(&VARIANT::from(0i32)));
+        assert!(!compartment_allows_input(&VARIANT::from(1i32)));
+        assert!(!compartment_allows_input(&VARIANT::from(-1i32)));
+        assert!(!compartment_allows_input(&VARIANT::from(false)));
+        assert!(!compartment_allows_input(&VARIANT::from("0")));
+    }
+
+    #[test]
+    fn missing_context_neither_claims_nor_feeds_a_key_and_discards_pending_text() {
+        let service = windows_core::ComObject::new(SmartKeyTextService::new());
+        let sink: ITfKeyEventSink = service.to_interface();
+        let _ = service.core.borrow_mut().handle_key(KeyEvent {
+            key: Key::Char('q'),
+            modifiers: Modifiers::empty(),
+        });
+        assert_eq!(service.core.borrow().current_word(), "q");
+        assert!(!unsafe { sink.OnTestKeyDown(None, WPARAM(0x41), LPARAM(0)).unwrap() }.as_bool());
+        assert!(service.core.borrow().current_word().is_empty());
+        assert!(!unsafe { sink.OnKeyDown(None, WPARAM(0x41), LPARAM(0)).unwrap() }.as_bool());
+        assert!(service.core.borrow().current_word().is_empty());
     }
 }
