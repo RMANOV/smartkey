@@ -88,6 +88,9 @@ class FakeO1Core:
     def reconcile_native_completion_word(self, caret_collapsed=False):
         raise AssertionError("startup must not reconcile text")
 
+    def native_completion_owned(self) -> bool:
+        return False
+
 
 class PreparingO1Core(FakeO1Core):
     """New-native fake that records startup cache preparation."""
@@ -753,6 +756,9 @@ def test_engine_init_starts_o1_only_after_corpus_load(
         def reconcile_native_completion_word(self, caret_collapsed=False):
             raise AssertionError("startup must not reconcile text")
 
+        def native_completion_owned(self) -> bool:
+            return False
+
         def load_personal(self):
             assert self.external_rewrite_supported is False
             self.calls.append("personal")
@@ -821,6 +827,9 @@ def test_engine_init_keeps_legacy_o1_snapshot_api_collector_active(tmp_path, mon
 
         def reconcile_native_completion_word(self, caret_collapsed=False):
             raise AssertionError("startup must not reconcile text")
+
+        def native_completion_owned(self) -> bool:
+            return False
 
         def load_personal(self):
             assert self.external_rewrite_supported is False

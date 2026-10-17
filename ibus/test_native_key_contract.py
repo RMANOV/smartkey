@@ -225,6 +225,47 @@ def test_native_adapter_native_word_survives_nonediting_callbacks(monkeypatch, k
 
 
 @pytest.mark.parametrize("keycode", [57, 0], ids=["raw", "keyval"])
+@pytest.mark.parametrize("boundary", [False, True], ids=["in-flight", "resolved"])
+def test_native_adapter_handoff_content_type_marker(monkeypatch, keycode, boundary):
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    engine.do_set_content_type(0, 0)
+    _adapter_owned_prefix(engine, rec)
+    assert engine.do_process_key_event(0x20, keycode, 4) is False
+    assert engine.do_process_key_event(0x20, keycode, 4) is False
+    assert engine._core.native_completion_owned() is True
+    if boundary:
+        assert engine.do_process_key_event(0x20, 57, 0) is False
+    assert engine._composition_in_flight() is (not boundary)
+    assert bool(engine._keys_since_content_type) is (not boundary)
+
+    # A new ordinary field must discard the retained old word; a completed
+    # native token must not leave a false mid-composition transition behind.
+    engine.do_set_content_type(1, 0)
+    assert engine._sensitive is (not boundary)
+    assert engine._core.current_word() == ""
+    assert engine._core.native_completion_owned() is False
+    assert engine._keys_since_content_type == 0
+    assert rec.commits == ["здра"]
+    assert engine.do_process_key_event(ord("z"), 44, 0) is True
+    assert engine._core.current_word() == "з"
+    assert engine._core.native_completion_owned() is False
+    assert rec.commits == ["здра"]
+    assert rec.preedits[-1][1] is True
+
+
+@pytest.mark.parametrize("keycode", [57, 0], ids=["raw", "keyval"])
+def test_native_adapter_empty_handoff_has_no_content_type_marker(monkeypatch, keycode):
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    engine.do_set_content_type(0, 0)
+    assert engine.do_process_key_event(0x20, keycode, 4) is False
+    assert engine._composition_in_flight() is False
+    engine.do_set_content_type(1, 0)
+    assert engine._sensitive is False
+    assert engine._keys_since_content_type == 0
+    assert rec.commits == []
+
+
+@pytest.mark.parametrize("keycode", [57, 0], ids=["raw", "keyval"])
 def test_native_adapter_completion_handoff_delivers_prefix_without_learning(
     tmp_path, monkeypatch, keycode,
 ):
@@ -264,7 +305,7 @@ def test_native_adapter_completion_handoff_delivers_prefix_without_learning(
         assert engine._active_prediction is None
         assert engine._surrounding_text is None
         assert engine._surrounding_cursor_pos is None
-        assert engine._keys_since_content_type == 0
+        assert engine._keys_since_content_type > 0
         assert collector._pending_seq is None
         assert outcomes == [], "delivery is neither prediction acceptance nor rejection"
         # Repeats, release, then ordinary Space must not recommit or lazily
@@ -273,6 +314,7 @@ def test_native_adapter_completion_handoff_delivers_prefix_without_learning(
         assert engine.do_process_key_event(0x20, keycode, 4) is False
         assert engine.do_process_key_event(0x20, keycode, 4 | RELEASE) is False
         assert engine.do_process_key_event(0x20, keycode, 0) is False
+        assert engine._keys_since_content_type == 0
         assert rec.commits == ["здра"]
         assert rec.forwarded_keys == []
         engine._core.export_personal(str(tmp_path / "after.json"))

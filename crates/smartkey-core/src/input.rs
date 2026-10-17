@@ -561,6 +561,17 @@ enum SentenceBoundaryHint {
 }
 
 impl SentenceBoundaryHint {
+    fn after_forwarded_key(key: &Key) -> Self {
+        match key {
+            Key::Return => Self::SentenceStart {
+                spaces: 0,
+                tail_count: 0,
+            },
+            Key::Char('.' | '!' | '?') => Self::AwaitingWhitespace { tail_count: 0 },
+            _ => Self::None,
+        }
+    }
+
     fn is_sentence_start(self) -> bool {
         matches!(self, Self::SentenceStart { .. })
     }
@@ -959,7 +970,12 @@ impl InputMethodCore {
             // The forwarded boundary may accept a different native candidate.
             // Its resulting client word is not observable before delivery.
             if self.native_completion_boundary_event(&event) {
+                let key = self
+                    .native_completion_character(&event)
+                    .map_or_else(|| event.key.clone(), Key::Char);
+                let next_boundary = SentenceBoundaryHint::after_forwarded_key(&key);
                 let mut actions = self.reset();
+                self.sentence_boundary = next_boundary;
                 actions.push(Action::ForwardKey);
                 return actions;
             }
@@ -1262,10 +1278,7 @@ impl InputMethodCore {
                         None
                     };
                 let next_boundary = if event.key == Key::Return {
-                    SentenceBoundaryHint::SentenceStart {
-                        spaces: 0,
-                        tail_count: 0,
-                    }
+                    SentenceBoundaryHint::after_forwarded_key(&event.key)
                 } else if self.current_word.is_empty() {
                     match self.sentence_boundary {
                         SentenceBoundaryHint::AwaitingWhitespace { tail_count } => {
@@ -1479,7 +1492,7 @@ impl InputMethodCore {
                     // terminates; punctuation never enters lexical learning.
                     if matches!(ch, '.' | '!' | '?') {
                         self.sentence_boundary =
-                            SentenceBoundaryHint::AwaitingWhitespace { tail_count: 0 };
+                            SentenceBoundaryHint::after_forwarded_key(&Key::Char(ch));
                     }
                     actions.push(Action::ForwardKey);
                     return actions;
@@ -1870,8 +1883,14 @@ impl InputMethodCore {
     /// Resolve raw glyphs in the retained delivery layout so Bulgarian letters
     /// on physical bracket keys remain refinements rather than boundaries.
     pub(crate) fn native_completion_boundary_event(&self, event: &KeyEvent) -> bool {
-        let character = match event.key {
-            Key::Tab | Key::Return | Key::Space => return true,
+        matches!(event.key, Key::Tab | Key::Return | Key::Space)
+            || self
+                .native_completion_character(event)
+                .is_some_and(|ch| !ch.is_alphabetic())
+    }
+
+    fn native_completion_character(&self, event: &KeyEvent) -> Option<char> {
+        match event.key {
             Key::Char(ch) => Some(ch),
             Key::RawCode(code) => keymap::scancode_to_both_with_caps(
                 code,
@@ -1896,8 +1915,7 @@ impl InputMethodCore {
                 }
             }),
             _ => None,
-        };
-        character.is_some_and(|ch| !ch.is_alphabetic())
+        }
     }
 
     #[cfg(test)]
@@ -10034,6 +10052,133 @@ mod layout_handoff_tests {
             assert_eq!(core.engine.learned_state_for_test(), learned);
             assert_eq!(self::metrics(&core), metrics);
             assert!(core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    fn sentence_boundary_events() -> [(KeyEvent, bool); 8] {
+        [
+            (press(Key::Return), false),
+            (press(Key::RawCode(28)), false),
+            (press(Key::Char('.')), true),
+            (press(Key::Char('!')), true),
+            (press(Key::Char('?')), true),
+            (press(Key::RawCode(52)), true),
+            (
+                KeyEvent {
+                    key: Key::RawCode(2),
+                    modifiers: Modifiers::SHIFT,
+                },
+                true,
+            ),
+            (
+                KeyEvent {
+                    key: Key::RawCode(53),
+                    modifiers: Modifiers::SHIFT,
+                },
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn native_sentence_boundaries_case_next_word_without_learning() {
+        for (event, needs_space) in sentence_boundary_events() {
+            let mut core = seeded_core();
+            core.load_word_lang("world", 1_000_000, LangId::En);
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(
+                core.handle_key(event.clone()),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            assert!(core.current_word().is_empty());
+            if needs_space {
+                core.handle_key(press(Key::Space));
+            }
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+            assert!(core.take_commit_learning().words.is_empty());
+            core.handle_key(press(Key::RawCode(17)));
+            assert_eq!(
+                core.predictions().first().map(|p| p.word.as_str()),
+                Some("World"),
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_sentence_boundaries_keep_casing_and_one_word_commit() {
+        for (event, needs_space) in sentence_boundary_events() {
+            let mut core = seeded_core();
+            core.load_word_lang("world", 1_000_000, LangId::En);
+            raw(&mut core, "hel");
+            let before = core.metrics().summary().total_commits;
+            let actions = core.handle_key(event.clone());
+            assert!(actions.contains(&Action::CommitText("hel".into())));
+            assert!(actions.contains(&Action::ForwardKey));
+            assert_eq!(core.take_commit_learning().words.len(), 1);
+            if needs_space {
+                core.handle_key(press(Key::Space));
+            }
+            assert_eq!(core.metrics().summary().total_commits, before + 1);
+            core.handle_key(press(Key::RawCode(17)));
+            assert_eq!(
+                core.predictions().first().map(|p| p.word.as_str()),
+                Some("World"),
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonsentence_native_boundaries_and_ordinary_controls_keep_lowercase() {
+        for native in [true, false] {
+            for (key, accepts) in [
+                (Key::Space, false),
+                (Key::RawCode(57), false),
+                (Key::Tab, true),
+                (Key::RawCode(15), true),
+                (Key::Char(','), false),
+                (Key::RawCode(51), false),
+            ] {
+                let mut core = seeded_core();
+                core.load_word_lang("world", 1_000_000, LangId::En);
+                raw(&mut core, "hel");
+                if native {
+                    core.handoff_preedit_for_native_completion();
+                }
+                let learned = core.engine.learned_state_for_test();
+                let before = core.metrics().summary().total_commits;
+                let accepted = core.metrics().summary().accepted_predictions;
+                let actions = core.handle_key(press(key.clone()));
+                if native {
+                    assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+                    assert_eq!(core.engine.learned_state_for_test(), learned);
+                    assert!(core.take_commit_learning().words.is_empty());
+                }
+                assert_eq!(
+                    core.metrics().summary().total_commits,
+                    before + u64::from(!native)
+                );
+                assert_eq!(
+                    core.metrics().summary().accepted_predictions,
+                    accepted + u64::from(!native && accepts)
+                );
+                core.handle_key(press(Key::Space));
+                assert_eq!(
+                    core.metrics().summary().total_commits,
+                    before + u64::from(!native)
+                );
+                core.handle_key(press(Key::RawCode(17)));
+                assert_eq!(
+                    core.predictions().first().map(|p| p.word.as_str()),
+                    Some("world"),
+                    "{key:?}, native={native}"
+                );
+            }
         }
     }
 

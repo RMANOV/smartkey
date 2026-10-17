@@ -38,6 +38,9 @@ def test_constructor_disables_external_rewrite_before_profile_or_corpus(monkeypa
         def reconcile_native_completion_word(self, caret_collapsed=False):
             raise AssertionError("startup must not reconcile text")
 
+        def native_completion_owned(self):
+            return False
+
         def set_external_rewrite_supported(self, supported):
             events.append(("external_rewrite", supported))
 
@@ -120,7 +123,11 @@ def test_surrounding_report_preserves_known_empty_and_missing_distinction(text, 
     assert engine._surrounding_cursor_pos == cursor
 
 
-@pytest.mark.parametrize("missing", ["handoff_preedit_for_native_completion", "reconcile_native_completion_word"])
+@pytest.mark.parametrize("missing", [
+    "handoff_preedit_for_native_completion",
+    "reconcile_native_completion_word",
+    "native_completion_owned",
+])
 @pytest.mark.parametrize("noncallable", [False, True])
 def test_incompatible_native_completion_refuses_startup_before_profile(monkeypatch, missing, noncallable):
     class Core:
@@ -131,9 +138,13 @@ def test_incompatible_native_completion_refuses_startup_before_profile(monkeypat
             raise AssertionError("startup must not deliver text")
 
     core = Core()
-    for api in ("handoff_preedit_for_native_completion", "reconcile_native_completion_word"):
+    for api, stub in (
+        ("handoff_preedit_for_native_completion", lambda: None),
+        ("reconcile_native_completion_word", lambda *args: None),
+        ("native_completion_owned", lambda: False),
+    ):
         if api != missing:
-            setattr(core, api, lambda *args: None)
+            setattr(core, api, stub)
     if noncallable:
         setattr(core, missing, None)
     events = _constructor_fixture(monkeypatch, core)

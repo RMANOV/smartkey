@@ -2246,9 +2246,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 elif not self._core_current_word():
                     self._clear_native_report_wait()
                 self._clear_language_choice()
+                # Let logical token resolution clear the content-type marker;
+                # handing text to the client still leaves this word in flight.
                 self._execute_actions(actions)
                 self._active_prediction = None
-                self._keys_since_content_type = 0
                 if (owned_before is not True
                         and getattr(self, "_surrounding_report_generation", 0) == generation):
                     self._sync_surrounding_text(None, None)

@@ -425,13 +425,20 @@ impl MasterLoop {
             return self.core.handle_key(event);
         }
 
-        if self.core.native_completion_owned()
-            && (self.core.native_completion_boundary_event(&event)
-                || matches!(event.key, Key::Escape | Key::Up | Key::Down))
+        let native_boundary = self.core.native_completion_owned()
+            && self.core.native_completion_boundary_event(&event);
+        if native_boundary
+            || (self.core.native_completion_owned()
+                && matches!(event.key, Key::Escape | Key::Up | Key::Down))
         {
             let actions = self.core.handle_key(event.clone());
             if !matches!(event.key, Key::Up | Key::Down) {
                 self.clear_native_completion_tracking();
+            }
+            if native_boundary {
+                // The previous presentation scope was retired without a word
+                // commit. Bind only this known forwarded delimiter's delivery.
+                self.record_sentence_delivery(&event, &actions, false, false, false, false);
             }
             // These keys operate the client's popup, not a SmartKey candidate.
             // In particular, Escape must not arm false ABANDON feedback.
@@ -5672,6 +5679,69 @@ mod layout_handoff_tests {
         ml.set_surrounding_text(Some("😀 seed hel".into()), Some(10));
         assert!(!ml.reconcile_native_completion_word(true));
         ml
+    }
+
+    #[test]
+    fn native_sentence_boundaries_follow_actual_forwarded_delivery_without_learning() {
+        for (event, suffix, needs_space) in [
+            (press(Key::Return), "\n", false),
+            (press(Key::RawCode(28)), "\n", false),
+            (press(Key::Char('.')), ".", true),
+            (press(Key::Char('!')), "!", true),
+            (press(Key::Char('?')), "?", true),
+            (press(Key::RawCode(52)), ".", true),
+            (
+                KeyEvent {
+                    key: Key::RawCode(2),
+                    modifiers: Modifiers::SHIFT,
+                },
+                "!",
+                true,
+            ),
+            (
+                KeyEvent {
+                    key: Key::RawCode(53),
+                    modifiers: Modifiers::SHIFT,
+                },
+                "?",
+                true,
+            ),
+        ] {
+            for inserted in [true, false] {
+                let mut ml = native_popup_fixture();
+                ml.load_word_lang("world", 1_000_000, LangId::En);
+                let learned = ml.core.learned_state_for_test();
+                let light = serde_json::to_value(&ml.light_profile).unwrap();
+                let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+                assert_eq!(
+                    ml.handle_key(event.clone()),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                assert!(!ml.native_completion_owned());
+                assert!(ml.current_word().is_empty());
+                // The native word itself was never observed. A fresh report
+                // can confirm or retract only the known delimiter's delivery.
+                let mut document = format!("😀 seed hello{}", if inserted { suffix } else { "" });
+                ml.set_surrounding_text(Some(document.clone()), Some(document.chars().count()));
+                if needs_space {
+                    ml.handle_key(press(Key::Space));
+                    document.push(' ');
+                    ml.set_surrounding_text(Some(document.clone()), Some(document.chars().count()));
+                }
+                assert_eq!(ml.core.learned_state_for_test(), learned);
+                assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+                assert_eq!(
+                    serde_json::to_value(ml.metrics().summary()).unwrap(),
+                    metrics
+                );
+                ml.handle_key(press(Key::RawCode(17)));
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(if inserted { "World" } else { "world" }),
+                    "{event:?}, inserted={inserted}"
+                );
+            }
+        }
     }
 
     #[test]
