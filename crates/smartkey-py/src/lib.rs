@@ -211,6 +211,11 @@ impl PyInputMethodCore {
         self.inner.reconcile_native_completion_word(caret_collapsed)
     }
 
+    /// Whether the client currently owns completion of the delivered token.
+    fn native_completion_owned(&self) -> bool {
+        self.inner.native_completion_owned()
+    }
+
     /// Update surrounding text from the platform adapter.
     fn set_surrounding_text(&mut self, text: Option<&str>, cursor_pos: Option<usize>) {
         self.inner

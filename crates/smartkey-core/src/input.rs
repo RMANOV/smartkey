@@ -956,14 +956,14 @@ impl InputMethodCore {
         }
 
         if self.native_completion_owned {
+            // The forwarded boundary may accept a different native candidate.
+            // Its resulting client word is not observable before delivery.
+            if self.native_completion_boundary_event(&event) {
+                let mut actions = self.reset();
+                actions.push(Action::ForwardKey);
+                return actions;
+            }
             match event.key {
-                // The client may accept a different word. Retire this prefix
-                // without treating that unobserved native outcome as learning.
-                Key::Tab | Key::Return => {
-                    let mut actions = self.reset();
-                    actions.push(Action::ForwardKey);
-                    return actions;
-                }
                 // Native popup navigation does not imply a moved text caret.
                 // A later surrounding report reconciles any actual movement.
                 Key::Up | Key::Down => return vec![Action::ForwardKey],
@@ -1864,6 +1864,45 @@ impl InputMethodCore {
 
     pub(crate) fn native_completion_owned(&self) -> bool {
         self.native_completion_owned
+    }
+
+    /// A client-owned boundary cannot attest the final native candidate.
+    /// Resolve raw glyphs in the retained delivery layout so Bulgarian letters
+    /// on physical bracket keys remain refinements rather than boundaries.
+    pub(crate) fn native_completion_boundary_event(&self, event: &KeyEvent) -> bool {
+        let character = match event.key {
+            Key::Tab | Key::Return | Key::Space => return true,
+            Key::Char(ch) => Some(ch),
+            Key::RawCode(code) => keymap::scancode_to_both_with_caps(
+                code,
+                event.modifiers.contains(Modifiers::SHIFT),
+                event.modifiers.contains(Modifiers::CAPS_LOCK),
+            )
+            .map(|(en, bg)| {
+                // Match the dispatcher's EN resolution when dual input is off,
+                // before its later legacy transliteration can process a glyph.
+                if !self.config.dual_buffer.enabled {
+                    return en;
+                }
+                match self
+                    .word_delivery_layout
+                    .unwrap_or(if self.transliteration_active {
+                        keymap::Layout::Bg
+                    } else {
+                        keymap::Layout::En
+                    }) {
+                    keymap::Layout::En => en,
+                    keymap::Layout::Bg => bg,
+                }
+            }),
+            _ => None,
+        };
+        character.is_some_and(|ch| !ch.is_alphabetic())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn learned_state_for_test(&self) -> crate::ensemble::LearnedStateSnapshot {
+        self.engine.learned_state_for_test()
     }
 
     /// Deliver owned preedit before handing input to a manually selected layout.
@@ -9919,7 +9958,7 @@ mod layout_handoff_tests {
     }
 
     #[test]
-    fn native_handoff_punctuation_and_digits_end_the_delivered_token() {
+    fn native_handoff_punctuation_and_digits_retire_the_unobserved_client_outcome() {
         for delimiter in [
             Key::Char('.'),
             Key::RawCode(52),
@@ -9934,7 +9973,9 @@ mod layout_handoff_tests {
             assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
             assert!(core.current_word().is_empty());
             assert!(!core.native_completion_owned());
-            assert_eq!(core.metrics().summary().total_commits, before + 1);
+            // Forwarding may replace the prefix with a native candidate; the
+            // old immediate +1 trained an outcome the client had not produced.
+            assert_eq!(core.metrics().summary().total_commits, before);
             let actions = core.handle_key(press(Key::RawCode(35)));
             assert!(core.debug_state().0);
             assert!(actions
@@ -9943,6 +9984,191 @@ mod layout_handoff_tests {
             assert!(!actions
                 .iter()
                 .any(|action| matches!(action, Action::CommitText(_))));
+        }
+    }
+
+    #[test]
+    fn native_popup_printable_commit_characters_preserve_all_learned_state() {
+        for event in [
+            press(Key::Char('(')),
+            press(Key::Char('.')),
+            press(Key::Char('1')),
+            press(Key::Char('_')),
+            press(Key::RawCode(52)),
+            press(Key::RawCode(2)),
+            press(Key::RawCode(26)),
+            KeyEvent {
+                key: Key::RawCode(10),
+                modifiers: Modifiers::SHIFT,
+            },
+        ] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            let actions = core.handle_key(event.clone());
+            assert_eq!(core.engine.learned_state_for_test(), learned, "{event:?}");
+            assert_eq!(self::metrics(&core), metrics, "{event:?}");
+            assert!(core.take_commit_learning().words.is_empty(), "{event:?}");
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert!(core.current_word().is_empty());
+            assert!(!core.native_completion_owned());
+            core.handle_key(press(Key::Space));
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+        }
+    }
+
+    #[test]
+    fn native_popup_space_preserves_all_learned_state() {
+        for key in [Key::Space, Key::RawCode(57)] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(
+                core.handle_key(press(key)),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+            assert!(core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    fn legacy_transliterating_core(dual_enabled: bool) -> InputMethodCore {
+        let mut config = InputConfig::default();
+        config.dual_buffer.enabled = dual_enabled;
+        let mut core = InputMethodCore::new(config);
+        core.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        core.handle_key(press(Key::Char('z')));
+        assert!(core
+            .handle_key(press(Key::Char('d')))
+            .contains(&Action::ReplaceWord {
+                replace_len: 1,
+                text: "зд".into(),
+            }));
+        assert_eq!(core.current_word(), "зд");
+        assert!(core.transliteration_active);
+        assert!(core.dual_buffer.is_none());
+        core
+    }
+
+    #[test]
+    fn native_popup_legacy_raw_brackets_retire_when_dual_buffer_disabled() {
+        for code in [26, 27, 41, 43] {
+            for modifiers in [
+                Modifiers::empty(),
+                Modifiers::SHIFT,
+                Modifiers::CAPS_LOCK,
+                Modifiers::SHIFT | Modifiers::CAPS_LOCK,
+            ] {
+                let mut core = legacy_transliterating_core(false);
+                assert_eq!(
+                    core.handoff_preedit_for_native_completion(),
+                    [Action::HideGhost]
+                );
+                let learned = core.engine.learned_state_for_test();
+                let metrics = metrics(&core);
+                let actions = core.handle_key(KeyEvent {
+                    key: Key::RawCode(code),
+                    modifiers,
+                });
+                assert_eq!(core.engine.learned_state_for_test(), learned);
+                assert_eq!(self::metrics(&core), metrics);
+                assert!(core.take_commit_learning().words.is_empty());
+                assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+                assert!(core.current_word().is_empty());
+                assert!(!core.native_completion_owned());
+            }
+        }
+    }
+
+    #[test]
+    fn native_popup_legacy_raw_brackets_refine_when_dual_buffer_enabled() {
+        for (code, lower, upper) in [
+            (26, 'ш', 'Ш'),
+            (27, 'щ', 'Щ'),
+            (41, 'ч', 'Ч'),
+            (43, 'ю', 'Ю'),
+        ] {
+            for (modifiers, glyph) in [
+                (Modifiers::empty(), lower),
+                (Modifiers::SHIFT, upper),
+                (Modifiers::CAPS_LOCK, upper),
+                (Modifiers::SHIFT | Modifiers::CAPS_LOCK, lower),
+            ] {
+                let mut core = legacy_transliterating_core(true);
+                core.handoff_preedit_for_native_completion();
+                let learned = core.engine.learned_state_for_test();
+                let metrics = metrics(&core);
+                let actions = core.handle_key(KeyEvent {
+                    key: Key::RawCode(code),
+                    modifiers,
+                });
+                assert_eq!(
+                    actions,
+                    [Action::CommitText(glyph.into()), Action::HideGhost]
+                );
+                assert_eq!(core.current_word(), format!("зд{glyph}"));
+                assert!(core.native_completion_owned());
+                assert_eq!(core.engine.learned_state_for_test(), learned);
+                assert_eq!(self::metrics(&core), metrics);
+                assert!(core.take_commit_learning().words.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_legacy_raw_brackets_preserve_transliteration_in_both_configurations() {
+        for dual_enabled in [false, true] {
+            for (code, glyph) in [(26, 'ш'), (27, 'щ'), (41, 'ч'), (43, 'ю')] {
+                let mut core = legacy_transliterating_core(dual_enabled);
+                let learned = core.engine.learned_state_for_test();
+                let commits_before = core.metrics().summary().total_commits;
+                let accepts_before = core.metrics().summary().accepted_predictions;
+                let actions = core.handle_key(press(Key::RawCode(code)));
+                assert!(actions.contains(&Action::CommitText(glyph.into())));
+                assert!(!actions.contains(&Action::ForwardKey));
+                assert_eq!(core.current_word(), format!("зд{glyph}"));
+                assert!(!core.native_completion_owned());
+                assert_eq!(core.engine.learned_state_for_test(), learned);
+                // Ordinary predictions add latency samples, but refinement is
+                // still not a learned commit or accepted prediction.
+                assert_eq!(core.metrics().summary().total_commits, commits_before);
+                assert_eq!(
+                    core.metrics().summary().accepted_predictions,
+                    accepts_before
+                );
+                assert!(core.take_commit_learning().words.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_composing_boundaries_still_learn_delivered_word_once() {
+        for key in [
+            Key::Space,
+            Key::RawCode(57),
+            Key::Char('.'),
+            Key::RawCode(52),
+        ] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            let learned = core.engine.learned_state_for_test();
+            let before = core.metrics().summary().total_commits;
+            let actions = core.handle_key(press(key));
+            assert!(actions.contains(&Action::CommitText("hel".into())));
+            assert!(actions.contains(&Action::ForwardKey));
+            assert_eq!(core.metrics().summary().total_commits, before + 1);
+            assert_ne!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(core.take_commit_learning().words.len(), 1);
+            let learned = core.engine.learned_state_for_test();
+            core.handle_key(press(Key::Space));
+            assert_eq!(core.metrics().summary().total_commits, before + 1);
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert!(core.take_commit_learning().words.is_empty());
         }
     }
 

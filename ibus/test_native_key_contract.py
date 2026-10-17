@@ -287,6 +287,51 @@ def test_native_adapter_completion_handoff_delivers_prefix_without_learning(
         assert conn.execute("SELECT outcome FROM events ORDER BY id").fetchall() == [(None,)]
 
 
+@pytest.mark.parametrize("native,keyval,keycode", [
+    (True, 0xFF09, 15), (True, 0xFF0D, 28),
+    (True, 0xFF09, 0), (True, 0xFF0D, 0),
+    (True, 0x20, 57), (True, ord("("), 0), (True, ord("1"), 0),
+    (False, 0x20, 57), (False, 0x20, 0),
+], ids=["native-tab-raw", "native-return-raw", "native-tab-semantic",
+        "native-return-semantic", "native-space", "native-punctuation", "native-digit",
+        "ordinary-space-raw", "ordinary-space-semantic"])
+def test_native_adapter_o1_does_not_attribute_client_acceptance_to_prefix(
+    tmp_path, monkeypatch, native, keyval, keycode,
+):
+    import sqlite3
+
+    from .o1_shim import O1Collector
+
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+    if native:
+        assert engine.do_process_key_event(0x20, 57, 4) is False
+        engine.do_set_surrounding_text("здра", 4, 4)
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text('{"unigrams":{"synthetic":1}}')
+    collector = O1Collector(
+        engine._core, {"data_dir": str(tmp_path / "o1")}, [str(corpus)], "test",
+    )
+    engine._o1 = collector
+    collector.on_word_commit("synthetic")
+    assert collector._pending_seq is not None
+    try:
+        engine.do_process_key_event(keyval, keycode, 0)
+        assert engine._core.current_word() == ""
+        if native:
+            assert rec.commits == ["здра"]
+            assert collector._pending_seq is None, "unknown native outcome must be abandoned"
+        else:
+            assert collector._pending_seq is not None, "ordinary typed boundary still records a word"
+    finally:
+        collector.close()
+    with sqlite3.connect(collector._db_path) as conn:
+        rows = conn.execute("SELECT outcome FROM events ORDER BY id").fetchall()
+    assert len(rows) == (1 if native else 2)
+    if native:
+        assert rows == [(None,)], "the client-selected word has not been observed"
+
+
 def test_native_adapter_completion_handoff_does_not_repeat_already_delivered_semantic_text(monkeypatch):
     engine, rec, _ske = _completion_adapter(monkeypatch)
     for key in "hel":
@@ -303,15 +348,16 @@ def test_native_adapter_completion_handoff_does_not_repeat_already_delivered_sem
 @pytest.mark.parametrize("report,expected", [
     (("здра", 4, 4), "здра"),
     (("здрасинтетична", 13, 13), ""),
-    (None, ""),
+    (None, "здра"),
+    ((None, 0, 0), ""),
     (("здра", 4, 0), ""),
     (("здра", 2, 2), ""),
     (("здра ", 5, 5), ""),
-], ids=["matching", "replaced", "missing", "selection", "moved", "boundary"])
+], ids=["matching", "replaced", "no-callback-yet", "unknown-callback", "selection", "moved", "boundary"])
 def test_native_adapter_repeated_completion_reconciles_before_handoff(
     tmp_path, monkeypatch, report, expected,
 ):
-    """A repeat must retire a stale token before forwarding the shortcut."""
+    """A repeat must reconcile newer reports before forwarding the shortcut."""
     engine, rec, _ske = _completion_adapter(monkeypatch)
     _adapter_owned_prefix(engine, rec)
     assert engine.do_process_key_event(0x20, 57, 4) is False
@@ -530,3 +576,321 @@ def test_native_adapter_explicit_completion_trace_keeps_accept_event(tmp_path, m
     assert len(accepted) == 1
     if level == 2:
         assert accepted[0]["committed_text"] == "здравей"
+
+
+# The recorder-based tests above cannot reproduce libibus retaining an older
+# surrounding report after the Python adapter clears its own fields. Keep the
+# real GI cache and actual audited Core together in a fresh child process.
+_GI_NATIVE_COMPLETION_PROBE = r'''
+import hashlib,importlib,json,os,sys
+from pathlib import Path
+import gi
+gi.require_version("IBus","1.0")
+from gi.repository import IBus,Gio
+
+module_root=Path(os.environ["SMARTKEY_NATIVE_MODULE_DIR"]).resolve(strict=True)
+assert not any(name=="smartkey_py" or name.startswith("smartkey_py.") for name in sys.modules)
+sys.path.insert(0,str(module_root))
+native=importlib.import_module("smartkey_py")
+Path(native.__file__).resolve(strict=True).relative_to(module_root)
+extensions=set()
+for name,module in tuple(sys.modules.items()):
+    if name=="smartkey_py" or name.startswith("smartkey_py."):
+        origin=Path(module.__file__).resolve(strict=True)
+        origin.relative_to(module_root)
+        if origin.suffix in {".so",".pyd"}:
+            extensions.add(origin)
+assert len(extensions)==1,extensions
+extension=extensions.pop()
+assert extension==Path(os.environ["SMARTKEY_NATIVE_EXTENSION"]).resolve(strict=True)
+assert hashlib.sha256(extension.read_bytes()).hexdigest()==os.environ["SMARTKEY_NATIVE_EXTENSION_SHA256"]
+assert native.__build_git_sha__==os.environ["SMARTKEY_EXPECT_BUILD_GIT_SHA"]
+assert native.__build_dirty__ is (os.environ["SMARTKEY_EXPECT_BUILD_GIT_DIRTY"]=="1")
+sys.path.insert(0,sys.argv[1])
+from ibus import smartkey_engine as adapter
+assert adapter._HAS_IBUS and adapter._HAS_CORE
+connection=Gio.bus_get_sync(Gio.BusType.SESSION,None)
+
+class NativeCacheProbe(adapter.SmartKeyEngine):
+    __gtype_name__="SmartKeyNativeCompletionCacheProbe"
+    def __init__(self):
+        # Only construction is bypassed: no KDE observer, personal profile or
+        # repository corpus is loaded. Parent GI callback/getter stay intact.
+        IBus.Engine.__init__(self,connection=connection,
+            object_path="/org/freedesktop/IBus/Engine/NativeCacheProbe",active_surrounding_text=True)
+        self._core=native.PyInputMethodCore(json.dumps({
+            "ghost_text_separation_margin":0.0,"use_ppm":False,"use_reranker":False}))
+        self._core.set_external_rewrite_supported(False)
+        if sys.argv[2]!="identifier-omitted-preedit":
+            self._core.load_word("здравей",1000000)
+        self._caps=0
+        self._language_choice_offer=None
+        self._language_choice_selected=None
+        self._language_choice_supported=False
+        self._language_choice_route_available=False
+        self._sensitive=False
+        self._content_type_key=(0,0)
+        self._declared_ordinary=True
+        self._keys_since_content_type=0
+        self._undeclared_bypass_logged=False
+        self._kde_layout=None
+        self._manual_layout_passthrough=False
+        self._preedit_active=False
+        self._preedit_mode=None
+        self._surrounding_text=None
+        self._surrounding_cursor_pos=None
+        self._surrounding_anchor_pos=None
+        self._session_id="private-native-cache"
+        self._prediction_seq=0
+        self._active_prediction=None
+        self._last_composing_typed=""
+        self._trace=None
+        self._o1=None
+        self.commits=[]
+        self.preedits=[]
+        self.forwarded=[]
+    def commit_text(self,text):
+        self.commits.append(text.get_text())
+        # Model a client echo delivered reentrantly during this real adapter
+        # dispatch. Only delivery is recorded; the GI signal and parent cache
+        # are real and retain their native descriptors.
+        if ((scenario=="sync-handoff" and self.commits==["здра"])
+                or (scenario=="sync-refinement" and self.commits==["здра","в"])):
+            value=old+"".join(self.commits)
+            self.emit("set-surrounding-text",IBus.Text.new_from_string(value),len(value),len(value))
+    def update_preedit_text(self,text,cursor,visible):
+        self.preedits.append([text.get_text(),cursor,bool(visible)])
+    def hide_preedit_text(self):
+        self.preedits.append(["",0,False])
+    def forward_key_event(self,keyval,keycode,state):
+        self.forwarded.append([keyval,keycode,state])
+
+engine=NativeCacheProbe()
+def cached():
+    value=engine.get_surrounding_text()
+    assert isinstance(value,tuple) and len(value)==3
+    return [value[0].get_text(),value[1],value[2]]
+def report(text,cursor=None,anchor=None):
+    if cursor is None: cursor=len(text)
+    if anchor is None: anchor=cursor
+    engine.emit("set-surrounding-text",IBus.Text.new_from_string(text),cursor,anchor)
+def step(keyval,keycode,state=0):
+    result=engine.do_process_key_event(keyval,keycode,state)
+    return {"consumed":result,"word":engine._core.current_word(),
+        "commits":list(engine.commits),"preedits":list(engine.preedits[handoff_mark:]),
+        "cache":cached(),"forwarded":list(engine.forwarded),
+        "canonical":[engine._surrounding_text,engine._surrounding_cursor_pos,engine._surrounding_anchor_pos]}
+def learning_snapshot():
+    path=Path(os.environ["SMARTKEY_PHASEA_DATA"])/"native-gi-learning.json"
+    engine._core.export_personal(str(path))
+    profile=json.loads(path.read_text())
+    return {key:profile[key] for key in (
+        "weights","light_profile","corrections","markov_bigrams","markov_trigrams")}|{
+        "cvm_words":profile["cvm"]["words"],"cvm_round":profile["cvm"]["round"]}
+def finish(observed):
+    observed["native"]={"path":str(extension),"sha256":hashlib.sha256(extension.read_bytes()).hexdigest(),
+        "build_git_sha":native.__build_git_sha__,"build_dirty":native.__build_dirty__}
+    observed["private_bus_name"]=connection.get_unique_name()
+    print(json.dumps(observed,ensure_ascii=False))
+
+scenario=sys.argv[2]
+old="synthetic context "
+if scenario=="identifier-omitted-preedit":
+    engine._core.load_word("food",1000000)
+    engine._core.load_word("bar",1000000)
+    for code,key in ((33,"f"),(24,"o"),(24,"o")):
+        assert engine.do_process_key_event(ord(key),code,0) is True
+    assert engine._core.current_word()=="foo"
+    assert engine.do_process_key_event(ord("_"),12,1) is False
+    assert engine.commits==["foo"]
+    # This client excludes the owned preedit from its surrounding report.
+    # The preceding foo boundary is legitimate and lies before the snapshot.
+    report("foo_")
+    for code,key in ((48,"b"),(30,"a")):
+        assert engine.do_process_key_event(ord(key),code,0) is True
+    assert engine._core.current_word()=="ba"
+    preedit_before=list(engine.preedits[-1])
+    assert preedit_before==["bar",2,True],preedit_before
+    before_handoff=cached()
+    learning_before=learning_snapshot()
+    assert engine.do_process_key_event(0x20,57,4) is False
+    assert engine._core.current_word()=="ba"
+    assert engine.commits==["foo","ba"]
+    after_handoff=cached()
+    handoff_mark=len(engine.preedits)
+    report("foo_ba")
+    observed={"before_handoff":before_handoff,"after_handoff":after_handoff,
+        "preedit_before_handoff":preedit_before,"refinement":step(ord("r"),19),
+        "learning_before":learning_before,"learning_after":learning_snapshot()}
+    finish(observed)
+    sys.exit(0)
+if scenario!="never-reported": report(old)
+old_cache=cached()
+for code,key in zip((44,32,19,30),"zdra"):
+    assert engine.do_process_key_event(ord(key),code,0) is True
+assert engine._core.current_word()=="здра"
+assert engine.commits==[]
+before_handoff=cached()
+learning_before=learning_snapshot() if scenario.startswith("sync-") or scenario=="new-empty" else None
+assert engine.do_process_key_event(0x20,57,4) is False
+assert engine.commits==["здра"]
+assert engine._core.current_word()=="здра"
+after_handoff=cached()
+handoff_mark=len(engine.preedits)
+observed={"old_cache":old_cache,"before_handoff":before_handoff,"after_handoff":after_handoff}
+observed["canonical_after_handoff"]=[engine._surrounding_text,engine._surrounding_cursor_pos,engine._surrounding_anchor_pos]
+if scenario=="stale-first":
+    observed["refinement"]=step(ord("w"),17)
+elif scenario=="stale-after-refinement":
+    report(old+"здра")
+    observed["first"]=step(ord("w"),17)
+    report(old+"здрав")
+    observed["second"]=step(ord("w"),17)
+    observed["third"]=step(ord("w"),17)
+elif scenario=="new-mismatch":
+    report("synthetic replacement")
+    observed["next"]=step(0x20,57)
+elif scenario=="never-reported":
+    observed["next"]=step(ord("w"),17)
+elif scenario=="new-empty":
+    report("")
+    observed["next"]=step(ord("w"),17)
+    observed["learning_before"]=learning_before
+    observed["learning_after"]=learning_snapshot()
+elif scenario=="reset":
+    engine.do_reset()
+    observed["next"]=step(ord("z"),44)
+elif scenario in {"sync-handoff","sync-refinement"}:
+    if scenario=="sync-refinement": report(old+"здра")
+    observed["first"]=step(ord("w"),17)
+    observed["second"]=step(ord("w"),17)
+    observed["learning_before"]=learning_before
+    observed["learning_after"]=learning_snapshot()
+else:
+    raise AssertionError(scenario)
+finish(observed)
+'''
+
+
+@pytest.mark.parametrize("scenario", [
+    "stale-first", "stale-after-refinement", "new-mismatch", "never-reported", "reset",
+    "sync-handoff", "sync-refinement", "new-empty", "identifier-omitted-preedit",
+])
+def test_native_adapter_real_gi_cached_report_waits_for_new_callback(tmp_path, scenario):
+    """A cached pre-mutation report must not reopen preedit under a native popup."""
+    from pathlib import Path
+    import shutil
+    import subprocess
+    import sys
+
+    if sys.platform != "linux":
+        pytest.skip("real IBus cache contract is Linux-specific")
+    python = Path("/usr/bin/python3")
+    dbus = shutil.which("dbus-run-session")
+    if not python.exists() or dbus is None:
+        pytest.skip("system Python/private D-Bus launcher unavailable")
+    env = {
+        "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "SMARTKEY_DEBUG": "off",
+        "PYTHONDONTWRITEBYTECODE": "1", "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+    }
+    for name in (
+        "SMARTKEY_NATIVE_MODULE_DIR", "SMARTKEY_NATIVE_EXTENSION", "SMARTKEY_NATIVE_EXTENSION_SHA256",
+        "SMARTKEY_EXPECT_BUILD_GIT_SHA", "SMARTKEY_EXPECT_BUILD_GIT_DIRTY",
+    ):
+        assert name in os.environ, f"audited native child requires {name}"
+        env[name] = os.environ[name]
+    for name in (
+        "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+        "TMPDIR", "SMARTKEY_PHASEA_DATA", "SMARTKEY_DEBUG_DIR",
+    ):
+        path = tmp_path / name.lower()
+        path.mkdir()
+        env[name] = str(path)
+    available = subprocess.run(
+        [str(python), "-I", "-B", "-c",
+         'import gi;gi.require_version("IBus","1.0");from gi.repository import IBus,Gio'],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    if available.returncode:
+        pytest.skip("system IBus GI typelib unavailable")
+    result = subprocess.run(
+        [dbus, "--", str(python), "-I", "-B", "-c", _GI_NATIVE_COMPLETION_PROBE,
+         str(Path(__file__).resolve().parents[1]), scenario],
+        env=env, capture_output=True, text=True, timeout=20,
+    )
+    (tmp_path / "native-gi-child.json").write_text(result.stdout)
+    (tmp_path / "native-gi-child.stderr").write_text(result.stderr)
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == "", result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["native"]["sha256"] == env["SMARTKEY_NATIVE_EXTENSION_SHA256"]
+    assert observed["native"]["build_git_sha"] == env["SMARTKEY_EXPECT_BUILD_GIT_SHA"]
+    assert observed["native"]["build_dirty"] is (env["SMARTKEY_EXPECT_BUILD_GIT_DIRTY"] == "1")
+    assert observed["private_bus_name"].startswith(":")
+    if scenario == "identifier-omitted-preedit":
+        assert observed["before_handoff"] == observed["after_handoff"] == ["foo_", 4, 4]
+        assert observed["preedit_before_handoff"] == ["bar", 2, True]
+        refinement = observed["refinement"]
+        assert refinement["cache"] == ["foo_ba", 6, 6]
+        assert refinement["word"] == "bar", observed
+        assert refinement["commits"] == ["foo", "ba", "r"], observed
+        assert not any(visible for _text, _cursor, visible in refinement["preedits"]), observed
+        assert observed["learning_after"] == observed["learning_before"], observed
+        return
+    if scenario != "never-reported":
+        expected_cache = ["synthetic context ", 18, 18]
+        assert observed["old_cache"] == observed["before_handoff"] == expected_cache
+        if scenario == "sync-handoff":
+            echoed = ["synthetic context здра", 22, 22]
+            assert observed["after_handoff"] == observed["canonical_after_handoff"] == echoed
+        else:
+            assert observed["after_handoff"] == expected_cache, "handoff must leave the real parent cache stale"
+    if scenario == "stale-first":
+        refinement = observed["refinement"]
+        assert refinement["cache"] == observed["old_cache"]
+        assert refinement["word"] == "здрав", observed
+        assert refinement["commits"] == ["здра", "в"], observed
+        assert not any(visible for _text, _cursor, visible in refinement["preedits"]), observed
+    elif scenario == "stale-after-refinement":
+        for name, word, commits in (
+            ("first", "здрав", ["здра", "в"]),
+            ("second", "здравв", ["здра", "в", "в"]),
+            ("third", "здраввв", ["здра", "в", "в", "в"]),
+        ):
+            assert observed[name]["word"] == word, observed
+            assert observed[name]["commits"] == commits, observed
+            assert not any(visible for _text, _cursor, visible in observed[name]["preedits"]), observed
+        assert observed["second"]["cache"] == observed["third"]["cache"] == ["synthetic context здрав", 23, 23]
+    elif scenario == "new-mismatch":
+        assert observed["next"]["consumed"] is False
+        assert observed["next"]["word"] == ""
+        assert observed["next"]["commits"] == ["здра"]
+    elif scenario == "never-reported":
+        assert observed["next"]["consumed"] is True
+        assert observed["next"]["word"] == "здрав", observed
+        assert observed["next"]["commits"] == ["здра", "в"], observed
+        assert not any(visible for _text, _cursor, visible in observed["next"]["preedits"]), observed
+    elif scenario == "new-empty":
+        assert observed["next"]["cache"] == ["", 0, 0]
+        assert observed["next"]["consumed"] is True
+        assert len(observed["next"]["word"]) == 1, observed
+        assert observed["next"]["commits"] == ["здра"], observed
+        assert any(visible for _text, _cursor, visible in observed["next"]["preedits"]), observed
+        assert observed["learning_after"] == observed["learning_before"], observed
+    elif scenario in {"sync-handoff", "sync-refinement"}:
+        for name, word, commits in (
+            ("first", "здрав", ["здра", "в"]),
+            ("second", "здравв", ["здра", "в", "в"]),
+        ):
+            assert observed[name]["word"] == word, observed
+            assert observed[name]["commits"] == commits, observed
+            assert not any(visible for _text, _cursor, visible in observed[name]["preedits"]), observed
+        if scenario == "sync-refinement":
+            echoed = ["synthetic context здрав", 23, 23]
+            assert observed["first"]["cache"] == observed["first"]["canonical"] == echoed
+        assert observed["learning_after"] == observed["learning_before"], observed
+    else:
+        assert observed["next"]["consumed"] is True
+        assert observed["next"]["commits"] == ["здра"]
+        assert any(visible for _text, _cursor, visible in observed["next"]["preedits"]), observed

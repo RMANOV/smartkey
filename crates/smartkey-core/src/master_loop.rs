@@ -426,10 +426,8 @@ impl MasterLoop {
         }
 
         if self.core.native_completion_owned()
-            && matches!(
-                event.key,
-                Key::Tab | Key::Return | Key::Escape | Key::Up | Key::Down
-            )
+            && (self.core.native_completion_boundary_event(&event)
+                || matches!(event.key, Key::Escape | Key::Up | Key::Down))
         {
             let actions = self.core.handle_key(event.clone());
             if !matches!(event.key, Key::Up | Key::Down) {
@@ -713,6 +711,11 @@ impl MasterLoop {
         actions
     }
 
+    /// Whether the delivered token is still owned by client completion.
+    pub fn native_completion_owned(&self) -> bool {
+        self.core.native_completion_owned()
+    }
+
     fn observed_native_identifier_prefix(&self) -> Option<String> {
         if !self.surrounding_caret_collapsed {
             return None;
@@ -720,13 +723,16 @@ impl MasterLoop {
         let chars: Vec<char> = self.surrounding_text.as_deref()?.chars().collect();
         let cursor = self.surrounding_cursor_pos?;
         let word: Vec<char> = self.core.current_word().chars().collect();
-        let start = cursor.checked_sub(word.len())?;
-        if word.is_empty()
-            || cursor > chars.len()
-            || chars[start..cursor] != word
-            || start == 0
-            || !(chars[start - 1] == '_' || chars[start - 1].is_ascii_digit())
-        {
+        if word.is_empty() || cursor > chars.len() {
+            return None;
+        }
+        // A client report may include the visible typed suffix, or omit the
+        // preedit that this handoff still owns and will deliver exactly once.
+        let start = cursor
+            .checked_sub(word.len())
+            .filter(|&start| chars[start..cursor] == word)
+            .or_else(|| self.core.debug_state().0.then_some(cursor))?;
+        if start == 0 || !(chars[start - 1] == '_' || chars[start - 1].is_ascii_digit()) {
             return None;
         }
         let prefix_start = chars[..start]
@@ -780,9 +786,10 @@ impl MasterLoop {
             return false;
         }
         self.clear_native_completion_tracking();
-        // Its characters are already in the client: cancellation must neither
-        // insert them again nor teach an unfinished or externally replaced word.
-        self.core.reset();
+        // The native token is already delivered, so navigation cannot flush it
+        // twice. An invalid client scope also invalidates location-dependent
+        // context, detector momentum and session cache, as ordinary navigation.
+        self.core.cursor_moved();
         true
     }
 
@@ -5669,8 +5676,22 @@ mod layout_handoff_tests {
 
     #[test]
     fn native_popup_accept_keys_preserve_all_models_before_client_acceptance() {
-        for key in [Key::Tab, Key::Return, Key::RawCode(15), Key::RawCode(28)] {
+        for key in [
+            Key::Tab,
+            Key::Return,
+            Key::RawCode(15),
+            Key::RawCode(28),
+            Key::Space,
+            Key::RawCode(57),
+            Key::Char('('),
+            Key::Char('.'),
+            Key::Char('1'),
+            Key::RawCode(52),
+            Key::RawCode(2),
+            Key::RawCode(26),
+        ] {
             let mut ml = native_popup_fixture();
+            let all_learned = ml.core.learned_state_for_test();
             let learned =
                 crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
             let light = serde_json::to_value(&ml.light_profile).unwrap();
@@ -5688,11 +5709,25 @@ mod layout_handoff_tests {
             );
             assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
             assert!(ml.current_word().is_empty());
+            assert!(!ml.native_completion_owned());
+            assert_eq!(ml.phase(), Phase::Anticipating);
+            assert!(!ml.anticipated);
             assert!(ml.last_prediction_accept.is_none() && ml.last_shown_ghost.is_none());
+            assert_eq!(ml.core.learned_state_for_test(), all_learned);
+            // Observing the client's later selection must not lazily teach
+            // either the old prefix or a native candidate.
+            ml.set_surrounding_text(Some("😀 seed hello(".into()), Some(13));
+            assert!(!ml.reconcile_native_completion_word(true));
             ml.handle_key(press(Key::Space));
             assert_eq!(
                 crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
                 learned
+            );
+            assert_eq!(ml.core.learned_state_for_test(), all_learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
             );
         }
     }
@@ -5701,6 +5736,7 @@ mod layout_handoff_tests {
     fn native_popup_vertical_navigation_waits_for_matching_or_moved_report() {
         for key in [Key::Up, Key::Down, Key::RawCode(103), Key::RawCode(108)] {
             let mut ml = native_popup_fixture();
+            let all_learned = ml.core.learned_state_for_test();
             let learned =
                 crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
             let light = serde_json::to_value(&ml.light_profile).unwrap();
@@ -5719,6 +5755,7 @@ mod layout_handoff_tests {
             );
             ml.set_surrounding_text(Some("😀 seed hel".into()), Some(10));
             assert!(!ml.reconcile_native_completion_word(true));
+            assert_eq!(ml.core.learned_state_for_test(), all_learned);
             assert_eq!(
                 ml.handle_key(press(Key::RawCode(38))),
                 [Action::CommitText("l".into()), Action::HideGhost]
@@ -5732,6 +5769,81 @@ mod layout_handoff_tests {
                 learned
             );
             assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+        }
+    }
+
+    #[test]
+    fn native_popup_observed_caret_move_clears_context_like_ordinary_navigation() {
+        for key in [Key::Up, Key::Down, Key::RawCode(103), Key::RawCode(108)] {
+            let mut deferred = native_popup_fixture();
+            let mut direct = native_popup_fixture();
+            let learned =
+                crate::ensemble::learned_profile_for_test(deferred.core.export_personal_profile());
+            let light = serde_json::to_value(&deferred.light_profile).unwrap();
+            let metrics = serde_json::to_value(deferred.metrics().summary()).unwrap();
+            let engine_before_move = deferred.core.learned_state_for_test();
+            assert_eq!(deferred.core.context_words(), (Some("five"), Some("four")));
+            assert!(deferred.detected_language().confidence > 0.0);
+
+            assert_eq!(deferred.handle_key(press(key)), [Action::ForwardKey]);
+            assert_eq!(
+                direct.handle_key(press(Key::Left)),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            assert_ne!(
+                direct.core.learned_state_for_test(),
+                engine_before_move,
+                "ordinary navigation must actually clear this fixture's session cache"
+            );
+            // Same client text, but the Unicode character cursor moved away
+            // from the delivered token: this is text navigation, not a popup.
+            deferred.set_surrounding_text(Some("😀 seed hel".into()), Some(2));
+            assert!(deferred.reconcile_native_completion_word(true));
+            assert_eq!(deferred.core.context_words(), (None, None));
+            assert_eq!(
+                deferred.core.learned_state_for_test(),
+                direct.core.learned_state_for_test(),
+                "transient session state must match ordinary navigation"
+            );
+            assert_eq!(
+                deferred.detected_language().lang,
+                direct.detected_language().lang
+            );
+            assert_eq!(
+                deferred.detected_language().confidence,
+                direct.detected_language().confidence
+            );
+            assert_eq!(deferred.phase(), Phase::Anticipating);
+            assert!(!deferred.anticipated);
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(deferred.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(
+                serde_json::to_value(&deferred.light_profile).unwrap(),
+                light
+            );
+            assert_eq!(
+                serde_json::to_value(deferred.metrics().summary()).unwrap(),
+                metrics
+            );
+
+            // Exercise the consumer after the move as well: old Markov,
+            // detector and session-cache state must yield the same predictions
+            // as the established ordinary-navigation path at the new caret.
+            for ml in [&mut deferred, &mut direct] {
+                ml.set_surrounding_text(Some("😀 seed hel".into()), Some(2));
+                ml.handle_key(press(Key::Char('h')));
+                ml.handle_key(press(Key::Char('e')));
+            }
+            let predictions = |ml: &MasterLoop| {
+                ml.predictions()
+                    .iter()
+                    .map(|p| (p.word.clone(), p.score, p.confidence))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(predictions(&deferred), predictions(&direct));
+            assert_eq!(deferred.ghost_text(), direct.ghost_text());
         }
     }
 
@@ -5945,6 +6057,123 @@ mod native_identifier_tests {
                 serde_json::to_value(ml.metrics().summary()).unwrap(),
                 metrics
             );
+        }
+    }
+
+    #[test]
+    fn native_identifier_reports_omitting_owned_preedit_keep_prefix_through_refinement() {
+        for (separator, before, after) in [
+            ('_', "😀 seed foo_", "😀 seed foo_ba"),
+            ('1', "😀 seed foo1", "😀 seed foo1ba"),
+            // A bounded client excerpt may contain only the delimiter. Its
+            // character cursor is shorter than the preedit being delivered.
+            ('_', "_", "_ba"),
+        ] {
+            let mut ml = fixture(separator);
+            let learned = ml.core.learned_state_for_test();
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            assert!(ml.debug_state().0, "ba is actually owned preedit");
+            handoff(&mut ml, Some(before), Some(before.chars().count()), true);
+            ml.set_surrounding_text(Some(after.into()), Some(after.chars().count()));
+            assert!(!ml.reconcile_native_completion_word(true), "{before:?}");
+            assert_eq!(
+                press(&mut ml, Key::RawCode(19)),
+                [Action::CommitText("r".into()), Action::HideGhost]
+            );
+            assert_eq!(ml.current_word(), "bar");
+            assert!(ml.native_completion_owned());
+            assert_eq!(ml.core.learned_state_for_test(), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+        }
+    }
+
+    #[test]
+    fn native_identifier_omitted_preedit_anchor_requires_known_collapsed_delimiter() {
+        for (before, cursor, collapsed, after) in [
+            ("foo_", Some(4), false, "foo_ba"),
+            ("foo_", None, true, "foo_ba"),
+            ("foo_", Some(99), true, "foo_ba"),
+            ("foo", Some(3), true, "fooba"),
+            ("foo١", Some(4), true, "foo١ba"),
+        ] {
+            let mut ml = fixture('_');
+            let learned = profile(&ml);
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            handoff(&mut ml, Some(before), cursor, collapsed);
+            ml.set_surrounding_text(Some(after.into()), Some(after.chars().count()));
+            assert!(ml.reconcile_native_completion_word(true), "{before:?}");
+            assert!(ml.current_word().is_empty());
+            assert_eq!(profile(&ml), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            assert!(ml.core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_identifier_semantic_delivered_word_cannot_borrow_omitted_preedit_anchor() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("bar", 1_000_000, LangId::En);
+        press(&mut ml, Key::Char('b'));
+        press(&mut ml, Key::Char('a'));
+        assert_eq!(ml.current_word(), "ba");
+        assert!(!ml.debug_state().0);
+        let learned = profile(&ml);
+        let light = serde_json::to_value(&ml.light_profile).unwrap();
+        let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+        ml.set_surrounding_text(Some("foo_".into()), Some(4));
+        assert!(!ml.reconcile_native_completion_word(true));
+        assert_eq!(
+            ml.handoff_preedit_for_native_completion(),
+            [Action::HideGhost]
+        );
+        ml.set_surrounding_text(Some("foo_ba".into()), Some(6));
+        assert!(ml.reconcile_native_completion_word(true));
+        assert!(ml.current_word().is_empty());
+        assert_eq!(profile(&ml), learned);
+        assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+        assert_eq!(
+            serde_json::to_value(ml.metrics().summary()).unwrap(),
+            metrics
+        );
+    }
+
+    #[test]
+    fn native_identifier_omitted_preedit_anchor_cannot_be_recaptured_or_accept_right_tail() {
+        for (after, cursor, repeated_handoff) in [("x_ba", 4, true), ("foo_bar", 6, false)] {
+            let mut ml = fixture('_');
+            let learned = profile(&ml);
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            handoff(&mut ml, Some("foo_"), Some(4), true);
+            // Establish that the omission form captured the original scope.
+            ml.set_surrounding_text(Some("foo_ba".into()), Some(6));
+            assert!(!ml.reconcile_native_completion_word(true));
+            ml.set_surrounding_text(Some(after.into()), Some(cursor));
+            if repeated_handoff {
+                assert_eq!(
+                    ml.handoff_preedit_for_native_completion(),
+                    [Action::HideGhost]
+                );
+            }
+            assert!(ml.reconcile_native_completion_word(true));
+            assert!(ml.current_word().is_empty());
+            assert_eq!(profile(&ml), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            assert!(ml.core.take_commit_learning().words.is_empty());
         }
     }
 

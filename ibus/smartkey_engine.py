@@ -486,6 +486,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         if not all(callable(getattr(self._core, api, None)) for api in (
             "handoff_preedit_for_native_completion", "reconcile_native_completion_word",
+            "native_completion_owned",
         )):
             raise RuntimeError(
                 "smartkey_py native extension cannot enforce native completion handoff; "
@@ -540,6 +541,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._surrounding_text: str | None = None
         self._surrounding_cursor_pos: int | None = None
         self._surrounding_anchor_pos: int | None = None
+        self._surrounding_report_generation = 0
+        self._native_report_barrier: int | None = None
         self._session_id = f"{int(time.time() * 1000)}-{os.getpid()}"
         self._prediction_seq = 0
         self._active_prediction: dict[str, object] | None = None
@@ -705,6 +708,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             log.debug("smartkey: failed to refresh surrounding text", exc_info=True)
             return
 
+        if getattr(self, "_native_report_barrier", None) is not None:
+            # The getter requests an update but can return the previous cache.
+            # Only a callback may update this native-owned token's report.
+            return
+
         text_obj: object | None = None
         cursor_pos: int | None = None
         anchor_pos: int | None = None
@@ -723,6 +731,31 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             cursor_pos,
             anchor_pos,
         )
+
+    def _clear_native_report_wait(self, *, lifecycle: bool = False) -> None:
+        self._native_report_barrier = None
+        if lifecycle:
+            self._surrounding_report_generation = 0
+
+    def _waiting_for_native_report(self) -> bool:
+        barrier = getattr(self, "_native_report_barrier", None)
+        return bool(
+            barrier is not None
+            and getattr(self, "_surrounding_report_generation", 0) <= barrier
+        )
+
+    def _prepare_native_delivery(
+        self, actions: list[tuple[str, str]], owned_before: bool | None,
+        word_before: str,
+    ) -> None:
+        if self._core_native_completion_owned() is not True:
+            self._clear_native_report_wait()
+        elif owned_before is True and (
+            any(kind in ("commit", "replace") for kind, _text in actions)
+            or self._core_current_word() != word_before
+        ):
+            # Capture before dispatch: delivery can synchronously echo a report.
+            self._native_report_barrier = getattr(self, "_surrounding_report_generation", 0)
 
     def _log_replay_event(self, event: str, **payload: object) -> None:
         if not _REPLAY_LOG:
@@ -1004,12 +1037,20 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         actions: list[tuple[str, str]],
         pending_prediction: dict[str, object] | None,
         pre_key_word: str,
+        *,
+        native_owned_before: bool | None = False,
     ) -> None:
         """Feed exactly one committed word to the optional passive tap."""
         collector = getattr(self, "_o1", None)
         if collector is None or key_release:
             return
         word_state_available, post_word = self._core_word_state()
+        if native_owned_before is not False:
+            # The client chooses the final word after this key is forwarded.
+            # An emptied prefix is abandonment, not an observed word commit.
+            if word_state_available and post_word == "":
+                collector.on_abandon()
+            return
         if word_state_available and post_word != "":
             # A delivered BG letter may carry a punctuation-looking EN keyval.
             # A failed query also cannot attest a word boundary.
@@ -1048,6 +1089,16 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def _core_current_word(self) -> str:
         _available, word = self._core_word_state()
         return word or ""
+
+    def _core_native_completion_owned(self) -> bool | None:
+        getter = getattr(self._core, "native_completion_owned", None)
+        if not callable(getter):
+            return False  # Legacy/fallback Core without native ownership.
+        try:
+            owned = getter()
+        except Exception:  # noqa: BLE001 -- an unknown outcome cannot be learned
+            return None
+        return owned if type(owned) is bool else None
 
     def _is_genuine_ghost_rejection(
         self,
@@ -1794,6 +1845,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         keystroke.
         """
         self._sensitive = True
+        self._clear_native_report_wait(lifecycle=True)
         self._clear_language_choice()
         self._update_language_choice_support()
         try:
@@ -2006,6 +2058,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return
         if _HAS_IBUS:
             IBus.Engine.do_set_surrounding_text(self, text, cursor_pos, anchor_pos)
+        self._surrounding_report_generation = (
+            getattr(self, "_surrounding_report_generation", 0) + 1
+        )
         self._sync_surrounding_text(
             self._decode_surrounding_text(text),
             cursor_pos,
@@ -2039,6 +2094,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return current
         manual = observer is not None and observer.manual_bg
         if manual != current:
+            self._clear_native_report_wait(lifecycle=True)
             if manual:
                 actions = self._core.flush_preedit_for_layout()
                 self._clear_language_choice()
@@ -2163,7 +2219,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             reconcile = getattr(self._core, "reconcile_native_completion_word", None)
             cursor = getattr(self, "_surrounding_cursor_pos", None)
             anchor = getattr(self, "_surrounding_anchor_pos", None)
-            if callable(reconcile) and reconcile(cursor is not None and anchor == cursor):
+            if (callable(reconcile) and not self._waiting_for_native_report()
+                    and reconcile(cursor is not None and anchor == cursor)):
+                self._clear_native_report_wait()
                 self._clear_language_choice()
                 self._active_prediction = None
                 collector = getattr(self, "_o1", None)
@@ -2179,12 +2237,21 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             handoff = getattr(self._core, "handoff_preedit_for_native_completion", None)
             reconcile = getattr(self._core, "reconcile_native_completion_word", None)
             if callable(handoff) and callable(reconcile):
+                owned_before = self._core_native_completion_owned()
+                generation = getattr(self, "_surrounding_report_generation", 0)
                 actions = handoff()
+                new_scope = owned_before is not True and bool(self._core_current_word())
+                if new_scope:
+                    self._native_report_barrier = generation
+                elif not self._core_current_word():
+                    self._clear_native_report_wait()
                 self._clear_language_choice()
                 self._execute_actions(actions)
                 self._active_prediction = None
                 self._keys_since_content_type = 0
-                self._sync_surrounding_text(None, None)
+                if (owned_before is not True
+                        and getattr(self, "_surrounding_report_generation", 0) == generation):
+                    self._sync_surrounding_text(None, None)
                 collector = getattr(self, "_o1", None)
                 if collector is not None:
                     collector.on_abandon()
@@ -2201,6 +2268,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 getattr(self, "_keys_since_content_type", 0) + 1
             )
 
+        native_owned_before = self._core_native_completion_owned()
+        native_word_before = self._core_current_word() if native_owned_before else ""
         # Capture the word before a key that can terminate composition. Its
         # post-core token state distinguishes a word ending from delivery only.
         o1_pre_word = ""
@@ -2233,12 +2302,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         if keycode > 0 and _HAS_CORE and has_keycode_api:
             actions = self._core.process_keycode(keycode, state)
             log.debug("actions (keycode): %s", actions)
+            self._prepare_native_delivery(actions, native_owned_before, native_word_before)
             result = self._execute_actions(actions)
             self._finalize_prediction_outcome(
                 keyval, key_release, actions, pending_prediction
             )
             self._o1_notify(
-                keyval, key_release, actions, pending_prediction, o1_pre_word
+                keyval, key_release, actions, pending_prediction, o1_pre_word,
+                native_owned_before=native_owned_before,
             )
             if not key_release:
                 self._refresh_language_choice()
@@ -2274,12 +2345,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             )
         actions = self._core.handle_key(keyval, state)
         log.debug("actions: %s", actions)
+        self._prepare_native_delivery(actions, native_owned_before, native_word_before)
         result = self._execute_actions(actions)
         self._finalize_prediction_outcome(
             keyval, key_release, actions, pending_prediction
         )
         self._o1_notify(
-            keyval, key_release, actions, pending_prediction, o1_pre_word
+            keyval, key_release, actions, pending_prediction, o1_pre_word,
+            native_owned_before=native_owned_before,
         )
         if not key_release:
             self._refresh_language_choice()
@@ -2294,6 +2367,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # IBus lifecycle callbacks.
     # -----------------------------------------------------------------------
     def do_focus_in(self) -> None:
+        self._clear_native_report_wait(lifecycle=True)
         self._init_kde_layout_observer()
         self._clear_language_choice()
         self._core.focus_gained()
@@ -2308,6 +2382,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._update_language_choice_support()
 
     def do_focus_out(self) -> None:
+        self._clear_native_report_wait(lifecycle=True)
         self._clear_language_choice()
         # The sensitivity declaration deliberately SURVIVES focus-out, because a
         # sticky flag is the correct mirror of how IBus actually delivers
@@ -2392,6 +2467,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         return [a for a in actions if a[0] not in ("commit", "replace")]
 
     def do_reset(self) -> None:
+        self._clear_native_report_wait(lifecycle=True)
         self._clear_language_choice()
         # Composition boundary, not a context boundary: the declared content
         # type survives (see do_focus_out).
@@ -2420,6 +2496,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         pass  # Rust core handles enabled state via kill switch.
 
     def do_disable(self) -> None:
+        self._clear_native_report_wait(lifecycle=True)
         self._clear_language_choice()
         # Same asymmetry as do_reset: an IME switch inside a password box must
         # not drop that box's declaration — and, like do_reset, this is a cancel

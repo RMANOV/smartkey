@@ -14,11 +14,15 @@ fn press(master: &mut MasterLoop, key: Key) -> Vec<Action> {
 }
 
 fn fixture() -> MasterLoop {
+    fixture_with_space_accept(true)
+}
+
+fn fixture_with_space_accept(space_accept: bool) -> MasterLoop {
     let mut master = MasterLoop::new(InputConfig {
         ghost_text_separation_margin: 0.0,
         use_ppm: false,
         use_reranker: false,
-        space_accept: true,
+        space_accept,
         ..InputConfig::default()
     });
     master.load_word_lang("здравей", 1_000_000, LangId::Bg);
@@ -26,6 +30,7 @@ fn fixture() -> MasterLoop {
         press(&mut master, Key::RawCode(code));
     }
     assert_eq!(master.current_word(), "здра");
+    assert!(!master.native_completion_owned());
     assert_eq!(
         master.ghost_text(),
         "вей",
@@ -73,6 +78,7 @@ fn handoff(master: &mut MasterLoop) {
         vec![Action::HideGhost, Action::CommitText("здра".into())]
     );
     assert_eq!(master.current_word(), "здра");
+    assert!(master.native_completion_owned());
     assert!(!master.debug_state().0, "typed prefix is now in the client");
     no_preedit_or_rewrite(master, &actions);
     assert_eq!(
@@ -88,6 +94,7 @@ fn assert_next_word_composes(master: &mut MasterLoop) {
         master.debug_state().0,
         "client ownership must not leak to the next token"
     );
+    assert!(!master.native_completion_owned());
     assert!(actions
         .iter()
         .any(|action| matches!(action, Action::ShowComposing { .. })));
@@ -220,7 +227,7 @@ fn backspace_edits_delivered_word_and_restores_composition_at_empty() {
 }
 
 #[test]
-fn delivered_boundary_learns_once_without_recommitting_or_accepting() {
+fn native_boundary_retires_without_learning_or_recommitting_or_accepting() {
     let mut master = fixture();
     handoff(&mut master);
     report(&mut master, "здра");
@@ -228,6 +235,23 @@ fn delivered_boundary_learns_once_without_recommitting_or_accepting() {
     let actions = press(&mut master, Key::Space);
     no_preedit_or_rewrite(&master, &actions);
     assert!(commits(&actions).is_empty());
+    assert!(actions.contains(&Action::ForwardKey));
+    assert_eq!(learned_counts(&master), (0, 0));
+    assert!(!master.native_completion_owned());
+    let prior = master.light_profile().lang_prior;
+    let actions = press(&mut master, Key::Space);
+    assert!(commits(&actions).is_empty());
+    assert_eq!(learned_counts(&master), (0, 0));
+    assert_eq!(master.light_profile().lang_prior, prior);
+    assert_next_word_composes(&mut master);
+}
+
+#[test]
+fn ordinary_delivered_boundary_still_learns_once() {
+    let mut master = fixture_with_space_accept(false);
+    assert!(!master.native_completion_owned());
+    let actions = press(&mut master, Key::Space);
+    assert_eq!(commits(&actions), "здра");
     assert!(actions.contains(&Action::ForwardKey));
     assert_eq!(learned_counts(&master), (1, 0));
     let prior = master.light_profile().lang_prior;
