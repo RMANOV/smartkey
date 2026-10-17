@@ -330,3 +330,101 @@ def test_list_change_read_failure_never_routes_new_index_through_old_list(
     assert connection.calls == calls  # Verified cached metadata stays inexpensive.
     observer.close()
     assert connection.callbacks == {}
+
+
+@pytest.mark.parametrize("initial_index", [0, 1])
+@pytest.mark.parametrize("event", ["layoutListChanged", "NameOwnerChanged"])
+@pytest.mark.parametrize("failed_method", ["getLayoutsList", "getLayout"])
+def test_failed_metadata_refresh_recovers_on_focus_without_later_signals(
+    monkeypatch, initial_index, event, failed_method
+):
+    from types import SimpleNamespace
+    from ibus.test_manual_layout import engine, ske
+
+    class Variant:
+        def __init__(self, value):
+            self.value = value
+
+        def unpack(self):
+            return self.value
+
+    class Connection:
+        def __init__(self):
+            self.layouts = LAYOUTS
+            self.index = initial_index
+            self.failed_method = None
+            self.calls = []
+            self.callbacks = {}
+
+        def signal_subscribe(self, *args):
+            handle = len(self.callbacks) + 1
+            self.callbacks[handle] = args[-1]
+            return handle
+
+        def signal_unsubscribe(self, handle):
+            del self.callbacks[handle]
+
+        def call_sync(self, _name, _path, _interface, method, *_args):
+            self.calls.append(method)
+            if method == self.failed_method:
+                raise RuntimeError("temporary metadata failure with same live owner")
+            return Variant((self.layouts,) if method == "getLayoutsList"
+                           else (self.index,))
+
+        def emit(self, event, value=()):
+            owner = event == "NameOwnerChanged"
+            self.callbacks[2 if owner else 1](
+                self, ":1.42", "/org/freedesktop/DBus" if owner else "/Layouts",
+                "org.freedesktop.DBus" if owner else "org.kde.KeyboardLayouts",
+                event, Variant(value))
+
+    gio = SimpleNamespace(DBusCallFlags=SimpleNamespace(NO_AUTO_START=1),
+                          DBusSignalFlags=SimpleNamespace(NONE=0))
+    connection = Connection()
+    observer = kde.KdeLayoutObserver(kde._GioBackend(gio, connection))
+    manual_before = initial_index == 1
+    assert observer.verified and observer.manual_bg is manual_before
+
+    connection.layouts = list(reversed(LAYOUTS))
+    # Keeping the index now selects the OTHER language, not just a new position.
+    connection.failed_method = failed_method
+    connection.emit(event)
+    assert observer.manual_bg is manual_before
+    reads_after_failure = len(connection.calls)
+    connection.failed_method = None  # No new signal and no owner change follows.
+
+    obj, recording = engine(monkeypatch)
+    obj._kde_layout = observer
+    monkeypatch.setattr(ske, "_HAS_IBUS", True)
+    obj.do_focus_in()  # Exercise the actual unverified-only adapter retry.
+    assert len(connection.calls) == reads_after_failure + 2
+    assert observer.verified and observer.manual_bg is not manual_before
+    assert recording.commits == [] and obj._core.key_calls() == []
+
+    reads = list(connection.calls)
+    obj.do_focus_in()
+    assert connection.calls == reads  # Verified focus performs no metadata I/O.
+    connection.emit("layoutChanged", (1 - initial_index,))
+    assert observer.verified and observer.manual_bg is manual_before
+    assert connection.calls == reads  # Valid cached signals also avoid queries.
+
+    observer.close()
+    observer.refresh((1 - initial_index, LAYOUTS))
+    assert observer.verified and observer.manual_bg is manual_before
+    assert connection.calls == reads and connection.callbacks == {}
+
+
+@pytest.mark.parametrize("initial_index", [0, 1])
+@pytest.mark.parametrize("snapshot", [(), (True, LAYOUTS), (0, [("bg",)])])
+def test_invalid_refresh_withdraws_verification_but_holds_last_manual_mode(
+    initial_index, snapshot
+):
+    backend = Backend(initial_index)
+    observer = kde.KdeLayoutObserver(backend)
+    manual_before = initial_index == 1
+    assert observer.verified and observer.manual_bg is manual_before
+    observer.refresh(snapshot)
+    assert observer.verified is False
+    assert observer.manual_bg is manual_before
+    observer.refresh()
+    assert observer.verified and observer.manual_bg is manual_before

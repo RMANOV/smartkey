@@ -75,6 +75,7 @@ class KdeLayoutObserver:
     def refresh(self, snapshot=None):
         if self._closed:
             return
+        self._verified = False  # Failed reads remain eligible for a focus retry.
         try:
             index, layouts = snapshot if snapshot is not None else self._backend.snapshot()
             if type(index) is not int or not isinstance(layouts, (list, tuple)):
@@ -88,7 +89,7 @@ class KdeLayoutObserver:
             self.manual_bg = row[0] == "bg"
             self._verified = True
         except Exception:
-            pass  # Startup unknown stays False; later errors hold the last proof.
+            pass  # Startup unknown stays False; later errors hold the manual mode.
 
     def close(self):
         self._closed = True
