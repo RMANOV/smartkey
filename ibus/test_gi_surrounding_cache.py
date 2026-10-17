@@ -41,12 +41,8 @@ def cached(engine):
 control=IBus.Engine(connection=connection,object_path="/org/freedesktop/IBus/Engine/Control")
 control.emit("set-surrounding-text",IBus.Text.new_from_string(text),position,position)
 control_report=cached(control)
-parent=IBus.Engine.do_set_surrounding_text
-parent_calls=[]
-def counted_parent(self,value,cursor,anchor):
-    parent_calls.append([cursor,anchor])
-    return parent(self,value,cursor,anchor)
-IBus.Engine.do_set_surrounding_text=counted_parent
+# Keep the native VFuncInfo descriptor intact: replacing it with a Python
+# function changes implicit-self binding and can hide a broken parent call.
 
 class CoreRecorder:
     def __init__(self): self.reports=[]
@@ -70,14 +66,12 @@ callback_report=[engine._surrounding_text,engine._surrounding_cursor_pos,engine.
 cache_report=cached(engine)
 engine._refresh_surrounding_text()
 refreshed=[engine._surrounding_text,engine._surrounding_cursor_pos,engine._surrounding_anchor_pos]
-ordinary_parent_count=len(parent_calls)
 sensitive=CallbackProbe("/org/freedesktop/IBus/Engine/Sensitive",True)
 sensitive.emit("set-surrounding-text",IBus.Text.new_from_string("synthetic-secret"),16,16)
 sensitive_cache=cached(sensitive)
 assert sys.modules["smartkey_py"] is blocked
 print(json.dumps(dict(control=control_report,callback=callback_report,cache=cache_report,
-    refreshed=refreshed,core_reports=engine._core.reports,parent_calls=parent_calls,
-    ordinary_parent_count=ordinary_parent_count,sensitive_parent_count=len(parent_calls)-ordinary_parent_count,
+    refreshed=refreshed,core_reports=engine._core.reports,
     sensitive_core_reports=sensitive._core.reports,sensitive_cache_empty=sensitive_cache==["",0,0],
     sensitive_python_empty=sensitive._surrounding_text is None,real_bus_unique_name=connection.get_unique_name())))
 '''
@@ -102,14 +96,12 @@ def test_real_gi_surrounding_callback_populates_parent_cache_before_refresh(tmp_
     assert result.returncode == 0, result.stderr
     (tmp_path / "gi-child.json").write_text(result.stdout)
     (tmp_path / "gi-child.stderr").write_text(result.stderr)
+    assert result.stderr == "", result.stderr
     observed = json.loads(result.stdout)
     expected = ["todo неделя todo нед", 20, 20]
     assert observed["control"] == observed["callback"] == expected
     assert observed["cache"] == observed["refreshed"] == expected, observed
-    assert observed["ordinary_parent_count"] == 2
-    assert observed["parent_calls"] == [[17, 17], [20, 20]]
     assert observed["core_reports"] == [["todo неделя todo ", 17], [expected[0], 20], [expected[0], 20]]
-    assert observed["sensitive_parent_count"] == 0
     assert observed["sensitive_core_reports"] == []
     assert observed["sensitive_cache_empty"] and observed["sensitive_python_empty"]
     assert observed["real_bus_unique_name"].startswith(":")

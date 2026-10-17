@@ -2003,7 +2003,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             # predictor or the trace.
             return
         if _HAS_IBUS:
-            super().do_set_surrounding_text(text, cursor_pos, anchor_pos)
+            IBus.Engine.do_set_surrounding_text(self, text, cursor_pos, anchor_pos)
         self._sync_surrounding_text(
             self._decode_surrounding_text(text),
             cursor_pos,
