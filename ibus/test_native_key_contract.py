@@ -147,7 +147,7 @@ def test_native_adapter_completion_refinement_stays_client_owned(monkeypatch):
     engine.do_set_surrounding_text("здра", 4, 4)
     before = len(rec.preedits)
 
-    assert engine.do_process_key_event(ord("v"), 47, 0) is True
+    assert engine.do_process_key_event(ord("w"), 17, 0) is True
 
     assert rec.commits == ["здра", "в"]
     assert not any(visible for _text, visible in rec.preedits[before:])
@@ -209,7 +209,7 @@ def test_native_adapter_stale_completion_retires_before_o1_capture(
 
 
 @pytest.mark.parametrize("keyval,keycode,state", [
-    (ord("v"), 47, RELEASE), (0xFFE3, 29, 4), (0xFFE1, 42, 1),
+    (ord("w"), 17, RELEASE), (0xFFE3, 29, 4), (0xFFE1, 42, 1),
 ])
 def test_native_adapter_native_word_survives_nonediting_callbacks(monkeypatch, keyval, keycode, state):
     engine, rec, _ske = _completion_adapter(monkeypatch)
@@ -220,7 +220,7 @@ def test_native_adapter_native_word_survives_nonediting_callbacks(monkeypatch, k
     assert engine.do_process_key_event(keyval, keycode, state) is False
     assert engine._core.current_word() == "здра"
     engine.do_set_surrounding_text("здра", 4, 4)
-    assert engine.do_process_key_event(ord("v"), 47, 0) is True
+    assert engine.do_process_key_event(ord("w"), 17, 0) is True
     assert rec.commits == ["здра", "в"]
 
 
