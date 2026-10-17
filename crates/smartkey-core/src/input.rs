@@ -955,6 +955,26 @@ impl InputMethodCore {
             return vec![Action::ForwardKey];
         }
 
+        if self.native_completion_owned {
+            match event.key {
+                // The client may accept a different word. Retire this prefix
+                // without treating that unobserved native outcome as learning.
+                Key::Tab | Key::Return => {
+                    let mut actions = self.reset();
+                    actions.push(Action::ForwardKey);
+                    return actions;
+                }
+                // Native popup navigation does not imply a moved text caret.
+                // A later surrounding report reconciles any actual movement.
+                Key::Up | Key::Down => return vec![Action::ForwardKey],
+                Key::Escape => {
+                    self.native_completion_owned = false;
+                    return vec![Action::ForwardKey];
+                }
+                _ => {}
+            }
+        }
+
         // A literal closing tail belongs to the forwarded terminator, not a
         // new lexical token. Raw keys qualify only when both layouts agree.
         if matches!(
@@ -9923,6 +9943,80 @@ mod layout_handoff_tests {
             assert!(!actions
                 .iter()
                 .any(|action| matches!(action, Action::CommitText(_))));
+        }
+    }
+
+    #[test]
+    fn native_popup_accept_keys_abandon_prefix_without_learning() {
+        for key in [Key::Tab, Key::Return, Key::RawCode(15), Key::RawCode(28)] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            let actions = core.handle_key(press(key.clone()));
+            assert_eq!(core.engine.learned_state_for_test(), learned, "{key:?}");
+            assert_eq!(self::metrics(&core), metrics, "{key:?}");
+            assert!(core.take_commit_learning().words.is_empty(), "{key:?}");
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert!(core.current_word().is_empty());
+            assert!(!core.native_completion_owned());
+            core.handle_key(press(Key::Space));
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+        }
+    }
+
+    #[test]
+    fn native_popup_vertical_navigation_preserves_delivered_word_and_learning() {
+        for key in [Key::Up, Key::Down, Key::RawCode(103), Key::RawCode(108)] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(core.handle_key(press(key)), [Action::ForwardKey]);
+            assert!(core.native_completion_owned());
+            assert_eq!(core.current_word(), "hel");
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+            assert!(core.take_commit_learning().words.is_empty());
+            assert_eq!(
+                core.handle_key(press(Key::RawCode(38))),
+                [Action::CommitText("l".into()), Action::HideGhost]
+            );
+            assert_eq!(core.current_word(), "hell");
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+        }
+    }
+
+    #[test]
+    fn native_popup_escape_releases_presentation_without_recommitting_or_learning() {
+        for key in [Key::Escape, Key::RawCode(1)] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let layout = core.word_delivery_layout;
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(core.handle_key(press(key)), [Action::ForwardKey]);
+            assert!(!core.native_completion_owned());
+            assert_eq!(core.current_word(), "hel");
+            assert_eq!(core.word_delivery_layout, layout);
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+            assert!(core.take_commit_learning().words.is_empty());
+            let actions = core.handle_key(press(Key::RawCode(38)));
+            assert_eq!(
+                actions,
+                [
+                    Action::CommitText("l".into()),
+                    Action::ShowGhost("o".into())
+                ]
+            );
+            assert!(!core.debug_state().0);
+            assert_eq!(core.current_word(), "hell");
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert!(core.take_commit_learning().words.is_empty());
         }
     }
 

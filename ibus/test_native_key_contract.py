@@ -300,6 +300,80 @@ def test_native_adapter_completion_handoff_does_not_repeat_already_delivered_sem
     assert rec.commits == [], "semantic characters already belong to the client"
 
 
+@pytest.mark.parametrize("report,expected", [
+    (("здра", 4, 4), "здра"),
+    (("здрасинтетична", 13, 13), ""),
+    (None, ""),
+    (("здра", 4, 0), ""),
+    (("здра", 2, 2), ""),
+    (("здра ", 5, 5), ""),
+], ids=["matching", "replaced", "missing", "selection", "moved", "boundary"])
+def test_native_adapter_repeated_completion_reconciles_before_handoff(
+    tmp_path, monkeypatch, report, expected,
+):
+    """A repeat must retire a stale token before forwarding the shortcut."""
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+    assert engine.do_process_key_event(0x20, 57, 4) is False
+    engine._core.export_personal(str(tmp_path / "before.json"))
+    if report is not None:
+        engine.do_set_surrounding_text(*report)
+
+    assert engine.do_process_key_event(0x20, 57, 4) is False
+
+    assert engine._core.current_word() == expected
+    assert rec.commits == ["здра"], "a repeat cannot deliver the prefix twice"
+    assert rec.forwarded_keys == [], "False forwards the original shortcut"
+    engine._core.export_personal(str(tmp_path / "after.json"))
+    before = json.loads((tmp_path / "before.json").read_text())
+    after = json.loads((tmp_path / "after.json").read_text())
+    for key in ("weights", "light_profile", "corrections", "markov_bigrams", "markov_trigrams"):
+        assert after[key] == before[key], key
+    assert after["cvm"]["words"] == before["cvm"]["words"]
+    assert after["cvm"]["round"] == before["cvm"]["round"]
+
+
+@pytest.mark.parametrize("separator,initial,after,collapsed,retained", [
+    ("_", "foo_bar", "foo_ba", True, True),
+    ("1", "foo1bar", "foo1ba", True, True),
+    ("_", "foo_bar", "x_ba", True, False),
+    ("_", None, "foo_ba", True, False),
+    ("_", "foobar", "fooba", True, False),
+    ("_", "foo_bar", "foo_ba", False, False),
+], ids=["underscore", "digit", "changed-prefix", "unknown", "alphabetic", "selection"])
+def test_native_adapter_identifier_handoff_uses_observed_token_anchor(
+    monkeypatch, separator, initial, after, collapsed, retained,
+):
+    """Raw delimiter tokenization and adapter caret metadata must agree."""
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    engine._core.load_word("food", 1_000_000)
+    engine._core.load_word("bar", 1_000_000)
+    for code, key in ((33, "f"), (24, "o"), (24, "o")):
+        assert engine.do_process_key_event(ord(key), code, 0) is True
+    assert engine._core.current_word() == "foo"
+    assert engine.do_process_key_event(
+        ord(separator), 12 if separator == "_" else 2, 1 if separator == "_" else 0,
+    ) is False
+    for code, key in ((48, "b"), (30, "a")):
+        assert engine.do_process_key_event(ord(key), code, 0) is True
+    assert engine._core.current_word() == "ba"
+    assert rec.preedits[-1] == ("bar", True)
+    assert rec.commits == ["foo"]
+    if initial is not None:
+        cursor = len(initial) - 1  # The visible unaccepted ghost is the final r.
+        engine.do_set_surrounding_text(initial, cursor, cursor if collapsed else 0)
+    assert engine.do_process_key_event(0x20, 57, 4) is False
+    assert rec.commits == ["foo", "ba"]
+    engine.do_set_surrounding_text(after, len(after), len(after))
+    before = len(rec.preedits)
+
+    assert engine.do_process_key_event(ord("r"), 19, 0) is True
+
+    assert engine._core.current_word() == ("bar" if retained else "r")
+    assert rec.commits == (["foo", "ba", "r"] if retained else ["foo", "ba"])
+    assert any(visible for _text, visible in rec.preedits[before:]) is not retained
+
+
 @pytest.mark.parametrize("keyval,keycode,state", [
     (0x20, 57, 4 | RELEASE), (0xFFE3, 29, 4),
     (ord("a"), 30, 4), (0x20, 57, 4 | 1), (0x20, 57, 4 | 8),
@@ -421,6 +495,9 @@ def test_native_adapter_completion_handoff_trace_records_forwarded_delivery(tmp_
     events = [json.loads(line) for line in raw.splitlines()]
     assert {event["seq"] for event in events} == {1}
     assert {"key_in", "core", "action", "outcome"} <= {event["event"] for event in events}
+    assert not any(event["event"] == "accept" for event in events), (
+        "handing off the typed prefix must not claim prediction acceptance"
+    )
     verdicts = [event["verdict"] for event in events if event["event"] == "core"]
     assert verdicts == ["forward"], "delivery actions must not label the shortcut consumed"
     actions = [event for event in events if event["event"] == "action"]
@@ -433,3 +510,23 @@ def test_native_adapter_completion_handoff_trace_records_forwarded_delivery(tmp_
         assert "здра" not in raw and "здравей" not in raw
         assert all("payload_text" not in event for event in actions)
         assert "committed_to_app" not in outcome[0]
+
+
+@pytest.mark.parametrize("level", [1, 2], ids=["structural", "full"])
+def test_native_adapter_explicit_completion_trace_keeps_accept_event(tmp_path, monkeypatch, level):
+    from .smartkey_debug import KeystrokeTrace
+
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+    trace = KeystrokeTrace(level=level, directory=tmp_path / "trace")
+    engine._trace = trace
+
+    assert engine.do_process_key_event(0xFF09, 15, 0) is True
+
+    assert rec.commits == ["здравей"]
+    trace.flush()
+    events = [json.loads(line) for line in trace._file.read_text().splitlines()]
+    accepted = [event for event in events if event["event"] == "accept"]
+    assert len(accepted) == 1
+    if level == 2:
+        assert accepted[0]["committed_text"] == "здравей"

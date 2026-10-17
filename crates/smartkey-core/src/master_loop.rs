@@ -352,6 +352,10 @@ pub struct MasterLoop {
     surrounding_text: Option<String>,
     /// Cursor position inside `surrounding_text` when provided by the platform.
     surrounding_cursor_pos: Option<usize>,
+    /// Collapsed-caret evidence supplied by the latest pre-key reconciliation.
+    surrounding_caret_collapsed: bool,
+    /// Identifier prefix observed once when native completion takes this word.
+    native_completion_prefix: Option<String>,
     /// Bounded presentation-only acknowledgements, never model context.
     sentence_echoes: Option<SentenceEchoes>,
     /// Most recently displayed `(typed prefix, full completion)` pair.
@@ -377,6 +381,8 @@ impl MasterLoop {
             anticipated: false,
             surrounding_text: None,
             surrounding_cursor_pos: None,
+            surrounding_caret_collapsed: false,
+            native_completion_prefix: None,
             sentence_echoes: None,
             last_shown_ghost: None,
             language_choice_revision: 0,
@@ -417,6 +423,21 @@ impl MasterLoop {
             self.last_prediction_accept = None;
             self.last_shown_ghost = None;
             return self.core.handle_key(event);
+        }
+
+        if self.core.native_completion_owned()
+            && matches!(
+                event.key,
+                Key::Tab | Key::Return | Key::Escape | Key::Up | Key::Down
+            )
+        {
+            let actions = self.core.handle_key(event.clone());
+            if !matches!(event.key, Key::Up | Key::Down) {
+                self.clear_native_completion_tracking();
+            }
+            // These keys operate the client's popup, not a SmartKey candidate.
+            // In particular, Escape must not arm false ABANDON feedback.
+            return actions;
         }
 
         let resets_context = matches!(
@@ -480,6 +501,9 @@ impl MasterLoop {
         let was_composing = self.core.debug_state().0;
         let word_was_empty = self.core.current_word().is_empty();
         let mut actions = self.core.handle_key(event.clone());
+        if !self.core.native_completion_owned() {
+            self.native_completion_prefix = None;
+        }
         self.core.latch_language_choice_policy();
         let commit_learning = self.core.take_commit_learning();
         let word_committed = !commit_learning.words.is_empty();
@@ -665,6 +689,8 @@ impl MasterLoop {
         self.frustration.reset_word();
         self.surrounding_text = None;
         self.surrounding_cursor_pos = None;
+        self.surrounding_caret_collapsed = false;
+        self.native_completion_prefix = None;
         self.last_shown_ghost = None;
         let actions = self.core.focus_lost();
         let commit_learning = self.core.take_commit_learning();
@@ -674,16 +700,50 @@ impl MasterLoop {
 
     /// Transfer presentation to native completion without ending the word.
     pub fn handoff_preedit_for_native_completion(&mut self) -> Vec<Action> {
+        let prefix = if self.core.native_completion_owned() {
+            self.native_completion_prefix.clone()
+        } else {
+            self.observed_native_identifier_prefix()
+        };
         self.clear_native_completion_tracking();
-        self.core.handoff_preedit_for_native_completion()
+        let actions = self.core.handoff_preedit_for_native_completion();
+        if self.core.native_completion_owned() {
+            self.native_completion_prefix = prefix;
+        }
+        actions
+    }
+
+    fn observed_native_identifier_prefix(&self) -> Option<String> {
+        if !self.surrounding_caret_collapsed {
+            return None;
+        }
+        let chars: Vec<char> = self.surrounding_text.as_deref()?.chars().collect();
+        let cursor = self.surrounding_cursor_pos?;
+        let word: Vec<char> = self.core.current_word().chars().collect();
+        let start = cursor.checked_sub(word.len())?;
+        if word.is_empty()
+            || cursor > chars.len()
+            || chars[start..cursor] != word
+            || start == 0
+            || !(chars[start - 1] == '_' || chars[start - 1].is_ascii_digit())
+        {
+            return None;
+        }
+        let prefix_start = chars[..start]
+            .iter()
+            .rposition(|ch| !(ch.is_alphanumeric() || *ch == '_'))
+            .map_or(0, |index| index + 1);
+        Some(chars[prefix_start..start].iter().collect())
     }
 
     /// Retire a client-owned token if the latest observed client state no
-    /// longer describes that exact whole word at a collapsed caret. Reports
+    /// longer describes that exact word and any captured identifier prefix at
+    /// a collapsed caret. Reports
     /// alone never cancel ordinary preedit; the adapter calls this before the
     /// next real press, before capturing word/prediction learning attribution.
     /// Returns true only when a stale native-completion token was retired.
     pub fn reconcile_native_completion_word(&mut self, caret_collapsed: bool) -> bool {
+        self.surrounding_caret_collapsed = caret_collapsed;
         if !self.core.native_completion_owned() {
             return false;
         }
@@ -696,10 +756,24 @@ impl MasterLoop {
                     let chars: Vec<char> = text.chars().collect();
                     let word: Vec<char> = self.core.current_word().chars().collect();
                     let lexical = |ch: char| ch.is_alphanumeric() || ch == '_';
-                    cursor <= chars.len()
-                        && cursor >= word.len()
-                        && chars[cursor - word.len()..cursor] == word
-                        && (cursor == word.len() || !lexical(chars[cursor - word.len() - 1]))
+                    if cursor > chars.len() || cursor < word.len() {
+                        return false;
+                    }
+                    let start = cursor - word.len();
+                    let left_valid = if let Some(prefix) = &self.native_completion_prefix {
+                        let prefix_start = chars[..start]
+                            .iter()
+                            .rposition(|ch| !lexical(*ch))
+                            .map_or(0, |index| index + 1);
+                        chars[prefix_start..start]
+                            .iter()
+                            .copied()
+                            .eq(prefix.chars())
+                    } else {
+                        start == 0 || !lexical(chars[start - 1])
+                    };
+                    chars[start..cursor] == word
+                        && left_valid
                         && (cursor == chars.len() || !lexical(chars[cursor]))
                 });
         if valid {
@@ -713,6 +787,7 @@ impl MasterLoop {
     }
 
     fn clear_native_completion_tracking(&mut self) {
+        self.native_completion_prefix = None;
         self.invalidate_language_choice();
         self.language_choice_dismissed = false;
         self.phase = Phase::Anticipating;
@@ -727,6 +802,8 @@ impl MasterLoop {
 
     /// Deliver owned preedit without treating a manual layout switch as a word.
     pub fn flush_preedit_for_layout(&mut self) -> Vec<Action> {
+        self.native_completion_prefix = None;
+        self.surrounding_caret_collapsed = false;
         self.invalidate_language_choice();
         self.language_choice_dismissed = false;
         self.phase = Phase::Anticipating;
@@ -742,6 +819,8 @@ impl MasterLoop {
     }
 
     pub fn focus_gained(&mut self) {
+        self.native_completion_prefix = None;
+        self.surrounding_caret_collapsed = false;
         self.invalidate_language_choice();
         self.language_choice_dismissed = false;
         self.sentence_echoes = None;
@@ -749,6 +828,8 @@ impl MasterLoop {
     }
 
     pub fn reset(&mut self) -> Vec<Action> {
+        self.native_completion_prefix = None;
+        self.surrounding_caret_collapsed = false;
         self.invalidate_language_choice();
         self.language_choice_dismissed = false;
         self.sentence_echoes = None;
@@ -890,6 +971,7 @@ impl MasterLoop {
     /// Linux IBus adapters can push live surrounding text here so the
     /// anticipation phase uses real document context instead of the null sampler.
     pub fn set_surrounding_text(&mut self, text: Option<String>, cursor_pos: Option<usize>) {
+        self.surrounding_caret_collapsed = false;
         if self.surrounding_text != text || self.surrounding_cursor_pos != cursor_pos {
             self.invalidate_language_choice();
         }
@@ -5562,6 +5644,134 @@ mod layout_handoff_tests {
         }
     }
 
+    fn native_popup_fixture() -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("hello", 1_000_000, LangId::En);
+        for word in ["one", "two", "three", "four", "five"] {
+            for ch in word.chars() {
+                ml.handle_key(press(Key::Char(ch)));
+            }
+            ml.handle_key(press(Key::Space));
+        }
+        for code in [35, 18, 38] {
+            ml.handle_key(press(Key::RawCode(code)));
+        }
+        assert_eq!(ml.current_word(), "hel");
+        assert_eq!(ml.ghost_text(), "lo");
+        ml.handoff_preedit_for_native_completion();
+        ml.set_surrounding_text(Some("😀 seed hel".into()), Some(10));
+        assert!(!ml.reconcile_native_completion_word(true));
+        ml
+    }
+
+    #[test]
+    fn native_popup_accept_keys_preserve_all_models_before_client_acceptance() {
+        for key in [Key::Tab, Key::Return, Key::RawCode(15), Key::RawCode(28)] {
+            let mut ml = native_popup_fixture();
+            let learned =
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            let actions = ml.handle_key(press(key.clone()));
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned,
+                "{key:?}"
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert!(ml.current_word().is_empty());
+            assert!(ml.last_prediction_accept.is_none() && ml.last_shown_ghost.is_none());
+            ml.handle_key(press(Key::Space));
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+        }
+    }
+
+    #[test]
+    fn native_popup_vertical_navigation_waits_for_matching_or_moved_report() {
+        for key in [Key::Up, Key::Down, Key::RawCode(103), Key::RawCode(108)] {
+            let mut ml = native_popup_fixture();
+            let learned =
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            assert_eq!(ml.handle_key(press(key)), [Action::ForwardKey]);
+            assert_eq!(ml.current_word(), "hel");
+            assert!(ml.core.native_completion_owned());
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            ml.set_surrounding_text(Some("😀 seed hel".into()), Some(10));
+            assert!(!ml.reconcile_native_completion_word(true));
+            assert_eq!(
+                ml.handle_key(press(Key::RawCode(38))),
+                [Action::CommitText("l".into()), Action::HideGhost]
+            );
+            assert_eq!(ml.current_word(), "hell");
+            ml.set_surrounding_text(Some("😀 seed hell".into()), Some(2));
+            assert!(ml.reconcile_native_completion_word(true));
+            assert!(ml.current_word().is_empty());
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+        }
+    }
+
+    #[test]
+    fn native_popup_escape_does_not_reject_smartkey_prediction_on_next_semantic_char() {
+        for key in [Key::Escape, Key::RawCode(1)] {
+            let mut ml = native_popup_fixture();
+            let learned =
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            assert_eq!(ml.handle_key(press(key)), [Action::ForwardKey]);
+            assert_eq!(ml.current_word(), "hel");
+            assert!(!ml.core.native_completion_owned());
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            let actions = ml.handle_key(press(Key::Char('l')));
+            assert_eq!(ml.current_word(), "hell");
+            assert!(actions.contains(&Action::ForwardKey));
+            assert!(!actions.iter().any(|action| matches!(
+                action,
+                Action::CommitText(_) | Action::ShowComposing { .. } | Action::ReplaceWord { .. }
+            )));
+            assert_eq!(ml.ghost_text(), "o");
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(ml.suppress_countdown, 0);
+        }
+    }
+
     #[test]
     fn native_word_report_retirement_preserves_profile_and_learning_attribution() {
         for (report, collapsed) in [("hel ", true), ("hello", true), ("hel", false)] {
@@ -5650,5 +5860,213 @@ mod layout_handoff_tests {
             serde_json::to_value(ml.metrics().summary()).unwrap(),
             metrics
         );
+    }
+}
+
+#[cfg(test)]
+mod native_identifier_tests {
+    use super::*;
+
+    fn press(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn fixture(separator: char) -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("food", 1_000_000, LangId::En);
+        ml.load_word_lang("bar", 1_000_000, LangId::En);
+        for code in [33, 24, 24] {
+            press(&mut ml, Key::RawCode(code));
+        }
+        assert_eq!(ml.current_word(), "foo");
+        let actions = ml.handle_key(KeyEvent {
+            key: Key::RawCode(if separator == '_' { 12 } else { 2 }),
+            modifiers: if separator == '_' {
+                Modifiers::SHIFT
+            } else {
+                Modifiers::empty()
+            },
+        });
+        assert!(actions.contains(&Action::CommitText("foo".into())));
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(ml.current_word().is_empty());
+        for code in [48, 30] {
+            press(&mut ml, Key::RawCode(code));
+        }
+        assert_eq!(ml.current_word(), "ba");
+        assert_eq!(ml.ghost_text(), "r");
+        ml
+    }
+
+    fn handoff(ml: &mut MasterLoop, text: Option<&str>, cursor: Option<usize>, collapsed: bool) {
+        ml.set_surrounding_text(text.map(str::to_owned), cursor);
+        assert!(!ml.reconcile_native_completion_word(collapsed));
+        assert_eq!(
+            ml.handoff_preedit_for_native_completion(),
+            [Action::HideGhost, Action::CommitText("ba".into())]
+        );
+    }
+
+    fn profile(ml: &MasterLoop) -> serde_json::Value {
+        crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile())
+    }
+
+    #[test]
+    fn native_identifier_delimiters_keep_matching_prefix_through_refinement() {
+        for separator in ['_', '1'] {
+            let mut ml = fixture(separator);
+            let learned = profile(&ml);
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            let document = format!("😀 seed foo{separator}ba");
+            // An ordinary preedit report may include its visible ghost on the right.
+            handoff(
+                &mut ml,
+                Some(&format!("{document}r")),
+                Some(document.chars().count()),
+                true,
+            );
+            ml.set_surrounding_text(Some(document.clone()), Some(document.chars().count()));
+            assert!(!ml.reconcile_native_completion_word(true), "{document}");
+            assert_eq!(
+                press(&mut ml, Key::RawCode(19)),
+                [Action::CommitText("r".into()), Action::HideGhost]
+            );
+            assert_eq!(ml.current_word(), "bar");
+            assert_eq!(profile(&ml), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+        }
+    }
+
+    #[test]
+    fn native_identifier_prefix_change_or_disappearance_retires_without_learning() {
+        for replacement in ["x_ba", "ba", "foo1ba"] {
+            let mut ml = fixture('_');
+            let learned = profile(&ml);
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            handoff(&mut ml, Some("foo_ba"), Some(6), true);
+            ml.set_surrounding_text(Some(replacement.into()), Some(replacement.chars().count()));
+            assert!(ml.reconcile_native_completion_word(true), "{replacement}");
+            assert!(ml.current_word().is_empty());
+            assert_eq!(profile(&ml), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            assert!(ml.core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_identifier_capture_requires_known_collapsed_suffix_and_core_delimiter() {
+        for (initial, cursor, collapsed, later) in [
+            (Some("fooba"), Some(5), true, "fooba"),
+            (None, None, true, "foo_ba"),
+            (Some("foo_ba"), None, true, "foo_ba"),
+            (Some("foo_ba"), Some(99), true, "foo_ba"),
+            (Some("foo_ba"), Some(6), false, "foo_ba"),
+            (Some("foo_bar"), Some(7), true, "foo_ba"),
+            (Some("foo١ba"), Some(6), true, "foo١ba"),
+        ] {
+            let mut ml = fixture('_');
+            let learned = profile(&ml);
+            handoff(&mut ml, initial, cursor, collapsed);
+            ml.set_surrounding_text(Some(later.into()), Some(later.chars().count()));
+            assert!(
+                ml.reconcile_native_completion_word(true),
+                "{initial:?}/{cursor:?}/{collapsed}"
+            );
+            assert!(ml.current_word().is_empty());
+            assert_eq!(profile(&ml), learned);
+        }
+    }
+
+    #[test]
+    fn native_identifier_repeated_handoff_cannot_adopt_replaced_prefix() {
+        let mut ml = fixture('_');
+        let learned = profile(&ml);
+        handoff(&mut ml, Some("foo_ba"), Some(6), true);
+        ml.set_surrounding_text(Some("x_ba".into()), Some(4));
+        assert_eq!(
+            ml.handoff_preedit_for_native_completion(),
+            [Action::HideGhost]
+        );
+        assert!(ml.reconcile_native_completion_word(true));
+        assert!(ml.current_word().is_empty());
+        assert_eq!(profile(&ml), learned);
+    }
+
+    #[test]
+    fn native_identifier_right_lexical_tail_is_only_tolerated_before_handoff() {
+        let mut ml = fixture('_');
+        let learned = profile(&ml);
+        handoff(&mut ml, Some("foo_bar"), Some(6), true);
+        ml.set_surrounding_text(Some("foo_bar".into()), Some(6));
+        assert!(ml.reconcile_native_completion_word(true));
+        assert!(ml.current_word().is_empty());
+        assert_eq!(profile(&ml), learned);
+    }
+
+    #[test]
+    fn native_identifier_lifecycle_does_not_transfer_anchor_to_next_token() {
+        for end in 0..9 {
+            let mut ml = fixture('_');
+            handoff(&mut ml, Some("foo_ba"), Some(6), true);
+            match end {
+                0 => {
+                    ml.reset();
+                }
+                1 => {
+                    ml.focus_lost();
+                }
+                2 => ml.focus_gained(),
+                3 => {
+                    ml.flush_preedit_for_layout();
+                }
+                4 => {
+                    press(&mut ml, Key::Backspace);
+                    press(&mut ml, Key::Backspace);
+                }
+                5 => {
+                    press(&mut ml, Key::Space);
+                }
+                6 => {
+                    press(&mut ml, Key::Tab);
+                }
+                7 => {
+                    press(&mut ml, Key::Return);
+                }
+                _ => {
+                    press(&mut ml, Key::Escape);
+                }
+            }
+            if ml.current_word().is_empty() {
+                for code in [48, 30] {
+                    press(&mut ml, Key::RawCode(code));
+                }
+            }
+            assert_eq!(ml.current_word(), "ba");
+            ml.set_surrounding_text(Some("ba".into()), Some(2));
+            assert!(!ml.reconcile_native_completion_word(true));
+            ml.handoff_preedit_for_native_completion();
+            ml.set_surrounding_text(Some("ba".into()), Some(2));
+            assert!(!ml.reconcile_native_completion_word(true), "endpoint {end}");
+            assert_eq!(
+                press(&mut ml, Key::RawCode(19)),
+                [Action::CommitText("r".into()), Action::HideGhost]
+            );
+        }
     }
 }

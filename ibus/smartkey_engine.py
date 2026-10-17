@@ -1117,6 +1117,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         key_release: bool,
         actions: list[tuple[str, str]],
         result: bool,
+        *,
+        delivery_only: bool = False,
     ) -> None:
         """Record the core verdict, dispatched actions, accept and outcome
         for the current keystroke.  No-op unless tracing is enabled."""
@@ -1164,7 +1166,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 if decoded is not None:
                     committed.append(decoded[1])
 
-        if committed and not key_release:
+        if committed and not key_release and not delivery_only:
             committed_text = "".join(committed)
             typed_prefix = getattr(self, "_last_composing_typed", "")
             # Same printable-key privacy rule as key_in: a composing-guard
@@ -2147,28 +2149,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             if keycode > 0 and _HAS_CORE and has_keycode_api
             else keyval == IBus.KEY_space
         )
-        # Native editor completion needs client-owned text, not a live IBus
-        # preedit. Ctrl+Space hands off only the typed prefix before forwarding
-        # the original shortcut. It is not acceptance or a word boundary.
-        # Caps/NumLock are incidental; every other modifier, including release,
-        # must retain its existing route. Older fallback cores keep forwarding.
-        if is_space and state & ~(2 | 16) == _MOD_CONTROL:
-            handoff = getattr(self._core, "handoff_preedit_for_native_completion", None)
-            reconcile = getattr(self._core, "reconcile_native_completion_word", None)
-            if callable(handoff) and callable(reconcile):
-                actions = handoff()
-                self._clear_language_choice()
-                self._execute_actions(actions)
-                self._active_prediction = None
-                self._keys_since_content_type = 0
-                self._sync_surrounding_text(None, None)
-                collector = getattr(self, "_o1", None)
-                if collector is not None:
-                    collector.on_abandon()
-                if tracing:
-                    self._trace_key_result(keyval, False, actions, False)
-                return False
-
         key_release = bool(state & _MOD_RELEASE)  # IBUS_RELEASE_MASK
         pure_modifier = (
             keycode in (29, 42, 54, 56, 58, 97, 100, 125, 126)
@@ -2189,6 +2169,29 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 collector = getattr(self, "_o1", None)
                 if collector is not None:
                     collector.on_abandon()
+
+        # Native editor completion needs client-owned text, not a live IBus
+        # preedit. Ctrl+Space hands off only the typed prefix before forwarding
+        # the original shortcut. It is not acceptance or a word boundary.
+        # Caps/NumLock are incidental; every other modifier, including release,
+        # must retain its existing route. Older fallback cores keep forwarding.
+        if is_space and state & ~(2 | 16) == _MOD_CONTROL:
+            handoff = getattr(self._core, "handoff_preedit_for_native_completion", None)
+            reconcile = getattr(self._core, "reconcile_native_completion_word", None)
+            if callable(handoff) and callable(reconcile):
+                actions = handoff()
+                self._clear_language_choice()
+                self._execute_actions(actions)
+                self._active_prediction = None
+                self._keys_since_content_type = 0
+                self._sync_surrounding_text(None, None)
+                collector = getattr(self, "_o1", None)
+                if collector is not None:
+                    collector.on_abandon()
+                if tracing:
+                    self._trace_key_result(keyval, False, actions, False, delivery_only=True)
+                return False
+
         if not key_release:
             # Fail-safe input for do_set_content_type: a content type that
             # changes after the user has started typing into this context is
