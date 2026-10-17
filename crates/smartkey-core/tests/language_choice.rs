@@ -483,12 +483,15 @@ fn language_choice_early_ambiguity_keeps_one_sided_final_correction_available() 
     ] {
         ml.load_word_lang(word, frequency, LangId::En);
     }
-    ml.load_word_lang("статия", 50_000, LangId::Bg);
+    // EN keeps prefix support through "stat" (status/static/station), so
+    // inferred-prefix recovery cannot make this boundary test pass early.
+    // Only the completed BG reading has exact support.
+    ml.load_word_lang("стат", 50_000, LangId::Bg);
     type_preedit(&mut ml, "st");
     let early = offer(&ml, "st", "ст");
     assert!(ml.dismiss_language_choice(early.revision));
-    type_preedit(&mut ml, "atiq");
-    assert_eq!(ml.current_word(), "statiq");
+    type_preedit(&mut ml, "at");
+    assert_eq!(ml.current_word(), "stat");
     assert!(
         ml.debug_state().1,
         "strong EN prefix must really survive locked"
@@ -497,7 +500,7 @@ fn language_choice_early_ambiguity_keeps_one_sided_final_correction_available() 
         ml.language_choice_offer().is_none(),
         "one-sided terminal evidence is not ambiguous"
     );
-    assert_only_commit(&ml.handle_key(event(Key::RawCode(57))), "статия", true);
+    assert_only_commit(&ml.handle_key(event(Key::RawCode(57))), "стат", true);
     assert_eq!(ml.metrics().summary().total_commits, 2);
     assert_eq!(ml.metrics().summary().accepted_predictions, 0);
 }

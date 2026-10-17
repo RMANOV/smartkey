@@ -2653,17 +2653,28 @@ impl InputMethodCore {
         let was_locked = db.is_locked();
         db.push(en_ch, bg_ch);
 
-        // Score both interpretations (skip if already locked — perf win).
-        if !was_locked {
+        // An inferred prefix lock can outlive its corpus support as the word
+        // grows. Recover only when the current side has none and the other
+        // still has support; explicit acceptance and ambiguity stay unchanged.
+        let mut rescored = false;
+        if !db.is_explicitly_locked() {
             let (en_freq, bg_freq) = self.engine.score_both(db.en_text(), db.bg_text());
-            db.update_scores(en_freq, bg_freq);
-            let lang_prior = self
-                .active_hints
-                .as_ref()
-                .and_then(|h| h.lang_prior)
-                .or_else(|| self.lang_detector.momentum_lang());
-            db.apply_prior_lock_hint(lang_prior);
-            db.apply_soft_context_prior(lang_prior);
+            let unsupported_winner = match db.winner_lang() {
+                LangId::En => en_freq == 0.0 && bg_freq > 0.0,
+                LangId::Bg => bg_freq == 0.0 && en_freq > 0.0,
+                LangId::Tech => false,
+            };
+            if !was_locked || unsupported_winner {
+                db.update_scores(en_freq, bg_freq);
+                let lang_prior = self
+                    .active_hints
+                    .as_ref()
+                    .and_then(|h| h.lang_prior)
+                    .or_else(|| self.lang_detector.momentum_lang());
+                db.apply_prior_lock_hint(lang_prior);
+                db.apply_soft_context_prior(lang_prior);
+                rescored = true;
+            }
         }
 
         // Propagate flip detection from dual buffer to regime detector flag.
@@ -2679,7 +2690,7 @@ impl InputMethodCore {
         // back as independent evidence; a prior/fallback or sticky display
         // lock cannot attest a new character.
         if self.config.lang_detection
-            && !was_locked
+            && rescored
             && db.evidence_origin() == crate::dual_buffer::EvidenceOrigin::Corpus
         {
             self.lang_detector
@@ -5999,15 +6010,15 @@ mod lang_prior_tests {
         assert_eq!(core.current_word(), "");
     }
 
-    /// Flush paths are outside this cycle: focus loss still delivers the
-    /// displayed reading.  Characterization of an explicit later task, not a
-    /// desired-output assertion.
+    /// Focus loss delivers the displayed reading; prefix recovery has already
+    /// selected Bulgarian before this flush, which makes no new layout choice.
     #[test]
     fn focus_lost_flush_keeps_the_displayed_reading() {
         let mut core = one_sided_exact_core();
         type_word(&mut core, &STATIQ);
+        assert_eq!(core.current_word(), "статия");
         let (commits, forwards, replaces) = delimiter_shape(&core.focus_lost());
-        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(commits, vec!["статия".to_string()]);
         assert_eq!(forwards, 0);
         assert_eq!(replaces, 0);
         assert_eq!(core.current_word(), "");
@@ -6023,30 +6034,32 @@ mod lang_prior_tests {
         core
     }
 
-    /// Tab without a ghost flushes the displayed reading (no boundary
-    /// resolution on this path).  Characterization of the later flush task.
+    /// Tab without a ghost flushes the already-recovered displayed reading,
+    /// without accepting a prediction or making another boundary selection.
     #[test]
     fn tab_flush_keeps_the_displayed_reading() {
         let mut core = one_sided_exact_core_without_ghost();
         type_word(&mut core, &STATIQ);
+        assert_eq!(core.current_word(), "статия");
         assert!(core.ghost.is_empty(), "precondition: no ghost to accept");
         let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_key(Key::Tab)));
-        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(commits, vec!["статия".to_string()]);
         assert_eq!(forwards, 1);
         assert_eq!(replaces, 0);
         assert_eq!(core.current_word(), "");
     }
 
-    /// Right without a ghost is a cursor move: flush the displayed reading,
-    /// then reset the word, context and detector.  Characterization.
+    /// Right without a ghost is a cursor move: flush the recovered reading,
+    /// then reset the word, context and detector.
     #[test]
     fn right_without_ghost_flushes_and_resets_context() {
         let mut core = one_sided_exact_core_without_ghost();
         type_word(&mut core, &STATIQ);
+        assert_eq!(core.current_word(), "статия");
         assert!(core.ghost.is_empty(), "precondition: no ghost to accept");
         let (commits, forwards, replaces) =
             delimiter_shape(&core.handle_key(press_key(Key::Right)));
-        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(commits, vec!["статия".to_string()]);
         assert_eq!(forwards, 1);
         assert_eq!(replaces, 0);
         assert_eq!(core.current_word(), "");

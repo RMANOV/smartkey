@@ -220,6 +220,10 @@ impl DualBuffer {
             self.flip_detected = true;
             // Update lock to new winner.
             self.locked_lang = Some(new_winner);
+            if self.inferred_lock_len.is_some() {
+                // Deleting this new deciding prefix must retract its lock.
+                self.inferred_lock_len = Some(self.len());
+            }
         }
 
         self.winner = new_winner;

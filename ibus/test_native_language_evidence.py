@@ -316,7 +316,9 @@ def test_native_terminal_context_erase_retype_uses_current_client_cache(withdraw
     _terminal_assert_boundary(core, 57, "wi" if withdraw else "ви")
 
 
-@pytest.mark.parametrize("fixture,expected", [("both-supported", "wix"), ("one-sided", "statiqx")])
+# The one-sided inferred prefix now recovers before the semantic handoff;
+# preserve that complete displayed BG word plus the exact literal suffix.
+@pytest.mark.parametrize("fixture,expected", [("both-supported", "wix"), ("one-sided", "статияx")])
 def test_native_terminal_resolution_keeps_direct_semantic_suffix(fixture, expected):
     core = _terminal_core() if fixture == "both-supported" else _native().PyInputMethodCore()
     if fixture == "one-sided":

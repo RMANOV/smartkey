@@ -478,6 +478,12 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 "delivery; rebuild the native module before starting SmartKey"
             ) from exc
 
+        # KDE's explicit BG layout is ordinary keyboard input. Its metadata
+        # observer never changes an engine, layout, or client text.
+        self._kde_layout = None
+        self._manual_layout_passthrough = False
+        self._init_kde_layout_observer()
+
         # Load personal profile (learned words from previous sessions).
         try:
             self._core.load_personal()
@@ -1978,6 +1984,40 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             cursor_pos,
         )
 
+    def _init_kde_layout_observer(self) -> None:
+        if not _HAS_IBUS or getattr(self, "_kde_layout", None) is not None:
+            return
+        try:
+            from ibus.kde_layout import create_kde_layout_observer
+
+            self._kde_layout = create_kde_layout_observer()
+        except (ImportError, OSError):
+            log.debug("smartkey: optional KDE layout metadata unavailable")
+
+    def _manual_layout_for_key(self, state: int) -> bool:
+        observer = getattr(self, "_kde_layout", None)
+        current = getattr(self, "_manual_layout_passthrough", False)
+        # Releases belong to the preceding press; they cannot start a new
+        # composition or flush it because a layout signal arrived meanwhile.
+        if state & _MOD_RELEASE:
+            return current
+        manual = observer is not None and observer.manual_bg
+        if manual != current:
+            if manual:
+                actions = self._core.focus_lost()
+                self._clear_language_choice()
+                self._execute_actions(actions)
+                self._active_prediction = None
+                self._keys_since_content_type = 0
+                self._sync_surrounding_text(None, None)
+                collector = getattr(self, "_o1", None)
+                if collector is not None:
+                    collector.on_abandon()
+            else:
+                self._core.focus_gained()
+            self._manual_layout_passthrough = manual
+        return manual
+
     # -----------------------------------------------------------------------
     # Key event handler.
     # -----------------------------------------------------------------------
@@ -2026,6 +2066,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                     "(structural event; no key content logged)"
                 )
                 self._undeclared_bypass_logged = True
+            return False
+
+        # An explicit KDE BG selection bypasses automatic interpretation,
+        # prediction, learning and content tracing. Retire any old owned
+        # preedit once before forwarding the first ordinary keyboard key.
+        if (
+            not self._is_spurious_zero_key_event(keyval, keycode, state)
+            and self._manual_layout_for_key(state)
+        ):
             return False
 
         log.debug("key: keyval=0x%04X keycode=%d state=0x%04X", keyval, keycode, state)
@@ -2164,6 +2213,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # IBus lifecycle callbacks.
     # -----------------------------------------------------------------------
     def do_focus_in(self) -> None:
+        self._init_kde_layout_observer()
         self._clear_language_choice()
         self._core.focus_gained()
         if getattr(self, "_sensitive", False):
@@ -2275,6 +2325,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         trace = getattr(self, "_trace", None)
         if trace is not None and trace.enabled:
             trace.flush()
+
+    def do_destroy(self) -> None:
+        observer = getattr(self, "_kde_layout", None)
+        self._kde_layout = None
+        if observer is not None:
+            observer.close()
+        destroy = getattr(super(), "do_destroy", None)
+        if callable(destroy):
+            destroy()
 
     def do_enable(self) -> None:
         pass  # Rust core handles enabled state via kill switch.

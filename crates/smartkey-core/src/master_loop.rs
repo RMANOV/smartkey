@@ -3005,11 +3005,13 @@ mod terminal_alignment_contract_tests {
         for code in [31, 20, 30, 20, 23, 16] {
             step(&mut ml, Key::RawCode(code), &mut text, &mut preedit);
         }
-        assert_eq!(ml.current_word(), "statiq");
+        // Inferred-prefix recovery precedes the semantic handoff. The actual
+        // complete displayed word and the literal suffix must both survive.
+        assert_eq!(ml.current_word(), "статия");
         assert_eq!(ml.core.debug_state(), (true, true, false));
         step(&mut ml, Key::Char('x'), &mut text, &mut preedit);
-        assert_eq!(ml.current_word(), "statiqx");
-        assert_full_token(&mut ml, "statiqx", &mut text, &mut preedit);
+        assert_eq!(ml.current_word(), "статияx");
+        assert_full_token(&mut ml, "статияx", &mut text, &mut preedit);
     }
 }
 
