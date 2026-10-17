@@ -315,3 +315,35 @@ def test_native_adapter_completion_handoff_respects_sensitive_guard(monkeypatch)
 
     assert engine._core.current_word() == "здра"
     assert rec.commits == []
+
+
+@pytest.mark.parametrize("level", [1, 2], ids=["structural", "full"])
+def test_native_adapter_completion_handoff_trace_records_forwarded_delivery(tmp_path, monkeypatch, level):
+    """An early return must not leave a trace sequence with only key_in."""
+    from .smartkey_debug import KeystrokeTrace
+
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+    trace = KeystrokeTrace(level=level, directory=tmp_path / "trace")
+    engine._trace = trace
+
+    assert engine.do_process_key_event(0x20, 57, 4) is False
+
+    assert rec.commits == ["здра"]
+    trace.flush()
+    raw = trace._file.read_text()
+    events = [json.loads(line) for line in raw.splitlines()]
+    assert {event["seq"] for event in events} == {1}
+    assert {"key_in", "core", "action", "outcome"} <= {event["event"] for event in events}
+    verdicts = [event["verdict"] for event in events if event["event"] == "core"]
+    assert verdicts == ["forward"], "delivery actions must not label the shortcut consumed"
+    actions = [event for event in events if event["event"] == "action"]
+    assert [(event["action_name"], event["payload_len"]) for event in actions] == [("commit", 4), ("hide", 0)]
+    outcome = [event for event in events if event["event"] == "outcome"]
+    assert len(outcome) == 1 and outcome[0]["committed_to_app_len"] == 4
+    if level == 2:
+        assert actions[0]["payload_text"] == outcome[0]["committed_to_app"] == "здра"
+    else:
+        assert "здра" not in raw and "здравей" not in raw
+        assert all("payload_text" not in event for event in actions)
+        assert "committed_to_app" not in outcome[0]

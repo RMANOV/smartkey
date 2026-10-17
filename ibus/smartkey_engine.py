@@ -2144,6 +2144,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 collector = getattr(self, "_o1", None)
                 if collector is not None:
                     collector.on_abandon()
+                if tracing:
+                    self._trace_key_result(keyval, False, actions, False)
                 return False
 
         key_release = bool(state & _MOD_RELEASE)  # IBUS_RELEASE_MASK
