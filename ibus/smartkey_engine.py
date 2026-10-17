@@ -484,6 +484,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 "rebuild the native module before starting SmartKey"
             )
 
+        if not all(callable(getattr(self._core, api, None)) for api in (
+            "handoff_preedit_for_native_completion", "reconcile_native_completion_word",
+        )):
+            raise RuntimeError(
+                "smartkey_py native extension cannot enforce native completion handoff; "
+                "rebuild the native module before starting SmartKey"
+            )
+
         # KDE's explicit BG layout is ordinary keyboard input. Its metadata
         # observer never changes an engine, layout, or client text.
         self._kde_layout = None
@@ -531,6 +539,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._preedit_mode: str | None = None
         self._surrounding_text: str | None = None
         self._surrounding_cursor_pos: int | None = None
+        self._surrounding_anchor_pos: int | None = None
         self._session_id = f"{int(time.time() * 1000)}-{os.getpid()}"
         self._prediction_seq = 0
         self._active_prediction: dict[str, object] | None = None
@@ -671,10 +680,15 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return text_obj
         return None
 
-    def _sync_surrounding_text(self, text: str | None, cursor_pos: int | None) -> None:
+    def _sync_surrounding_text(
+        self, text: str | None, cursor_pos: int | None, anchor_pos: int | None = None,
+    ) -> None:
         self._surrounding_text = text
         self._surrounding_cursor_pos = (
             cursor_pos if cursor_pos is not None and cursor_pos >= 0 else None
+        )
+        self._surrounding_anchor_pos = (
+            anchor_pos if anchor_pos is not None and anchor_pos >= 0 else None
         )
         self._core.set_surrounding_text(
             self._surrounding_text, self._surrounding_cursor_pos
@@ -693,17 +707,21 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         text_obj: object | None = None
         cursor_pos: int | None = None
+        anchor_pos: int | None = None
         if isinstance(surrounding, tuple):
             if surrounding:
                 text_obj = surrounding[0]
             if len(surrounding) >= 2 and isinstance(surrounding[1], int):
                 cursor_pos = surrounding[1]
+            if len(surrounding) >= 3 and isinstance(surrounding[2], int):
+                anchor_pos = surrounding[2]
         else:
             text_obj = surrounding
 
         self._sync_surrounding_text(
             self._decode_surrounding_text(text_obj),
             cursor_pos,
+            anchor_pos,
         )
 
     def _log_replay_event(self, event: str, **payload: object) -> None:
@@ -1980,7 +1998,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def do_set_surrounding_text(
         self, text: object, cursor_pos: int, anchor_pos: int
     ) -> None:
-        _ = anchor_pos
         if getattr(self, "_sensitive", False):
             # A sensitive field's contents must never reach the core, the
             # predictor or the trace.
@@ -1988,6 +2005,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._sync_surrounding_text(
             self._decode_surrounding_text(text),
             cursor_pos,
+            anchor_pos,
         )
 
     def _init_kde_layout_observer(self) -> None:
@@ -2133,9 +2151,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # Caps/NumLock are incidental; every other modifier, including release,
         # must retain its existing route. Older fallback cores keep forwarding.
         if is_space and state & ~(2 | 16) == _MOD_CONTROL:
-            flush = getattr(self._core, "flush_preedit_for_layout", None)
-            if callable(flush):
-                actions = flush()
+            handoff = getattr(self._core, "handoff_preedit_for_native_completion", None)
+            reconcile = getattr(self._core, "reconcile_native_completion_word", None)
+            if callable(handoff) and callable(reconcile):
+                actions = handoff()
                 self._clear_language_choice()
                 self._execute_actions(actions)
                 self._active_prediction = None
@@ -2149,6 +2168,25 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 return False
 
         key_release = bool(state & _MOD_RELEASE)  # IBUS_RELEASE_MASK
+        pure_modifier = (
+            keycode in (29, 42, 54, 56, 58, 97, 100, 125, 126)
+            if keycode > 0 and _HAS_CORE and has_keycode_api
+            else 0xFFE1 <= keyval <= 0xFFEE
+        )
+        if not key_release and not pure_modifier:
+            # IBus returns its latest cached report and requests another update;
+            # this is not a synchronous client query. Reconcile only at a key,
+            # before capturing any prediction or word-learning attribution.
+            self._refresh_surrounding_text()
+            reconcile = getattr(self._core, "reconcile_native_completion_word", None)
+            cursor = getattr(self, "_surrounding_cursor_pos", None)
+            anchor = getattr(self, "_surrounding_anchor_pos", None)
+            if callable(reconcile) and reconcile(cursor is not None and anchor == cursor):
+                self._clear_language_choice()
+                self._active_prediction = None
+                collector = getattr(self, "_o1", None)
+                if collector is not None:
+                    collector.on_abandon()
         if not key_release:
             # Fail-safe input for do_set_content_type: a content type that
             # changes after the user has started typing into this context is
@@ -2176,8 +2214,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         )
         if pending_prediction is not None:
             pending_prediction["pre_key_word"] = self._core_current_word()
-        if not key_release:
-            self._refresh_surrounding_text()
         choice_result = self._language_choice_key(keyval, state)
         if choice_result is not None:
             return choice_result

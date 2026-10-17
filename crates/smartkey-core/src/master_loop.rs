@@ -672,6 +672,59 @@ impl MasterLoop {
         actions
     }
 
+    /// Transfer presentation to native completion without ending the word.
+    pub fn handoff_preedit_for_native_completion(&mut self) -> Vec<Action> {
+        self.clear_native_completion_tracking();
+        self.core.handoff_preedit_for_native_completion()
+    }
+
+    /// Retire a client-owned token if the latest observed client state no
+    /// longer describes that exact whole word at a collapsed caret. Reports
+    /// alone never cancel ordinary preedit; the adapter calls this before the
+    /// next real press, before capturing word/prediction learning attribution.
+    /// Returns true only when a stale native-completion token was retired.
+    pub fn reconcile_native_completion_word(&mut self, caret_collapsed: bool) -> bool {
+        if !self.core.native_completion_owned() {
+            return false;
+        }
+        let valid = caret_collapsed
+            && self
+                .surrounding_text
+                .as_deref()
+                .zip(self.surrounding_cursor_pos)
+                .is_some_and(|(text, cursor)| {
+                    let chars: Vec<char> = text.chars().collect();
+                    let word: Vec<char> = self.core.current_word().chars().collect();
+                    let lexical = |ch: char| ch.is_alphanumeric() || ch == '_';
+                    cursor <= chars.len()
+                        && cursor >= word.len()
+                        && chars[cursor - word.len()..cursor] == word
+                        && (cursor == word.len() || !lexical(chars[cursor - word.len() - 1]))
+                        && (cursor == chars.len() || !lexical(chars[cursor]))
+                });
+        if valid {
+            return false;
+        }
+        self.clear_native_completion_tracking();
+        // Its characters are already in the client: cancellation must neither
+        // insert them again nor teach an unfinished or externally replaced word.
+        self.core.reset();
+        true
+    }
+
+    fn clear_native_completion_tracking(&mut self) {
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
+        self.phase = Phase::Anticipating;
+        self.sentence_echoes = None;
+        self.anticipated = false;
+        self.core.clear_hints();
+        self.frustration.reset_word();
+        self.last_shown_ghost = None;
+        self.last_prediction_accept = None;
+        self.last_accepted_prediction = None;
+    }
+
     /// Deliver owned preedit without treating a manual layout switch as a word.
     pub fn flush_preedit_for_layout(&mut self) -> Vec<Action> {
         self.invalidate_language_choice();
@@ -5506,6 +5559,42 @@ mod layout_handoff_tests {
         KeyEvent {
             key,
             modifiers: Modifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn native_word_report_retirement_preserves_profile_and_learning_attribution() {
+        for (report, collapsed) in [("hel ", true), ("hello", true), ("hel", false)] {
+            let mut ml = MasterLoop::new(InputConfig::default());
+            for word in ["one", "two", "three", "four", "five"] {
+                for ch in word.chars() {
+                    ml.handle_key(press(Key::Char(ch)));
+                }
+                ml.handle_key(press(Key::Space));
+            }
+            ml.load_word_lang("hello", 1_000_000, LangId::En);
+            for code in [35, 18, 38] {
+                ml.handle_key(press(Key::RawCode(code)));
+            }
+            let profile =
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            ml.handoff_preedit_for_native_completion();
+            ml.set_surrounding_text(Some(report.into()), Some(report.chars().count()));
+            assert!(ml.reconcile_native_completion_word(collapsed));
+            assert!(ml.current_word().is_empty());
+            assert!(ml.last_prediction_accept.is_none() && ml.last_shown_ghost.is_none());
+            ml.handle_key(press(Key::Space));
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                profile
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
         }
     }
 

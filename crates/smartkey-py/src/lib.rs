@@ -196,6 +196,21 @@ impl PyInputMethodCore {
             .collect()
     }
 
+    /// Deliver typed preedit while retaining the native-completion word/layout.
+    fn handoff_preedit_for_native_completion(&mut self) -> Vec<(String, String)> {
+        self.inner
+            .handoff_preedit_for_native_completion()
+            .iter()
+            .map(action_to_tuple)
+            .collect()
+    }
+
+    /// True means a stale client-owned native-completion token was retired.
+    #[pyo3(signature = (caret_collapsed=false))]
+    fn reconcile_native_completion_word(&mut self, caret_collapsed: bool) -> bool {
+        self.inner.reconcile_native_completion_word(caret_collapsed)
+    }
+
     /// Update surrounding text from the platform adapter.
     fn set_surrounding_text(&mut self, text: Option<&str>, cursor_pos: Option<usize>) {
         self.inner

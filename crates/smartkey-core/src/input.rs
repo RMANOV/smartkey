@@ -607,6 +607,9 @@ pub struct InputMethodCore {
     dual_buffer: Option<DualBuffer>,
     /// Rendering layout after a token leaves preedit; never language evidence.
     word_delivery_layout: Option<keymap::Layout>,
+    /// This delivered token belongs to the client's native completion UI.
+    /// Keep its rendering layout, but never offer an IBus completion for it.
+    native_completion_owned: bool,
     /// Typing regime detector (v0.5+) — gates tech vocab δ weight in the ensemble.
     regime_detector: RegimeDetector,
     /// True when the current word triggered a dual-buffer layout flip (for regime detection).
@@ -650,6 +653,7 @@ impl InputMethodCore {
             transliteration_active: false,
             dual_buffer: None,
             word_delivery_layout: None,
+            native_completion_owned: false,
             regime_detector: RegimeDetector::new(),
             current_word_had_flip: false,
             caps_engine: CapsEngine::new(),
@@ -1226,7 +1230,8 @@ impl InputMethodCore {
                     return self.accept_ghost_with_delimiter();
                 }
                 // Capture whole-word ownership before taking/resetting the token.
-                let rewrite_allowed = self.external_rewrite_supported || self.dual_buffer.is_some();
+                let rewrite_allowed = !self.native_completion_owned
+                    && (self.external_rewrite_supported || self.dual_buffer.is_some());
                 let sentence_start = self.sentence_start_override();
                 // Empty Space does not finish a word; retain its current-position
                 // decision. Return instead establishes a new local boundary.
@@ -1424,17 +1429,21 @@ impl InputMethodCore {
                 // bypass the dual buffer, so they would clear the preedit via
                 // HideGhost without committing the composed text — losing the
                 // user's typed letters.  Commit the composed word first.
-                if self.dual_buffer.is_some()
+                if (self.dual_buffer.is_some() || self.native_completion_owned)
                     && !self.current_word.is_empty()
                     && !ch.is_alphabetic()
                 {
-                    let rewrite_allowed =
-                        self.external_rewrite_supported || self.dual_buffer.is_some();
+                    let composing = self.dual_buffer.is_some();
+                    let rewrite_allowed = !self.native_completion_owned
+                        && (self.external_rewrite_supported || composing);
                     let sentence_start = self.sentence_start_override();
                     let word = self.resolve_word_boundary();
                     let correction = self.commit_boundary_word(&word, rewrite_allowed);
                     self.reset_word();
-                    let mut actions = vec![Action::HideGhost, Action::CommitText(word.clone())];
+                    let mut actions = vec![Action::HideGhost];
+                    if composing {
+                        actions.push(Action::CommitText(word.clone()));
+                    }
                     // The punctuation key is forwarded only after the adapter
                     // finishes this batch.  Never install a fresh preedit in
                     // front of it; otherwise characters such as `!` can be
@@ -1817,6 +1826,26 @@ impl InputMethodCore {
 
     // -- focus / reset --------------------------------------------------
 
+    /// Deliver only the typed preedit, retaining this word's selected layout.
+    /// Native completion owns presentation until this token ends or is retired.
+    pub fn handoff_preedit_for_native_completion(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
+        let mut actions = self.handoff_preedit();
+        self.native_completion_owned = !self.current_word.is_empty();
+        self.clear_ghost();
+        self.last_predictions.clear();
+        self.last_prediction_language = None;
+        self.space_accept_display_attested = false;
+        if actions.is_empty() {
+            actions.push(Action::HideGhost);
+        }
+        actions
+    }
+
+    pub(crate) fn native_completion_owned(&self) -> bool {
+        self.native_completion_owned
+    }
+
     /// Deliver owned preedit before handing input to a manually selected layout.
     ///
     /// A layout switch is not a word boundary: the user may continue the same
@@ -1837,6 +1866,9 @@ impl InputMethodCore {
     /// Called when the input field loses focus.
     pub fn focus_lost(&mut self) -> Vec<Action> {
         self.commit_learning = CommitLearningBatch::default();
+        if self.native_completion_owned {
+            return self.reset();
+        }
         // Flush the preedit to the application BEFORE learning from it —
         // the lock gate that used to sit here made the engine learn a word
         // the application never received.
@@ -1853,6 +1885,9 @@ impl InputMethodCore {
     /// Called when the input field gains focus.
     pub fn focus_gained(&mut self) {
         self.commit_learning = CommitLearningBatch::default();
+        if self.native_completion_owned {
+            self.reset_word();
+        }
         self.sentence_boundary = SentenceBoundaryHint::None;
         self.sentence_presentation_override = None;
     }
@@ -2036,7 +2071,7 @@ impl InputMethodCore {
     /// Returns a replacement display action when the correction can be shown
     /// for the current prefix; otherwise leaves state unchanged.
     pub fn apply_prediction_override(&mut self, replacement: &str) -> Option<Action> {
-        if self.current_word.is_empty() {
+        if self.current_word.is_empty() || self.native_completion_owned {
             return None;
         }
 
@@ -2153,6 +2188,7 @@ impl InputMethodCore {
         self.word_origins.pop();
         if self.current_word.is_empty() {
             self.language_choice_token_policy = false;
+            self.native_completion_owned = false;
         }
     }
 
@@ -2654,6 +2690,7 @@ impl InputMethodCore {
         self.transliteration_active = false;
         self.dual_buffer = None;
         self.word_delivery_layout = None;
+        self.native_completion_owned = false;
         self.language_choice_token_policy = false;
         self.current_word_had_flip = false;
         self.anticipatory_ghost_active = false;
@@ -2841,7 +2878,9 @@ impl InputMethodCore {
     /// then applies the user's capitalization pattern to predictions.
     fn compute_ghost_suffix(&mut self) -> String {
         // MasterLoop hint: suppress ghost entirely.
-        if self.active_hints.as_ref().is_some_and(|h| h.suppress_ghost) {
+        if self.native_completion_owned
+            || self.active_hints.as_ref().is_some_and(|h| h.suppress_ghost)
+        {
             self.ghost.clear();
             self.last_predictions.clear();
             self.last_prediction_language = None;
@@ -9826,6 +9865,65 @@ mod layout_handoff_tests {
             learned,
             "next empty boundary must not lazily learn the flushed prefix"
         );
+    }
+
+    #[test]
+    fn native_handoff_refinement_and_abandon_preserve_all_learned_state() {
+        for boundary in 0..4 {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(
+                core.handoff_preedit_for_native_completion(),
+                [Action::HideGhost, Action::CommitText("hel".into())]
+            );
+            assert!(core.apply_prediction_override("hello").is_none());
+            assert_eq!(
+                core.handle_key(press(Key::RawCode(38))),
+                [Action::CommitText("l".into()), Action::HideGhost]
+            );
+            assert_eq!(core.current_word(), "hell");
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            match boundary {
+                0 => assert_eq!(core.reset(), [Action::HideGhost]),
+                1 => assert_eq!(core.focus_lost(), [Action::HideGhost]),
+                2 => core.focus_gained(),
+                _ => assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]),
+            }
+            assert!(core.current_word().is_empty());
+            assert!(core.take_commit_learning().words.is_empty());
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+        }
+    }
+
+    #[test]
+    fn native_handoff_punctuation_and_digits_end_the_delivered_token() {
+        for delimiter in [
+            Key::Char('.'),
+            Key::RawCode(52),
+            Key::Char('1'),
+            Key::RawCode(2),
+        ] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let before = core.metrics().summary().total_commits;
+            let actions = core.handle_key(press(delimiter));
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert!(core.current_word().is_empty());
+            assert!(!core.native_completion_owned());
+            assert_eq!(core.metrics().summary().total_commits, before + 1);
+            let actions = core.handle_key(press(Key::RawCode(35)));
+            assert!(core.debug_state().0);
+            assert!(actions
+                .iter()
+                .any(|action| matches!(action, Action::ShowComposing { .. })));
+            assert!(!actions
+                .iter()
+                .any(|action| matches!(action, Action::CommitText(_))));
+        }
     }
 
     #[test]

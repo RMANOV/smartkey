@@ -32,6 +32,12 @@ def _constructor_fixture(monkeypatch, core):
 
 def test_constructor_disables_external_rewrite_before_profile_or_corpus(monkeypatch):
     class Core:
+        def handoff_preedit_for_native_completion(self):
+            raise AssertionError("startup must not hand off text")
+
+        def reconcile_native_completion_word(self, caret_collapsed=False):
+            raise AssertionError("startup must not reconcile text")
+
         def set_external_rewrite_supported(self, supported):
             events.append(("external_rewrite", supported))
 
@@ -112,3 +118,25 @@ def test_surrounding_report_preserves_known_empty_and_missing_distinction(text, 
     assert reports == [(text, cursor)]
     assert engine._surrounding_text == text
     assert engine._surrounding_cursor_pos == cursor
+
+
+@pytest.mark.parametrize("missing", ["handoff_preedit_for_native_completion", "reconcile_native_completion_word"])
+@pytest.mark.parametrize("noncallable", [False, True])
+def test_incompatible_native_completion_refuses_startup_before_profile(monkeypatch, missing, noncallable):
+    class Core:
+        def set_external_rewrite_supported(self, supported):
+            events.append(("external_rewrite", supported))
+
+        def flush_preedit_for_layout(self):
+            raise AssertionError("startup must not deliver text")
+
+    core = Core()
+    for api in ("handoff_preedit_for_native_completion", "reconcile_native_completion_word"):
+        if api != missing:
+            setattr(core, api, lambda *args: None)
+    if noncallable:
+        setattr(core, missing, None)
+    events = _constructor_fixture(monkeypatch, core)
+    with pytest.raises(RuntimeError, match="native completion handoff"):
+        ske.SmartKeyEngine()
+    assert events == ["create", ("external_rewrite", False)]
