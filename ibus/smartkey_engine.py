@@ -1699,6 +1699,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return True if selected_tab else None
         if offer is not None and plain:
             if keyval in (IBus.KEY_Up, IBus.KEY_Down):
+                # Client preedit echoes can retire the displayed revision. An
+                # explicit arrow starts a fresh selection of the current offer;
+                # selected Tab must keep its original lease and never retry.
+                self._refresh_language_choice()
+                offer = self._language_choice_offer
+                selected = self._language_choice_selected
+                if offer is None:
+                    return True
                 step = 1 if keyval == IBus.KEY_Down else -1
                 self._language_choice_selected = ((selected or 0) + step) % 2
                 self._render_language_choice()

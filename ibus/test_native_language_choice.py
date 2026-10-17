@@ -128,3 +128,123 @@ def test_native_historical_whole_readings_preserve_space_and_accept_explicit_bg(
             assert actions.count(("forward", "")) == 1
             assert not any(kind == "replace" for kind, _ in actions)
         assert core.current_word() == "" and core.language_choice_offer() is None
+
+
+def _adapter_with_repeated_top(monkeypatch):
+    """Real Core/adapter; only the external IBus display/panel is recorded."""
+    core = _native().PyInputMethodCore(json.dumps({"ghost_text": False}))
+    from .test_language_choice import _engine, ske
+
+    for word, count in (("неделя", 1_000_000), ("top", 2_137_962), ("топ", 12_302)):
+        core.load_word(word, count)
+    eng, rec = _engine(monkeypatch)
+    eng._core = core
+    eng._language_choice_supported = False
+    eng.do_set_capabilities(41)
+    prefix = "Искам да благодаря "
+    eng._sync_surrounding_text(prefix, len(prefix), len(prefix))
+
+    def tap(keyval, code):
+        result = eng.do_process_key_event(keyval, code, 0)
+        eng.do_process_key_event(keyval, code, 1 << 30)
+        return result
+
+    for key, code in zip("nedelq", (49, 18, 32, 18, 38, 16)):
+        tap(ord(key), code)
+    tap(32, 57)
+    assert rec.commits == ["неделя"]
+    prefix += "неделя "
+    eng._sync_surrounding_text(prefix, len(prefix), len(prefix))
+    for key, code in zip("top", (20, 24, 25)):
+        tap(ord(key), code)
+    assert core.current_word() == "top"
+    tap(32, 57)
+    assert rec.commits == ["неделя", "top"]
+    prefix += "top "
+    eng._sync_surrounding_text(prefix, len(prefix), len(prefix))
+    for key, code in zip("top", (20, 24, 25)):
+        tap(ord(key), code)
+    assert rec.lookups[-1] == (("top", "топ"), 0, False, True)
+    # Actual Qt reports after final p: committed prefix, then preedit-inclusive
+    # text/caret. Neither report rewrites the token or chooses a reading.
+    eng._sync_surrounding_text(prefix, len(prefix), len(prefix))
+    rendered = prefix + "top"
+    eng._sync_surrounding_text(rendered, len(rendered), len(rendered))
+    return eng, rec, ske, tap, rendered
+
+
+def _assert_same_learned_state(before, after):
+    for key in ("weights", "light_profile", "corrections", "markov_bigrams", "markov_trigrams"):
+        assert after[key] == before[key]
+    # Exported age_secs advances with wall time; words/round are the learned
+    # state. Language tracks are a serialized map, whose order is not semantic.
+    for key in ("words", "round"):
+        assert after["cvm"][key] == before["cvm"][key]
+        assert {lang: track[key] for lang, track in after["lang_cvm"]["tracks"]} == {
+            lang: track[key] for lang, track in before["lang_cvm"]["tracks"]
+        }
+
+
+@pytest.mark.parametrize("arrows,positions", [
+    (("Down",), (1,)),
+    (("Down", "Up", "Down"), (1, 0, 1)),
+])
+def test_native_adapter_selected_tab_accepts_after_preedit_surrounding_echo(
+    monkeypatch, tmp_path, arrows, positions,
+):
+    """A fresh arrow selection must bind the current lease, not the old UI lease.
+
+    KWrite reports the rendered preedit after the last letter. That report
+    invalidates the Core revision while the visible table stays cached.
+    """
+    eng, rec, ske, tap, _rendered = _adapter_with_repeated_top(monkeypatch)
+    eng._core.export_personal(str(tmp_path / "before-arrows.json"))
+    before_arrows = json.loads((tmp_path / "before-arrows.json").read_text())
+    before_preedits = list(rec.preedits)
+    for arrow, position in zip(arrows, positions):
+        assert tap(getattr(ske.IBus, "KEY_" + arrow), 108 if arrow == "Down" else 103) is True
+        assert rec.lookups[-1] == (("top", "топ"), position, True, True)
+    assert rec.lookups[-1] == (("top", "топ"), 1, True, True)
+    assert eng._core.current_word() == "top" and rec.commits == ["неделя", "top"]
+    assert rec.preedits == before_preedits
+    eng._core.export_personal(str(tmp_path / "after-arrows.json"))
+    after_arrows = json.loads((tmp_path / "after-arrows.json").read_text())
+    _assert_same_learned_state(before_arrows, after_arrows)
+
+    assert tap(ske.IBus.KEY_Tab, 15) is True
+
+    assert rec.commits == ["неделя", "top", "топ"]
+    assert eng._core.current_word() == "" and not eng._preedit_active
+
+
+@pytest.mark.parametrize("report", ["cursor-move", "changed-text", "noncollapsed"])
+def test_native_adapter_selected_tab_rejects_report_change_after_selection(monkeypatch, tmp_path, report):
+    """Tab cannot silently rebind a selection after a client state change."""
+    eng, rec, ske, tap, rendered = _adapter_with_repeated_top(monkeypatch)
+    assert tap(ske.IBus.KEY_Down, 108) is True
+    selected_revision = eng._language_choice_offer["revision"]
+    if report == "cursor-move":
+        eng._sync_surrounding_text(rendered, len(rendered) - 1, len(rendered) - 1)
+    elif report == "changed-text":
+        changed = rendered + "x"
+        eng._sync_surrounding_text(changed, len(changed), len(changed))
+    else:
+        # The Core API does not receive anchor state; a changed cursor in an
+        # actual noncollapsed report must still leave the old lease invalid.
+        eng._sync_surrounding_text(rendered, len(rendered) - 1, len(rendered))
+    current_offer = eng._core.language_choice_offer()
+    assert current_offer is not None and current_offer["revision"] != selected_revision
+    before_preedits = list(rec.preedits)
+    before_feedback = list(eng._o1.words)
+    eng._core.export_personal(str(tmp_path / "before-stale-Tab.json"))
+
+    assert tap(ske.IBus.KEY_Tab, 15) is True
+
+    assert rec.commits == ["неделя", "top"]
+    assert eng._core.current_word() == "top"
+    assert rec.preedits == before_preedits and eng._o1.words == before_feedback
+    eng._core.export_personal(str(tmp_path / "after-stale-Tab.json"))
+    _assert_same_learned_state(
+        json.loads((tmp_path / "before-stale-Tab.json").read_text()),
+        json.loads((tmp_path / "after-stale-Tab.json").read_text()),
+    )
