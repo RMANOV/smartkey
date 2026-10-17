@@ -2121,6 +2121,31 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 trace.emit("core", verdict="consume_spurious")
             return True
 
+        has_keycode_api = callable(getattr(self._core, "process_keycode", None))
+        is_space = (
+            keycode == 57
+            if keycode > 0 and _HAS_CORE and has_keycode_api
+            else keyval == IBus.KEY_space
+        )
+        # Native editor completion needs client-owned text, not a live IBus
+        # preedit. Ctrl+Space hands off only the typed prefix before forwarding
+        # the original shortcut. It is not acceptance or a word boundary.
+        # Caps/NumLock are incidental; every other modifier, including release,
+        # must retain its existing route. Older fallback cores keep forwarding.
+        if is_space and state & ~(2 | 16) == _MOD_CONTROL:
+            flush = getattr(self._core, "flush_preedit_for_layout", None)
+            if callable(flush):
+                actions = flush()
+                self._clear_language_choice()
+                self._execute_actions(actions)
+                self._active_prediction = None
+                self._keys_since_content_type = 0
+                self._sync_surrounding_text(None, None)
+                collector = getattr(self, "_o1", None)
+                if collector is not None:
+                    collector.on_abandon()
+                return False
+
         key_release = bool(state & _MOD_RELEASE)  # IBUS_RELEASE_MASK
         if not key_release:
             # Fail-safe input for do_set_content_type: a content type that
@@ -2162,7 +2187,6 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # A native module satisfying the mandatory rewrite-capability API may
         # still lack the optional raw-scancode API. Keep its keyval path usable
         # instead of raising/consuming the browser's key event.
-        has_keycode_api = callable(getattr(self._core, "process_keycode", None))
         if keycode > 0 and _HAS_CORE and has_keycode_api:
             actions = self._core.process_keycode(keycode, state)
             log.debug("actions (keycode): %s", actions)

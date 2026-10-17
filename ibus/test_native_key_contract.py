@@ -116,3 +116,202 @@ def test_native_super_space_stays_literal_with_space_accept_enabled(api, super_m
     assert ("forward", "") in actions
     assert not any(kind == "commit" and "здравей" in text for kind, text in actions)
     assert core.current_word() == ""
+
+
+def _completion_adapter(monkeypatch):
+    # Import the bus recorder only after the audited native loader has checked
+    # provenance. The adapter and Core are real; only IBus delivery is recorded.
+    core = _core()
+    from .test_input_safety import build_engine, ske
+
+    engine, recording = build_engine()
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    engine._core = core
+    engine._session_id = "native-completion-test"
+    return engine, recording, ske
+
+
+def _adapter_owned_prefix(engine, recording):
+    for code, key in zip(ZDRA, "zdra"):
+        assert engine.do_process_key_event(ord(key), code, 0) is True
+    assert engine._core.current_word() == "здра"
+    assert recording.preedits[-1] == ("здравей", True)
+    assert recording.commits == []
+
+
+@pytest.mark.parametrize("keycode", [57, 0], ids=["raw", "keyval"])
+def test_native_adapter_completion_handoff_delivers_prefix_without_learning(
+    tmp_path, monkeypatch, keycode,
+):
+    """Missing handoff leaves a live preedit; focus_lost would instead learn it."""
+    import sqlite3
+
+    from .o1_shim import O1Collector
+
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    # Start with nonempty learned history so equality also protects existing
+    # Markov/profile state, not just an empty first-run model.
+    for word in ("one", "two", "three", "four", "five"):
+        for char in word:
+            engine._core.handle_key(ord(char), 0)
+        engine._core.handle_key(0x20, 0)
+    engine._core.flush_preedit_for_layout()
+    _adapter_owned_prefix(engine, rec)
+    assert engine._active_prediction is not None
+    outcomes = []
+    engine._log_replay_event = lambda event, **fields: outcomes.append((event, fields))
+    engine._sync_surrounding_text("synthetic context", 17)
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text('{"unigrams":{"synthetic":1}}')
+    collector = O1Collector(
+        engine._core, {"data_dir": str(tmp_path / "o1")}, [str(corpus)], "test",
+    )
+    engine._o1 = collector
+    collector.on_word_commit("synthetic")
+    engine._core.export_personal(str(tmp_path / "before.json"))
+    before = json.loads((tmp_path / "before.json").read_text())
+    assert before["markov_bigrams"] and before["markov_trigrams"]
+    try:
+        assert engine.do_process_key_event(0x20, keycode, 4) is False
+        assert rec.commits == ["здра"], "unaccepted ghost must never be delivered"
+        assert rec.preedits[-1] == ("", False)
+        assert engine._core.current_word() == ""
+        assert engine._active_prediction is None
+        assert engine._surrounding_text is None
+        assert engine._surrounding_cursor_pos is None
+        assert engine._keys_since_content_type == 0
+        assert collector._pending_seq is None
+        assert outcomes == [], "delivery is neither prediction acceptance nor rejection"
+        # Repeats, release, then ordinary Space must not recommit or lazily
+        # learn the delivered prefix. The original shortcut is forwarded by
+        # the False return, never re-emitted through IBus.forward_key_event.
+        assert engine.do_process_key_event(0x20, keycode, 4) is False
+        assert engine.do_process_key_event(0x20, keycode, 4 | RELEASE) is False
+        assert engine.do_process_key_event(0x20, keycode, 0) is False
+        assert rec.commits == ["здра"]
+        assert rec.forwarded_keys == []
+        engine._core.export_personal(str(tmp_path / "after.json"))
+        after = json.loads((tmp_path / "after.json").read_text())
+        for key in ("weights", "light_profile", "corrections", "markov_bigrams", "markov_trigrams"):
+            assert after[key] == before[key], key
+        assert after["cvm"]["words"] == before["cvm"]["words"]
+        assert after["cvm"]["round"] == before["cvm"]["round"]
+    finally:
+        collector.close()
+    with sqlite3.connect(collector._db_path) as conn:
+        assert conn.execute("SELECT outcome FROM events ORDER BY id").fetchall() == [(None,)]
+
+
+def test_native_adapter_completion_handoff_does_not_repeat_already_delivered_semantic_text(monkeypatch):
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    for key in "hel":
+        assert engine.do_process_key_event(ord(key), 0, 0) is False
+    assert engine._core.current_word() == "hel"
+    assert rec.commits == []
+
+    assert engine.do_process_key_event(0x20, 0, 4) is False
+
+    assert engine._core.current_word() == ""
+    assert rec.commits == [], "semantic characters already belong to the client"
+
+
+@pytest.mark.parametrize("keyval,keycode,state", [
+    (0x20, 57, 4 | RELEASE), (0xFFE3, 29, 4),
+    (ord("a"), 30, 4), (0x20, 57, 4 | 1), (0x20, 57, 4 | 8),
+    (0x20, 57, 4 | (1 << 6)), (0x20, 57, 4 | (1 << 26)),
+    (0x20, 57, 4 | (1 << 5)), (0x20, 57, 4 | (1 << 7)),
+    (0x20, 57, 4 | (1 << 27)), (0x20, 57, 4 | (1 << 28)),
+])
+def test_native_adapter_other_shortcuts_preserve_owned_composition(monkeypatch, keyval, keycode, state):
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+
+    assert engine.do_process_key_event(keyval, keycode, state) is False
+
+    assert engine._core.current_word() == "здра"
+    assert rec.commits == []
+
+
+@pytest.mark.parametrize("locks", [0, 2, 16, 18])
+def test_native_adapter_completion_ignores_caps_and_numlock(monkeypatch, locks):
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+
+    assert engine.do_process_key_event(0x20, 57, 4 | locks) is False
+
+    assert rec.commits == ["здра"]
+    assert engine._core.current_word() == ""
+
+
+class _OptionalNativeAPIs:
+    """Expose an older Core's optional API surface, keep all other native work."""
+
+    def __init__(self, core, *, raw=True, flush=True):
+        self.core = core
+        self.raw = raw
+        self.flush = flush
+
+    def __getattr__(self, name):
+        if (name == "process_keycode" and not self.raw
+                or name == "flush_preedit_for_layout" and not self.flush):
+            raise AttributeError(name)
+        return getattr(self.core, name)
+
+
+@pytest.mark.parametrize("raw,keyval,keycode,commits,word", [
+    (True, ord("a"), 57, ["здра"], ""),
+    (True, 0x20, 30, [], "здра"),
+    (False, 0x20, 30, ["здра"], ""),
+    (False, ord("a"), 57, [], "здра"),
+])
+def test_native_adapter_completion_space_identity_follows_actual_dispatch(
+    monkeypatch, raw, keyval, keycode, commits, word,
+):
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+    engine._core = _OptionalNativeAPIs(engine._core, raw=raw)
+
+    assert engine.do_process_key_event(keyval, keycode, 4) is False
+
+    assert rec.commits == commits
+    assert engine._core.current_word() == word
+
+
+def test_native_adapter_older_core_without_handoff_keeps_existing_forward_route(monkeypatch):
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+    engine._core = _OptionalNativeAPIs(engine._core, flush=False)
+
+    assert engine.do_process_key_event(0x20, 57, 4) is False
+
+    assert rec.commits == []
+    assert engine._core.current_word() == "здра"
+
+
+def test_native_adapter_completion_retires_unselected_language_choice(monkeypatch):
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    engine._core.set_language_choice_supported(True)
+    for code in (16, 45, 44):
+        engine._execute_actions(engine._core.process_keycode(code, 0))
+    engine._language_choice_offer = engine._core.language_choice_offer()
+    assert engine._language_choice_offer is not None
+    typed = engine._core.current_word()
+    engine._language_choice_selected = 1
+
+    assert engine.do_process_key_event(0x20, 57, 4) is False
+
+    assert rec.commits == [typed]
+    assert engine._language_choice_offer is None
+    assert engine._language_choice_selected is None
+    assert engine._core.language_choice_offer() is None
+
+
+def test_native_adapter_completion_handoff_respects_sensitive_guard(monkeypatch):
+    engine, rec, _ske = _completion_adapter(monkeypatch)
+    _adapter_owned_prefix(engine, rec)
+    engine._sensitive = True
+
+    assert engine.do_process_key_event(0x20, 57, 4) is False
+
+    assert engine._core.current_word() == "здра"
+    assert rec.commits == []
