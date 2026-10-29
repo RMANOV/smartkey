@@ -1877,6 +1877,24 @@ impl InputMethodCore {
         actions
     }
 
+    /// Deliver the composing word early and keep it open (direct delivery: the
+    /// operator paused or pressed a shortcut modifier).  The dual buffer's
+    /// current winner fixes the word's script: later keys append in it, a
+    /// BackSpace is forwarded, and the boundary types nothing again.  Unlike
+    /// the native-completion handoff the word stays owned by this core.
+    pub fn handoff_preedit_for_delivery(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
+        let mut actions = self.handoff_preedit();
+        self.clear_ghost();
+        self.last_predictions.clear();
+        self.last_prediction_language = None;
+        self.space_accept_display_attested = false;
+        if actions.is_empty() {
+            actions.push(Action::HideGhost);
+        }
+        actions
+    }
+
     pub(crate) fn native_completion_owned(&self) -> bool {
         self.native_completion_owned
     }
@@ -9975,6 +9993,57 @@ mod layout_handoff_tests {
             assert_eq!(core.engine.learned_state_for_test(), learned);
             assert_eq!(self::metrics(&core), metrics);
         }
+    }
+
+    #[test]
+    fn delivery_handoff_keeps_the_word_open_in_its_script_and_never_retypes_it() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        assert_eq!(
+            core.handoff_preedit_for_delivery(),
+            [Action::HideGhost, Action::CommitText("hel".into())]
+        );
+        assert!(!core.native_completion_owned());
+        assert!(
+            !core.debug_state().0,
+            "the dual buffer is gone: the script is fixed"
+        );
+        let appended = core.handle_key(press(Key::RawCode(38)));
+        assert_eq!(appended.first(), Some(&Action::CommitText("l".into())));
+        assert_eq!(core.current_word(), "hell");
+        core.focus_gained();
+        assert_eq!(
+            core.current_word(),
+            "hell",
+            "focus-in keeps a delivered word"
+        );
+        let boundary = core.handle_key(press(Key::Space));
+        assert!(
+            !boundary
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })),
+            "the delivered word is never typed again: {boundary:?}"
+        );
+        assert!(core.current_word().is_empty());
+    }
+
+    #[test]
+    fn delivery_handoff_backspace_is_forwarded_and_removes_one_letter() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        core.handoff_preedit_for_delivery();
+        assert_eq!(
+            core.handle_key(press(Key::Backspace)).last(),
+            Some(&Action::ForwardKey)
+        );
+        assert_eq!(core.current_word(), "he");
+    }
+
+    #[test]
+    fn delivery_handoff_without_a_composing_word_only_hides_the_ghost() {
+        let mut core = seeded_core();
+        assert_eq!(core.handoff_preedit_for_delivery(), [Action::HideGhost]);
+        assert!(core.current_word().is_empty());
     }
 
     #[test]

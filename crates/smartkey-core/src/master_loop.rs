@@ -721,6 +721,13 @@ impl MasterLoop {
         actions
     }
 
+    /// Deliver the in-flight word early and keep it open (direct delivery).
+    pub fn handoff_preedit_for_delivery(&mut self) -> Vec<Action> {
+        self.invalidate_language_choice();
+        self.last_shown_ghost = None;
+        self.core.handoff_preedit_for_delivery()
+    }
+
     /// Whether the delivered token is still owned by client completion.
     pub fn native_completion_owned(&self) -> bool {
         self.core.native_completion_owned()
