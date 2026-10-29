@@ -14,7 +14,9 @@ only append.  The only deletion is one character for the operator's own
 consumed BackSpace; any other revision is refused and the core's word ends.
 Keys the client handles itself first receive the undelivered word, then the
 word ends, so nothing typed later can revise text at a caret the engine cannot
-see.
+see.  A mouse click (Chrome sends Reset) or a window switch (focus-out) carries
+no keystroke and discards an undelivered word, so a pause types the word as
+typed so far, and so does a shortcut modifier; the word stays open.
 
 The editor model applies the engine's output in order: commits insert at the
 caret, forwarded BackSpace deletes before it, keys the engine does not consume
@@ -27,7 +29,7 @@ from __future__ import annotations
 
 import pytest
 
-from .test_space_accept import FakeCore, build_engine
+from .test_space_accept import FakeCore, build_engine, ske
 
 CHROME_CAPS = 0x09   # PREEDIT_TEXT | FOCUS — Chrome/Electron via GTK im-ibus
 NATIVE_CAPS = 0x29   # + SURROUNDING_TEXT — Konsole/Qt, ordinary GTK widgets
@@ -38,9 +40,15 @@ SUPER = 1 << 26
 
 KEYCODE = {"n": 49, "a": 30, "b": 48, "y": 21, "l": 38, "g": 34, "r": 19,
            "s": 31, "k": 37, "i": 23, "c": 46, "p": 25, "o": 24, "z": 44,
-           "space": 57, "BackSpace": 14, "Tab": 15, "Escape": 1, "NumLock": 69}
+           "d": 32, "m": 50,
+           "space": 57, "BackSpace": 14, "Tab": 15, "Escape": 1, "NumLock": 69,
+           "Control_L": 29, "Alt_L": 56, "Super_L": 125, "Shift_L": 42,
+           "ISO_Level3_Shift": 100, "Control_R": 97, "Alt_R": 100, "Super_R": 126,
+           "Meta_L": 56, "Hyper_L": 125}
 KEYVAL = {"space": 0x20, "BackSpace": BACKSPACE, "Tab": 0xFF09, "Escape": 0xFF1B,
-          "NumLock": 0xFF7F}
+          "NumLock": 0xFF7F, "Control_L": 0xFFE3, "Alt_L": 0xFFE9, "Super_L": 0xFFEB,
+          "Shift_L": 0xFFE1, "ISO_Level3_Shift": 0xFE03, "Control_R": 0xFFE4,
+          "Alt_R": 0xFFEA, "Super_R": 0xFFEC, "Meta_L": 0xFFE7, "Hyper_L": 0xFFED}
 
 UNLOCKED = (True, False, True)   # (dual_buffer_present, locked, hypothesis_phase)
 LOCKED = (True, True, False)
@@ -97,13 +105,13 @@ class Core(FakeCore):
         self.external_rewrite = supported
 
 
-def build(steps=(), caps=CHROME_CAPS, **core_kw):
+def build(steps=(), caps=CHROME_CAPS, core_cls=None, **core_kw):
     scripts, states = [], []
     for _key, actions, state in steps:
         scripts += [actions, [("forward", "")]]      # press, then its release
         states += [state, state]
     eng, _rec = build_engine(scripts)
-    eng._core = Core(scripts, states=states, **core_kw)
+    eng._core = (core_cls or Core)(scripts, states=states, **core_kw)
     eng._last_save = 0.0
     log = []
     eng.commit_text = lambda t: log.append(("commit", t.s))
@@ -548,3 +556,529 @@ def test_other_clients_keep_the_composing_preedit():
     _eng, log = run(PHRASE, caps=NATIVE_CAPS)
     assert visible_preedits(log), "native clients keep today's composing preedit"
     assert commits(log) == ["по", "бързина"]
+
+
+# --- an undecided word is never left invisible -----------------------------------------
+#
+# A word in its hypothesis phase exists only inside the engine.  A mouse click
+# (Reset) or a window switch (focus-out) carries no keystroke and discards it, so
+# a pause types it as typed so far, and so does a shortcut modifier (the Tab of
+# Alt+Tab never reaches the engine).  The core takes the word over at that point
+# (handoff_preedit_for_delivery): its script is fixed, so later keys append in it
+# and an unstable hypothesis can never leave a mixed-script word behind.
+
+DO = [  # a two-letter word: the dual buffer never locks before four letters
+    ("d", [("composing", "д\x00")], UNLOCKED),
+    ("o", [("composing", "до\x00")], UNLOCKED),
+]
+# What the real core returns once it took a word over: each later letter is
+# committed on its own, BackSpace and the boundary go to the client, and nothing
+# delivered is typed again (pinned in the core's own tests).
+HANDOFF_DO = [("hide", ""), ("commit", "до")]
+AFTER_DO = [
+    ("m", [("commit", "м"), ("hide", "")], NO_WORD),
+    ("space", [("hide", ""), ("forward", "")], NO_WORD),
+]
+
+
+class Timers:
+    """Deterministic stand-in for GLib.timeout_add / GLib.source_remove."""
+
+    def __init__(self):
+        self.live = {}
+        self.removed = []
+        self._next = 1
+
+    def add(self, ms, callback):
+        source = self._next
+        self._next += 1
+        self.live[source] = (ms, callback)
+        return source
+
+    def remove(self, source):
+        assert source in self.live, "only a live source may be removed"
+        self.removed.append(source)
+        del self.live[source]
+
+    def fire(self, ms):
+        """The one live timer of *ms* milliseconds runs once."""
+        matches = [source for source, (each, _cb) in self.live.items() if each == ms]
+        assert len(matches) == 1, self.live
+        _ms, callback = self.live.pop(matches[0])
+        assert callback() is False, "a one-shot source"
+
+    def elapse(self):
+        """The pause passes: the single live timer runs once."""
+        assert len(self.live) == 1, self.live
+        _source, (_ms, callback) = self.live.popitem()
+        assert callback() is False, "a one-shot source"
+
+
+class Trace:
+    enabled = True
+    level = 1
+
+    def __init__(self):
+        self.events = []
+
+    def begin_keystroke(self):
+        return 0
+
+    def emit(self, event, **fields):
+        self.events.append((event, fields))
+
+    def flush(self):
+        return None
+
+    def named(self, name):
+        return [fields for event, fields in self.events if event == name]
+
+
+class Clock:
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        return self.now
+
+
+class HandoffCore(Core):
+    """A core with the early-delivery handoff and a readable current word."""
+
+    def __init__(self, scripts, handoff=None, **kw):
+        super().__init__(scripts, **kw)
+        self._handoff = list(handoff or [("hide", "")])
+        self.word = ""
+
+    def handoff_preedit_for_delivery(self):
+        self.events.append("handoff")
+        return list(self._handoff)
+
+    def current_word(self):
+        return self.word
+
+
+def build_timed(steps=(), idle_ms=800, **kw):
+    eng, log = build(steps, core_cls=HandoffCore, **kw)
+    timers = Timers()
+    eng._direct_idle_schedule = timers.add
+    eng._direct_idle_unschedule = timers.remove
+    eng._direct_idle_ms = idle_ms
+    eng._direct_clock = Clock()
+    eng._trace = Trace()
+    return eng, log, timers
+
+
+def test_a_pause_types_the_undecided_word_and_keeps_it_open():
+    eng, log, timers = build_timed([*DO, *AFTER_DO], handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    assert commits(log) == []
+    assert [ms for ms, _cb in timers.live.values()] == [800]
+    timers.elapse()
+    assert eng._core.events == ["handoff"], "the core takes the word over; nothing resets it"
+    assert commits(log) == ["до"]
+    press(eng, log, "m")
+    assert commits(log) == ["до", "м"], "later keys append at once"
+    press(eng, log, "space")
+    assert editor(log) == "дом "
+    assert backspaces(log) == []
+    assert eng._trace.named("direct_early") == [{"seq": 0, "trigger": "pause"}]
+
+
+def test_a_pause_never_types_the_undisplayed_ghost():
+    # Defence in depth: even a core that handed the ghost over gets it cut.
+    steps = [("d", [("composing", "д\x00ом")], UNLOCKED)]
+    eng, log, timers = build_timed(steps, handoff=[("hide", ""), ("commit", "дом")])
+    press(eng, log, "d")
+    timers.elapse()
+    assert commits(log) == ["д"]
+
+
+def test_after_a_pause_the_word_continues_in_its_fixed_script():
+    # The core fixed the script at the pause: a later contrary hypothesis can no
+    # longer flip the word, so there is no refusal and no mixed-script word.
+    steps = [
+        ("m", [("composing", "m\x00")], UNLOCKED),
+        ("i", [("composing", "mi\x00")], UNLOCKED),
+        ("r", [("commit", "r"), ("hide", "")], NO_WORD),
+        ("space", [("hide", ""), ("forward", "")], NO_WORD),
+    ]
+    eng, log, timers = build_timed(steps, handoff=[("hide", ""), ("commit", "mi")])
+    press(eng, log, "m")
+    press(eng, log, "i")
+    timers.elapse()
+    press(eng, log, "r")
+    press(eng, log, "space")
+    assert editor(log) == "mir "
+    assert backspaces(log) == []
+    assert eng._trace.named("direct_revision") == []
+
+
+def test_a_refused_revision_is_traced_without_content():
+    steps = [
+        ("b", [("composing", "бъ\x00")], LOCKED),
+        ("y", [("composing", "by\x00")], LOCKED),
+    ]
+    eng, log, _timers = build_timed(steps)
+    press(eng, log, "b")
+    press(eng, log, "y")
+    assert eng._trace.named("direct_revision") == [{"seq": 0, "refused": True}]
+
+
+def test_a_key_release_restarts_the_pause_and_a_phantom_event_does_not():
+    eng, log, timers = build_timed(DO)
+    eng.do_process_key_event(ord("d"), KEYCODE["d"], 0)
+    after_press = set(timers.live)
+    eng.do_process_key_event(ord("d"), KEYCODE["d"], RELEASE)
+    after_release = set(timers.live)
+    assert len(after_release) == 1 and after_press != after_release
+    eng.do_process_key_event(0, 240, 0)  # the inert zero-key callback storm
+    assert set(timers.live) == after_release, "a phantom event must not postpone the word"
+
+
+def test_no_pause_timer_once_the_word_is_delivered():
+    eng, log, timers = build_timed([("m", [("composing", "м\x00")], LOCKED)])
+    press(eng, log, "m")
+    assert commits(log) == ["м"]
+    assert timers.live == {}
+
+
+@pytest.mark.parametrize(("idle_ms", "caps"), [(0, CHROME_CAPS), (600, NATIVE_CAPS)])
+def test_no_pause_timer_when_disabled_or_with_a_preedit(idle_ms, caps):
+    eng, log, timers = build_timed(DO, idle_ms=idle_ms, caps=caps)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    assert timers.live == {}
+
+
+def test_every_key_event_restarts_the_pause():
+    eng, log, timers = build_timed(DO)
+    press(eng, log, "d")
+    first = set(timers.live)
+    press(eng, log, "o")
+    assert len(timers.live) == 1
+    assert not first & set(timers.live)
+    assert first <= set(timers.removed)
+
+
+@pytest.mark.parametrize(
+    ("event", "cause"),
+    [("do_reset", "reset"), ("do_focus_out", "focus_out"), ("do_disable", "disable")],
+)
+def test_a_click_or_window_switch_before_the_pause_drops_the_word_and_counts_it(event, cause):
+    eng, log, timers = build_timed(DO, cancel=[("hide", "")])
+    press(eng, log, "d")
+    press(eng, log, "o")
+    getattr(eng, event)()
+    assert commits(log) == [], "never typed at a moved caret or into the next window"
+    assert timers.live == {}, "the pause can no longer type it"
+    assert eng._trace.named("direct_dropped") == [{"seq": 0, "cause": cause}]
+
+
+def test_a_held_mode_switch_that_lands_counts_the_dropped_word():
+    eng, log, timers = build_timed(DO, cancel=[("hide", "")])
+    press(eng, log, "d")
+    eng.do_set_capabilities(NATIVE_CAPS)
+    assert eng._direct_delivery is True, "held while a word is in flight"
+    timers.fire(50)
+    assert eng._direct_delivery is False
+    assert eng._trace.named("direct_dropped") == [{"seq": 0, "cause": "mode"}]
+    assert timers.live == {}
+    assert commits(log) == []
+
+
+def test_a_secret_field_counts_the_dropped_word():
+    eng, log, timers = build_timed(DO, cancel=[("hide", "")])
+    press(eng, log, "d")
+    eng._switch_sensitivity(True)
+    assert eng._trace.named("direct_dropped") == [{"seq": 0, "cause": "sensitive"}]
+    assert timers.live == {}
+    assert commits(log) == []
+
+
+# --- Chrome's new input context announcing SURROUNDING_TEXT for a moment -------------
+#
+# After a commit into an editor that re-renders its DOM, Chrome may create a new
+# input context: capabilities 41 (SURROUNDING_TEXT) and then 9 again.  A switch
+# to preedit on that flicker would end the word in flight.
+
+def test_a_capability_flicker_keeps_the_word_in_flight():
+    eng, log, timers = build_timed(LOCKED_MI)
+    press(eng, log, "m")
+    eng.do_set_capabilities(NATIVE_CAPS)
+    eng.do_set_capabilities(CHROME_CAPS)
+    assert timers.live == {}
+    press(eng, log, "i")
+    assert editor(log) == "ми"
+    assert eng._direct_delivery is True
+    assert "reset" not in eng._core.events
+
+
+def test_a_held_mode_switch_lands_before_the_next_key():
+    eng, log, timers = build_timed(LOCKED_MI)
+    press(eng, log, "m")
+    eng.do_set_capabilities(NATIVE_CAPS)
+    press(eng, log, "i")
+    assert eng._direct_delivery is False, "the key belongs to the new mode"
+    assert "reset" in eng._core.events
+    assert timers.live == {}
+
+
+def test_a_switch_to_direct_is_never_held():
+    steps = [("b", [("composing", "б\x00ързина")], UNLOCKED)]
+    eng, log, timers = build_timed(steps, caps=NATIVE_CAPS)
+    press(eng, log, "b")
+    eng.do_set_capabilities(CHROME_CAPS)
+    assert eng._direct_delivery is True, "a preedit must never stay up in Chrome"
+    assert timers.live == {}
+
+
+def test_a_switch_without_a_word_in_flight_is_immediate():
+    eng, log, timers = build_timed(LOCKED_MI)
+    eng.do_set_capabilities(NATIVE_CAPS)
+    assert eng._direct_delivery is False
+    assert timers.live == {}
+
+
+def test_the_kill_switch_with_a_delivered_word_is_not_a_refused_revision():
+    # Super+Escape reaches the core, which hides its state: nothing is revised
+    # and the chord does not leak to the client (Escape may close a compose box).
+    steps = [("m", [("composing", "м\x00")], LOCKED), ("Escape", [("hide", "")], NO_WORD)]
+    eng, log, _timers = build_timed(steps)
+    press(eng, log, "m")
+    assert eng.do_process_key_event(KEYVAL["Escape"], KEYCODE["Escape"], SUPER) is True
+    assert eng._trace.named("direct_revision") == []
+    assert editor(log) == "м"
+
+
+def test_a_click_after_the_pause_keeps_the_word_and_drops_nothing():
+    eng, log, timers = build_timed(DO, cancel=[("hide", "")], handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    timers.elapse()
+    eng.do_reset()
+    assert editor(log) == "до"
+    assert eng._trace.named("direct_dropped") == []
+
+
+@pytest.mark.parametrize(
+    "modifier",
+    ["Control_L", "Control_R", "Alt_L", "Alt_R", "Super_L", "Super_R", "Meta_L", "Hyper_L"],
+)
+def test_a_shortcut_modifier_types_the_word_first_and_keeps_it_open(modifier):
+    steps = [*DO, (modifier, [("forward", "")], NO_WORD), *AFTER_DO]
+    eng, log, _timers = build_timed(steps, handoff=HANDOFF_DO)
+    for key, _a, _s in steps:
+        press(eng, log, key)
+    assert log.index(("commit", "до")) < log.index(("client", modifier, 0))
+    assert editor(log) == "дом "
+    assert backspaces(log) == []
+    assert "reset" not in eng._core.events
+    assert eng._trace.named("direct_early") == [{"seq": 0, "trigger": "modifier"}]
+
+
+def test_a_modifier_release_types_nothing():
+    steps = [*DO, ("Control_L", [("forward", "")], UNLOCKED)]
+    eng, log, _timers = build_timed(steps, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    eng.do_process_key_event(KEYVAL["Control_L"], KEYCODE["Control_L"], RELEASE)
+    assert commits(log) == []
+    assert "handoff" not in eng._core.events
+
+
+@pytest.mark.parametrize("modifier", ["Shift_L", "ISO_Level3_Shift"])
+def test_shift_and_altgr_leave_the_word_undecided(modifier):
+    steps = [*DO, (modifier, [("forward", "")], UNLOCKED)]
+    eng, log, _timers = build_timed(steps, handoff=HANDOFF_DO)
+    for key, _a, _s in steps:
+        press(eng, log, key)
+    assert commits(log) == []
+    assert "handoff" not in eng._core.events
+
+
+def test_after_a_pause_the_next_letters_append_at_once():
+    steps = [
+        *DO,
+        ("b", [("commit", "б"), ("hide", "")], NO_WORD),
+        ("r", [("commit", "р"), ("hide", "")], NO_WORD),
+        ("o", [("commit", "о"), ("hide", "")], NO_WORD),
+        ("space", [("hide", ""), ("forward", "")], NO_WORD),
+    ]
+    eng, log, timers = build_timed(steps, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    timers.elapse()
+    press(eng, log, "b")
+    assert commits(log) == ["до", "б"]
+    press(eng, log, "r")
+    press(eng, log, "o")
+    press(eng, log, "space")
+    assert editor(log) == "добро "
+    assert backspaces(log) == []
+
+
+def test_backspace_after_a_pause_is_left_to_the_client():
+    steps = [*DO, ("BackSpace", [("hide", ""), ("forward", "")], NO_WORD)]
+    eng, log, timers = build_timed(steps, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    timers.elapse()
+    assert press(eng, log, "BackSpace") is False
+    assert editor(log) == "д"
+    assert backspaces(log) == [], "the deletion is the client's own"
+
+
+def test_a_core_without_the_handoff_types_nothing_early():
+    # An unfixed hypothesis could flip on the next key and leave a mixed-script
+    # word, so an older core keeps the word until it is decided, as before.
+    eng, log = build([*DO, ("Control_L", [("forward", "")], UNLOCKED)])
+    timers = Timers()
+    eng._direct_idle_schedule = timers.add
+    eng._direct_idle_unschedule = timers.remove
+    eng._direct_idle_ms = 800
+    for key in ("d", "o", "Control_L"):
+        press(eng, log, key)
+    assert timers.live == {}
+    assert commits(log) == []
+
+
+def test_a_sensitive_field_cancels_the_pause_and_a_stale_timer_types_nothing():
+    eng, log, timers = build_timed(DO, cancel=[("hide", "")], handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    eng._switch_sensitivity(True)
+    assert timers.live == {}
+    eng._direct_pending = "до"  # even with a stale word, a secret field gets nothing
+    assert eng._direct_idle_fire() is False
+    assert commits(log) == []
+    assert "handoff" not in eng._core.events
+
+
+# --- a re-rendering editor refocusing after a commit -----------------------------------
+#
+# Right after a commit made for a key, Chrome may answer an editor that
+# re-renders its DOM with FocusOut and an immediate FocusIn on the same field.
+# Ending the word there would split it, and the rest would be decided again.
+
+LOCKED_MI = [
+    ("m", [("composing", "м\x00")], LOCKED),
+    ("i", [("composing", "ми\x00")], LOCKED),
+]
+
+
+def test_a_refocus_right_after_a_commit_keeps_the_word():
+    eng, log, timers = build_timed(LOCKED_MI)
+    press(eng, log, "m")
+    eng.do_focus_out()
+    assert [ms for ms, _cb in timers.live.values()] == [50]
+    eng.do_focus_in()
+    assert timers.live == {}
+    press(eng, log, "i")
+    assert editor(log) == "ми"
+    assert "reset" not in eng._core.events, "the word survived the refocus"
+
+
+def test_a_focus_out_long_after_the_last_commit_ends_the_word():
+    eng, log, timers = build_timed(LOCKED_MI)
+    press(eng, log, "m")
+    eng._direct_clock.now += 1.0
+    eng.do_focus_out()
+    assert timers.live == {}
+    assert "reset" in eng._core.events
+
+
+def test_a_refocus_that_never_comes_back_ends_the_word():
+    eng, log, timers = build_timed(LOCKED_MI)
+    press(eng, log, "m")
+    eng.do_focus_out()
+    timers.elapse()
+    assert "reset" in eng._core.events
+    assert eng._direct_word == ""
+    assert editor(log) == "м"
+
+
+def test_a_refocus_keeps_a_word_the_core_took_over():
+    steps = [*DO, ("b", [("commit", "б"), ("hide", "")], NO_WORD)]
+    eng, log, timers = build_timed(steps, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    timers.elapse()
+    press(eng, log, "b")
+    eng._core.word = "доб"  # the core still owns the open word
+    eng.do_focus_out()
+    assert [ms for ms, _cb in timers.live.values()] == [50]
+    eng.do_focus_in()
+    assert timers.live == {}
+    assert "reset" not in eng._core.events
+
+
+def test_a_refocus_right_after_a_pause_keeps_the_word():
+    # Chrome may refocus a re-rendering editor right after the pause's commit.
+    eng, log, timers = build_timed(DO, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    timers.elapse()
+    eng._core.word = "до"
+    eng.do_focus_out()
+    assert [ms for ms, _cb in timers.live.values()] == [50]
+    eng.do_focus_in()
+    assert timers.live == {}
+    assert "reset" not in eng._core.events
+
+
+def test_a_modifier_commit_never_holds_a_word_through_focus_out():
+    steps = [*DO, ("Control_L", [("forward", "")], NO_WORD)]
+    eng, log, timers = build_timed(steps, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    press(eng, log, "Control_L")
+    assert commits(log) == ["до"]
+    eng._core.word = "до"  # open in the core, yet the commit came from Alt/Ctrl/Super
+    eng.do_focus_out()
+    assert timers.live == {}, "Alt+Tab must not carry the word into another window"
+    assert "reset" in eng._core.events
+
+
+def test_an_undelivered_word_is_never_held_through_focus_out():
+    steps = [
+        ("m", [("composing", "м\x00")], LOCKED),
+        ("space", [("hide", ""), ("commit", "м"), ("forward", "")], NO_WORD),
+        ("d", [("composing", "д\x00")], UNLOCKED),
+    ]
+    eng, log, timers = build_timed(steps)
+    for key, _a, _s in steps:
+        press(eng, log, key)
+    eng.do_focus_out()
+    assert timers.live == {}
+    assert editor(log) == "м "
+    assert eng._trace.named("direct_dropped") == [{"seq": 0, "cause": "focus_out"}]
+
+
+def test_destroy_cancels_the_pause():
+    eng, log, timers = build_timed(DO)
+    press(eng, log, "d")
+    eng.do_destroy()
+    assert timers.live == {}
+
+
+@pytest.mark.parametrize(
+    ("cfg", "expected"),
+    [
+        (None, 800),
+        ({}, 800),
+        ({"mode": "auto"}, 800),
+        ({"idle_ms": 350}, 350),
+        ({"idle_ms": 0}, 0),
+        ({"idle_ms": 1}, 200),
+        ({"idle_ms": 199}, 200),
+        ({"idle_ms": 200}, 200),
+        ({"idle_ms": -1}, 800),
+        ({"idle_ms": True}, 800),
+        ({"idle_ms": "300"}, 800),
+        ({"idle_ms": 99999}, 5000),
+    ],
+)
+def test_the_pause_is_configurable(cfg, expected):
+    assert ske._direct_idle_ms_from_config(cfg) == expected
