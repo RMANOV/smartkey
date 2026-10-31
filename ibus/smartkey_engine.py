@@ -195,8 +195,13 @@ _CAP_SURROUNDING_TEXT = 0x20
 # ever displayed there, so none may be accepted.  Tab, ISO_Left_Tab, Right, Esc.
 _DIRECT_PASSTHROUGH_KEYS = frozenset({0xFF09, 0xFE20, 0xFF53, 0xFF1B})
 # evdev keycodes that never act on the client's text: modifiers (Ctrl, Shift,
-# Alt, CapsLock, Super), NumLock, ScrollLock, Compose/Menu, and keycode 0.
-_NO_DELIVERY_KEYCODES = frozenset({0, 29, 42, 54, 56, 58, 69, 70, 97, 100, 125, 126, 127})
+# Alt, CapsLock, Super), NumLock, ScrollLock, Compose/Menu.
+_NO_DELIVERY_KEYCODES = frozenset({29, 42, 54, 56, 58, 69, 70, 97, 100, 125, 126, 127})
+# The keyval fallback has no reliable hardware code. Only empty callbacks,
+# modifier/lock keys, AltGr and Compose/Menu are inert; navigation is not.
+_NO_DELIVERY_KEYVALS = frozenset(
+    {0, 0xFE03, 0xFF14, 0xFF20, 0xFF67, 0xFF7F, *range(0xFFE1, 0xFFEF)}
+)
 # Shortcut modifiers (Control, Meta, Alt, Super, Hyper; left and right keyvals).
 # A modifier press invalidates refocus eligibility but does not deliver an
 # uncertain token. Only the actual chord, if IBus receives it, ends the token.
@@ -563,6 +568,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 "delivery; rebuild the native module before starting SmartKey"
             ) from exc
 
+        # Direct mode cannot apply composing-word replacements either. The
+        # core must suppress those corrections before learning their result.
+        try:
+            set_composing = getattr(self._core, "set_composing_rewrite_supported", None)
+            if not callable(set_composing):
+                raise TypeError("missing composing rewrite capability API")
+            set_composing(False)
+        except Exception as exc:
+            raise RuntimeError(
+                "smartkey_py native extension cannot enforce composing rewrite "
+                "delivery; rebuild the native module before starting SmartKey"
+            ) from exc
+
         # KDE's explicit BG layout is ordinary keyboard input. Its metadata
         # observer never changes an engine, layout, or client text.
         self._kde_layout = None
@@ -596,6 +614,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._direct_key_press = False
         self._direct_key_backspace = False
         self._direct_key_inert = False
+        self._direct_key_semantic_char = False
         self._direct_emitted = 0
         # Typing after a pause (see _direct_idle_fire): a one-shot GLib timer.
         self._direct_idle_ms = _direct_idle_ms_from_config(delivery_cfg)
@@ -1908,6 +1927,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             not consumed
             and getattr(self, "_direct_key_press", False)
             and not getattr(self, "_direct_key_inert", False)
+            and not getattr(self, "_direct_key_semantic_char", False)
             and not {"commit", "replace"} & set(types)
             and (
                 getattr(self, "_direct_pending", "")
@@ -2055,6 +2075,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         set_display = getattr(self._core, "set_completion_display_supported", None)
         if callable(set_display):
             set_display(not self._direct_delivery)
+        set_composing = getattr(self._core, "set_composing_rewrite_supported", None)
+        if callable(set_composing):
+            set_composing(not self._direct_delivery)
         self._clear_language_choice()
         self._refresh_language_choice_route()
         self._update_language_choice_support()
@@ -2135,7 +2158,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 getattr(self, "_declared_ordinary", False)
                 or getattr(self, "_content_type_key", None) is None
             )
-            and self._caps & 1  # Owned full-word preedit must be renderable too.
+            # Owned full-word preedit must be renderable too.
+            and self._caps & _CAP_PREEDIT_TEXT
             and getattr(self, "_language_choice_route_available", False)
             # Direct delivery owns no preedit and passes Tab/Esc to the client.
             and not getattr(self, "_direct_delivery", False)
@@ -2646,6 +2670,17 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     # Key event handler.
     # -----------------------------------------------------------------------
+    def _direct_event_inert(self, keyval: int, keycode: int) -> bool:
+        """Classify the same hardware/keyval route used by core dispatch."""
+        if self._uses_raw_keycode(keycode):
+            return keycode in _NO_DELIVERY_KEYCODES
+        return keyval in _NO_DELIVERY_KEYVALS
+
+    def _uses_raw_keycode(self, keycode: int) -> bool:
+        return keycode > 0 and _HAS_CORE and callable(
+            getattr(self._core, "process_keycode", None)
+        )
+
     def do_process_key_event(self, keyval: int, keycode: int, state: int) -> bool:
         """Route one key event; direct delivery adds guards around it."""
         if (
@@ -2680,7 +2715,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             and keyval != 0
             and keyval != 0xFE03  # ISO_Level3_Shift (AltGr)
             and not 0xFFE1 <= keyval <= 0xFFEE  # pure modifier keyvals
-            and (keycode == 0 or keycode not in _NO_DELIVERY_KEYCODES)
+            and not self._direct_event_inert(keyval, keycode)
             and not (keyval == 0xFF1B and state & _MOD_SUPER)  # core kill switch
         ):
             # The actual editing chord is a boundary. Deliver before the client
@@ -2703,7 +2738,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             and keyval == IBus.KEY_BackSpace
             and not state & (_MOD_CONTROL | _MOD_ALT | _MOD_SUPER)
         )
-        self._direct_key_inert = keycode in _NO_DELIVERY_KEYCODES
+        self._direct_key_inert = self._direct_event_inert(keyval, keycode)
+        self._direct_key_semantic_char = False
         try:
             return self._process_key_event_impl(keyval, keycode, state)
         finally:
@@ -2711,6 +2747,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._direct_key_press = False
             self._direct_key_backspace = False
             self._direct_key_inert = False
+            self._direct_key_semantic_char = False
             if not self._is_spurious_zero_key_event(keyval, keycode, state):
                 self._direct_idle_rearm()  # every real key event restarts the pause
 
@@ -2948,6 +2985,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             log.debug(
                 "keysym converted: 0x%04X → 0x%04X (%s)", orig_keyval, keyval, ch_repr
             )
+        # Match PyO3 keyval_to_key after the same keysym normalization.
+        # A semantic Char is already typed by the client: its ForwardKey
+        # continues the token rather than moving the caret. Space/Return and
+        # unsupported symbols retain their own boundary/forwarding behavior.
+        self._direct_key_semantic_char = (
+            0x21 <= keyval <= 0x7E
+            or 0xA0 <= keyval <= 0xEFFF and not 0xD800 <= keyval <= 0xDFFF
+        )
         actions = self._core.handle_key(keyval, state)
         log.debug("actions: %s", actions)
         self._prepare_native_delivery(actions, native_owned_before, native_word_before)
