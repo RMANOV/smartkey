@@ -178,6 +178,25 @@ _MOD_CONTROL = 1 << 2  # IBus.ModifierType.CONTROL_MASK
 _MOD_ALT = 1 << 3  # IBus.ModifierType.MOD1_MASK
 _MOD_RELEASE = 1 << 30  # IBus.ModifierType.RELEASE_MASK
 
+_MOD_SUPER = (1 << 6) | (1 << 26)  # MOD4_MASK | SUPER_MASK
+_CAP_PREEDIT_TEXT = 0x01
+_CAP_SURROUNDING_TEXT = 0x20
+
+# Direct delivery: no composing preedit, and delivered text is never revised,
+# for clients that cannot report the text around the caret (no
+# SURROUNDING_TEXT capability).  That is Chromium and Electron through GTK
+# im-ibus (capabilities 9), whose rich web editors (Gmail compose) re-render the
+# DOM during composition and turn every preedit state — ghost suffix
+# included — into permanent text.  Without surrounding text nothing delivered
+# can be verified, so nothing delivered is ever deleted except by the
+# operator's own BackSpace.
+# Accept gestures go straight to the client in direct delivery: no ghost is
+# ever displayed there, so none may be accepted.  Tab, ISO_Left_Tab, Right, Esc.
+_DIRECT_PASSTHROUGH_KEYS = frozenset({0xFF09, 0xFE20, 0xFF53, 0xFF1B})
+# evdev keycodes that never act on the client's text: modifiers (Ctrl, Shift,
+# Alt, CapsLock, Super), NumLock, ScrollLock, Compose/Menu, and keycode 0.
+_NO_DELIVERY_KEYCODES = frozenset({0, 29, 42, 54, 56, 58, 69, 70, 97, 100, 125, 126, 127})
+
 # Exceptions the hard-stop paths let propagate.  Everything else counts as a
 # refusal: pyo3 raises a Rust panic as ``PanicException``, which derives from
 # ``BaseException``, so ``except Exception`` would let it escape the cleanup.
@@ -512,6 +531,22 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         # IBus client capabilities (set by do_set_capabilities callback).
         self._caps: int = 0
+        # Direct delivery state (see _execute_actions_direct).  The mode is
+        # chosen per focused client; "off" in smartkey.json disables it.
+        delivery_cfg = user_cfg.get("delivery") if isinstance(user_cfg, dict) else None
+        self._delivery_mode = (
+            delivery_cfg.get("mode", "auto") if isinstance(delivery_cfg, dict) else "auto"
+        )
+        self._direct_delivery = False
+        self._direct_word = ""
+        self._direct_pending = ""
+        self._direct_ghost = ""
+        self._direct_key_active = False
+        self._direct_key_press = False
+        self._direct_key_backspace = False
+        self._direct_key_inert = False
+        self._direct_emitted = 0
+        self._caps_known = False
         self._language_choice_offer: dict[str, object] | None = None
         self._language_choice_selected: int | None = None
         self._language_choice_supported = False
@@ -1427,8 +1462,214 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return word == ""
         return resolving_action
 
+    # -----------------------------------------------------------------------
+    # Direct delivery (clients without surrounding text): no composing preedit.
+    # -----------------------------------------------------------------------
+    def _update_delivery_mode(self) -> None:
+        """Choose preedit or direct delivery from the client's capabilities.
+
+        "auto" (default): direct for a client that advertises no
+        SURROUNDING_TEXT, because nothing delivered could be verified there;
+        "off": always preedit; "direct": always direct.  Until the first
+        capability report the mode stays preedit.
+        """
+        mode = getattr(self, "_delivery_mode", "auto")
+        if mode == "direct":
+            direct = True
+        elif mode == "off" or not getattr(self, "_caps_known", False):
+            direct = False
+        else:
+            direct = not getattr(self, "_caps", 0) & _CAP_SURROUNDING_TEXT
+        changed = direct != getattr(self, "_direct_delivery", False)
+        if changed:
+            # Never carry a word across delivery modes: take down any live
+            # preedit (ghost included) and end the core's word first.
+            if getattr(self, "_preedit_active", False):
+                self.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
+                self._preedit_active = False
+                self._preedit_mode = None
+            self._direct_end_word()
+        self._direct_delivery = direct
+        if changed:
+            trace = getattr(self, "_trace", None)
+            if trace is not None and trace.enabled:
+                trace.emit("delivery", seq=0, mode="direct" if direct else "preedit")
+
+    def _direct_backspace(self) -> None:
+        self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
+        self.forward_key_event(IBus.KEY_BackSpace, 14, _MOD_RELEASE)
+
+    def _direct_apply(self, target: str) -> bool:
+        """Bring the client to *target* for the in-flight word, never revising.
+
+        Appends are delivered.  The only deletion is one character for the
+        operator's own consumed BackSpace.  Anything else would revise text the
+        client already owns, which cannot be verified here (no surrounding
+        text, and a forwarded BackSpace can land after the next commit): the
+        change is refused, the core's word ends and the delivered text stays.
+        Returns False when the change was refused.
+        """
+        current = getattr(self, "_direct_word", "")
+        if target.startswith(current):
+            tail = target[len(current):]
+            if tail:
+                self.commit_text(IBus.Text.new_from_string(tail))
+                self._direct_emitted = getattr(self, "_direct_emitted", 0) + 1
+            self._direct_word = target
+            return True
+        if (
+            getattr(self, "_direct_key_backspace", False)
+            and current.startswith(target)
+            and len(current) - len(target) == 1
+        ):
+            self._direct_backspace()
+            self._direct_emitted = getattr(self, "_direct_emitted", 0) + 1
+            self._direct_word = target
+            self._direct_key_backspace = False  # one deletion per operator BackSpace
+            return True
+        trace = getattr(self, "_trace", None)
+        if trace is not None and trace.enabled:
+            trace.emit("direct_revision", seq=0, refused=True)
+        self._direct_end_word()
+        return False
+
+    def _direct_end_word(self) -> None:
+        """End the core's word; whatever was delivered stays in the client."""
+        try:
+            self._core.reset()  # its actions only hide a preedit that never existed
+        except _UNCATCHABLE:
+            raise
+        except BaseException:  # noqa: BLE001 — a refused reset must not break typing
+            log.warning("smartkey: core reset refused while ending a direct word")
+        self._direct_clear()
+
+    def _direct_clear(self) -> None:
+        self._direct_word = ""
+        self._direct_pending = ""
+        self._direct_ghost = ""
+
+    def _direct_decided(self) -> bool:
+        """True once the core's dual buffer has left its hypothesis phase.
+
+        Until then the script can still flip ("by" -> "бър"), and revising
+        delivered text needs a BackSpace that Chrome may apply after the
+        following commit.  Unknown state counts as undecided (the word is
+        then delivered at its boundary).
+        """
+        debug_state = getattr(self._core, "debug_state", None)
+        if not callable(debug_state):
+            return False
+        try:
+            dual_present, locked, _hypothesis = debug_state()
+        except Exception:  # noqa: BLE001 — undecided is the safe answer
+            return False
+        return bool(locked) or not dual_present
+
+    def _direct_deliver_pending(self) -> None:
+        """Hand the client the word as typed so far (never the ghost)."""
+        pending = getattr(self, "_direct_pending", "")
+        if pending and pending != getattr(self, "_direct_word", ""):
+            self._direct_apply(pending)
+
+    def _direct_commit(self, text: str) -> bool:
+        """Resolve the in-flight word (boundary, flush or choice) to *text*."""
+        typed = getattr(self, "_direct_pending", "") or getattr(self, "_direct_word", "")
+        ghost = getattr(self, "_direct_ghost", "")
+        if ghost and text.startswith(typed + ghost):
+            # A completion the operator never saw must not be typed.
+            text = typed + text[len(typed) + len(ghost):]
+        applied = self._direct_apply(text)
+        self._direct_clear()
+        return applied
+
+    def _execute_actions_direct(self, actions: list[tuple[str, str]]) -> bool:
+        """Deliver core actions without any preedit: decide, deliver, never revise.
+
+        While the dual buffer is in its hypothesis phase nothing reaches the
+        client; once it locks the word is committed in its final script and
+        later keys only append.  Returns True if the key was consumed.
+        """
+        composition_resolved = self._composition_resolved_by(actions)
+        consumed = True
+        refused = False
+        emitted_before = getattr(self, "_direct_emitted", 0)
+        types = [action_type for action_type, _ in actions]
+        for idx, (action_type, payload) in enumerate(actions):
+            later = set(types[idx + 1 :])
+            if refused and action_type in {"composing", "commit", "replace", "hide"}:
+                continue  # the word already ended; nothing may be delivered again
+            if action_type == "composing":
+                decoded = ffi_decode_composing_payload(payload)
+                if decoded is None:
+                    log.warning("smartkey: malformed composing payload (content omitted)")
+                    continue
+                typed, ghost = decoded
+                self._direct_pending = typed
+                self._direct_ghost = ghost
+                if getattr(self, "_direct_word", "") or self._direct_decided():
+                    refused = not self._direct_apply(typed)
+            elif action_type == "commit":
+                refused = not self._direct_commit(payload)
+            elif action_type == "replace":
+                decoded = ffi_decode_replace_payload(payload)
+                if decoded is None:
+                    log.warning("smartkey: malformed replace payload (content omitted)")
+                    continue
+                replace_len, text = decoded
+                word = getattr(self, "_direct_pending", "") or getattr(self, "_direct_word", "")
+                if word and replace_len <= len(word):
+                    self._direct_pending = word[: len(word) - replace_len] + text
+                    if getattr(self, "_direct_word", "") or self._direct_decided():
+                        refused = not self._direct_apply(self._direct_pending)
+                else:
+                    # Text outside the in-flight word is not provably ours.
+                    log.warning("smartkey: direct delivery skipped an unverifiable rewrite")
+            elif action_type == "hide":
+                if later & {"commit", "replace", "composing"}:
+                    continue
+                if getattr(self, "_direct_key_active", False) and getattr(
+                    self, "_direct_key_press", False
+                ):
+                    # A consumed key emptied the word: only the operator's own
+                    # BackSpace may remove the one delivered character left.
+                    refused = not self._direct_apply("")
+                # Cancel paths: delivered text belongs to the client; an
+                # undelivered hypothesis is discarded like a cleared preedit.
+                self._direct_clear()
+            elif action_type == "forward":
+                consumed = False
+            # "ghost" (idle next-word prediction) is never displayed here.
+        if (
+            refused
+            and getattr(self, "_direct_key_active", False)
+            and getattr(self, "_direct_key_press", False)
+            and getattr(self, "_direct_emitted", 0) == emitted_before
+        ):
+            # A refused revision must not swallow the operator's key: when
+            # nothing was emitted for it, the client handles it natively (a
+            # BackSpace deletes one character, a letter is typed as the layout
+            # gives it); the word has already ended.
+            consumed = False
+        if (
+            not consumed
+            and getattr(self, "_direct_key_press", False)
+            and not getattr(self, "_direct_key_inert", False)
+            and not {"commit", "replace"} & set(types)
+            and (getattr(self, "_direct_pending", "") or getattr(self, "_direct_word", ""))
+        ):
+            # The client handles this key itself (caret moves, shortcuts,
+            # edits): the word lands first and then ends, so nothing typed
+            # later can revise text at a caret this engine cannot see.
+            self._direct_deliver_pending()
+            self._direct_end_word()
+        if composition_resolved:
+            self._keys_since_content_type = 0
+        return consumed
+
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
+        if getattr(self, "_direct_delivery", False):
+            return self._execute_actions_direct(actions)
         actions = self._coalesce_same_batch_commit_replace(actions)
         actions = self._drop_forward_race_ghost(actions)
         composing_resolution_pending = (
@@ -1534,8 +1775,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         return consumed
 
     def do_set_capabilities(self, caps: int) -> None:
-        self._core.set_external_rewrite_supported(bool(caps & 0x20))
         self._caps = caps
+        self._caps_known = True
+        self._update_delivery_mode()
+        # Direct delivery never revises delivered text, so the core must not
+        # plan rewrites the adapter would refuse.
+        self._core.set_external_rewrite_supported(
+            bool(caps & _CAP_SURROUNDING_TEXT) and not self._direct_delivery
+        )
         self._clear_language_choice()
         self._refresh_language_choice_route()
         self._update_language_choice_support()
@@ -1618,6 +1865,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             )
             and self._caps & 1  # Owned full-word preedit must be renderable too.
             and getattr(self, "_language_choice_route_available", False)
+            # Direct delivery owns no preedit and passes Tab/Esc to the client.
+            and not getattr(self, "_direct_delivery", False)
         )
         if supported != getattr(self, "_language_choice_supported", False):
             try:
@@ -1853,6 +2102,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         keystroke.
         """
         self._sensitive = True
+        # The in-flight word is discarded: nothing pending may be replayed into
+        # the field, and nothing delivered may be revised by a later word.
+        self._direct_clear()
         self._clear_native_report_wait(lifecycle=True)
         self._clear_language_choice()
         self._update_language_choice_support()
@@ -2122,6 +2374,31 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Key event handler.
     # -----------------------------------------------------------------------
     def do_process_key_event(self, keyval: int, keycode: int, state: int) -> bool:
+        """Route one key event; direct delivery adds two guards around it."""
+        if (
+            getattr(self, "_direct_delivery", False)
+            and not getattr(self, "_sensitive", False)
+            and keyval in _DIRECT_PASSTHROUGH_KEYS
+            and not state & (_MOD_RELEASE | _MOD_CONTROL | _MOD_ALT | _MOD_SUPER)
+        ):
+            # The key belongs to the client: deliver the word as typed (never
+            # the undisplayed ghost), end it, then let the client act.
+            self._direct_deliver_pending()
+            self.do_reset()
+            return False
+        self._direct_key_active = True
+        self._direct_key_press = not state & _MOD_RELEASE
+        self._direct_key_backspace = self._direct_key_press and keyval == IBus.KEY_BackSpace
+        self._direct_key_inert = keycode in _NO_DELIVERY_KEYCODES
+        try:
+            return self._process_key_event_impl(keyval, keycode, state)
+        finally:
+            self._direct_key_active = False
+            self._direct_key_press = False
+            self._direct_key_backspace = False
+            self._direct_key_inert = False
+
+    def _process_key_event_impl(self, keyval: int, keycode: int, state: int) -> bool:
         """Handle an IBus key event via the Rust core.
 
         When a valid hardware scancode is available (keycode > 0), the event
@@ -2436,8 +2713,16 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             # the previous field's word, or keys typed into this secret field
             # before its declaration arrived.  It stays unflushed; the stop is
             # released only after a successful reset, which discards it.
-            actions = self._core.focus_lost()
-            self._execute_actions(actions)
+            if getattr(self, "_direct_delivery", False):
+                # ibus-daemon has already moved its focus when this runs, so a
+                # flushed tail could land in the next window.  The delivered
+                # part stays; an undelivered hypothesis is dropped like a
+                # cleared preedit.
+                self._direct_end_word()
+            else:
+                actions = self._core.focus_lost()
+                self._execute_actions(actions)
+        self._direct_clear()  # the core's word has ended either way
         self._active_prediction = None
         collector = getattr(self, "_o1", None)
         if collector is not None:
@@ -2489,6 +2774,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._keys_since_content_type = 0
         actions = self._cancel_safe(self._core.reset())
         self._execute_actions(actions)
+        self._direct_clear()  # the core's word has ended
         self._active_prediction = None
         collector = getattr(self, "_o1", None)
         if collector is not None:
@@ -2519,6 +2805,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._keys_since_content_type = 0
         actions = self._cancel_safe(self._core.reset())
         self._execute_actions(actions)
+        self._direct_clear()  # the core's word has ended
         self._active_prediction = None
         collector = getattr(self, "_o1", None)
         if collector is not None:
