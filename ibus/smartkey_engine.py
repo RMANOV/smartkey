@@ -176,7 +176,64 @@ for _known_hint in _KNOWN_HINT_VALUES:
 # IBus modifier bits used by the phantom-key filter.
 _MOD_CONTROL = 1 << 2  # IBus.ModifierType.CONTROL_MASK
 _MOD_ALT = 1 << 3  # IBus.ModifierType.MOD1_MASK
+_MOD_LEVEL3 = 1 << 7  # MOD5_MASK: AltGr text input, not an editing chord
 _MOD_RELEASE = 1 << 30  # IBus.ModifierType.RELEASE_MASK
+
+_MOD_SUPER = (1 << 6) | (1 << 26)  # MOD4_MASK | SUPER_MASK
+_CAP_PREEDIT_TEXT = 0x01
+_CAP_SURROUNDING_TEXT = 0x20
+
+# Direct delivery: no composing preedit, and delivered text is never revised,
+# for clients that cannot report the text around the caret (no
+# SURROUNDING_TEXT capability).  That is Chromium and Electron through GTK
+# im-ibus (capabilities 9), whose rich web editors (Gmail compose) re-render the
+# DOM during composition and turn every preedit state — ghost suffix
+# included — into permanent text.  Without surrounding text nothing delivered
+# can be verified, so nothing delivered is ever deleted except by the
+# operator's own BackSpace.
+# Accept gestures go straight to the client in direct delivery: no ghost is
+# ever displayed there, so none may be accepted.  Tab, ISO_Left_Tab, Right, Esc.
+_DIRECT_PASSTHROUGH_KEYS = frozenset({0xFF09, 0xFE20, 0xFF53, 0xFF1B})
+# evdev keycodes that never act on the client's text: modifiers (Ctrl, Shift,
+# Alt, CapsLock, Super), NumLock, ScrollLock, Compose/Menu, and keycode 0.
+_NO_DELIVERY_KEYCODES = frozenset({0, 29, 42, 54, 56, 58, 69, 70, 97, 100, 125, 126, 127})
+# Shortcut modifiers (Control, Meta, Alt, Super, Hyper; left and right keyvals).
+# A modifier press invalidates refocus eligibility but does not deliver an
+# uncertain token. Only the actual chord, if IBus receives it, ends the token.
+# Shift and AltGr (ISO_Level3_Shift) are absent: they type text.
+_DIRECT_SHORTCUT_MODIFIERS = frozenset(
+    {0xFFE3, 0xFFE4, 0xFFE7, 0xFFE8, 0xFFE9, 0xFFEA, 0xFFEB, 0xFFEC, 0xFFED, 0xFFEE}
+)
+# A word in its hypothesis phase is invisible to the client, and a mouse click
+# or a window switch discards it without any keystroke to announce them.  After
+# an explicitly configured pause the current reading can be delivered early.
+# It is off by default: pausing inside a word must not fix an uncertain script.
+# smartkey.json "delivery": {"idle_ms": N}; 0 disables it.
+_DIRECT_IDLE_MS_DEFAULT = 0
+_DIRECT_IDLE_MS_MIN = 200
+_DIRECT_IDLE_MS_MAX = 5000
+# Chrome answers a re-rendering editor's DOM change after a commit with
+# FocusOut and an immediate FocusIn on the same field, and may create a new
+# input context that announces SURROUNDING_TEXT for a moment.  A focus-out this
+# soon after a commit waits this long for that focus-in, and a switch to preedit
+# while a word is in flight waits this long for the capabilities to come back
+# (see _direct_refocus_hold and _direct_mode_switch_held).
+_DIRECT_REFOCUS_MS = 50
+
+
+def _direct_idle_ms_from_config(delivery_cfg: object) -> int:
+    """The configured pause before an undelivered word is typed (0 = never)."""
+    value = (
+        delivery_cfg.get("idle_ms", _DIRECT_IDLE_MS_DEFAULT)
+        if isinstance(delivery_cfg, dict)
+        else _DIRECT_IDLE_MS_DEFAULT
+    )
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return _DIRECT_IDLE_MS_DEFAULT
+    if value == 0:
+        return 0
+    return max(_DIRECT_IDLE_MS_MIN, min(value, _DIRECT_IDLE_MS_MAX))
+
 
 # Exceptions the hard-stop paths let propagate.  Everything else counts as a
 # refusal: pyo3 raises a Rust panic as ``PanicException``, which derives from
@@ -493,6 +550,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 "rebuild the native module before starting SmartKey"
             )
 
+        # Until the client declares its capabilities there is no attested
+        # completion display. A hidden suffix must not be accepted or learned.
+        try:
+            set_display = getattr(self._core, "set_completion_display_supported", None)
+            if not callable(set_display):
+                raise TypeError("missing completion display capability API")
+            set_display(False)
+        except Exception as exc:
+            raise RuntimeError(
+                "smartkey_py native extension cannot enforce completion display "
+                "delivery; rebuild the native module before starting SmartKey"
+            ) from exc
+
         # KDE's explicit BG layout is ordinary keyboard input. Its metadata
         # observer never changes an engine, layout, or client text.
         self._kde_layout = None
@@ -512,6 +582,43 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         # IBus client capabilities (set by do_set_capabilities callback).
         self._caps: int = 0
+        # Direct delivery state (see _execute_actions_direct).  The mode is
+        # chosen per focused client; "off" in smartkey.json disables it.
+        delivery_cfg = user_cfg.get("delivery") if isinstance(user_cfg, dict) else None
+        self._delivery_mode = (
+            delivery_cfg.get("mode", "auto") if isinstance(delivery_cfg, dict) else "auto"
+        )
+        self._direct_delivery = False
+        self._direct_word = ""
+        self._direct_pending = ""
+        self._direct_ghost = ""
+        self._direct_key_active = False
+        self._direct_key_press = False
+        self._direct_key_backspace = False
+        self._direct_key_inert = False
+        self._direct_emitted = 0
+        # Typing after a pause (see _direct_idle_fire): a one-shot GLib timer.
+        self._direct_idle_ms = _direct_idle_ms_from_config(delivery_cfg)
+        self._direct_idle_source: int | None = None
+        self._direct_clock = time.monotonic
+        self._direct_commit_at: float | None = None
+        self._direct_refocus_source: int | None = None
+        self._direct_idle_schedule = None
+        self._direct_idle_unschedule = None
+        if _HAS_IBUS:
+            try:
+                from gi.repository import GLib  # noqa: PLC0415
+
+                def schedule(ms: int, callback: object) -> int:
+                    # Below D-Bus dispatch: a reset, focus-out or focus-in that
+                    # is already queued always runs before a due timer.
+                    return GLib.timeout_add(ms, callback, priority=GLib.PRIORITY_LOW)
+
+                self._direct_idle_schedule = schedule
+                self._direct_idle_unschedule = GLib.source_remove
+            except ImportError:
+                pass
+        self._caps_known = False
         self._language_choice_offer: dict[str, object] | None = None
         self._language_choice_selected: int | None = None
         self._language_choice_supported = False
@@ -1427,8 +1534,403 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             return word == ""
         return resolving_action
 
+    # -----------------------------------------------------------------------
+    # Direct delivery (clients without surrounding text): no composing preedit.
+    # -----------------------------------------------------------------------
+    def _update_delivery_mode(self) -> None:
+        """Choose preedit or direct delivery from the client's capabilities.
+
+        "auto" (default): direct for a client that advertises no
+        SURROUNDING_TEXT, because nothing delivered could be verified there;
+        "off": always preedit; "direct": always direct.  Until the first
+        capability report the mode stays preedit.
+        """
+        direct = self._desired_direct_delivery()
+        changed = direct != getattr(self, "_direct_delivery", False)
+        if changed:
+            # Never carry a word across delivery modes: take down any live
+            # preedit (ghost included) and end the core's word first.
+            if getattr(self, "_preedit_active", False):
+                self.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
+                self._preedit_active = False
+                self._preedit_mode = None
+            self._direct_trace_drop("mode")
+            self._direct_end_word()
+        self._direct_delivery = direct
+        if changed:
+            trace = getattr(self, "_trace", None)
+            if trace is not None and trace.enabled:
+                trace.emit("delivery", seq=0, mode="direct" if direct else "preedit")
+
+    def _desired_direct_delivery(self) -> bool:
+        mode = getattr(self, "_delivery_mode", "auto")
+        if mode == "direct":
+            return True
+        if mode == "off" or not getattr(self, "_caps_known", False):
+            return False
+        return not getattr(self, "_caps", 0) & _CAP_SURROUNDING_TEXT
+
+    def _direct_mode_switch_held(self) -> bool:
+        """Hold a switch from direct to preedit while a word is in flight.
+
+        After a commit into an editor that re-renders its DOM, Chrome creates a
+        new input context: it announces SURROUNDING_TEXT (capabilities 41) and
+        drops it a moment later (9).  Switching on that flicker would end the
+        word in flight, and its rest would be decided again as a new word.  So
+        the switch waits _DIRECT_REFOCUS_MS, or until the next key, and is
+        dropped when the capabilities come back.  The opposite switch, to a
+        client that cannot report surrounding text after all, is never held.
+        """
+        if not (getattr(self, "_direct_delivery", False) and not self._desired_direct_delivery()):
+            self._direct_mode_switch_cancel()
+            return False
+        if not (
+            getattr(self, "_direct_word", "")
+            or getattr(self, "_direct_pending", "")
+            or self._core_current_word()
+        ):
+            return False
+        if getattr(self, "_direct_mode_switch_source", None) is None:
+            schedule = getattr(self, "_direct_idle_schedule", None)
+            if not callable(schedule):
+                return False
+            self._direct_mode_switch_source = schedule(
+                _DIRECT_REFOCUS_MS, self._direct_mode_switch_due
+            )
+        return True
+
+    def _direct_mode_switch_cancel(self) -> None:
+        source = getattr(self, "_direct_mode_switch_source", None)
+        self._direct_mode_switch_source = None
+        unschedule = getattr(self, "_direct_idle_unschedule", None)
+        if source is not None and callable(unschedule):
+            unschedule(source)
+
+    def _direct_mode_switch_due(self) -> bool:
+        """The capabilities did not come back: the held switch happens now."""
+        self._direct_mode_switch_source = None  # a one-shot source is spent once it runs
+        self._apply_capabilities()
+        return False
+
+    def _direct_backspace(self) -> None:
+        self.forward_key_event(IBus.KEY_BackSpace, 14, 0)
+        self.forward_key_event(IBus.KEY_BackSpace, 14, _MOD_RELEASE)
+
+    def _direct_apply(self, target: str) -> bool:
+        """Bring the client to *target* for the in-flight word, never revising.
+
+        Appends are delivered.  The only deletion is one character for the
+        operator's own consumed BackSpace.  Anything else would revise text the
+        client already owns, which cannot be verified here (no surrounding
+        text, and a forwarded BackSpace can land after the next commit): the
+        change is refused, the core's word ends and the delivered text stays.
+        Returns False when the change was refused.
+        """
+        current = getattr(self, "_direct_word", "")
+        if target.startswith(current):
+            tail = target[len(current):]
+            if tail:
+                self.commit_text(IBus.Text.new_from_string(tail))
+                self._direct_emitted = getattr(self, "_direct_emitted", 0) + 1
+                self._direct_mark_commit()
+            self._direct_word = target
+            return True
+        if (
+            getattr(self, "_direct_key_backspace", False)
+            and current.startswith(target)
+            and len(current) - len(target) == 1
+        ):
+            self._direct_backspace()
+            self._direct_emitted = getattr(self, "_direct_emitted", 0) + 1
+            self._direct_mark_commit()
+            self._direct_word = target
+            self._direct_key_backspace = False  # one deletion per operator BackSpace
+            return True
+        trace = getattr(self, "_trace", None)
+        if trace is not None and trace.enabled:
+            trace.emit("direct_revision", seq=0, refused=True)
+        self._direct_end_word()
+        return False
+
+    def _direct_end_word(self) -> None:
+        """End the core's word; whatever was delivered stays in the client."""
+        try:
+            self._core.reset()  # its actions only hide a preedit that never existed
+        except _UNCATCHABLE:
+            raise
+        except BaseException:  # noqa: BLE001 — a refused reset must not break typing
+            log.warning("smartkey: core reset refused while ending a direct word")
+        self._direct_clear()
+
+    def _direct_clear(self) -> None:
+        self._direct_word = ""
+        self._direct_pending = ""
+        self._direct_ghost = ""
+        self._direct_idle_cancel()  # no word is left to type after a pause
+        self._direct_refocus_cancel()  # nor to keep through a refocus
+
+    def _direct_decided(self) -> bool:
+        """True once the core's dual buffer has left its hypothesis phase.
+
+        Until then the script can still flip ("by" -> "бър"), and revising
+        delivered text needs a BackSpace that Chrome may apply after the
+        following commit.  Unknown state counts as undecided (the word is
+        then delivered at its boundary).
+        """
+        debug_state = getattr(self._core, "debug_state", None)
+        if not callable(debug_state):
+            return False
+        try:
+            dual_present, locked, _hypothesis = debug_state()
+        except Exception:  # noqa: BLE001 — undecided is the safe answer
+            return False
+        return bool(locked) or not dual_present
+
+    def _direct_deliver_pending(self) -> None:
+        """Hand the client the word as typed so far (never the ghost)."""
+        pending = getattr(self, "_direct_pending", "")
+        if pending and pending != getattr(self, "_direct_word", ""):
+            self._direct_apply(pending)
+
+    def _direct_undelivered(self) -> bool:
+        """True while typed text of the in-flight word has not reached the client."""
+        pending = getattr(self, "_direct_pending", "")
+        return bool(pending) and pending != getattr(self, "_direct_word", "")
+
+    def _direct_idle_cancel(self) -> None:
+        source = getattr(self, "_direct_idle_source", None)
+        self._direct_idle_source = None
+        unschedule = getattr(self, "_direct_idle_unschedule", None)
+        if source is not None and callable(unschedule):
+            unschedule(source)
+
+    def _direct_idle_rearm(self) -> None:
+        """Restart the pause countdown while the in-flight word is undelivered."""
+        self._direct_idle_cancel()
+        idle_ms = getattr(self, "_direct_idle_ms", 0)
+        schedule = getattr(self, "_direct_idle_schedule", None)
+        if (
+            idle_ms > 0
+            and callable(schedule)
+            and callable(getattr(self._core, "handoff_preedit_for_delivery", None))
+            and getattr(self, "_direct_delivery", False)
+            and not getattr(self, "_sensitive", False)
+            and self._direct_undelivered()
+        ):
+            self._direct_idle_source = schedule(idle_ms, self._direct_idle_fire)
+
+    def _direct_deliver_early(self, trigger: str) -> None:
+        """Type the undelivered word now and keep it open in its current script.
+
+        The core fixes the word's script at its current winner, so later keys
+        append in it and nothing delivered is ever revised.  A core without
+        that handoff delivers nothing early: an unfixed hypothesis could flip
+        on the next key and leave a mixed-script word, homoglyphs included.
+        """
+        handoff = getattr(self._core, "handoff_preedit_for_delivery", None)
+        if not callable(handoff) or not self._direct_undelivered():
+            return
+        try:
+            actions = handoff()
+        except _UNCATCHABLE:
+            raise
+        except BaseException:  # noqa: BLE001 — a refused handoff must not break typing
+            log.warning("smartkey: core refused an early delivery handoff")
+            return
+        self._execute_actions_direct(actions)
+        trace = getattr(self, "_trace", None)
+        if trace is not None and trace.enabled:
+            trace.emit("direct_early", seq=0, trigger=trigger)
+
+    def _direct_idle_fire(self) -> bool:
+        """The operator paused: type the word as typed so far and keep it open.
+
+        A mouse click or a window switch reaches this engine only as a reset or
+        a focus-out, which discard an undelivered word (see do_reset and
+        do_focus_out).  The core keeps the word in its fixed script (see
+        _direct_deliver_early).
+        """
+        self._direct_idle_source = None  # a one-shot source is spent once it runs
+        if (
+            getattr(self, "_direct_delivery", False)
+            and not getattr(self, "_sensitive", False)
+            and self._direct_undelivered()
+        ):
+            emitted = getattr(self, "_direct_emitted", 0)
+            self._direct_deliver_early("pause")
+            if getattr(self, "_direct_emitted", 0) != emitted:
+                self._direct_mark_commit(pause=True)
+        return False
+
+    def _direct_mark_commit(self, pause: bool = False) -> None:
+        """Remember when text was emitted for an ordinary key or after a pause.
+
+        A shortcut's boundary delivery never counts (see _direct_refocus_hold).
+        """
+        if pause or (
+            getattr(self, "_direct_key_active", False)
+            and not getattr(self, "_direct_key_inert", False)
+        ):
+            self._direct_commit_at = getattr(self, "_direct_clock", time.monotonic)()
+
+    def _direct_refocus_hold(self) -> bool:
+        """Keep the word through Chrome refocusing a re-rendering editor.
+
+        Right after a commit made for a key or after a pause, Chrome may answer
+        an editor that re-renders its DOM (the reference is a rich compose box)
+        with FocusOut and an immediate FocusIn on the same field.  Ending the
+        word there splits it, and the rest is decided again as a new word,
+        possibly in the other script.  So a focus-out within _DIRECT_REFOCUS_MS
+        of such a commit, with nothing left undelivered, waits that long for the
+        focus-in; without it the word ends as for any focus loss. A shortcut
+        modifier invalidates eligibility, so Alt+Tab cannot carry the word.
+        """
+        schedule = getattr(self, "_direct_idle_schedule", None)
+        committed_at = getattr(self, "_direct_commit_at", None)
+        now = getattr(self, "_direct_clock", time.monotonic)()
+        if (
+            not callable(schedule)
+            or committed_at is None
+            or now - committed_at > _DIRECT_REFOCUS_MS / 1000
+            or not (getattr(self, "_direct_word", "") or self._core_current_word())
+            or self._direct_undelivered()
+        ):
+            return False
+        self._direct_refocus_cancel()
+        self._direct_refocus_source = schedule(_DIRECT_REFOCUS_MS, self._direct_refocus_expire)
+        return True
+
+    def _direct_refocus_cancel(self) -> None:
+        source = getattr(self, "_direct_refocus_source", None)
+        self._direct_refocus_source = None
+        unschedule = getattr(self, "_direct_idle_unschedule", None)
+        if source is not None and callable(unschedule):
+            unschedule(source)
+
+    def _direct_refocus_expire(self) -> bool:
+        """No focus-in followed the focus-out: an ordinary focus loss after all."""
+        self._direct_refocus_source = None  # a one-shot source is spent once it runs
+        self._direct_end_word()
+        return False
+
+    def _direct_trace_drop(self, cause: str) -> None:
+        """Count (never content) an undelivered word that *cause* discards."""
+        if getattr(self, "_direct_delivery", False) and self._direct_undelivered():
+            trace = getattr(self, "_trace", None)
+            if trace is not None and trace.enabled:
+                trace.emit("direct_dropped", seq=0, cause=cause)
+
+    def _direct_commit(self, text: str) -> bool:
+        """Resolve the in-flight word (boundary, flush or choice) to *text*."""
+        typed = getattr(self, "_direct_pending", "") or getattr(self, "_direct_word", "")
+        ghost = getattr(self, "_direct_ghost", "")
+        if ghost and text.startswith(typed + ghost):
+            # A completion the operator never saw must not be typed.
+            text = typed + text[len(typed) + len(ghost):]
+        applied = self._direct_apply(text)
+        self._direct_clear()
+        return applied
+
+    def _execute_actions_direct(self, actions: list[tuple[str, str]]) -> bool:
+        """Deliver core actions without any preedit: decide, deliver, never revise.
+
+        While the dual buffer is in its hypothesis phase nothing reaches the
+        client; once it locks the word is committed in its final script and
+        later keys only append. An explicitly configured pause can hand the
+        word over early (see _direct_idle_fire); a shortcut delivers and ends it.
+        Returns True if the key was consumed.
+        """
+        composition_resolved = self._composition_resolved_by(actions)
+        consumed = True
+        refused = False
+        emitted_before = getattr(self, "_direct_emitted", 0)
+        types = [action_type for action_type, _ in actions]
+        for idx, (action_type, payload) in enumerate(actions):
+            later = set(types[idx + 1 :])
+            if refused and action_type in {"composing", "commit", "replace", "hide"}:
+                continue  # the word already ended; nothing may be delivered again
+            if action_type == "composing":
+                decoded = ffi_decode_composing_payload(payload)
+                if decoded is None:
+                    log.warning("smartkey: malformed composing payload (content omitted)")
+                    continue
+                typed, ghost = decoded
+                self._direct_pending = typed
+                self._direct_ghost = ghost
+                if getattr(self, "_direct_word", "") or self._direct_decided():
+                    refused = not self._direct_apply(typed)
+            elif action_type == "commit":
+                refused = not self._direct_commit(payload)
+            elif action_type == "replace":
+                decoded = ffi_decode_replace_payload(payload)
+                if decoded is None:
+                    log.warning("smartkey: malformed replace payload (content omitted)")
+                    continue
+                replace_len, text = decoded
+                word = getattr(self, "_direct_pending", "") or getattr(self, "_direct_word", "")
+                if word and replace_len <= len(word):
+                    self._direct_pending = word[: len(word) - replace_len] + text
+                    if getattr(self, "_direct_word", "") or self._direct_decided():
+                        refused = not self._direct_apply(self._direct_pending)
+                else:
+                    # Text outside the in-flight word is not provably ours.
+                    log.warning("smartkey: direct delivery skipped an unverifiable rewrite")
+            elif action_type == "hide":
+                if later & {"commit", "replace", "composing"}:
+                    continue
+                if (
+                    getattr(self, "_direct_key_active", False)
+                    and getattr(self, "_direct_key_press", False)
+                    and getattr(self, "_direct_key_backspace", False)
+                ):
+                    # The operator's BackSpace emptied the word: it may remove
+                    # the one delivered character left.  Any other consumed key
+                    # (the Super+Escape kill switch) only ends the word.
+                    refused = not self._direct_apply("")
+                # Cancel paths: delivered text belongs to the client; an
+                # undelivered hypothesis is discarded like a cleared preedit.
+                self._direct_clear()
+            elif action_type == "forward":
+                consumed = False
+            # "ghost" (idle next-word prediction) is never displayed here.
+        if (
+            refused
+            and getattr(self, "_direct_key_active", False)
+            and getattr(self, "_direct_key_press", False)
+            and getattr(self, "_direct_emitted", 0) == emitted_before
+        ):
+            # A refused revision must not swallow the operator's key: when
+            # nothing was emitted for it, the client handles it natively (a
+            # BackSpace deletes one character, a letter is typed as the layout
+            # gives it); the word has already ended.
+            consumed = False
+        if (
+            not consumed
+            and getattr(self, "_direct_key_press", False)
+            and not getattr(self, "_direct_key_inert", False)
+            and not {"commit", "replace"} & set(types)
+            and (
+                getattr(self, "_direct_pending", "")
+                or getattr(self, "_direct_word", "")
+                or (
+                    not getattr(self, "_direct_key_backspace", False)
+                    and self._core_current_word()
+                )
+            )
+        ):
+            # The client handles this key itself (caret moves, shortcuts,
+            # edits): the word lands first and then ends, so nothing typed
+            # later can revise text at a caret this engine cannot see.
+            self._direct_deliver_pending()
+            self._direct_end_word()
+        if composition_resolved:
+            self._keys_since_content_type = 0
+        return consumed
+
     def _execute_actions(self, actions: list[tuple[str, str]]) -> bool:
         """Execute action tuples from Rust. Returns True if key was consumed."""
+        if getattr(self, "_direct_delivery", False):
+            return self._execute_actions_direct(actions)
         actions = self._coalesce_same_batch_commit_replace(actions)
         actions = self._drop_forward_race_ghost(actions)
         composing_resolution_pending = (
@@ -1534,8 +2036,25 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         return consumed
 
     def do_set_capabilities(self, caps: int) -> None:
-        self._core.set_external_rewrite_supported(bool(caps & 0x20))
         self._caps = caps
+        self._caps_known = True
+        if self._direct_mode_switch_held():
+            return
+        self._apply_capabilities()
+
+    def _apply_capabilities(self) -> None:
+        self._direct_mode_switch_cancel()
+        self._update_delivery_mode()
+        # Direct delivery never revises delivered text, so the core must not
+        # plan rewrites the adapter would refuse.
+        self._core.set_external_rewrite_supported(
+            bool(getattr(self, "_caps", 0) & _CAP_SURROUNDING_TEXT) and not self._direct_delivery
+        )
+        # Startup requires this API. The callable check keeps constructor-free
+        # adapter test doubles usable without admitting an older live module.
+        set_display = getattr(self._core, "set_completion_display_supported", None)
+        if callable(set_display):
+            set_display(not self._direct_delivery)
         self._clear_language_choice()
         self._refresh_language_choice_route()
         self._update_language_choice_support()
@@ -1618,6 +2137,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             )
             and self._caps & 1  # Owned full-word preedit must be renderable too.
             and getattr(self, "_language_choice_route_available", False)
+            # Direct delivery owns no preedit and passes Tab/Esc to the client.
+            and not getattr(self, "_direct_delivery", False)
         )
         if supported != getattr(self, "_language_choice_supported", False):
             try:
@@ -1853,6 +2374,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         keystroke.
         """
         self._sensitive = True
+        # The in-flight word is discarded: nothing pending may be replayed into
+        # the field, and nothing delivered may be revised by a later word.
+        self._direct_trace_drop("sensitive")
+        self._direct_clear()
         self._clear_native_report_wait(lifecycle=True)
         self._clear_language_choice()
         self._update_language_choice_support()
@@ -2122,6 +2647,74 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # Key event handler.
     # -----------------------------------------------------------------------
     def do_process_key_event(self, keyval: int, keycode: int, state: int) -> bool:
+        """Route one key event; direct delivery adds guards around it."""
+        if (
+            getattr(self, "_direct_mode_switch_source", None) is not None
+            and not state & _MOD_RELEASE
+            and not self._is_spurious_zero_key_event(keyval, keycode, state)
+        ):
+            self._apply_capabilities()  # a held mode switch lands before this key
+        direct = getattr(self, "_direct_delivery", False) and not getattr(
+            self, "_sensitive", False
+        )
+        if (
+            direct
+            and keyval in _DIRECT_PASSTHROUGH_KEYS
+            and not state & (_MOD_RELEASE | _MOD_CONTROL | _MOD_ALT | _MOD_SUPER)
+        ):
+            # The key belongs to the client: deliver the word as typed (never
+            # the undisplayed ghost), end it, then let the client act.
+            self._direct_deliver_pending()
+            self.do_reset()
+            return False
+        if direct and keyval in _DIRECT_SHORTCUT_MODIFIERS and not state & _MOD_RELEASE:
+            # A prior ordinary commit must not make Alt+Tab look like the
+            # editor refocusing after that commit, even with no pending text.
+            # A bare modifier may be released with no shortcut: it must not
+            # fix the script or emit text that triggers a DOM refocus.
+            self._direct_commit_at = None
+        if (
+            direct
+            and state & (_MOD_CONTROL | _MOD_ALT | _MOD_SUPER)
+            and not state & (_MOD_RELEASE | _MOD_LEVEL3)
+            and keyval != 0
+            and keyval != 0xFE03  # ISO_Level3_Shift (AltGr)
+            and not 0xFFE1 <= keyval <= 0xFFEE  # pure modifier keyvals
+            and (keycode == 0 or keycode not in _NO_DELIVERY_KEYCODES)
+            and not (keyval == 0xFF1B and state & _MOD_SUPER)  # core kill switch
+        ):
+            # The actual editing chord is a boundary. Deliver before the client
+            # acts, then retire all token state so edits cannot continue it.
+            self._direct_commit_at = None
+            if callable(getattr(self._core, "handoff_preedit_for_delivery", None)):
+                self._direct_deliver_early("shortcut")
+            else:
+                # An older core cannot keep an early token open safely, but
+                # this actual chord ends the word immediately in either case.
+                self._direct_deliver_pending()
+            self._direct_end_word()
+            # This chord belongs to the client. Do not ask the core to
+            # reinterpret it as text after the token has already ended.
+            return False
+        self._direct_key_active = True
+        self._direct_key_press = not state & _MOD_RELEASE
+        self._direct_key_backspace = (
+            self._direct_key_press
+            and keyval == IBus.KEY_BackSpace
+            and not state & (_MOD_CONTROL | _MOD_ALT | _MOD_SUPER)
+        )
+        self._direct_key_inert = keycode in _NO_DELIVERY_KEYCODES
+        try:
+            return self._process_key_event_impl(keyval, keycode, state)
+        finally:
+            self._direct_key_active = False
+            self._direct_key_press = False
+            self._direct_key_backspace = False
+            self._direct_key_inert = False
+            if not self._is_spurious_zero_key_event(keyval, keycode, state):
+                self._direct_idle_rearm()  # every real key event restarts the pause
+
+    def _process_key_event_impl(self, keyval: int, keycode: int, state: int) -> bool:
         """Handle an IBus key event via the Rust core.
 
         When a valid hardware scancode is available (keycode > 0), the event
@@ -2382,6 +2975,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # IBus lifecycle callbacks.
     # -----------------------------------------------------------------------
     def do_focus_in(self) -> None:
+        if getattr(self, "_direct_refocus_source", None) is not None:
+            self._direct_refocus_cancel()  # the editor refocused: the word goes on
         self._clear_native_report_wait(lifecycle=True)
         self._init_kde_layout_observer()
         self._clear_language_choice()
@@ -2436,8 +3031,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             # the previous field's word, or keys typed into this secret field
             # before its declaration arrived.  It stays unflushed; the stop is
             # released only after a successful reset, which discards it.
-            actions = self._core.focus_lost()
-            self._execute_actions(actions)
+            if getattr(self, "_direct_delivery", False):
+                if not self._direct_refocus_hold():
+                    # ibus-daemon has already moved its focus when this runs, so
+                    # a flushed tail could land in the next window.  The
+                    # delivered part stays; an undelivered hypothesis is dropped
+                    # like a cleared preedit.
+                    self._direct_trace_drop("focus_out")
+                    self._direct_end_word()
+            else:
+                actions = self._core.focus_lost()
+                self._execute_actions(actions)
+        if getattr(self, "_direct_refocus_source", None) is None:
+            self._direct_clear()  # the core's word has ended either way
         self._active_prediction = None
         collector = getattr(self, "_o1", None)
         if collector is not None:
@@ -2487,8 +3093,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # Composition boundary, not a context boundary: the declared content
         # type survives (see do_focus_out).
         self._keys_since_content_type = 0
+        self._direct_trace_drop("reset")
         actions = self._cancel_safe(self._core.reset())
         self._execute_actions(actions)
+        self._direct_clear()  # the core's word has ended
         self._active_prediction = None
         collector = getattr(self, "_o1", None)
         if collector is not None:
@@ -2499,6 +3107,9 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             trace.flush()
 
     def do_destroy(self) -> None:
+        self._direct_idle_cancel()  # never type into a context after destroy
+        self._direct_refocus_cancel()
+        self._direct_mode_switch_cancel()
         observer = getattr(self, "_kde_layout", None)
         self._kde_layout = None
         if observer is not None:
@@ -2517,8 +3128,10 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         # not drop that box's declaration — and, like do_reset, this is a cancel
         # path, so no text may be produced from it.
         self._keys_since_content_type = 0
+        self._direct_trace_drop("disable")
         actions = self._cancel_safe(self._core.reset())
         self._execute_actions(actions)
+        self._direct_clear()  # the core's word has ended
         self._active_prediction = None
         collector = getattr(self, "_o1", None)
         if collector is not None:

@@ -205,6 +205,15 @@ impl PyInputMethodCore {
             .collect()
     }
 
+    /// Deliver the in-flight word early and keep it open in its script.
+    fn handoff_preedit_for_delivery(&mut self) -> Vec<(String, String)> {
+        self.inner
+            .handoff_preedit_for_delivery()
+            .iter()
+            .map(action_to_tuple)
+            .collect()
+    }
+
     /// True means a stale client-owned native-completion token was retired.
     #[pyo3(signature = (caret_collapsed=false))]
     fn reconcile_native_completion_word(&mut self, caret_collapsed: bool) -> bool {
@@ -225,6 +234,11 @@ impl PyInputMethodCore {
     /// Set the current host's ability to replace already-delivered client text.
     fn set_external_rewrite_supported(&mut self, supported: bool) {
         self.inner.set_external_rewrite_supported(supported);
+    }
+
+    /// Disable completion attribution when the host hides completion suffixes.
+    fn set_completion_display_supported(&mut self, supported: bool) {
+        self.inner.set_completion_display_supported(supported);
     }
 
     /// Enable whole-word language choices only when the adapter can render them.

@@ -602,6 +602,8 @@ pub struct InputMethodCore {
     external_rewrite_supported: bool,
     /// Ephemeral host UI capability, independent of language configuration.
     language_choice_supported: bool,
+    /// Whether the host actually displays completion suffixes.
+    completion_display_supported: bool,
     /// Keep ambiguous boundary policy after the offer is dismissed or hidden.
     language_choice_token_policy: bool,
     last_predictions: Vec<Prediction>,
@@ -621,6 +623,8 @@ pub struct InputMethodCore {
     /// This delivered token belongs to the client's native completion UI.
     /// Keep its rendering layout, but never offer an IBus completion for it.
     native_completion_owned: bool,
+    /// Early delivery fixes an unconfirmed token: preserve rendering, never learn it.
+    direct_delivery_owned: bool,
     /// Typing regime detector (v0.5+) — gates tech vocab δ weight in the ensemble.
     regime_detector: RegimeDetector,
     /// True when the current word triggered a dual-buffer layout flip (for regime detection).
@@ -658,6 +662,7 @@ impl InputMethodCore {
             enabled,
             external_rewrite_supported: true,
             language_choice_supported: false,
+            completion_display_supported: true,
             language_choice_token_policy: false,
             last_predictions: Vec::new(),
             last_prediction_language: None,
@@ -665,6 +670,7 @@ impl InputMethodCore {
             dual_buffer: None,
             word_delivery_layout: None,
             native_completion_owned: false,
+            direct_delivery_owned: false,
             regime_detector: RegimeDetector::new(),
             current_word_had_flip: false,
             caps_engine: CapsEngine::new(),
@@ -693,6 +699,29 @@ impl InputMethodCore {
     /// Update the host's ability to replace already-delivered client text.
     pub fn set_external_rewrite_supported(&mut self, supported: bool) {
         self.external_rewrite_supported = supported;
+    }
+
+    /// Transport capability, independent of the user's completion preference.
+    pub fn set_completion_display_supported(&mut self, supported: bool) {
+        self.completion_display_supported = supported;
+        if !supported {
+            self.clear_ghost();
+            self.last_predictions.clear();
+            self.last_prediction_language = None;
+            self.space_accept_display_attested = false;
+        }
+    }
+
+    pub(crate) fn direct_delivery_owned(&self) -> bool {
+        self.direct_delivery_owned
+    }
+
+    fn retire_direct_delivery(&mut self) -> Vec<Action> {
+        self.reset_word();
+        self.context.clear();
+        self.lang_detector.reset();
+        self.clear_hints();
+        vec![Action::HideGhost]
     }
 
     pub(crate) fn set_language_choice_supported(&mut self, supported: bool) {
@@ -958,6 +987,27 @@ impl InputMethodCore {
 
         if event.key.is_pure_modifier() {
             return vec![Action::ForwardKey];
+        }
+
+        if self.direct_delivery_owned {
+            let character = self.native_completion_character(&event);
+            let boundary = event
+                .modifiers
+                .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                || match event.key {
+                    Key::Backspace => false,
+                    Key::Char(_) | Key::RawCode(_) => {
+                        character.is_none_or(|ch| !ch.is_alphabetic())
+                    }
+                    _ => true,
+                };
+            if boundary {
+                let resolved_key = character.map_or_else(|| event.key.clone(), Key::Char);
+                let mut actions = self.retire_direct_delivery();
+                self.sentence_boundary = SentenceBoundaryHint::after_forwarded_key(&resolved_key);
+                actions.push(Action::ForwardKey);
+                return actions;
+            }
         }
 
         // Ignore shortcuts with Ctrl or Alt held, not the modifier key itself.
@@ -1451,6 +1501,7 @@ impl InputMethodCore {
                 if self.current_word.is_empty() {
                     self.terminal_context_lang = None;
                     self.word_delivery_layout = None;
+                    self.direct_delivery_owned = false;
                 }
                 let ghost_action = self.update_predictions();
                 vec![ghost_action, Action::ForwardKey]
@@ -1622,7 +1673,9 @@ impl InputMethodCore {
     /// Sensitive fields and focus/cursor transitions never reach this point:
     /// the adapter bypasses the core, and `reset_word()` clears the ghost.
     fn space_accept_eligible(&self) -> bool {
-        if self.dual_buffer.is_none()
+        if !self.completion_display_supported
+            || self.direct_delivery_owned
+            || self.dual_buffer.is_none()
             || self.current_word.is_empty()
             || self.ghost.is_empty()
             || self.anticipatory_ghost_active
@@ -1877,6 +1930,38 @@ impl InputMethodCore {
         actions
     }
 
+    /// Deliver the composing word early and keep it open (direct delivery: the
+    /// operator paused or pressed a shortcut modifier).  The dual buffer's
+    /// boundary choice fixes the word's script: later keys append in it, a
+    /// BackSpace is forwarded, and the boundary types nothing again. This
+    /// speculative token never contributes learning or lexical context.
+    pub fn handoff_preedit_for_delivery(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
+        // The same complete prefix must choose the same script as Space. The
+        // prefix scoring winner alone may differ from the exact-word resolver.
+        let resolved = self.resolve_word_boundary();
+        let selected_layout = self.dual_buffer.as_ref().map(|db| {
+            if resolved == db.bg_text() {
+                keymap::Layout::Bg
+            } else {
+                keymap::Layout::En
+            }
+        });
+        let mut actions = self.handoff_preedit();
+        if let Some(layout) = selected_layout {
+            self.word_delivery_layout = Some(layout);
+        }
+        self.direct_delivery_owned = !self.current_word.is_empty();
+        self.clear_ghost();
+        self.last_predictions.clear();
+        self.last_prediction_language = None;
+        self.space_accept_display_attested = false;
+        if actions.is_empty() {
+            actions.push(Action::HideGhost);
+        }
+        actions
+    }
+
     pub(crate) fn native_completion_owned(&self) -> bool {
         self.native_completion_owned
     }
@@ -1945,6 +2030,9 @@ impl InputMethodCore {
     /// Called when the input field loses focus.
     pub fn focus_lost(&mut self) -> Vec<Action> {
         self.commit_learning = CommitLearningBatch::default();
+        if self.direct_delivery_owned {
+            return self.retire_direct_delivery();
+        }
         if self.native_completion_owned {
             return self.reset();
         }
@@ -2011,6 +2099,9 @@ impl InputMethodCore {
     /// actions live in different worktrees.
     pub fn reset(&mut self) -> Vec<Action> {
         self.commit_learning = CommitLearningBatch::default();
+        if self.direct_delivery_owned {
+            return self.retire_direct_delivery();
+        }
         self.reset_word();
         vec![Action::HideGhost]
     }
@@ -2150,7 +2241,11 @@ impl InputMethodCore {
     /// Returns a replacement display action when the correction can be shown
     /// for the current prefix; otherwise leaves state unchanged.
     pub fn apply_prediction_override(&mut self, replacement: &str) -> Option<Action> {
-        if self.current_word.is_empty() || self.native_completion_owned {
+        if self.current_word.is_empty()
+            || self.native_completion_owned
+            || self.direct_delivery_owned
+            || !self.completion_display_supported
+        {
             return None;
         }
 
@@ -2592,6 +2687,9 @@ impl InputMethodCore {
     /// Predicts the most likely next word with empty prefix. If confidence
     /// is above threshold, shows it as ghost text. Tab accepts, typing clears.
     fn try_anticipatory_ghost(&mut self) -> Option<Action> {
+        if !self.completion_display_supported || self.direct_delivery_owned {
+            return None;
+        }
         let lang = if self.config.lang_detection {
             Some(self.lang_detector.detected().lang)
         } else {
@@ -2770,6 +2868,7 @@ impl InputMethodCore {
         self.dual_buffer = None;
         self.word_delivery_layout = None;
         self.native_completion_owned = false;
+        self.direct_delivery_owned = false;
         self.language_choice_token_policy = false;
         self.current_word_had_flip = false;
         self.anticipatory_ghost_active = false;
@@ -2958,6 +3057,8 @@ impl InputMethodCore {
     fn compute_ghost_suffix(&mut self) -> String {
         // MasterLoop hint: suppress ghost entirely.
         if self.native_completion_owned
+            || self.direct_delivery_owned
+            || !self.completion_display_supported
             || self.active_hints.as_ref().is_some_and(|h| h.suppress_ghost)
         {
             self.ghost.clear();
@@ -9978,6 +10079,57 @@ mod layout_handoff_tests {
     }
 
     #[test]
+    fn delivery_handoff_keeps_the_word_open_in_its_script_and_never_retypes_it() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        assert_eq!(
+            core.handoff_preedit_for_delivery(),
+            [Action::HideGhost, Action::CommitText("hel".into())]
+        );
+        assert!(!core.native_completion_owned());
+        assert!(
+            !core.debug_state().0,
+            "the dual buffer is gone: the script is fixed"
+        );
+        let appended = core.handle_key(press(Key::RawCode(38)));
+        assert_eq!(appended.first(), Some(&Action::CommitText("l".into())));
+        assert_eq!(core.current_word(), "hell");
+        core.focus_gained();
+        assert_eq!(
+            core.current_word(),
+            "hell",
+            "focus-in keeps a delivered word"
+        );
+        let boundary = core.handle_key(press(Key::Space));
+        assert!(
+            !boundary
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })),
+            "the delivered word is never typed again: {boundary:?}"
+        );
+        assert!(core.current_word().is_empty());
+    }
+
+    #[test]
+    fn delivery_handoff_backspace_is_forwarded_and_removes_one_letter() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        core.handoff_preedit_for_delivery();
+        assert_eq!(
+            core.handle_key(press(Key::Backspace)).last(),
+            Some(&Action::ForwardKey)
+        );
+        assert_eq!(core.current_word(), "he");
+    }
+
+    #[test]
+    fn delivery_handoff_without_a_composing_word_only_hides_the_ghost() {
+        let mut core = seeded_core();
+        assert_eq!(core.handoff_preedit_for_delivery(), [Action::HideGhost]);
+        assert!(core.current_word().is_empty());
+    }
+
+    #[test]
     fn native_handoff_punctuation_and_digits_retire_the_unobserved_client_outcome() {
         for delimiter in [
             Key::Char('.'),
@@ -10552,5 +10704,135 @@ mod backspace_recovered_detector_tests {
             (LangId::Bg, fresh.ghost_text())
         );
         assert!(edited.predictions().iter().any(|p| p.word == "листове"));
+    }
+}
+
+#[cfg(test)]
+mod direct_delivery_regression_tests {
+    use super::*;
+
+    fn key(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn prefix() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("hello", 1000, LangId::En);
+        for code in [35, 18, 38] {
+            core.handle_key(key(Key::RawCode(code)));
+        }
+        assert_eq!(core.current_word(), "hel");
+        core.handoff_preedit_for_delivery();
+        core
+    }
+
+    #[test]
+    fn direct_delivery_boundaries_do_not_learn_speculative_tokens() {
+        for boundary in [
+            Key::Space,
+            Key::Return,
+            Key::Tab,
+            Key::RawCode(51),
+            Key::RawCode(2),
+            Key::RawCode(26),
+        ] {
+            let mut core = prefix();
+            let learned = core.learned_state_for_test();
+            let before = core.metrics().summary().total_commits;
+            let actions = core.handle_key(key(boundary.clone()));
+            assert_eq!(core.current_word(), "", "boundary {boundary:?}");
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert_eq!(core.learned_state_for_test(), learned);
+            assert_eq!(core.metrics().summary().total_commits, before);
+            assert!(core.take_commit_learning().words.is_empty());
+            assert_eq!(core.context_words(), (None, None));
+        }
+    }
+
+    #[test]
+    fn direct_delivery_shortcut_retires_token_and_layout() {
+        for modifiers in [Modifiers::CTRL, Modifiers::ALT, Modifiers::SUPER] {
+            let mut core = prefix();
+            let learned = core.learned_state_for_test();
+            core.handle_key(KeyEvent {
+                key: Key::RawCode(30),
+                modifiers,
+            });
+            assert_eq!(core.current_word(), "", "shortcut {modifiers:?}");
+            assert_eq!(core.learned_state_for_test(), learned);
+            core.handle_key(key(Key::RawCode(32)));
+            assert!(
+                core.debug_state().0,
+                "new token must decide its layout anew"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_delivery_backspace_keeps_only_nonempty_token() {
+        let mut core = prefix();
+        let learned = core.learned_state_for_test();
+        core.handle_key(key(Key::Backspace));
+        assert_eq!(core.current_word(), "he");
+        core.handle_key(key(Key::RawCode(38)));
+        assert_eq!(core.current_word(), "hel");
+        for _ in 0..3 {
+            core.handle_key(key(Key::Backspace));
+        }
+        core.handle_key(key(Key::RawCode(32)));
+        assert!(core.debug_state().0);
+        assert_eq!(core.learned_state_for_test(), learned);
+    }
+
+    #[test]
+    fn direct_delivery_handoff_uses_completed_word_boundary_choice() {
+        let build = || {
+            let mut core = InputMethodCore::new(InputConfig::default());
+            core.load_word_lang("sky", 10, LangId::En);
+            core.load_word_lang("скъп", 100000, LangId::Bg);
+            for code in [31, 37, 21] {
+                core.handle_key(key(Key::RawCode(code)));
+            }
+            core
+        };
+        let mut boundary = build();
+        let expected = boundary
+            .handle_key(key(Key::Space))
+            .into_iter()
+            .find_map(|a| match a {
+                Action::CommitText(text) => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        let mut delivered = build();
+        let actual = delivered
+            .handoff_preedit_for_delivery()
+            .into_iter()
+            .find_map(|a| match a {
+                Action::CommitText(text) => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            delivered.handle_key(key(Key::RawCode(26))),
+            [Action::HideGhost, Action::ForwardKey]
+        );
+    }
+
+    #[test]
+    fn direct_delivery_bg_bracket_key_remains_a_letter() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("още", 10000, LangId::Bg);
+        core.handle_key(key(Key::RawCode(24)));
+        core.handoff_preedit_for_delivery();
+        let actions = core.handle_key(key(Key::RawCode(27)));
+        assert_eq!(core.current_word(), "ощ");
+        assert!(actions.contains(&Action::CommitText("щ".into())));
+        core.handle_key(key(Key::Space));
+        assert_eq!(core.metrics().summary().total_commits, 0);
     }
 }

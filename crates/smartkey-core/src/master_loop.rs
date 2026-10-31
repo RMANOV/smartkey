@@ -414,6 +414,16 @@ impl MasterLoop {
         if self.core.current_word().is_empty() {
             self.language_choice_dismissed = false;
         }
+        if self.core.direct_delivery_owned() {
+            // Speculative delivery fixes presentation only. Neither its edits
+            // nor its boundary establish a user-confirmed learning outcome.
+            let actions = self.core.handle_key(event.clone());
+            if !self.core.direct_delivery_owned() {
+                self.clear_native_completion_tracking();
+                self.record_sentence_delivery(&event, &actions, false, false, false, false);
+            }
+            return actions;
+        }
         // Forwarded shortcuts can edit client text. Invalidate attribution,
         // but do not start anticipation or count them as adaptation events.
         if !event.key.is_pure_modifier()
@@ -683,6 +693,16 @@ impl MasterLoop {
         self.language_choice_revision = self.language_choice_revision.wrapping_add(1);
     }
 
+    /// A hidden suffix cannot attest acceptance or rejection feedback.
+    pub fn set_completion_display_supported(&mut self, supported: bool) {
+        self.core.set_completion_display_supported(supported);
+        if !supported {
+            self.last_shown_ghost = None;
+            self.last_prediction_accept = None;
+            self.last_accepted_prediction = None;
+        }
+    }
+
     pub fn set_external_rewrite_supported(&mut self, supported: bool) {
         self.invalidate_language_choice();
         self.core.set_external_rewrite_supported(supported);
@@ -718,6 +738,13 @@ impl MasterLoop {
         if self.core.native_completion_owned() {
             self.native_completion_prefix = prefix;
         }
+        actions
+    }
+
+    /// Deliver the in-flight word early and keep it open (direct delivery).
+    pub fn handoff_preedit_for_delivery(&mut self) -> Vec<Action> {
+        let actions = self.core.handoff_preedit_for_delivery();
+        self.clear_native_completion_tracking();
         actions
     }
 
@@ -6389,6 +6416,90 @@ mod native_identifier_tests {
                 press(&mut ml, Key::RawCode(19)),
                 [Action::CommitText("r".into()), Action::HideGhost]
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_display_regression_tests {
+    use super::*;
+    use crate::input::{Key, Modifiers};
+
+    fn key(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+    fn fixture() -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig {
+            space_accept: true,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("hello", 10000, LangId::En);
+        ml
+    }
+    fn type_prefix(ml: &mut MasterLoop) {
+        for code in [35, 18, 38] {
+            ml.handle_key(key(Key::RawCode(code)));
+        }
+        assert_eq!(ml.current_word(), "hel");
+    }
+
+    #[test]
+    fn direct_display_hidden_space_does_not_accept_or_learn_completion() {
+        let mut ml = fixture();
+        type_prefix(&mut ml);
+        assert_eq!(ml.ghost_text(), "lo");
+        ml.set_completion_display_supported(false);
+        let accepted = ml.core.metrics().summary().accepted_predictions;
+        let actions = ml.handle_key(key(Key::Space));
+        assert!(
+            actions.contains(&Action::CommitText("hel".into())),
+            "{actions:?}"
+        );
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, accepted);
+        assert_eq!(ml.core.context_words(), (Some("hel"), None));
+        assert!(ml.last_shown_ghost.is_none());
+    }
+
+    #[test]
+    fn direct_display_disables_generation_and_restores_user_acceptance() {
+        let mut ml = fixture();
+        ml.set_completion_display_supported(false);
+        type_prefix(&mut ml);
+        assert_eq!(ml.ghost_text(), "");
+        assert!(ml.last_shown_ghost.is_none());
+        assert!(ml.core.apply_prediction_override("hello").is_none());
+        ml.reset();
+        ml.set_completion_display_supported(true);
+        type_prefix(&mut ml);
+        assert_eq!(ml.ghost_text(), "lo");
+        let actions = ml.handle_key(key(Key::Space));
+        assert!(
+            actions.contains(&Action::CommitText("hello ".into())),
+            "{actions:?}"
+        );
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 1);
+    }
+    #[test]
+    fn direct_display_handoff_edits_do_not_train_profile_or_feedback() {
+        for boundary in [Key::Space, Key::RawCode(51), Key::Escape, Key::Left] {
+            let mut ml = fixture();
+            type_prefix(&mut ml);
+            ml.handoff_preedit_for_delivery();
+            let learned = ml.core.learned_state_for_test();
+            let light = serde_json::to_value(ml.light_profile()).unwrap();
+            ml.handle_key(key(Key::Backspace));
+            ml.handle_key(key(Key::RawCode(38)));
+            ml.handle_key(key(boundary));
+            assert_eq!(ml.core.learned_state_for_test(), learned);
+            assert_eq!(serde_json::to_value(ml.light_profile()).unwrap(), light);
+            assert_eq!(ml.current_word(), "");
+            assert!(ml.last_shown_ghost.is_none());
+            assert!(ml.last_prediction_accept.is_none());
+            assert!(ml.last_accepted_prediction.is_none());
         }
     }
 }
