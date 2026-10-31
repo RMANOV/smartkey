@@ -14,9 +14,10 @@ only append.  The only deletion is one character for the operator's own
 consumed BackSpace; any other revision is refused and the core's word ends.
 Keys the client handles itself first receive the undelivered word, then the
 word ends, so nothing typed later can revise text at a caret the engine cannot
-see.  A mouse click (Chrome sends Reset) or a window switch (focus-out) carries
-no keystroke and discards an undelivered word, so a pause types the word as
-typed so far, and so does a shortcut modifier; the word stays open.
+see. A mouse click (Chrome sends Reset) or a window switch (focus-out) carries
+no keystroke and discards an undelivered word. An opt-in pause can deliver early
+and keep the word open. An actual editing chord delivers and ends the word;
+a bare modifier tap never delivers. The pause is off by default.
 
 The editor model applies the engine's output in order: commits insert at the
 caret, forwarded BackSpace deletes before it, keys the engine does not consume
@@ -40,7 +41,7 @@ SUPER = 1 << 26
 
 KEYCODE = {"n": 49, "a": 30, "b": 48, "y": 21, "l": 38, "g": 34, "r": 19,
            "s": 31, "k": 37, "i": 23, "c": 46, "p": 25, "o": 24, "z": 44,
-           "d": 32, "m": 50,
+           "d": 32, "m": 50, "v": 47,
            "space": 57, "BackSpace": 14, "Tab": 15, "Escape": 1, "NumLock": 69,
            "Control_L": 29, "Alt_L": 56, "Super_L": 125, "Shift_L": 42,
            "ISO_Level3_Shift": 100, "Control_R": 97, "Alt_R": 100, "Super_R": 126,
@@ -103,6 +104,9 @@ class Core(FakeCore):
 
     def set_external_rewrite_supported(self, supported):
         self.external_rewrite = supported
+
+    def set_completion_display_supported(self, supported):
+        self.completion_display = supported
 
 
 def build(steps=(), caps=CHROME_CAPS, core_cls=None, **core_kw):
@@ -309,6 +313,10 @@ def test_ctrl_backspace_then_a_flip_never_deletes_text_before_the_word():
         ("n", [("composing", "бън\x00")], LOCKED),
     ]
     eng, log = build(steps)
+    # The actual chord press is handled entirely by the adapter. Its release
+    # still reaches the scripted core, so omit only the bypassed press slot.
+    del eng._core._scripts[4]
+    del eng._core._states[4]
     press(eng, log, "b")
     press(eng, log, "y")
     press(eng, log, "BackSpace", state=CONTROL)  # client deletes the word "by"
@@ -558,14 +566,14 @@ def test_other_clients_keep_the_composing_preedit():
     assert commits(log) == ["по", "бързина"]
 
 
-# --- an undecided word is never left invisible -----------------------------------------
+# --- optional early delivery and actual shortcut boundaries ----------------------------
 #
 # A word in its hypothesis phase exists only inside the engine.  A mouse click
-# (Reset) or a window switch (focus-out) carries no keystroke and discards it, so
-# a pause types it as typed so far, and so does a shortcut modifier (the Tab of
-# Alt+Tab never reaches the engine).  The core takes the word over at that point
-# (handoff_preedit_for_delivery): its script is fixed, so later keys append in it
-# and an unstable hypothesis can never leave a mixed-script word behind.
+# (Reset) or a window switch (focus-out) carries no keystroke and discards it.
+# An explicitly enabled pause uses handoff_preedit_for_delivery to retain its
+# script for later letters. An actual editing chord uses that same handoff but
+# retires the token before forwarding. A pure modifier does not deliver text:
+# its eventual chord may never reach the engine (e.g. compositor Alt+Tab).
 
 DO = [  # a two-letter word: the dual buffer never locks before four letters
     ("d", [("composing", "д\x00")], UNLOCKED),
@@ -866,16 +874,20 @@ def test_a_click_after_the_pause_keeps_the_word_and_drops_nothing():
     "modifier",
     ["Control_L", "Control_R", "Alt_L", "Alt_R", "Super_L", "Super_R", "Meta_L", "Hyper_L"],
 )
-def test_a_shortcut_modifier_types_the_word_first_and_keeps_it_open(modifier):
-    steps = [*DO, (modifier, [("forward", "")], NO_WORD), *AFTER_DO]
-    eng, log, _timers = build_timed(steps, handoff=HANDOFF_DO)
+def test_a_shortcut_modifier_tap_does_not_deliver_or_split_a_word(modifier):
+    steps = [
+        *DO, (modifier, [("forward", "")], UNLOCKED),
+        ("m", [("composing", "дом\x00")], UNLOCKED),
+        ("space", [("hide", ""), ("commit", "дом"), ("forward", "")], NO_WORD),
+    ]
+    eng, log, _timers = build_timed(steps, idle_ms=0, handoff=HANDOFF_DO)
     for key, _a, _s in steps:
         press(eng, log, key)
-    assert log.index(("commit", "до")) < log.index(("client", modifier, 0))
+    assert commits(log) == ["дом"]
     assert editor(log) == "дом "
     assert backspaces(log) == []
     assert "reset" not in eng._core.events
-    assert eng._trace.named("direct_early") == [{"seq": 0, "trigger": "modifier"}]
+    assert eng._trace.named("direct_early") == []
 
 
 def test_a_modifier_release_types_nothing():
@@ -1028,17 +1040,74 @@ def test_a_refocus_right_after_a_pause_keeps_the_word():
     assert "reset" not in eng._core.events
 
 
-def test_a_modifier_commit_never_holds_a_word_through_focus_out():
+def test_a_modifier_then_focus_out_drops_an_undelivered_word():
     steps = [*DO, ("Control_L", [("forward", "")], NO_WORD)]
     eng, log, timers = build_timed(steps, handoff=HANDOFF_DO)
     press(eng, log, "d")
     press(eng, log, "o")
     press(eng, log, "Control_L")
-    assert commits(log) == ["до"]
-    eng._core.word = "до"  # open in the core, yet the commit came from Alt/Ctrl/Super
+    assert commits(log) == []
     eng.do_focus_out()
     assert timers.live == {}, "Alt+Tab must not carry the word into another window"
     assert "reset" in eng._core.events
+
+
+@pytest.mark.parametrize("key", ["a", "BackSpace", "v"])
+def test_an_actual_editing_chord_delivers_then_retires_before_client_key(key):
+    steps = [*DO, (key, [("forward", "")], NO_WORD)]
+    eng, log, timers = build_timed(steps, idle_ms=0, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    assert commits(log) == []
+    assert press(eng, log, key, CONTROL) is False
+    assert log.index(("commit", "до")) < log.index(("client", key, CONTROL))
+    assert eng._core.events[:2] == ["handoff", "reset"]
+    assert eng._direct_pending == eng._direct_word == ""
+    assert timers.live == {}
+    assert eng._trace.named("direct_early") == [{"seq": 0, "trigger": "shortcut"}]
+
+
+@pytest.mark.parametrize("key", ["a", "BackSpace"])
+def test_super_editing_chord_is_forwarded_without_core_reinterpretation(key):
+    # A core without a generic Super-shortcut path would treat the letter as
+    # text or Backspace as an empty-word edit. The adapter must not ask it.
+    steps = [*DO, (key, [("commit", "x"), ("hide", "")], NO_WORD)]
+    eng, log, _timers = build_timed(steps, idle_ms=0, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    keyval = KEYVAL[key] if key in KEYVAL else ord(key)
+    assert eng.do_process_key_event(keyval, KEYCODE[key], SUPER) is False
+    log.append(("client", key, SUPER))
+    assert commits(log) == ["до"]
+    assert log.index(("commit", "до")) < log.index(("client", key, SUPER))
+
+
+def test_kill_switch_does_not_trigger_shortcut_delivery():
+    steps = [*DO, ("Escape", [("hide", "")], NO_WORD)]
+    eng, log, _timers = build_timed(steps, idle_ms=0, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    assert press(eng, log, "Escape", SUPER) is True
+    assert commits(log) == []
+    assert "handoff" not in eng._core.events
+
+
+@pytest.mark.parametrize("event", ["release", "phantom", "altgr"])
+def test_nonchord_events_with_modifier_flags_do_not_trigger_delivery(event):
+    steps = [*DO, ("a", [("forward", "")], UNLOCKED)]
+    eng, log, _timers = build_timed(steps, idle_ms=0, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    if event == "release":
+        eng.do_process_key_event(ord("a"), KEYCODE["a"], CONTROL | RELEASE)
+    elif event == "phantom":
+        eng.do_process_key_event(0, 240, SUPER)
+    else:
+        # AltGr can include Ctrl+Alt on some client paths; MOD5 says text input.
+        eng._core._scripts[0] = [("composing", "доа\x00")]
+        eng.do_process_key_event(ord("a"), KEYCODE["a"], CONTROL | (1 << 3) | (1 << 7))
+    assert "handoff" not in eng._core.events
+    assert commits(log) == []
 
 
 def test_an_undelivered_word_is_never_held_through_focus_out():
@@ -1066,19 +1135,91 @@ def test_destroy_cancels_the_pause():
 @pytest.mark.parametrize(
     ("cfg", "expected"),
     [
-        (None, 800),
-        ({}, 800),
-        ({"mode": "auto"}, 800),
+        (None, 0),
+        ({}, 0),
+        ({"mode": "auto"}, 0),
         ({"idle_ms": 350}, 350),
         ({"idle_ms": 0}, 0),
         ({"idle_ms": 1}, 200),
         ({"idle_ms": 199}, 200),
         ({"idle_ms": 200}, 200),
-        ({"idle_ms": -1}, 800),
-        ({"idle_ms": True}, 800),
-        ({"idle_ms": "300"}, 800),
+        ({"idle_ms": -1}, 0),
+        ({"idle_ms": True}, 0),
+        ({"idle_ms": "300"}, 0),
         ({"idle_ms": 99999}, 5000),
     ],
 )
 def test_the_pause_is_configurable(cfg, expected):
     assert ske._direct_idle_ms_from_config(cfg) == expected
+
+
+def test_default_config_does_not_type_an_unfinished_word_on_a_pause():
+    eng, log, timers = build_timed(DO, idle_ms=ske._direct_idle_ms_from_config({}))
+    press(eng, log, "d")
+    press(eng, log, "o")
+    assert timers.live == {}
+    assert commits(log) == []
+
+
+def test_direct_delivery_disables_completion_display_and_preedit_restores_it():
+    eng, _log = build()
+    assert eng._core.completion_display is False
+    eng.do_set_capabilities(NATIVE_CAPS)
+    assert eng._core.completion_display is True
+    eng.do_set_capabilities(CHROME_CAPS)
+    assert eng._core.completion_display is False
+
+
+@pytest.mark.parametrize("event", ["release", "phantom"])
+def test_nonpress_events_do_not_end_a_word_during_capability_flicker(event):
+    eng, log, timers = build_timed(LOCKED_MI)
+    press(eng, log, "m")
+    eng.do_set_capabilities(NATIVE_CAPS)
+    if event == "release":
+        eng.do_process_key_event(ord("m"), KEYCODE["m"], RELEASE)
+    else:
+        eng.do_process_key_event(0, 240, 16)
+    assert eng._direct_delivery is True
+    assert "reset" not in eng._core.events
+    eng.do_set_capabilities(CHROME_CAPS)
+    assert not any(ms == 50 for ms, _cb in timers.live.values())
+
+
+@pytest.mark.parametrize("modifier", ["Control_L", "Alt_L", "Super_L"])
+def test_modifier_invalidates_refocus_from_an_already_delivered_word(modifier):
+    steps = [LOCKED_MI[0], (modifier, [("forward", "")], LOCKED)]
+    eng, log, timers = build_timed(steps)
+    press(eng, log, "m")
+    assert eng._direct_commit_at is not None
+    press(eng, log, modifier)
+    eng.do_focus_out()
+    eng.do_focus_in()
+    assert timers.live == {}
+    assert "reset" in eng._core.events
+    assert eng._direct_word == ""
+
+
+@pytest.mark.parametrize(("key", "state"), [("a", CONTROL), ("BackSpace", CONTROL), ("c", CONTROL)])
+def test_editing_chord_retires_a_core_owned_word_after_handoff(key, state):
+    steps = [*DO, (key, [("forward", "")], NO_WORD)]
+    eng, log, timers = build_timed(steps, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    timers.elapse()
+    eng._core.word = "до"
+    assert eng._direct_pending == eng._direct_word == ""
+    press(eng, log, key, state)
+    assert "reset" in eng._core.events
+    assert commits(log) == ["до"], "editing must not redeliver the handed-off token"
+
+
+def test_plain_backspace_preserves_core_owned_continuation_after_handoff():
+    steps = [*DO, ("BackSpace", [("hide", ""), ("forward", "")], NO_WORD)]
+    eng, log, timers = build_timed(steps, handoff=HANDOFF_DO)
+    press(eng, log, "d")
+    press(eng, log, "o")
+    timers.elapse()
+    eng._core.word = "д"  # the core already removed the last character
+    press(eng, log, "BackSpace")
+    assert "reset" not in eng._core.events
+    assert editor(log) == "д"

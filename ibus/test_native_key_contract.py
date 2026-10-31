@@ -985,3 +985,161 @@ def test_native_adapter_real_gi_cached_report_waits_for_new_callback(tmp_path, s
         assert observed["next"]["consumed"] is True
         assert observed["next"]["commits"] == ["здра"]
         assert any(visible for _text, _cursor, visible in observed["next"]["preedits"]), observed
+
+
+# Direct delivery: actual adapter/core state agreement with recorded IBus output.
+CONTROL = 1 << 2
+ALT = 1 << 3
+CODES = dict(zip("qwertyuiop", range(16, 26)))
+CODES.update(zip("asdfghjkl", range(30, 39)))
+CODES.update(zip("zxcvbnm", range(44, 51)))
+
+
+class Rig:
+    def __init__(self, monkeypatch, *, exact=True, idle=False):
+        core = _native().PyInputMethodCore(json.dumps({
+            "accept": {"space_accept": True},
+            "ghost_text_separation_margin": 0.0,
+            "use_ppm": False,
+        }))
+        for word in (("qax",) if exact else ()) + ("qaxyz", "beta", "betamax"):
+            core.load_word(word, 1_000_000)
+        from . import test_direct_delivery as tdd
+        self.tdd = tdd
+        self.engine, self.log = tdd.build()
+        self.engine._core = core
+        self.core = core
+        monkeypatch.setattr(tdd.ske, "_HAS_CORE", True)
+        self.timers = tdd.Timers()
+        self.engine._direct_idle_schedule = self.timers.add
+        self.engine._direct_idle_unschedule = self.timers.remove
+        self.engine._direct_idle_ms = 800 if idle else tdd.ske._direct_idle_ms_from_config({})
+        self.engine._direct_clock = tdd.Clock()
+        self.engine._last_save = float("inf")
+        self.engine.do_set_capabilities(tdd.CHROME_CAPS)
+
+    def key(self, keyval, code, name, state=0):
+        consumed = self.engine.do_process_key_event(keyval, code, state)
+        if not consumed:
+            self.log.append(("client", name, state))
+        self.engine.do_process_key_event(keyval, code, state | RELEASE)
+        return consumed
+
+    def type(self, text):
+        for ch in text:
+            self.key(ord(ch), 57 if ch == " " else CODES[ch],
+                     "space" if ch == " " else ch)
+
+    def modifier(self, alt=False):
+        return self.key(0xFFE9 if alt else 0xFFE3, 56 if alt else 29,
+                        "Alt_L" if alt else "Control_L")
+
+    def text(self):
+        return self.tdd.editor(self.log)
+
+    def profile(self, path):
+        self.core.export_personal(str(path))
+        profile = json.loads(path.read_text())
+        # Export wall-clock metadata changes even without a learning event.
+        profile.get("cvm", {}).pop("saved_at_unix", None)
+        return profile
+
+
+def test_default_pause_never_delivers_an_undecided_token(monkeypatch):
+    rig = Rig(monkeypatch)
+    rig.type("qa")
+    assert rig.engine._direct_idle_ms == 0
+    assert rig.timers.live == {}
+    assert rig.text() == ""
+    rig.type("x ")
+    assert rig.text() == "qax "
+
+
+@pytest.mark.parametrize("keyval,code,name", [
+    (0xFF08, 14, "BackSpace"), (ord("a"), 30, "a"),
+    (ord("v"), 47, "v"), (0xFF51, 105, "Left"),
+])
+def test_shortcut_retires_real_handoff_before_next_token(monkeypatch, tmp_path,
+                                                       keyval, code, name):
+    rig = Rig(monkeypatch)
+    before = rig.profile(tmp_path / "before.json")
+    rig.type("qax")
+    rig.modifier()
+    assert rig.text() == "", "a modifier alone must not deliver"
+    rig.key(keyval, code, name, CONTROL)
+    assert rig.tdd.commits(rig.log) == ["qax"]
+    assert rig.core.current_word() == ""
+    assert rig.profile(tmp_path / "after.json") == before
+    rig.log.clear()  # the next field's output is a separate observation
+    rig.type("beta ")
+    assert rig.text() == "beta "
+
+
+@pytest.mark.parametrize("keyval,code,name", [
+    (ord(","), 51, ","), (ord("."), 52, "."), (ord("2"), 3, "2"),
+])
+def test_real_handoff_delimiter_is_not_a_learned_word(monkeypatch, tmp_path,
+                                                    keyval, code, name):
+    rig = Rig(monkeypatch, idle=True)
+    before = rig.profile(tmp_path / "before.json")
+    rig.type("qax")
+    rig.timers.fire(800)
+    rig.key(keyval, code, name)
+    assert rig.text() == "qax" + name
+    assert rig.core.current_word() == ""
+    assert rig.profile(tmp_path / "after.json") == before
+
+
+def test_hidden_completion_space_learns_only_visible_token(monkeypatch, tmp_path):
+    rig = Rig(monkeypatch, exact=False)
+    rig.type("qax ")
+    assert rig.text() == "qax "
+    assert not rig.tdd.visible_preedits(rig.log)
+    profile = rig.profile(tmp_path / "profile.json")
+    words = profile.get("cvm", {}).get("words", [])
+    assert "qaxyz" not in str(words)
+
+
+def test_real_alt_switch_cannot_retain_previous_word(monkeypatch):
+    rig = Rig(monkeypatch)
+    rig.type("beta")
+    assert rig.text() == "beta"
+    rig.modifier(alt=True)
+    # The compositor consumes Alt+Tab: IBus sees only the Alt press.
+    rig.engine.do_focus_out()
+    rig.engine.do_focus_in()
+    assert rig.core.current_word() == ""
+    rig.log.clear()
+    rig.type("qax ")
+    assert rig.text() == "qax "
+
+
+def test_real_plain_backspace_preserves_handoff_refinement(monkeypatch):
+    rig = Rig(monkeypatch, idle=True)
+    rig.type("qax")
+    rig.timers.fire(800)
+    rig.key(0xFF08, 14, "BackSpace")
+    assert rig.text() == "qa"
+    assert rig.core.current_word() == "qa"
+    rig.type("x ")
+    assert rig.text() == "qax "
+
+
+def test_real_modifier_tap_does_not_split_a_word(monkeypatch):
+    rig = Rig(monkeypatch)
+    rig.type("qa")
+    rig.modifier()
+    assert rig.text() == ""
+    rig.type("x ")
+    assert rig.text() == "qax "
+
+
+@pytest.mark.parametrize("keyval,code,name", [(ord("a"), 30, "a"), (0xFF08, 14, "BackSpace")])
+def test_real_super_chord_is_forwarded_after_delivery(monkeypatch, keyval, code, name):
+    rig = Rig(monkeypatch)
+    rig.type("qax")
+    rig.key(0xFFEB, 125, "Super_L")
+    assert rig.text() == ""
+    assert rig.key(keyval, code, name, 1 << 26) is False
+    assert rig.tdd.commits(rig.log) == ["qax"]
+    assert rig.core.current_word() == ""

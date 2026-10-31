@@ -176,6 +176,7 @@ for _known_hint in _KNOWN_HINT_VALUES:
 # IBus modifier bits used by the phantom-key filter.
 _MOD_CONTROL = 1 << 2  # IBus.ModifierType.CONTROL_MASK
 _MOD_ALT = 1 << 3  # IBus.ModifierType.MOD1_MASK
+_MOD_LEVEL3 = 1 << 7  # MOD5_MASK: AltGr text input, not an editing chord
 _MOD_RELEASE = 1 << 30  # IBus.ModifierType.RELEASE_MASK
 
 _MOD_SUPER = (1 << 6) | (1 << 26)  # MOD4_MASK | SUPER_MASK
@@ -197,19 +198,18 @@ _DIRECT_PASSTHROUGH_KEYS = frozenset({0xFF09, 0xFE20, 0xFF53, 0xFF1B})
 # Alt, CapsLock, Super), NumLock, ScrollLock, Compose/Menu, and keycode 0.
 _NO_DELIVERY_KEYCODES = frozenset({0, 29, 42, 54, 56, 58, 69, 70, 97, 100, 125, 126, 127})
 # Shortcut modifiers (Control, Meta, Alt, Super, Hyper; left and right keyvals).
-# Their press announces a shortcut or a window switch (the Tab of Alt+Tab never
-# reaches this engine), so a word still in its hypothesis phase is typed first.
+# A modifier press invalidates refocus eligibility but does not deliver an
+# uncertain token. Only the actual chord, if IBus receives it, ends the token.
 # Shift and AltGr (ISO_Level3_Shift) are absent: they type text.
-_DIRECT_DELIVER_MODIFIERS = frozenset(
+_DIRECT_SHORTCUT_MODIFIERS = frozenset(
     {0xFFE3, 0xFFE4, 0xFFE7, 0xFFE8, 0xFFE9, 0xFFEA, 0xFFEB, 0xFFEC, 0xFFED, 0xFFEE}
 )
 # A word in its hypothesis phase is invisible to the client, and a mouse click
 # or a window switch discards it without any keystroke to announce them.  After
-# this pause with no key event the word is typed as typed so far.  The pause is
-# longer than ordinary gaps between the letters of a word and shorter than
-# moving a hand from the keyboard to the mouse and pointing.
+# an explicitly configured pause the current reading can be delivered early.
+# It is off by default: pausing inside a word must not fix an uncertain script.
 # smartkey.json "delivery": {"idle_ms": N}; 0 disables it.
-_DIRECT_IDLE_MS_DEFAULT = 800
+_DIRECT_IDLE_MS_DEFAULT = 0
 _DIRECT_IDLE_MS_MIN = 200
 _DIRECT_IDLE_MS_MAX = 5000
 # Chrome answers a re-rendering editor's DOM change after a commit with
@@ -549,6 +549,19 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
                 "smartkey_py native extension cannot enforce native completion handoff; "
                 "rebuild the native module before starting SmartKey"
             )
+
+        # Until the client declares its capabilities there is no attested
+        # completion display. A hidden suffix must not be accepted or learned.
+        try:
+            set_display = getattr(self._core, "set_completion_display_supported", None)
+            if not callable(set_display):
+                raise TypeError("missing completion display capability API")
+            set_display(False)
+        except Exception as exc:
+            raise RuntimeError(
+                "smartkey_py native extension cannot enforce completion display "
+                "delivery; rebuild the native module before starting SmartKey"
+            ) from exc
 
         # KDE's explicit BG layout is ordinary keyboard input. Its metadata
         # observer never changes an engine, layout, or client text.
@@ -1752,7 +1765,7 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     def _direct_mark_commit(self, pause: bool = False) -> None:
         """Remember when text was emitted for an ordinary key or after a pause.
 
-        A modifier's early delivery never counts (see _direct_refocus_hold).
+        A shortcut's boundary delivery never counts (see _direct_refocus_hold).
         """
         if pause or (
             getattr(self, "_direct_key_active", False)
@@ -1769,8 +1782,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         word there splits it, and the rest is decided again as a new word,
         possibly in the other script.  So a focus-out within _DIRECT_REFOCUS_MS
         of such a commit, with nothing left undelivered, waits that long for the
-        focus-in; without it the word ends as for any focus loss.  A modifier's
-        commit never counts, so Alt+Tab cannot carry a word into another window.
+        focus-in; without it the word ends as for any focus loss. A shortcut
+        modifier invalidates eligibility, so Alt+Tab cannot carry the word.
         """
         schedule = getattr(self, "_direct_idle_schedule", None)
         committed_at = getattr(self, "_direct_commit_at", None)
@@ -1823,8 +1836,8 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
 
         While the dual buffer is in its hypothesis phase nothing reaches the
         client; once it locks the word is committed in its final script and
-        later keys only append.  A pause or a shortcut modifier types the word
-        as typed so far (see _direct_idle_fire); later keys then append too.
+        later keys only append. An explicitly configured pause can hand the
+        word over early (see _direct_idle_fire); a shortcut delivers and ends it.
         Returns True if the key was consumed.
         """
         composition_resolved = self._composition_resolved_by(actions)
@@ -1896,7 +1909,14 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             and getattr(self, "_direct_key_press", False)
             and not getattr(self, "_direct_key_inert", False)
             and not {"commit", "replace"} & set(types)
-            and (getattr(self, "_direct_pending", "") or getattr(self, "_direct_word", ""))
+            and (
+                getattr(self, "_direct_pending", "")
+                or getattr(self, "_direct_word", "")
+                or (
+                    not getattr(self, "_direct_key_backspace", False)
+                    and self._core_current_word()
+                )
+            )
         ):
             # The client handles this key itself (caret moves, shortcuts,
             # edits): the word lands first and then ends, so nothing typed
@@ -2030,6 +2050,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
         self._core.set_external_rewrite_supported(
             bool(getattr(self, "_caps", 0) & _CAP_SURROUNDING_TEXT) and not self._direct_delivery
         )
+        # Startup requires this API. The callable check keeps constructor-free
+        # adapter test doubles usable without admitting an older live module.
+        set_display = getattr(self._core, "set_completion_display_supported", None)
+        if callable(set_display):
+            set_display(not self._direct_delivery)
         self._clear_language_choice()
         self._refresh_language_choice_route()
         self._update_language_choice_support()
@@ -2623,7 +2648,11 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
     # -----------------------------------------------------------------------
     def do_process_key_event(self, keyval: int, keycode: int, state: int) -> bool:
         """Route one key event; direct delivery adds guards around it."""
-        if getattr(self, "_direct_mode_switch_source", None) is not None:
+        if (
+            getattr(self, "_direct_mode_switch_source", None) is not None
+            and not state & _MOD_RELEASE
+            and not self._is_spurious_zero_key_event(keyval, keycode, state)
+        ):
             self._apply_capabilities()  # a held mode switch lands before this key
         direct = getattr(self, "_direct_delivery", False) and not getattr(
             self, "_sensitive", False
@@ -2638,13 +2667,42 @@ class SmartKeyEngine(IBus.Engine):  # type: ignore[misc]
             self._direct_deliver_pending()
             self.do_reset()
             return False
-        if direct and keyval in _DIRECT_DELIVER_MODIFIERS and not state & _MOD_RELEASE:
-            # A shortcut or a window switch follows: type the undelivered word
-            # first and keep it open; the modifier itself changes nothing else.
-            self._direct_deliver_early("modifier")
+        if direct and keyval in _DIRECT_SHORTCUT_MODIFIERS and not state & _MOD_RELEASE:
+            # A prior ordinary commit must not make Alt+Tab look like the
+            # editor refocusing after that commit, even with no pending text.
+            # A bare modifier may be released with no shortcut: it must not
+            # fix the script or emit text that triggers a DOM refocus.
+            self._direct_commit_at = None
+        if (
+            direct
+            and state & (_MOD_CONTROL | _MOD_ALT | _MOD_SUPER)
+            and not state & (_MOD_RELEASE | _MOD_LEVEL3)
+            and keyval != 0
+            and keyval != 0xFE03  # ISO_Level3_Shift (AltGr)
+            and not 0xFFE1 <= keyval <= 0xFFEE  # pure modifier keyvals
+            and (keycode == 0 or keycode not in _NO_DELIVERY_KEYCODES)
+            and not (keyval == 0xFF1B and state & _MOD_SUPER)  # core kill switch
+        ):
+            # The actual editing chord is a boundary. Deliver before the client
+            # acts, then retire all token state so edits cannot continue it.
+            self._direct_commit_at = None
+            if callable(getattr(self._core, "handoff_preedit_for_delivery", None)):
+                self._direct_deliver_early("shortcut")
+            else:
+                # An older core cannot keep an early token open safely, but
+                # this actual chord ends the word immediately in either case.
+                self._direct_deliver_pending()
+            self._direct_end_word()
+            # This chord belongs to the client. Do not ask the core to
+            # reinterpret it as text after the token has already ended.
+            return False
         self._direct_key_active = True
         self._direct_key_press = not state & _MOD_RELEASE
-        self._direct_key_backspace = self._direct_key_press and keyval == IBus.KEY_BackSpace
+        self._direct_key_backspace = (
+            self._direct_key_press
+            and keyval == IBus.KEY_BackSpace
+            and not state & (_MOD_CONTROL | _MOD_ALT | _MOD_SUPER)
+        )
         self._direct_key_inert = keycode in _NO_DELIVERY_KEYCODES
         try:
             return self._process_key_event_impl(keyval, keycode, state)

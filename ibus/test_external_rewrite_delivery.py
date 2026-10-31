@@ -41,6 +41,9 @@ def test_constructor_disables_external_rewrite_before_profile_or_corpus(monkeypa
         def native_completion_owned(self):
             return False
 
+        def set_completion_display_supported(self, supported):
+            events.append(("completion_display", supported))
+
         def set_external_rewrite_supported(self, supported):
             events.append(("external_rewrite", supported))
 
@@ -50,7 +53,42 @@ def test_constructor_disables_external_rewrite_before_profile_or_corpus(monkeypa
     events = _constructor_fixture(monkeypatch, Core())
     engine = ske.SmartKeyEngine()
     assert engine._caps == 0
-    assert events == ["create", ("external_rewrite", False), "personal", "corpus"]
+    assert events == [
+        "create", ("external_rewrite", False), ("completion_display", False),
+        "personal", "corpus",
+    ]
+
+
+@pytest.mark.parametrize("api", ["missing", "noncallable", "raising"])
+def test_incompatible_completion_display_refuses_startup_before_profile(monkeypatch, api):
+    class Core:
+        def set_external_rewrite_supported(self, supported):
+            events.append(("external_rewrite", supported))
+
+        def flush_preedit_for_layout(self):
+            raise AssertionError("startup must not flush")
+
+        def handoff_preedit_for_native_completion(self):
+            raise AssertionError("startup must not hand off")
+
+        def reconcile_native_completion_word(self, caret_collapsed=False):
+            raise AssertionError("startup must not reconcile")
+
+        def native_completion_owned(self):
+            return False
+
+    core = Core()
+    if api == "noncallable":
+        core.set_completion_display_supported = None
+    elif api == "raising":
+        def fail(_supported):
+            raise ValueError("synthetic incompatible native")
+
+        core.set_completion_display_supported = fail
+    events = _constructor_fixture(monkeypatch, core)
+    with pytest.raises(RuntimeError, match="completion display"):
+        ske.SmartKeyEngine()
+    assert events == ["create", ("external_rewrite", False)]
 
 
 @pytest.mark.parametrize("api", ["missing", "noncallable"])

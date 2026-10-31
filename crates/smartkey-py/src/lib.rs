@@ -236,6 +236,11 @@ impl PyInputMethodCore {
         self.inner.set_external_rewrite_supported(supported);
     }
 
+    /// Disable completion attribution when the host hides completion suffixes.
+    fn set_completion_display_supported(&mut self, supported: bool) {
+        self.inner.set_completion_display_supported(supported);
+    }
+
     /// Enable whole-word language choices only when the adapter can render them.
     fn set_language_choice_supported(&mut self, supported: bool) {
         self.inner.set_language_choice_supported(supported);
