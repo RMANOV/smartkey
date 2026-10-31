@@ -1143,3 +1143,76 @@ def test_real_super_chord_is_forwarded_after_delivery(monkeypatch, keyval, code,
     assert rig.key(keyval, code, name, 1 << 26) is False
     assert rig.tdd.commits(rig.log) == ["qax"]
     assert rig.core.current_word() == ""
+
+
+def _autocorrect_rig(monkeypatch):
+    rig = Rig(monkeypatch)
+    rig.core = _native().PyInputMethodCore(json.dumps({
+        "post_commit_autocorrect": True,
+        "ghost_text": False,
+        "use_ppm": False,
+    }))
+    for word, frequency in (("царство", 1_000_000), ("цар", 5), ("car", 100)):
+        rig.core.load_word(word, frequency)
+    rig.engine._core = rig.core
+    rig.engine.do_set_capabilities(rig.tdd.CHROME_CAPS)
+    return rig
+
+
+@pytest.mark.parametrize("keyval,code,name", [
+    (0x20, 57, "space"), (0xFF0D, 28, "Return"), (ord("!"), 2, "!"),
+])
+def test_direct_autocorrect_boundary_learns_only_delivered_word(
+    monkeypatch, tmp_path, keyval, code, name,
+):
+    rig = _autocorrect_rig(monkeypatch)
+    rig.type("car")
+    assert rig.core.current_word() == "цар"
+    assert rig.tdd.commits(rig.log) == [], "the ambiguous token is still pending"
+    rig.key(keyval, code, name)
+    assert rig.tdd.commits(rig.log) == ["цар"]
+    words = rig.profile(tmp_path / "profile.json")["cvm"]["words"]
+    assert words == ["цар"], "learning must match the token actually delivered"
+
+
+def test_preedit_restores_owned_correction_without_external_rewrites(monkeypatch, tmp_path):
+    rig = _autocorrect_rig(monkeypatch)
+    # Keep SURROUNDING_TEXT absent: only owned composing replacements become
+    # available when an operator opts back into ordinary preedit delivery.
+    rig.engine._delivery_mode = "off"
+    rig.engine.do_set_capabilities(rig.tdd.CHROME_CAPS)
+    assert rig.engine._direct_delivery is False
+    rig.type("car ")
+    assert rig.tdd.commits(rig.log) == ["Car"]
+    assert rig.profile(tmp_path / "profile.json")["cvm"]["words"] == ["car"]
+
+
+def test_zero_keycode_keypad_navigation_retires_before_forwarding(monkeypatch):
+    rig = Rig(monkeypatch)
+    rig.core.load_word("x", 1_000_000)
+    rig.type("qa")
+    assert rig.tdd.commits(rig.log) == []
+    assert rig.key(0xFF96, 0, "KP_Left") is False
+    assert rig.tdd.commits(rig.log) == ["qa"]
+    assert rig.core.current_word() == ""
+    rig.log.clear()  # The client has moved its caret after the delivered token.
+    rig.type("x ")
+    assert rig.text() == "x "
+
+
+@pytest.mark.parametrize("text", ["hello", "abc1", "abc!"])
+def test_zero_keycode_chars_keep_one_token_until_boundary(monkeypatch, tmp_path, text):
+    rig = Rig(monkeypatch)
+    for index, char in enumerate(text, 1):
+        assert rig.key(ord(char), 0, char) is False
+        assert rig.core.current_word() == text[:index]
+    rig.key(0x20, 0, "space")
+    assert rig.text() == text + " "
+    assert rig.core.current_word() == ""
+    profile = rig.profile(tmp_path / "profile.json")
+    assert profile["cvm"]["words"] == [text]
+    assert profile["markov_bigrams"] == []
+    rig.key(0x20, 0, "space")
+    after_empty = rig.profile(tmp_path / "empty-boundary.json")
+    assert after_empty["cvm"]["words"] == [text]
+    assert after_empty["markov_bigrams"] == [], "empty boundary must not relearn the word"

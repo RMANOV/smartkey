@@ -708,6 +708,11 @@ impl MasterLoop {
         self.core.set_external_rewrite_supported(supported);
     }
 
+    pub fn set_composing_rewrite_supported(&mut self, supported: bool) {
+        self.invalidate_language_choice();
+        self.core.set_composing_rewrite_supported(supported);
+    }
+
     pub fn focus_lost(&mut self) -> Vec<Action> {
         self.invalidate_language_choice();
         self.language_choice_dismissed = false;

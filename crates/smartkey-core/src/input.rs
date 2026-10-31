@@ -600,6 +600,9 @@ pub struct InputMethodCore {
     /// Whether the current host can replace text already delivered to its client.
     /// Ephemeral transport capability; never part of config or personal state.
     external_rewrite_supported: bool,
+    /// Whether the host keeps composing text revisable until its final commit.
+    /// Direct delivery may append early and must not use this ownership shortcut.
+    composing_rewrite_supported: bool,
     /// Ephemeral host UI capability, independent of language configuration.
     language_choice_supported: bool,
     /// Whether the host actually displays completion suffixes.
@@ -661,6 +664,7 @@ impl InputMethodCore {
             sentence_presentation_override: None,
             enabled,
             external_rewrite_supported: true,
+            composing_rewrite_supported: true,
             language_choice_supported: false,
             completion_display_supported: true,
             language_choice_token_policy: false,
@@ -699,6 +703,11 @@ impl InputMethodCore {
     /// Update the host's ability to replace already-delivered client text.
     pub fn set_external_rewrite_supported(&mut self, supported: bool) {
         self.external_rewrite_supported = supported;
+    }
+
+    /// Update the host's ability to revise its own composing text.
+    pub fn set_composing_rewrite_supported(&mut self, supported: bool) {
+        self.composing_rewrite_supported = supported;
     }
 
     /// Transport capability, independent of the user's completion preference.
@@ -1319,7 +1328,8 @@ impl InputMethodCore {
                 }
                 // Capture whole-word ownership before taking/resetting the token.
                 let rewrite_allowed = !self.native_completion_owned
-                    && (self.external_rewrite_supported || self.dual_buffer.is_some());
+                    && (self.external_rewrite_supported
+                        || (self.composing_rewrite_supported && self.dual_buffer.is_some()));
                 let sentence_start = self.sentence_start_override();
                 // Empty Space does not finish a word; retain its current-position
                 // decision. Return instead establishes a new local boundary.
@@ -1521,7 +1531,8 @@ impl InputMethodCore {
                 {
                     let composing = self.dual_buffer.is_some();
                     let rewrite_allowed = !self.native_completion_owned
-                        && (self.external_rewrite_supported || composing);
+                        && (self.external_rewrite_supported
+                            || (self.composing_rewrite_supported && composing));
                     let sentence_start = self.sentence_start_override();
                     let word = self.resolve_word_boundary();
                     let correction = self.commit_boundary_word(&word, rewrite_allowed);
@@ -1839,8 +1850,8 @@ impl InputMethodCore {
         let prefix_in_preedit = self.dual_buffer.is_some();
         // A suffix-only or multiword commit cannot replace an externally owned
         // whole token. Capture this before confirmation, learning and reset.
-        let rewrite_allowed =
-            self.external_rewrite_supported || (prefix_in_preedit && words.len() == 1);
+        let rewrite_allowed = self.external_rewrite_supported
+            || (self.composing_rewrite_supported && prefix_in_preedit && words.len() == 1);
         // Conserve the exact shown composition. First-word phrase casing belongs
         // in its pre-display producer, not this final-word post-commit pipeline.
         let sentence_start = if words.len() == 1 {
@@ -8534,6 +8545,64 @@ mod external_rewrite_contract_tests {
         project(&mut document, &a, Some(' '));
         assert_eq!(document, "Hello ");
         learned_once(&mut core, &["hello"]);
+    }
+
+    #[test]
+    fn composing_rewrite_disabled_boundaries_preserve_delivered_learning() {
+        for boundary in [Key::Space, Key::Return, Key::Char('!')] {
+            let mut core = fresh(false, true, false);
+            core.set_composing_rewrite_supported(false);
+            core.load_word_lang("царство", 1_000_000, LangId::Bg);
+            core.load_word_lang("цар", 5, LangId::Bg);
+            core.load_word_lang("car", 100, LangId::En);
+            raw(&mut core, &[46, 30, 19]);
+            assert_eq!(core.current_word(), "цар");
+            assert!(core.debug_state().0, "the token is still composing");
+            let actions = key(&mut core, boundary);
+            assert_eq!(commits(&actions), vec!["цар"]);
+            assert!(replacements(&actions).is_empty());
+            assert_eq!(core.context_words().0, Some("цар"));
+            learned_once(&mut core, &["цар"]);
+            assert!(!core
+                .export_personal_profile()
+                .cvm
+                .words
+                .iter()
+                .any(|word| word == "car"));
+        }
+    }
+
+    #[test]
+    fn composing_rewrite_capability_restores_preedit_corrections() {
+        let mut core = fresh(false, true, false);
+        core.set_composing_rewrite_supported(false);
+        core.reset_word();
+        assert!(!core.composing_rewrite_supported);
+        core.set_composing_rewrite_supported(true);
+        core.load_word_lang("царство", 1_000_000, LangId::Bg);
+        core.load_word_lang("цар", 5, LangId::Bg);
+        core.load_word_lang("car", 100, LangId::En);
+        raw(&mut core, &[46, 30, 19]);
+        let actions = key(&mut core, Key::Space);
+        assert_eq!(replacements(&actions), vec![(3, "car"), (3, "Car")]);
+        assert_eq!(core.context_words().0, Some("car"));
+        learned_once(&mut core, &["car"]);
+    }
+
+    #[test]
+    fn composing_rewrite_disabled_accept_preserves_shown_word() {
+        let mut core = fresh(false, true, true);
+        core.set_composing_rewrite_supported(false);
+        core.load_word_lang("царство", 1_000_000, LangId::Bg);
+        core.load_word_lang("цар", 5, LangId::Bg);
+        core.load_word_lang("car", 100, LangId::En);
+        raw(&mut core, &[46]);
+        assert!(core.apply_prediction_override("цар").is_some());
+        let actions = key(&mut core, Key::Tab);
+        assert_eq!(commits(&actions), vec!["цар"]);
+        assert!(replacements(&actions).is_empty());
+        assert_eq!(core.context_words().0, Some("цар"));
+        learned_once(&mut core, &["цар"]);
     }
 
     #[test]

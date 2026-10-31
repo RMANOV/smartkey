@@ -108,6 +108,9 @@ class Core(FakeCore):
     def set_completion_display_supported(self, supported):
         self.completion_display = supported
 
+    def set_composing_rewrite_supported(self, supported):
+        self.composing_rewrite = supported
+
 
 def build(steps=(), caps=CHROME_CAPS, core_cls=None, **core_kw):
     scripts, states = [], []
@@ -353,6 +356,48 @@ def test_inert_keys_do_not_flush_or_end_the_word():
     for key, _a, _s in steps:
         press(eng, log, key)
     assert commits(log) == []
+    assert "reset" not in eng._core.events
+
+
+@pytest.mark.parametrize("keycode,raw_api", [(0, True), (69, False), (105, True)])
+def test_navigation_delivers_before_forwarding_on_the_actual_key_route(
+    monkeypatch, keycode, raw_api,
+):
+    steps = PHRASE[3:5] + [("KP_Left", [("forward", "")], UNLOCKED)]
+    eng, log = build(steps)
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    press(eng, log, "b")
+    press(eng, log, "y")
+    if not raw_api:
+        eng._core.process_keycode = None
+
+    assert eng.do_process_key_event(0xFF96, keycode, 0) is False
+    log.append(("client", "KP_Left", 0))
+
+    assert commits(log) == ["by"]
+    assert log.index(("commit", "by")) < log.index(("client", "KP_Left", 0))
+    assert eng._direct_pending == ""
+    assert "reset" in eng._core.events
+
+
+@pytest.mark.parametrize("keyval", [0, 0xFFE1, 0xFFE3, 0xFFEB, 0xFE03,
+                                    0xFF7F, 0xFF14, 0xFF20, 0xFF67])
+@pytest.mark.parametrize("keycode,raw_api", [(0, True), (105, False)])
+def test_fallback_modifiers_locks_and_empty_events_keep_pending_word(
+    monkeypatch, keyval, keycode, raw_api,
+):
+    steps = PHRASE[3:5] + [("inert", [("forward", "")], UNLOCKED)]
+    eng, log = build(steps)
+    monkeypatch.setattr(ske, "_HAS_CORE", True)
+    press(eng, log, "b")
+    press(eng, log, "y")
+    if not raw_api:
+        eng._core.process_keycode = None
+
+    assert eng.do_process_key_event(keyval, keycode, 0) is False
+
+    assert commits(log) == []
+    assert eng._direct_pending == "by"
     assert "reset" not in eng._core.events
 
 
@@ -1168,6 +1213,15 @@ def test_direct_delivery_disables_completion_display_and_preedit_restores_it():
     assert eng._core.completion_display is True
     eng.do_set_capabilities(CHROME_CAPS)
     assert eng._core.completion_display is False
+
+
+def test_direct_delivery_disables_composing_rewrites_and_preedit_restores_them():
+    eng, _log = build()
+    assert eng._core.composing_rewrite is False
+    eng.do_set_capabilities(NATIVE_CAPS)
+    assert eng._core.composing_rewrite is True
+    eng.do_set_capabilities(CHROME_CAPS)
+    assert eng._core.composing_rewrite is False
 
 
 @pytest.mark.parametrize("event", ["release", "phantom"])
