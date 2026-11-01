@@ -1,5 +1,12 @@
 # SmartKey Windows experimental pilot evidence form
 
+> Historical form for the superseded `smartkey-windows-pilot` package. It does not
+> describe the current `smartkey-windows-standalone` candidate. For that package,
+> use [README-WINDOWS.md](../packaging/README-WINDOWS.md): explicit administrator
+> machine setup, then normal-user controls. Native maintenance CI does not replace
+> the interactive typing, Win+Space and real-logon checks. The old staging and
+> unavailable-registration instructions below are retained only as historical evidence.
+
 This form is for a future disposable, standard-user Windows pilot. Packaging is not registration, native acceptance, or daily-readiness evidence. Do not use a daily account, elevation, employer data, private corpora, or real keystrokes.
 
 ## Artifact identity and completeness
