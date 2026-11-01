@@ -386,7 +386,7 @@ impl ITfKeyEventSink_Impl for SmartKeyTextService_Impl {
             modifiers: mods,
         };
 
-        let actions = self.core.borrow_mut().handle_key(event);
+        let actions = crate::text_contract::handle_key(&mut self.core.borrow_mut(), event);
 
         let consumed = if let Some(ctx) = pic {
             self.execute_actions(&actions, ctx)

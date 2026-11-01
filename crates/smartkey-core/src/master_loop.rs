@@ -8,15 +8,16 @@
 //
 // Implements the Decorator pattern: mirrors InputMethodCore's public API 1:1.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::context_sampler::{self, ContextSampler, NullContextSampler};
+use crate::context_sampler::{self, ContextAnalysis, ContextSampler, NullContextSampler};
 use crate::correction_memory::CorrectionMemory;
 use crate::ensemble::Prediction;
 use crate::eval::PredictionMetrics;
 use crate::frustration::{FrustrationDetector, FrustrationSignal};
-use crate::input::{Action, InputConfig, InputMethodCore, KeyEvent};
+use crate::input::{Action, InputConfig, InputMethodCore, Key, KeyEvent, Modifiers};
 use crate::lang_detect::{DetectedLanguage, LangId};
 use crate::light_profile::LightProfile;
 use crate::rejection_memory::RejectionMemory;
@@ -32,6 +33,15 @@ pub enum Phase {
     Correcting,
     /// Word committed — recording corrections, updating profile.
     Learning,
+}
+
+/// Whole-token readings offered without changing the composing preedit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageChoiceOffer {
+    pub revision: u64,
+    pub current_language: LangId,
+    pub en: String,
+    pub bg: String,
 }
 
 /// Hints passed from MasterLoop to InputMethodCore to bias predictions.
@@ -62,6 +72,260 @@ impl Default for Hints {
     }
 }
 
+const MAX_SENTENCE_ECHOES: usize = 64;
+const MAX_SENTENCE_ECHO_BYTES: usize = 64 * 1024;
+
+/// A local replacement ending at the original cursor, sharing the document.
+/// Preedit never enters this projection; cursor positions count Unicode chars.
+#[derive(Clone, PartialEq, Eq)]
+struct SentenceEchoImage {
+    left: usize,
+    cursor: usize,
+    inserted: String,
+}
+
+#[derive(Clone, Copy)]
+enum OpaqueSeparator {
+    Return,
+    Tab,
+}
+
+/// Possible delivered echoes while sentence presentation remains bound to a
+/// client segment. Matching acknowledges progress, never an undo log.
+struct SentenceEchoes {
+    base: Box<str>,
+    anchor: usize,
+    images: Vec<SentenceEchoImage>,
+    opaque: Option<OpaqueSeparator>,
+}
+
+impl SentenceEchoes {
+    fn new(text: &str, cursor: usize) -> Option<Self> {
+        let anchor = text
+            .char_indices()
+            .nth(cursor)
+            .map(|(byte, _)| byte)
+            .or_else(|| (cursor == text.chars().count()).then_some(text.len()))?;
+        Some(Self {
+            base: text.into(),
+            anchor,
+            images: vec![SentenceEchoImage {
+                left: anchor,
+                cursor,
+                inserted: String::new(),
+            }],
+            opaque: None,
+        })
+    }
+
+    fn matches(&self, image: &SentenceEchoImage, text: &str, cursor: usize) -> bool {
+        cursor == image.cursor
+            && text.len() == image.left + image.inserted.len() + self.base.len() - self.anchor
+            && text.starts_with(&self.base[..image.left])
+            && text[image.left..].starts_with(&image.inserted)
+            && text.ends_with(&self.base[self.anchor..])
+    }
+
+    fn acknowledge(&mut self, text: &str, cursor: usize) -> bool {
+        if let Some(index) = self
+            .images
+            .iter()
+            .rposition(|image| self.matches(image, text, cursor))
+        {
+            self.images.drain(..index);
+            return true;
+        }
+        if let Some(kind) = self.opaque {
+            let last = self.images.last().expect("an echo always has a base image");
+            let gap = text
+                .strip_prefix(&self.base[..last.left])
+                .and_then(|rest| rest.strip_prefix(last.inserted.as_str()))
+                .and_then(|rest| rest.strip_suffix(&self.base[self.anchor..]));
+            if let Some(gap) = gap {
+                let compatible = !gap.is_empty()
+                    && gap.chars().all(char::is_whitespace)
+                    && match kind {
+                        OpaqueSeparator::Return => gap.contains(['\r', '\n']),
+                        OpaqueSeparator::Tab => true,
+                    };
+                if compatible && cursor == last.cursor + gap.chars().count() {
+                    // The opaque key's actual result is now known. Retire all
+                    // pre-barrier images and bind subsequent edits to this ACK.
+                    *self = Self::new(text, cursor).expect("validated character cursor");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn push(&mut self, image: SentenceEchoImage) -> bool {
+        if self.images.last() == Some(&image) {
+            return true;
+        }
+        if self.images.len() >= MAX_SENTENCE_ECHOES
+            || self.images.iter().map(|i| i.inserted.len()).sum::<usize>() + image.inserted.len()
+                > MAX_SENTENCE_ECHO_BYTES
+        {
+            return false;
+        }
+        self.images.push(image);
+        true
+    }
+
+    fn edit(&mut self, delete: usize, insert: &str) -> bool {
+        if self.opaque.is_some() || insert.len() > MAX_SENTENCE_ECHO_BYTES {
+            return false;
+        }
+        let mut image = self.images.last().expect("base image").clone();
+        for _ in 0..delete {
+            if image.inserted.pop().is_none() {
+                let Some((byte, _)) = self.base[..image.left].char_indices().next_back() else {
+                    return false;
+                };
+                image.left = byte;
+            }
+            image.cursor -= 1;
+        }
+        // Standalone surrounding replacement really exposes the deletion
+        // before its commit. Coalesced same-batch replacement never does.
+        if delete > 0 && !self.push(image.clone()) {
+            return false;
+        }
+        image.inserted.push_str(insert);
+        image.cursor += insert.chars().count();
+        self.push(image)
+    }
+
+    fn has_known_linebreak_or_blank_prefix(&self) -> bool {
+        if self.opaque.is_some() {
+            return false;
+        }
+        let image = self.images.last().expect("base image");
+        let mut linebreak = false;
+        let mut only_spaces = true;
+        for ch in self.base[..image.left]
+            .chars()
+            .chain(image.inserted.chars())
+            .rev()
+        {
+            if !ch.is_whitespace() {
+                return linebreak;
+            }
+            linebreak |= matches!(ch, '\r' | '\n');
+            only_spaces &= ch == ' ';
+        }
+        linebreak || only_spaces
+    }
+
+    fn before_cursor(&self) -> Option<Cow<'_, str>> {
+        if self.opaque.is_some() {
+            return None;
+        }
+        let image = self.images.last()?;
+        let left = &self.base[..image.left];
+        if image.inserted.is_empty() {
+            return Some(Cow::Borrowed(left));
+        }
+        if left.is_empty() {
+            return Some(Cow::Borrowed(image.inserted.as_str()));
+        }
+        let bytes = left.len().checked_add(image.inserted.len())?;
+        if bytes > MAX_SENTENCE_ECHO_BYTES {
+            return None;
+        }
+        let mut prefix = String::with_capacity(bytes);
+        prefix.push_str(left);
+        prefix.push_str(&image.inserted);
+        Some(Cow::Owned(prefix))
+    }
+
+    fn record(&mut self, event: &KeyEvent, actions: &[Action], mut composing: bool) -> bool {
+        // Match the IBus adapter's exact commit+same-length-replace folding.
+        // In particular Commithello+ReplaceHello has no lowercase echo.
+        let mut wire: Vec<Action> = Vec::new();
+        let mut pending_commit: Option<usize> = None;
+        for action in actions {
+            if let Action::ReplaceWord { replace_len, text } = action {
+                if let Some(index) = pending_commit {
+                    if let Action::CommitText(previous) = &wire[index] {
+                        if *replace_len == previous.chars().count() {
+                            wire[index] = Action::CommitText(text.clone());
+                            continue;
+                        }
+                    }
+                }
+            }
+            if matches!(action, Action::CommitText(_)) {
+                pending_commit = Some(wire.len());
+            }
+            wire.push(action.clone());
+        }
+        for (index, action) in wire.iter().enumerate() {
+            match action {
+                Action::CommitText(text) => {
+                    if !self.edit(0, text) {
+                        return false;
+                    }
+                    composing = false;
+                }
+                Action::ReplaceWord { replace_len, text } => {
+                    if !self.edit(if composing { 0 } else { *replace_len }, text) {
+                        return false;
+                    }
+                    composing = false;
+                }
+                Action::ShowComposing { .. } => composing = true,
+                Action::ShowGhost(_) => composing = false,
+                Action::HideGhost => {
+                    if !wire[index + 1..]
+                        .iter()
+                        .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. }))
+                    {
+                        composing = false;
+                    }
+                }
+                Action::ForwardKey => {}
+            }
+        }
+        if !actions.iter().any(|a| matches!(a, Action::ForwardKey)) || event.key.is_pure_modifier()
+        {
+            return true;
+        }
+        // Forward is delivered after the entire action batch. Raw letters do
+        // not reveal the OS keyval; project only layout-identical glyphs.
+        match event.key {
+            Key::Return | Key::Tab => {
+                if self.opaque.is_none() || matches!(event.key, Key::Return) {
+                    self.opaque = Some(if matches!(event.key, Key::Return) {
+                        OpaqueSeparator::Return
+                    } else {
+                        OpaqueSeparator::Tab
+                    });
+                }
+                true
+            }
+            Key::Space if self.opaque.is_some() => true,
+            Key::Space => self.edit(0, " "),
+            Key::Backspace => self.edit(1, ""),
+            Key::Char(ch) if !ch.is_control() => self.edit(0, ch.encode_utf8(&mut [0; 4])),
+            Key::RawCode(code) => {
+                let pair = crate::keymap::scancode_to_both_with_caps(
+                    code,
+                    event.modifiers.contains(Modifiers::SHIFT),
+                    event.modifiers.contains(Modifiers::CAPS_LOCK),
+                );
+                if let Some((en, _)) = pair.filter(|(en, bg)| en == bg) {
+                    self.edit(0, en.encode_utf8(&mut [0; 4]))
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Proactive orchestrator wrapping InputMethodCore.
 ///
 /// Adds anticipation (predict before typing), frustration detection,
@@ -82,16 +346,23 @@ pub struct MasterLoop {
     last_prediction_accept: Option<Instant>,
     /// The prediction most recently accepted via Tab or final Right.
     last_accepted_prediction: Option<String>,
-    /// Last known commit count from metrics (for change detection).
-    last_known_commits: usize,
     /// Whether anticipation was already run for the current word.
     anticipated: bool,
     /// Cached surrounding text from the platform adapter (Linux IBus path).
     surrounding_text: Option<String>,
     /// Cursor position inside `surrounding_text` when provided by the platform.
     surrounding_cursor_pos: Option<usize>,
+    /// Collapsed-caret evidence supplied by the latest pre-key reconciliation.
+    surrounding_caret_collapsed: bool,
+    /// Identifier prefix observed once when native completion takes this word.
+    native_completion_prefix: Option<String>,
+    /// Bounded presentation-only acknowledgements, never model context.
+    sentence_echoes: Option<SentenceEchoes>,
     /// Most recently displayed `(typed prefix, full completion)` pair.
     last_shown_ghost: Option<(String, String)>,
+    language_choice_revision: u64,
+    language_choice_supported: bool,
+    language_choice_dismissed: bool,
 }
 
 impl MasterLoop {
@@ -107,11 +378,16 @@ impl MasterLoop {
             suppress_countdown: 0,
             last_prediction_accept: None,
             last_accepted_prediction: None,
-            last_known_commits: 0,
             anticipated: false,
             surrounding_text: None,
             surrounding_cursor_pos: None,
+            surrounding_caret_collapsed: false,
+            native_completion_prefix: None,
+            sentence_echoes: None,
             last_shown_ghost: None,
+            language_choice_revision: 0,
+            language_choice_supported: false,
+            language_choice_dismissed: false,
         }
     }
 
@@ -129,6 +405,59 @@ impl MasterLoop {
 
     /// Process a key event through the master loop state machine.
     pub fn handle_key(&mut self, event: KeyEvent) -> Vec<Action> {
+        let event = event.normalize_special_key();
+        // Key-up must preserve the attribution from its matching press.
+        if event.modifiers.contains(Modifiers::RELEASE) {
+            return self.core.handle_key(event);
+        }
+        self.invalidate_language_choice();
+        if self.core.current_word().is_empty() {
+            self.language_choice_dismissed = false;
+        }
+        if self.core.direct_delivery_owned() {
+            // Speculative delivery fixes presentation only. Neither its edits
+            // nor its boundary establish a user-confirmed learning outcome.
+            let actions = self.core.handle_key(event.clone());
+            if !self.core.direct_delivery_owned() {
+                self.clear_native_completion_tracking();
+                self.record_sentence_delivery(&event, &actions, false, false, false, false);
+            }
+            return actions;
+        }
+        // Forwarded shortcuts can edit client text. Invalidate attribution,
+        // but do not start anticipation or count them as adaptation events.
+        if !event.key.is_pure_modifier()
+            && event.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT)
+        {
+            self.sentence_echoes = None;
+            self.last_prediction_accept = None;
+            self.last_shown_ghost = None;
+            return self.core.handle_key(event);
+        }
+
+        let native_boundary = self.core.native_completion_owned()
+            && self.core.native_completion_boundary_event(&event);
+        if native_boundary
+            || (self.core.native_completion_owned()
+                && matches!(
+                    event.key,
+                    Key::Escape | Key::Up | Key::Down | Key::PageUp | Key::PageDown
+                ))
+        {
+            let actions = self.core.handle_key(event.clone());
+            if !matches!(event.key, Key::Up | Key::Down | Key::PageUp | Key::PageDown) {
+                self.clear_native_completion_tracking();
+            }
+            if native_boundary {
+                // The previous presentation scope was retired without a word
+                // commit. Bind only this known forwarded delimiter's delivery.
+                self.record_sentence_delivery(&event, &actions, false, false, false, false);
+            }
+            // These keys operate the client's popup, not a SmartKey candidate.
+            // In particular, Escape must not arm false ABANDON feedback.
+            return actions;
+        }
+
         let resets_context = matches!(
             event.key,
             crate::input::Key::Left
@@ -142,12 +471,17 @@ impl MasterLoop {
             && !self.core.has_ghost());
 
         // ── Phase 1: ANTICIPATE (on word start) ──────────────────────
-        if !self.anticipated && self.core.current_word().is_empty() {
-            self.phase = Phase::Anticipating;
-            let hints = self.anticipate();
-            self.core.apply_hints(&hints);
-            self.anticipated = true;
-            self.phase = Phase::Tracking;
+        if self.core.current_word().is_empty() {
+            let cached_analysis = self.cached_surrounding_analysis();
+            let terminal_lang = self.terminal_context_language(cached_analysis.as_ref());
+            self.core.set_terminal_context_lang(terminal_lang);
+            if !self.anticipated {
+                self.phase = Phase::Anticipating;
+                let hints = self.anticipate(cached_analysis);
+                self.core.apply_hints(&hints);
+                self.anticipated = true;
+                self.phase = Phase::Tracking;
+            }
         }
 
         // ── Phase 2: DELEGATE to core ────────────────────────────────
@@ -173,7 +507,7 @@ impl MasterLoop {
             self.last_prediction_accept = None;
             self.last_shown_ghost = None;
         }
-        // Capture prediction and commit count BEFORE delegation. Terminal Tab
+        // Capture prediction BEFORE delegation. Terminal Tab
         // and Right clear last_predictions/current_word inside the core, while
         // a partial Right keeps both alive and must not count as acceptance.
         let pre_accept_prediction = if is_accept_key && self.core.has_ghost() {
@@ -181,13 +515,30 @@ impl MasterLoop {
         } else {
             None
         };
-        let pre_commit_count = self.core.metrics().commit_count();
+        let hint_was_live = self.core.has_sentence_boundary_hint();
+        let was_composing = self.core.debug_state().0;
+        let word_was_empty = self.core.current_word().is_empty();
         let mut actions = self.core.handle_key(event.clone());
+        if !self.core.native_completion_owned() {
+            self.native_completion_prefix = None;
+        }
+        self.core.latch_language_choice_policy();
+        let commit_learning = self.core.take_commit_learning();
+        let word_committed = !commit_learning.words.is_empty();
         self.apply_correction_override(&mut actions);
         self.enforce_rejection_suppression(&mut actions);
-        let terminal_accept = pre_accept_prediction.is_some()
-            && self.core.current_word().is_empty()
-            && self.core.metrics().commit_count() > pre_commit_count;
+        if !self.core.current_word().is_empty()
+            && actions.iter().any(|a| matches!(a, Action::CommitText(_)))
+            && actions
+                .iter()
+                .any(|a| matches!(a, Action::ForwardKey | Action::HideGhost))
+        {
+            // Forwarded handoffs and consumed delivery can both remove the
+            // displayed ghost. Retire its old identity before further edits.
+            self.last_shown_ghost = None;
+        }
+        let terminal_accept =
+            pre_accept_prediction.is_some() && commit_learning.accepted_prediction;
 
         if resets_context {
             self.anticipated = false;
@@ -244,9 +595,9 @@ impl MasterLoop {
         }
 
         // Word committed? → LEARNING phase.
-        if self.core.current_word().is_empty() && self.session_commits_changed() {
+        if word_committed {
             self.phase = Phase::Learning;
-            self.learn_from_commit();
+            self.learn_from_commit(commit_learning);
             self.phase = Phase::Anticipating;
             self.anticipated = false;
             self.core.clear_hints();
@@ -261,6 +612,14 @@ impl MasterLoop {
         }
 
         self.note_shown_ghost(&actions);
+        self.record_sentence_delivery(
+            &event,
+            &actions,
+            hint_was_live,
+            was_composing,
+            word_was_empty,
+            word_committed,
+        );
 
         actions
     }
@@ -269,21 +628,260 @@ impl MasterLoop {
     // Delegated API (1:1 mirror of InputMethodCore)
     // ======================================================================
 
+    pub fn set_language_choice_supported(&mut self, supported: bool) {
+        if self.language_choice_supported != supported {
+            self.invalidate_language_choice();
+            self.language_choice_supported = supported;
+            self.core.set_language_choice_supported(supported);
+        }
+    }
+
+    pub fn language_choice_offer(&self) -> Option<LanguageChoiceOffer> {
+        if !self.language_choice_supported || self.language_choice_dismissed {
+            return None;
+        }
+        let (current_language, en, bg) = self.core.language_choice_readings()?;
+        Some(LanguageChoiceOffer {
+            revision: self.language_choice_revision,
+            current_language,
+            en: en.to_owned(),
+            bg: bg.to_owned(),
+        })
+    }
+
+    pub fn dismiss_language_choice(&mut self, revision: u64) -> bool {
+        if self
+            .language_choice_offer()
+            .is_none_or(|offer| offer.revision != revision)
+        {
+            return false;
+        }
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = true;
+        true
+    }
+
+    pub fn accept_language_choice(
+        &mut self,
+        revision: u64,
+        language: LangId,
+    ) -> Option<Vec<Action>> {
+        if self
+            .language_choice_offer()
+            .is_none_or(|offer| offer.revision != revision)
+        {
+            return None;
+        }
+        let actions = self.core.accept_language_choice(language)?;
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
+        let batch = self.core.take_commit_learning();
+        self.phase = Phase::Learning;
+        self.learn_from_commit(batch);
+        self.phase = Phase::Anticipating;
+        self.anticipated = false;
+        self.core.clear_hints();
+        self.frustration.reset_word();
+        self.last_prediction_accept = None;
+        self.last_accepted_prediction = None;
+        self.last_shown_ghost = None;
+        self.sentence_echoes = None;
+        Some(actions)
+    }
+
+    fn invalidate_language_choice(&mut self) {
+        self.language_choice_revision = self.language_choice_revision.wrapping_add(1);
+    }
+
+    /// A hidden suffix cannot attest acceptance or rejection feedback.
+    pub fn set_completion_display_supported(&mut self, supported: bool) {
+        self.core.set_completion_display_supported(supported);
+        if !supported {
+            self.last_shown_ghost = None;
+            self.last_prediction_accept = None;
+            self.last_accepted_prediction = None;
+        }
+    }
+
+    pub fn set_external_rewrite_supported(&mut self, supported: bool) {
+        self.invalidate_language_choice();
+        self.core.set_external_rewrite_supported(supported);
+    }
+
+    pub fn set_composing_rewrite_supported(&mut self, supported: bool) {
+        self.invalidate_language_choice();
+        self.core.set_composing_rewrite_supported(supported);
+    }
+
     pub fn focus_lost(&mut self) -> Vec<Action> {
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
+        self.sentence_echoes = None;
         self.anticipated = false;
         self.core.clear_hints();
         self.frustration.reset_word();
         self.surrounding_text = None;
         self.surrounding_cursor_pos = None;
+        self.surrounding_caret_collapsed = false;
+        self.native_completion_prefix = None;
         self.last_shown_ghost = None;
-        self.core.focus_lost()
+        let actions = self.core.focus_lost();
+        let commit_learning = self.core.take_commit_learning();
+        self.learn_from_commit(commit_learning);
+        actions
+    }
+
+    /// Transfer presentation to native completion without ending the word.
+    pub fn handoff_preedit_for_native_completion(&mut self) -> Vec<Action> {
+        let prefix = if self.core.native_completion_owned() {
+            self.native_completion_prefix.clone()
+        } else {
+            self.observed_native_identifier_prefix()
+        };
+        self.clear_native_completion_tracking();
+        let actions = self.core.handoff_preedit_for_native_completion();
+        if self.core.native_completion_owned() {
+            self.native_completion_prefix = prefix;
+        }
+        actions
+    }
+
+    /// Deliver the in-flight word early and keep it open (direct delivery).
+    pub fn handoff_preedit_for_delivery(&mut self) -> Vec<Action> {
+        let actions = self.core.handoff_preedit_for_delivery();
+        self.clear_native_completion_tracking();
+        actions
+    }
+
+    /// Whether the delivered token is still owned by client completion.
+    pub fn native_completion_owned(&self) -> bool {
+        self.core.native_completion_owned()
+    }
+
+    fn observed_native_identifier_prefix(&self) -> Option<String> {
+        if !self.surrounding_caret_collapsed {
+            return None;
+        }
+        let chars: Vec<char> = self.surrounding_text.as_deref()?.chars().collect();
+        let cursor = self.surrounding_cursor_pos?;
+        let word: Vec<char> = self.core.current_word().chars().collect();
+        if word.is_empty() || cursor > chars.len() {
+            return None;
+        }
+        // A client report may include the visible typed suffix, or omit the
+        // preedit that this handoff still owns and will deliver exactly once.
+        let start = cursor
+            .checked_sub(word.len())
+            .filter(|&start| chars[start..cursor] == word)
+            .or_else(|| self.core.debug_state().0.then_some(cursor))?;
+        if start == 0 || !(chars[start - 1] == '_' || chars[start - 1].is_ascii_digit()) {
+            return None;
+        }
+        let prefix_start = chars[..start]
+            .iter()
+            .rposition(|ch| !(ch.is_alphanumeric() || *ch == '_'))
+            .map_or(0, |index| index + 1);
+        Some(chars[prefix_start..start].iter().collect())
+    }
+
+    /// Retire a client-owned token if the latest observed client state no
+    /// longer describes that exact word and any captured identifier prefix at
+    /// a collapsed caret. Reports
+    /// alone never cancel ordinary preedit; the adapter calls this before the
+    /// next real press, before capturing word/prediction learning attribution.
+    /// Returns true only when a stale native-completion token was retired.
+    pub fn reconcile_native_completion_word(&mut self, caret_collapsed: bool) -> bool {
+        self.surrounding_caret_collapsed = caret_collapsed;
+        if !self.core.native_completion_owned() {
+            return false;
+        }
+        let valid = caret_collapsed
+            && self
+                .surrounding_text
+                .as_deref()
+                .zip(self.surrounding_cursor_pos)
+                .is_some_and(|(text, cursor)| {
+                    let chars: Vec<char> = text.chars().collect();
+                    let word: Vec<char> = self.core.current_word().chars().collect();
+                    let lexical = |ch: char| ch.is_alphanumeric() || ch == '_';
+                    if cursor > chars.len() || cursor < word.len() {
+                        return false;
+                    }
+                    let start = cursor - word.len();
+                    let left_valid = if let Some(prefix) = &self.native_completion_prefix {
+                        let prefix_start = chars[..start]
+                            .iter()
+                            .rposition(|ch| !lexical(*ch))
+                            .map_or(0, |index| index + 1);
+                        chars[prefix_start..start]
+                            .iter()
+                            .copied()
+                            .eq(prefix.chars())
+                    } else {
+                        start == 0 || !lexical(chars[start - 1])
+                    };
+                    chars[start..cursor] == word
+                        && left_valid
+                        && (cursor == chars.len() || !lexical(chars[cursor]))
+                });
+        if valid {
+            return false;
+        }
+        self.clear_native_completion_tracking();
+        // The native token is already delivered, so navigation cannot flush it
+        // twice. An invalid client scope also invalidates location-dependent
+        // context, detector momentum and session cache, as ordinary navigation.
+        self.core.cursor_moved();
+        true
+    }
+
+    fn clear_native_completion_tracking(&mut self) {
+        self.native_completion_prefix = None;
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
+        self.phase = Phase::Anticipating;
+        self.sentence_echoes = None;
+        self.anticipated = false;
+        self.core.clear_hints();
+        self.frustration.reset_word();
+        self.last_shown_ghost = None;
+        self.last_prediction_accept = None;
+        self.last_accepted_prediction = None;
+    }
+
+    /// Deliver owned preedit without treating a manual layout switch as a word.
+    pub fn flush_preedit_for_layout(&mut self) -> Vec<Action> {
+        self.native_completion_prefix = None;
+        self.surrounding_caret_collapsed = false;
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
+        self.phase = Phase::Anticipating;
+        self.sentence_echoes = None;
+        self.anticipated = false;
+        self.frustration.reset_word();
+        self.surrounding_text = None;
+        self.surrounding_cursor_pos = None;
+        self.last_shown_ghost = None;
+        self.last_prediction_accept = None;
+        self.last_accepted_prediction = None;
+        self.core.flush_preedit_for_layout()
     }
 
     pub fn focus_gained(&mut self) {
+        self.native_completion_prefix = None;
+        self.surrounding_caret_collapsed = false;
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
+        self.sentence_echoes = None;
         self.core.focus_gained();
     }
 
     pub fn reset(&mut self) -> Vec<Action> {
+        self.native_completion_prefix = None;
+        self.surrounding_caret_collapsed = false;
+        self.invalidate_language_choice();
+        self.language_choice_dismissed = false;
+        self.sentence_echoes = None;
         self.anticipated = false;
         self.core.clear_hints();
         self.frustration.reset_word();
@@ -353,6 +951,7 @@ impl MasterLoop {
         let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let profile = crate::personal::load_personal_json(&data)?;
 
+        self.invalidate_language_choice();
         self.core.import_personal_profile(&profile);
         self.corrections = profile
             .corrections
@@ -365,11 +964,11 @@ impl MasterLoop {
     }
 
     pub fn save_personal_default(&self) -> Result<(), String> {
-        self.core.save_personal_default()
+        self.save_personal(&crate::paths::personal_profile_path())
     }
 
     pub fn load_personal_default(&mut self) -> Result<(), String> {
-        self.core.load_personal_default()
+        self.load_personal(&crate::paths::personal_profile_path())
     }
 
     pub fn metrics(&self) -> &PredictionMetrics {
@@ -382,30 +981,37 @@ impl MasterLoop {
 
     // Corpus loading (delegated).
     pub fn load_word(&mut self, word: &str, freq: u32) {
+        self.invalidate_language_choice();
         self.core.load_word(word, freq);
     }
 
     pub fn load_bigram(&mut self, ctx: &str, word: &str, count: u32) {
+        self.invalidate_language_choice();
         self.core.load_bigram(ctx, word, count);
     }
 
     pub fn load_trigram(&mut self, w1: &str, w2: &str, word: &str, count: u32) {
+        self.invalidate_language_choice();
         self.core.load_trigram(w1, w2, word, count);
     }
 
     pub fn load_word_lang(&mut self, word: &str, freq: u32, lang: LangId) {
+        self.invalidate_language_choice();
         self.core.load_word_lang(word, freq, lang);
     }
 
     pub fn load_bigram_lang(&mut self, ctx: &str, word: &str, count: u32, lang: LangId) {
+        self.invalidate_language_choice();
         self.core.load_bigram_lang(ctx, word, count, lang);
     }
 
     pub fn load_trigram_lang(&mut self, w1: &str, w2: &str, word: &str, count: u32, lang: LangId) {
+        self.invalidate_language_choice();
         self.core.load_trigram_lang(w1, w2, word, count, lang);
     }
 
     pub fn load_corpus_file(&mut self, path: &Path) -> Result<(), String> {
+        self.invalidate_language_choice();
         self.core.load_corpus_file(path)
     }
 
@@ -414,8 +1020,116 @@ impl MasterLoop {
     /// Linux IBus adapters can push live surrounding text here so the
     /// anticipation phase uses real document context instead of the null sampler.
     pub fn set_surrounding_text(&mut self, text: Option<String>, cursor_pos: Option<usize>) {
-        self.surrounding_text = text.filter(|value| !value.trim().is_empty());
+        self.surrounding_caret_collapsed = false;
+        if self.surrounding_text != text || self.surrounding_cursor_pos != cursor_pos {
+            self.invalidate_language_choice();
+        }
+        self.surrounding_text = text;
         self.surrounding_cursor_pos = cursor_pos;
+        self.reconcile_sentence_report();
+        let analysis = self.cached_surrounding_analysis();
+        let terminal_lang = self.terminal_context_language(analysis.as_ref());
+        self.core.set_terminal_context_lang(terminal_lang);
+    }
+
+    fn reconcile_sentence_report(&mut self) {
+        if self.sentence_echoes.is_none() && !self.core.has_sentence_boundary_hint() {
+            return;
+        }
+        let Some((text, cursor)) = self
+            .surrounding_text
+            .as_deref()
+            .zip(self.surrounding_cursor_pos)
+            .filter(|(text, cursor)| *cursor <= text.chars().count())
+        else {
+            // Unavailable geometry supplies no authority, including no means
+            // to lift an already established negative presentation decision.
+            return;
+        };
+        let Some(echoes) = self.sentence_echoes.as_mut() else {
+            // An unbound first report cannot be assumed to echo an empty
+            // document. Withdraw presentation only; retain the active token.
+            self.core.withdraw_sentence_boundary_hint();
+            return;
+        };
+        if !echoes.acknowledge(text, cursor) {
+            let byte = text
+                .char_indices()
+                .nth(cursor)
+                .map(|(byte, _)| byte)
+                .unwrap_or(text.len());
+            self.core.reconcile_sentence_boundary_hint(&text[..byte]);
+            // The lease already existed. A fresh valid report can replace
+            // its anchor even when ordinary text removed the local hint.
+            self.sentence_echoes = SentenceEchoes::new(text, cursor);
+        }
+    }
+
+    fn record_sentence_delivery(
+        &mut self,
+        event: &KeyEvent,
+        actions: &[Action],
+        hint_was_live: bool,
+        was_composing: bool,
+        word_was_empty: bool,
+        word_committed: bool,
+    ) {
+        let forwarded_backspace = matches!(event.key, Key::Backspace)
+            && actions.iter().any(|a| matches!(a, Action::ForwardKey));
+        if self.core.is_enabled()
+            && forwarded_backspace
+            && word_was_empty
+            && self.core.current_word().is_empty()
+            && !word_committed
+            && !actions.iter().any(|a| matches!(a, Action::CommitText(_)))
+            && self
+                .sentence_echoes
+                .as_ref()
+                .is_some_and(SentenceEchoes::has_known_linebreak_or_blank_prefix)
+        {
+            // The generic Core hint cannot retract opaque layout whitespace.
+            // This existing exact, nonopaque image can: project the final wire
+            // batch once, then classify the actual remaining client prefix.
+            let echoes = self.sentence_echoes.as_mut().expect("checked bound image");
+            let retained = if echoes.record(event, actions, was_composing) {
+                if let Some(prefix) = echoes.before_cursor() {
+                    self.core.reconcile_sentence_boundary_hint(&prefix);
+                    self.core.has_sentence_boundary_hint()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !retained {
+                self.core.withdraw_sentence_boundary_hint();
+                self.sentence_echoes = None;
+            }
+            return;
+        }
+        let hint_is_live = self.core.has_sentence_boundary_hint();
+        if !self.core.is_enabled()
+            || (!hint_is_live
+                && (self.sentence_echoes.is_none() || word_committed || forwarded_backspace))
+        {
+            self.sentence_echoes = None;
+            return;
+        }
+        if !hint_was_live && hint_is_live && self.sentence_echoes.is_none() {
+            self.sentence_echoes = self
+                .surrounding_text
+                .as_deref()
+                .zip(self.surrounding_cursor_pos)
+                .and_then(|(text, cursor)| SentenceEchoes::new(text, cursor));
+        }
+        if self
+            .sentence_echoes
+            .as_mut()
+            .is_some_and(|echoes| !echoes.record(event, actions, was_composing))
+        {
+            self.core.withdraw_sentence_boundary_hint();
+            self.sentence_echoes = None;
+        }
     }
 
     /// Current phase of the master loop state machine.
@@ -464,15 +1178,15 @@ impl MasterLoop {
     // Internal: Anticipation
     // ======================================================================
 
-    fn anticipate(&mut self) -> Hints {
+    fn anticipate(&mut self, cached_analysis: Option<ContextAnalysis>) -> Hints {
         let mut hints = Hints::default();
 
         // 1. Sample surrounding text for context.
-        if let Some(text) = self
-            .cached_surrounding_excerpt(100)
-            .or_else(|| self.context_sampler.get_surrounding_text(100))
-        {
-            let analysis = context_sampler::analyze_surrounding(&text);
+        if let Some(analysis) = cached_analysis.or_else(|| {
+            self.context_sampler
+                .get_surrounding_text(100)
+                .map(|text| context_sampler::analyze_surrounding(&text))
+        }) {
             if let Some(lang) = analysis.lang {
                 hints.lang_prior = Some(lang);
             }
@@ -521,6 +1235,24 @@ impl MasterLoop {
         hints.confidence_floor = Some(self.light_profile.confidence_floor);
 
         hints
+    }
+
+    fn cached_surrounding_analysis(&self) -> Option<ContextAnalysis> {
+        self.cached_surrounding_excerpt(100)
+            .map(|text| context_sampler::analyze_surrounding(&text))
+    }
+
+    fn terminal_context_language(&self, analysis: Option<&ContextAnalysis>) -> Option<LangId> {
+        let text = self.surrounding_text.as_deref()?;
+        let cursor = self.surrounding_cursor_pos?;
+        // Legacy live hints accept absent/byte-like cursors. Terminal routing
+        // requires an actual client character position and its pre-cursor text.
+        if cursor > text.chars().count() {
+            return None;
+        }
+        analysis?
+            .lang
+            .filter(|lang| matches!(lang, LangId::En | LangId::Bg))
     }
 
     fn cached_surrounding_excerpt(&self, max_chars: usize) -> Option<String> {
@@ -735,23 +1467,16 @@ impl MasterLoop {
     // Internal: Learning
     // ======================================================================
 
-    fn learn_from_commit(&mut self) {
-        self.last_known_commits = self.core.metrics().commit_count();
-
-        // Update language prior from detection.
-        let lang = self.core.detected_language().lang;
-        if self.last_accepted_prediction.is_some() {
-            self.light_profile.record_accept(lang);
-        } else {
-            self.light_profile.observe_lang(lang);
+    fn learn_from_commit(&mut self, batch: crate::input::CommitLearningBatch) {
+        if batch.accepted_prediction {
+            self.light_profile.record_acceptance();
         }
-
-        // Clear the accepted prediction tracker.
+        for word in batch.words {
+            if let Some(language) = word.language {
+                self.light_profile.observe_lang(language);
+            }
+        }
         self.last_accepted_prediction = None;
-    }
-
-    fn session_commits_changed(&self) -> bool {
-        self.core.metrics().commit_count() != self.last_known_commits
     }
 
     fn current_context_hash(&self) -> u64 {
@@ -1554,5 +2279,4232 @@ mod tests {
             .iter()
             .any(|action| matches!(action, Action::ForwardKey)));
         assert_eq!(ml.phase(), Phase::Tracking);
+    }
+}
+
+#[cfg(test)]
+mod review_tech_prior_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn assert_tech_prior_once(keys: impl IntoIterator<Item = KeyEvent>, boundary: KeyEvent) {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        for key in keys {
+            ml.handle_key(key);
+        }
+        assert_eq!(ml.detected_language().lang, LangId::Tech);
+        assert!((ml.detected_language().confidence - 0.9).abs() < 1e-12);
+        assert_eq!(ml.light_profile().lang_prior, [0.33, 0.34, 0.33]);
+        ml.handle_key(boundary);
+        let observed = ml.light_profile().lang_prior;
+        for (actual, expected) in observed.iter().zip([0.3234, 0.3332, 0.3434]) {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "one direct Tech word must update its prior: {observed:?}"
+            );
+        }
+        assert_eq!(ml.light_profile().ghost_accept_rate, 0.5);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        ml.handle_key(press(Key::Space));
+        assert_eq!(ml.light_profile().lang_prior, observed);
+    }
+
+    #[test]
+    fn review_tech_direct_symbols_update_prior_without_acceptance() {
+        assert_tech_prior_once(
+            "___".chars().map(|ch| press(Key::Char(ch))),
+            press(Key::Space),
+        );
+    }
+
+    #[test]
+    fn review_tech_direct_digits_update_prior_on_return() {
+        assert_tech_prior_once(
+            "123".chars().map(|ch| press(Key::Char(ch))),
+            press(Key::Return),
+        );
+    }
+
+    #[test]
+    fn review_tech_shared_shift_key_updates_prior_without_acceptance() {
+        assert_tech_prior_once(
+            (0..3).map(|_| KeyEvent {
+                key: Key::RawCode(12),
+                modifiers: Modifiers::SHIFT,
+            }),
+            press(Key::RawCode(57)),
+        );
+    }
+}
+
+#[cfg(test)]
+mod retraction_prior_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn assert_retracted_tech_prior(keys: impl IntoIterator<Item = Key>, boundary: Key) {
+        let mut config = InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        };
+        config.dual_buffer.enabled = false;
+        let mut ml = MasterLoop::new(config);
+        for key in keys {
+            ml.handle_key(press(key));
+        }
+        ml.handle_key(press(boundary));
+        let priors = ml.light_profile().lang_prior;
+        for (actual, expected) in priors.iter().zip([0.3234, 0.3332, 0.3434]) {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "one surviving direct Tech token must update its prior: {priors:?}"
+            );
+        }
+        assert_eq!(ml.light_profile().ghost_accept_rate, 0.5);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        ml.handle_key(press(Key::Space));
+        assert_eq!(ml.light_profile().lang_prior, priors);
+    }
+
+    #[test]
+    fn retraction_deleted_inferred_raw_suffix_restores_tech_prior() {
+        assert_retracted_tech_prior(
+            [
+                Key::Char('_'),
+                Key::RawCode(26),
+                Key::Backspace,
+                Key::Char('_'),
+                Key::Char('_'),
+            ],
+            Key::Space,
+        );
+    }
+
+    #[test]
+    fn retraction_deleted_script_restores_tech_prior() {
+        assert_retracted_tech_prior(
+            "123a".chars().map(Key::Char).chain([Key::Backspace]),
+            Key::Return,
+        );
+    }
+
+    #[test]
+    fn retraction_deleted_entire_prefix_does_not_suppress_tech_prior() {
+        assert_retracted_tech_prior(
+            [
+                Key::Char('a'),
+                Key::Backspace,
+                Key::Char('1'),
+                Key::Char('2'),
+                Key::Char('3'),
+            ],
+            Key::Space,
+        );
+    }
+}
+
+#[cfg(test)]
+mod commit_language_receipt_contract_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    // Break caught: focus_lost commits in core without synchronously consuming
+    // its language evidence, then a later key learns the old commit.
+    #[test]
+    fn focus_lost_learns_language_immediately_and_only_once() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.load_word("мама", 1_000_000);
+        for code in [50, 30, 50, 30] {
+            ml.handle_key(press(Key::RawCode(code)));
+        }
+        assert_eq!(ml.current_word(), "мама");
+        let mut expected = ml.light_profile.clone();
+        expected.observe_lang(LangId::Bg);
+        let before_commits = ml.metrics().commit_count();
+        ml.focus_lost();
+        assert_eq!(ml.metrics().commit_count(), before_commits + 1);
+        assert_eq!(
+            ml.light_profile.lang_prior, expected.lang_prior,
+            "focus_lost must consume its own word evidence before returning"
+        );
+        ml.handle_key(press(Key::Space));
+        ml.focus_lost();
+        assert_eq!(
+            ml.light_profile.lang_prior, expected.lang_prior,
+            "empty boundaries must not relearn the old commit"
+        );
+    }
+
+    // Break caught: using one stale prefix-detector language for all words in
+    // one fully accepted completion; accepting once must still update UX once.
+    #[test]
+    fn multiword_tab_accept_observes_each_words_language_once() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word("hello", 1_000_000);
+        ml.load_word("здравей", 1_000_000);
+        for ch in "hel".chars() {
+            ml.handle_key(press(Key::Char(ch)));
+        }
+        assert!(ml.core.apply_prediction_override("hello здравей").is_some());
+        let mut expected = ml.light_profile.clone();
+        expected.record_accept(LangId::En);
+        expected.observe_lang(LangId::Bg);
+        ml.handle_key(press(Key::Tab));
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+        assert_eq!(
+            ml.light_profile.ghost_accept_rate,
+            expected.ghost_accept_rate
+        );
+        assert_eq!(
+            ml.light_profile.lang_prior, expected.lang_prior,
+            "accepted words must not all inherit the prefix detector language"
+        );
+        ml.handle_key(press(Key::Space));
+        assert_eq!(ml.light_profile.lang_prior, expected.lang_prior);
+    }
+
+    #[test]
+    fn unsupported_delimiter_does_not_reinforce_inherited_language_prior() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.light_profile.lang_prior = [0.80, 0.10, 0.10];
+        for code in [16, 45] {
+            ml.handle_key(press(Key::RawCode(code)));
+        }
+        assert!(!ml.current_word().is_empty());
+        let before = ml.light_profile.clone();
+        ml.handle_key(press(Key::Space));
+        assert_eq!(ml.metrics().commit_count(), 1);
+        assert_eq!(
+            ml.light_profile.lang_prior, before.lang_prior,
+            "an inherited unsupported winner is not new language evidence"
+        );
+        assert_eq!(ml.light_profile.ghost_accept_rate, before.ghost_accept_rate);
+    }
+
+    #[test]
+    fn accepted_mixed_script_has_positive_feedback_without_a_language_vote() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.handle_key(press(Key::Char('h')));
+        assert!(ml.core.apply_prediction_override("hеllo").is_some());
+        let before = ml.light_profile.clone();
+        ml.handle_key(press(Key::Tab));
+        assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+        assert_eq!(ml.light_profile.lang_prior, before.lang_prior);
+        assert_eq!(
+            ml.light_profile.ghost_accept_rate,
+            0.95 * before.ghost_accept_rate + 0.05
+        );
+        let accepted_prior = ml.light_profile.lang_prior;
+        let accepted_rate = ml.light_profile.ghost_accept_rate;
+        ml.handle_key(press(Key::Space));
+        ml.focus_lost();
+        assert_eq!(ml.light_profile.lang_prior, accepted_prior);
+        assert_eq!(ml.light_profile.ghost_accept_rate, accepted_rate);
+    }
+}
+
+#[cfg(test)]
+mod shortword_surrounding_routing_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn reduced(context: &str) -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.core.load_word_lang("like", 2_570_395, LangId::En);
+        ml.core.load_word_lang("li", 17_782, LangId::En);
+        ml.core.load_word_lang("ли", 2_511_886, LangId::Bg);
+        ml.set_surrounding_text(Some(context.to_string()), Some(context.chars().count()));
+        ml
+    }
+
+    #[test]
+    fn shortword_recorded_bg_intent_survives_surrounding_hint_to_literal_boundary() {
+        // Public synthetic BG context isolates the same actual surrounding-text
+        // hint path; the recorded private literal stays in the frozen packet.
+        for boundary in [57, 28] {
+            let mut ml = reduced("има ");
+            ml.handle_key(raw(38));
+            let actions = ml.handle_key(raw(23));
+            assert_eq!(ml.current_word(), "ли");
+            assert!(actions.iter().any(
+                |action| matches!(action, Action::ShowComposing { typed, .. } if typed == "ли")
+            ));
+            assert_eq!(ml.core.debug_state(), (true, false, true));
+            let actions = ml.handle_key(raw(boundary));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, Action::CommitText(word) if word == "ли"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, Action::ForwardKey))
+                    .count(),
+                1
+            );
+            assert!(!actions
+                .iter()
+                .any(|action| matches!(action, Action::ReplaceWord { .. })));
+            assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            assert_eq!(ml.light_profile().ghost_accept_rate, 0.5);
+            assert!((ml.light_profile().lang_prior[0] - 0.3434).abs() < 1e-12);
+            let prior = ml.light_profile().lang_prior;
+            ml.handle_key(raw(57));
+            assert_eq!(
+                ml.light_profile().lang_prior,
+                prior,
+                "one committed word supplies one independent observation"
+            );
+        }
+    }
+
+    #[test]
+    fn shortword_english_and_mixed_context_do_not_blanket_select_bg() {
+        for context in ["hello ", "има hello "] {
+            let mut ml = reduced(context);
+            ml.handle_key(raw(38));
+            ml.handle_key(raw(23));
+            assert_eq!(ml.current_word(), "li");
+            let actions = ml.handle_key(raw(57));
+            assert!(actions
+                .iter()
+                .any(|action| matches!(action, Action::CommitText(word) if word == "li")));
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_context_contract_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    const BG_CONTEXT: &str = "Искам да благодаря ";
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn raw(code: u16) -> KeyEvent {
+        press(Key::RawCode(code))
+    }
+
+    fn context(ml: &mut MasterLoop, text: Option<&str>) {
+        ml.set_surrounding_text(text.map(str::to_string), text.map(|s| s.chars().count()));
+    }
+
+    fn reduced(text: Option<&str>) -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        // Public reduced fixtures distinguish completed words from a longer
+        // prefix candidate. They do not stand in for the copied-corpus replay.
+        ml.load_word_lang("with", 7_079_457, LangId::En);
+        ml.load_word_lang("wi", 12_302, LangId::En);
+        ml.load_word_lang("ви", 2_137_962, LangId::Bg);
+        context(&mut ml, text);
+        ml
+    }
+
+    fn type_wi(ml: &mut MasterLoop) {
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        assert_eq!(
+            ml.current_word(),
+            "wi",
+            "prefix selection remains unchanged"
+        );
+        assert_eq!(ml.core.debug_state(), (true, false, true));
+    }
+
+    fn boundary(ml: &mut MasterLoop, key: Key, expected: &str) {
+        let before = ml.metrics().summary();
+        let actions = ml.handle_key(press(key));
+        let commits: Vec<&str> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::CommitText(word) => Some(word.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commits, vec![expected], "{actions:?}");
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1,
+            "{actions:?}"
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(ml.current_word(), "");
+        assert_eq!(
+            ml.metrics().summary().total_commits,
+            before.total_commits + 1
+        );
+        assert_eq!(
+            ml.metrics().summary().accepted_predictions,
+            before.accepted_predictions
+        );
+    }
+
+    #[test]
+    fn terminal_context_bg_exact_word_wins_at_space_without_accepting_ghost() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        assert_eq!(ml.ghost_text(), "th");
+        boundary(&mut ml, Key::RawCode(57), "ви");
+        assert_eq!(ml.light_profile().ghost_accept_rate, 0.5);
+        assert!((ml.light_profile().lang_prior[0] - 0.3434).abs() < 1e-12);
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+        let prior = ml.light_profile().lang_prior;
+        let commits = ml.metrics().summary().total_commits;
+        ml.handle_key(raw(57));
+        ml.focus_lost();
+        assert_eq!(
+            ml.light_profile().lang_prior,
+            prior,
+            "one language observation only"
+        );
+        assert_eq!(ml.metrics().summary().total_commits, commits);
+    }
+
+    #[test]
+    fn terminal_context_bg_exact_word_wins_at_return() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::RawCode(28), "ви");
+    }
+
+    #[test]
+    fn terminal_context_bg_exact_word_wins_at_punctuation() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Char(','), "ви");
+    }
+
+    #[test]
+    fn terminal_context_unchanged_bg_setter_keeps_current_authority() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        context(&mut ml, Some(BG_CONTEXT));
+        boundary(&mut ml, Key::Space, "ви");
+    }
+
+    #[test]
+    fn terminal_context_withdrawn_midword_cannot_use_stale_bg_authority() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        context(&mut ml, None);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_changed_to_en_midword_cannot_use_stale_bg_authority() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        context(&mut ml, Some("I want to thank "));
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_erase_to_empty_withdraw_and_retype_cannot_reuse_authority() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        ml.handle_key(raw(14));
+        ml.handle_key(raw(14));
+        assert_eq!(ml.current_word(), "");
+        context(&mut ml, None);
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_absent_opposed_and_tech_context_keep_display() {
+        for text in [None, Some("I want to thank "), Some("_!!! ")] {
+            let mut ml = reduced(text);
+            type_wi(&mut ml);
+            boundary(&mut ml, Key::Space, "wi");
+        }
+    }
+
+    #[test]
+    fn terminal_context_profile_prior_alone_is_not_surrounding_proof() {
+        let mut ml = reduced(None);
+        ml.light_profile.lang_prior = [0.8, 0.1, 0.1];
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_committed_momentum_alone_is_not_surrounding_proof() {
+        let mut ml = reduced(None);
+        for ch in "име".chars() {
+            ml.handle_key(press(Key::Char(ch)));
+        }
+        ml.handle_key(raw(57));
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_exact_tie_keeps_display() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        ml.load_word_lang("wi", 2_137_962, LangId::En);
+        type_wi(&mut ml);
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_symmetric_english_exact_word_can_win() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("wi", 2_137_962, LangId::En);
+        ml.load_word_lang("вина", 7_079_457, LangId::Bg);
+        ml.load_word_lang("ви", 12_302, LangId::Bg);
+        context(&mut ml, Some("I want to thank "));
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        assert_eq!(ml.current_word(), "ви");
+        assert_eq!(ml.core.debug_state(), (true, false, true));
+        boundary(&mut ml, Key::Space, "wi");
+    }
+
+    #[test]
+    fn terminal_context_strong_exact_english_survives_bg_context() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("he", 1_000_000, LangId::En);
+        ml.load_word_lang("хе", 1, LangId::Bg);
+        context(&mut ml, Some(BG_CONTEXT));
+        ml.handle_key(raw(35));
+        ml.handle_key(raw(18));
+        assert_eq!(ml.current_word(), "he");
+        boundary(&mut ml, Key::Space, "he");
+    }
+
+    #[test]
+    fn terminal_context_existing_li_absent_en_and_mixed_guards_survive() {
+        for text in [None, Some("hello "), Some("има hello ")] {
+            let mut ml = MasterLoop::new(InputConfig::default());
+            ml.load_word_lang("like", 2_570_395, LangId::En);
+            ml.load_word_lang("li", 17_782, LangId::En);
+            ml.load_word_lang("ли", 2_511_886, LangId::Bg);
+            context(&mut ml, text);
+            ml.handle_key(raw(38));
+            ml.handle_key(raw(23));
+            assert_eq!(ml.current_word(), "li");
+            boundary(&mut ml, Key::Space, "li");
+        }
+    }
+
+    #[test]
+    fn terminal_context_casing_uses_original_selected_buffer() {
+        for (modifiers, expected) in [(Modifiers::SHIFT, "Ви"), (Modifiers::CAPS_LOCK, "ВИ")] {
+            let mut ml = reduced(Some(BG_CONTEXT));
+            ml.handle_key(KeyEvent {
+                key: Key::RawCode(17),
+                modifiers,
+            });
+            ml.handle_key(KeyEvent {
+                key: Key::RawCode(23),
+                modifiers: if modifiers == Modifiers::SHIFT {
+                    Modifiers::empty()
+                } else {
+                    modifiers
+                },
+            });
+            assert_eq!(ml.core.debug_state(), (true, false, true));
+            boundary(&mut ml, Key::Space, expected);
+        }
+    }
+
+    #[test]
+    fn terminal_context_direct_semantic_chars_stay_literal() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        for ch in "wi".chars() {
+            ml.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(ml.current_word(), "wi");
+        assert!(!ml.core.debug_state().0);
+        let actions = ml.handle_key(raw(57));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+    }
+
+    #[test]
+    fn terminal_context_explicit_full_tab_accepts_visible_completion() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        type_wi(&mut ml);
+        assert_eq!(ml.ghost_text(), "th");
+        let actions = ml.handle_key(press(Key::Tab));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["with"]
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ForwardKey | Action::ReplaceWord { .. })));
+        assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+        let commits = ml.metrics().summary().total_commits;
+        ml.handle_key(raw(57));
+        assert_eq!(ml.metrics().summary().total_commits, commits);
+    }
+
+    #[test]
+    fn terminal_context_partial_right_keeps_accepted_prefix_locked() {
+        let mut ml = reduced(Some(BG_CONTEXT));
+        ml.load_word_lang("wit", 12_302, LangId::En);
+        ml.load_word_lang("вит", 2_137_962, LangId::Bg);
+        type_wi(&mut ml);
+        ml.handle_key(press(Key::Right));
+        assert_eq!(ml.current_word(), "wit");
+        assert_eq!(ml.core.debug_state(), (true, true, false));
+        boundary(&mut ml, Key::Space, "wit");
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn terminal_context_locked_both_supported_keeps_existing_decision() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("withers", 90_000_000, LangId::En);
+        ml.load_word_lang("with", 1, LangId::En);
+        ml.load_word_lang("витх", 2_137_962, LangId::Bg);
+        context(&mut ml, Some(BG_CONTEXT));
+        for code in [17, 23, 20, 35] {
+            ml.handle_key(raw(code));
+        }
+        assert_eq!(ml.current_word(), "with");
+        assert_eq!(ml.core.debug_state(), (true, true, false));
+        boundary(&mut ml, Key::Space, "with");
+    }
+}
+
+#[cfg(test)]
+mod terminal_context_source_quality_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    const BG_CONTEXT: &str = "Искам да благодаря ";
+
+    struct BgSampler;
+
+    impl ContextSampler for BgSampler {
+        fn get_surrounding_text(&self, _max_chars: usize) -> Option<String> {
+            Some(BG_CONTEXT.to_string())
+        }
+    }
+
+    fn fixture(ml: &mut MasterLoop) {
+        ml.load_word_lang("with", 7_079_457, LangId::En);
+        ml.load_word_lang("wi", 12_302, LangId::En);
+        ml.load_word_lang("ви", 2_137_962, LangId::Bg);
+    }
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn assert_no_terminal_crossover(ml: &mut MasterLoop) {
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        assert_eq!(ml.current_word(), "wi");
+        let actions = ml.handle_key(raw(57));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["wi"]
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+    }
+
+    #[test]
+    fn terminal_context_sampler_return_without_client_cache_is_not_authority() {
+        let mut ml = MasterLoop::with_context_sampler(InputConfig::default(), Box::new(BgSampler));
+        fixture(&mut ml);
+        ml.handle_key(raw(17));
+        assert_eq!(
+            ml.current_word(),
+            "в",
+            "nonempty BG sampler still supplies the existing live hint"
+        );
+        ml.handle_key(raw(23));
+        assert_eq!(ml.current_word(), "wi");
+        let actions = ml.handle_key(raw(57));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["wi"]
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+    }
+
+    #[test]
+    fn terminal_context_unknown_or_out_of_range_cursor_is_not_authority() {
+        for cursor in [None, Some(BG_CONTEXT.chars().count() + 1), Some(usize::MAX)] {
+            let mut ml = MasterLoop::new(InputConfig::default());
+            fixture(&mut ml);
+            ml.set_surrounding_text(Some(BG_CONTEXT.to_string()), cursor);
+            assert_no_terminal_crossover(&mut ml);
+        }
+    }
+
+    #[test]
+    fn terminal_context_erase_retype_reseeds_still_valid_client_cache() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        fixture(&mut ml);
+        ml.set_surrounding_text(
+            Some(BG_CONTEXT.to_string()),
+            Some(BG_CONTEXT.chars().count()),
+        );
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        ml.handle_key(raw(14));
+        ml.handle_key(raw(14));
+        assert_eq!(ml.current_word(), "");
+        ml.handle_key(raw(17));
+        ml.handle_key(raw(23));
+        assert_eq!(ml.current_word(), "wi");
+        let actions = ml.handle_key(raw(57));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["ви"]
+        );
+    }
+
+    #[test]
+    fn terminal_context_uses_only_known_pre_cursor_client_text() {
+        for (text, cursor, expected) in [
+            (
+                format!("hello {BG_CONTEXT}"),
+                "hello ".chars().count(),
+                "wi",
+            ),
+            (
+                format!("{BG_CONTEXT}hello "),
+                BG_CONTEXT.chars().count(),
+                "ви",
+            ),
+            (BG_CONTEXT.to_string(), 0, "wi"),
+        ] {
+            let mut ml = MasterLoop::new(InputConfig::default());
+            fixture(&mut ml);
+            ml.set_surrounding_text(Some(text), Some(cursor));
+            ml.handle_key(raw(17));
+            ml.handle_key(raw(23));
+            assert_eq!(ml.current_word(), "wi");
+            let actions = ml.handle_key(raw(57));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter_map(|a| match a {
+                        Action::CommitText(word) => Some(word.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![expected]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_alignment_contract_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn step(ml: &mut MasterLoop, key: Key, text: &mut String, preedit: &mut String) {
+        let actions = ml.handle_key(KeyEvent {
+            key: key.clone(),
+            modifiers: Modifiers::empty(),
+        });
+        super::hybrid_delivery_contract_tests::project(&actions, &key, text, preedit);
+    }
+
+    fn assert_full_token(
+        ml: &mut MasterLoop,
+        expected: &str,
+        text: &mut String,
+        preedit: &mut String,
+    ) {
+        assert_eq!(ml.current_word(), expected);
+        assert_eq!(
+            text, expected,
+            "handoff delivered the prefix and semantic suffix once"
+        );
+        assert!(preedit.is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        let actions = ml.handle_key(raw(57));
+        super::hybrid_delivery_contract_tests::project(&actions, &Key::RawCode(57), text, preedit);
+        assert_eq!(text, &format!("{expected} "));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(word) => Some(word.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "{actions:?}"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(ml.current_word(), "");
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert!(ml
+            .core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|word| word == expected));
+    }
+
+    #[test]
+    fn terminal_alignment_both_supported_cannot_discard_direct_semantic_suffix() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("with", 7_079_457, LangId::En);
+        ml.load_word_lang("wi", 12_302, LangId::En);
+        ml.load_word_lang("ви", 2_137_962, LangId::Bg);
+        let text = "Искам да благодаря ";
+        ml.set_surrounding_text(Some(text.to_string()), Some(text.chars().count()));
+        let (mut text, mut preedit) = (String::new(), String::new());
+        step(&mut ml, Key::RawCode(17), &mut text, &mut preedit);
+        step(&mut ml, Key::RawCode(23), &mut text, &mut preedit);
+        assert_eq!(ml.current_word(), "wi");
+        step(&mut ml, Key::Char('x'), &mut text, &mut preedit);
+        assert_eq!(ml.current_word(), "wix");
+        assert_full_token(&mut ml, "wix", &mut text, &mut preedit);
+    }
+
+    #[test]
+    fn terminal_alignment_one_sided_cannot_discard_direct_semantic_suffix() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        for (word, frequency) in [
+            ("status", 900_000),
+            ("static", 600_000),
+            ("station", 500_000),
+        ] {
+            ml.load_word_lang(word, frequency, LangId::En);
+        }
+        ml.load_word_lang("статия", 50_000, LangId::Bg);
+        let (mut text, mut preedit) = (String::new(), String::new());
+        for code in [31, 20, 30, 20, 23, 16] {
+            step(&mut ml, Key::RawCode(code), &mut text, &mut preedit);
+        }
+        // Inferred-prefix recovery precedes the semantic handoff. The actual
+        // complete displayed word and the literal suffix must both survive.
+        assert_eq!(ml.current_word(), "статия");
+        assert_eq!(ml.core.debug_state(), (true, true, false));
+        step(&mut ml, Key::Char('x'), &mut text, &mut preedit);
+        assert_eq!(ml.current_word(), "статияx");
+        assert_full_token(&mut ml, "статияx", &mut text, &mut preedit);
+    }
+}
+
+#[cfg(test)]
+mod no_regression_contract_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn check(context: Option<&str>, expected: &str) {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        // Verified current JSON frequencies form a reduced fixture; the sealed
+        // copied-binary replay is separate evidence, not a historical replay.
+        ml.load_word_lang("no", 2_238_721, LangId::En);
+        ml.load_word_lang("not", 4_897_788, LangId::En);
+        ml.load_word_lang("но", 3_630_780, LangId::Bg);
+        if let Some(text) = context {
+            ml.set_surrounding_text(Some(text.to_string()), Some(text.chars().count()));
+        }
+        let mut readings = Vec::new();
+        let raw = |code| KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        };
+        for code in [49, 24] {
+            let actions = ml.handle_key(raw(code));
+            let word = ml.current_word().to_string();
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, Action::ShowComposing { typed, .. } if typed == &word)));
+            assert!(!actions.iter().any(|a| matches!(
+                a,
+                Action::CommitText(_) | Action::ForwardKey | Action::ReplaceWord { .. }
+            )));
+            readings.push(word);
+        }
+        let actions = ml.handle_key(raw(57));
+        let commits: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::CommitText(word) => Some(word.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            commits,
+            vec![expected],
+            "preedit={readings:?}; actions={actions:?}"
+        );
+        assert_eq!(readings.last().map(String::as_str), Some(expected));
+        if context.is_some() {
+            assert_eq!(readings[0], "н");
+        }
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(ml.current_word(), "");
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+    }
+
+    #[test]
+    fn no_regression_known_bg_context_commits_particle_once() {
+        check(Some("Искам да благодаря "), "но");
+    }
+
+    #[test]
+    fn no_regression_absent_context_keeps_observational_latin_control() {
+        check(None, "no");
+    }
+}
+
+#[cfg(test)]
+mod hybrid_delivery_contract_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn scenario(name: &str) -> (Vec<Key>, &'static str) {
+        use Key::{Backspace as Bs, Char as Ch, RawCode as Raw};
+        match name {
+            "raw_suffix" => (vec![Raw(16), Ch('a'), Raw(45)], "qax"),
+            "one_raw_backspace" => (vec![Raw(16), Ch('a'), Bs], "q"),
+            "two_raw_backspace" => (vec![Raw(16), Raw(45), Ch('a'), Bs], "qx"),
+            "direct_prefix" => (vec![Ch('a'), Raw(16)], "aq"),
+            "immediate_space" => (vec![Raw(16), Ch('a')], "qa"),
+            "raw_only" => (vec![Raw(16), Raw(45), Bs], "q"),
+            "direct_only" => (vec![Ch('q'), Ch('a')], "qa"),
+            "unicode_mixed" => (vec![Ch('é'), Ch('д'), Bs, Ch('я')], "éя"),
+            _ => panic!("unknown test scenario"),
+        }
+    }
+
+    // Projection of the bounded IBus dispatcher contract: composing replaces
+    // preedit, hide discards it, safe_commit clears it before insertion, and a
+    // ForwardKey delivers the ORIGINAL event keyval after the action batch.
+    // Raw fixture keyvals below are explicitly Latin q/x, not inferred winners.
+    pub(super) fn project(actions: &[Action], key: &Key, text: &mut String, preedit: &mut String) {
+        for action in actions {
+            match action {
+                Action::ShowComposing { typed, .. } => preedit.clone_from(typed),
+                Action::HideGhost | Action::ShowGhost(_) => preedit.clear(),
+                Action::CommitText(word) => {
+                    preedit.clear();
+                    text.push_str(word);
+                }
+                Action::ReplaceWord { .. } => panic!("unexpected replacement: {actions:?}"),
+                Action::ForwardKey => {}
+            }
+        }
+        if actions
+            .iter()
+            .any(|action| matches!(action, Action::ForwardKey))
+        {
+            match key {
+                Key::Char(ch) => text.push(*ch),
+                Key::RawCode(16) => text.push('q'),
+                Key::RawCode(45) => text.push('x'),
+                Key::RawCode(57) | Key::Space => text.push(' '),
+                Key::Backspace => {
+                    text.pop();
+                }
+                _ => panic!("unmodelled ORIGINAL forwarded keyval: {key:?}"),
+            }
+        }
+    }
+
+    fn run(name: &str, canonical: bool) {
+        let (keys, expected) = scenario(name);
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        let (mut delivered, mut preedit, mut trace) = (String::new(), String::new(), Vec::new());
+        for key in keys.into_iter().chain([Key::RawCode(57)]) {
+            let word_before = ml.current_word().to_string();
+            let actions = ml.handle_key(KeyEvent {
+                key: key.clone(),
+                modifiers: Modifiers::empty(),
+            });
+            project(&actions, &key, &mut delivered, &mut preedit);
+            trace.push(format!("key={key:?}; word={:?}; actions={actions:?}; committed={delivered:?}; preedit={preedit:?}", ml.current_word()));
+            if key != Key::RawCode(57) {
+                assert_eq!(ml.metrics().summary().total_commits, 0, "{trace:#?}");
+            }
+            if key == Key::RawCode(57) {
+                eprintln!("scenario={name}; trace={trace:#?}");
+                assert_eq!(ml.current_word(), "");
+                assert!(preedit.is_empty());
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|a| matches!(a, Action::ForwardKey))
+                        .count(),
+                    1
+                );
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                if canonical {
+                    assert_eq!(
+                        word_before, expected,
+                        "canonical token conservation; {trace:#?}"
+                    );
+                } else {
+                    assert_eq!(
+                        delivered,
+                        format!("{expected} "),
+                        "client delivery projection; {trace:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    macro_rules! contract {
+        ($test:ident, $scenario:literal, $canonical:literal) => {
+            #[test]
+            fn $test() {
+                run($scenario, $canonical);
+            }
+        };
+    }
+    contract!(hybrid_canonical_raw_suffix, "raw_suffix", true);
+    contract!(
+        hybrid_canonical_one_raw_backspace,
+        "one_raw_backspace",
+        true
+    );
+    contract!(
+        hybrid_canonical_two_raw_backspace,
+        "two_raw_backspace",
+        true
+    );
+    contract!(hybrid_canonical_direct_prefix, "direct_prefix", true);
+    contract!(hybrid_client_raw_suffix, "raw_suffix", false);
+    contract!(hybrid_client_one_raw_backspace, "one_raw_backspace", false);
+    contract!(hybrid_client_two_raw_backspace, "two_raw_backspace", false);
+    contract!(hybrid_client_direct_prefix, "direct_prefix", false);
+    contract!(hybrid_client_immediate_space, "immediate_space", false);
+    contract!(hybrid_control_raw_only, "raw_only", false);
+    contract!(hybrid_control_direct_only, "direct_only", false);
+    contract!(hybrid_control_unicode_mixed, "unicode_mixed", false);
+}
+
+#[cfg(test)]
+mod hybrid_handoff_control_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn key(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn core(ghost: bool) -> MasterLoop {
+        MasterLoop::new(InputConfig {
+            ghost_text: ghost,
+            ..InputConfig::default()
+        })
+    }
+
+    fn handoff(ml: &mut MasterLoop) {
+        key(ml, Key::RawCode(16));
+        let prefix = ml.current_word().to_string();
+        let actions = key(ml, Key::Char('a'));
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [prefix.as_str()]
+        );
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::ReplaceWord { .. } | Action::ShowGhost(_) | Action::ShowComposing { .. }
+        )));
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        assert!(ml.core.export_personal_profile().cvm.words.is_empty());
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn hybrid_control_layout_snapshot_preserves_caps_and_physical_punctuation() {
+        for bg in [false, true] {
+            for modifiers in [
+                Modifiers::empty(),
+                Modifiers::CAPS_LOCK,
+                Modifiers::SHIFT,
+                Modifiers::SHIFT | Modifiers::CAPS_LOCK,
+            ] {
+                for (code, en, shifted_en, bg_lower, bg_upper) in [
+                    (26, '[', '{', 'ш', 'Ш'),
+                    (27, ']', '}', 'щ', 'Щ'),
+                    (41, '`', '~', 'ч', 'Ч'),
+                    (43, '\\', '|', 'ю', 'Ю'),
+                ] {
+                    let mut ml = core(false);
+                    ml.load_word_lang(
+                        if bg { "яяя" } else { "question" },
+                        1000,
+                        if bg { LangId::Bg } else { LangId::En },
+                    );
+                    handoff(&mut ml);
+                    let before = ml.core.detected_language();
+                    let prior = ml.light_profile().lang_prior;
+                    let actions = ml.handle_key(KeyEvent {
+                        key: Key::RawCode(code),
+                        modifiers,
+                    });
+                    let selected = if bg {
+                        if modifiers.contains(Modifiers::SHIFT)
+                            ^ modifiers.contains(Modifiers::CAPS_LOCK)
+                        {
+                            bg_upper
+                        } else {
+                            bg_lower
+                        }
+                    } else if modifiers.contains(Modifiers::SHIFT) {
+                        shifted_en
+                    } else {
+                        en
+                    };
+                    assert!(
+                        actions.contains(&Action::CommitText(selected.to_string())),
+                        "{actions:?}"
+                    );
+                    assert!(!actions
+                        .iter()
+                        .any(|a| matches!(a, Action::ForwardKey | Action::ReplaceWord { .. })));
+                    assert_eq!(
+                        ml.current_word(),
+                        format!("{}a{selected}", if bg { "я" } else { "q" })
+                    );
+                    let after = ml.core.detected_language();
+                    assert_eq!(
+                        (after.lang, after.confidence),
+                        (before.lang, before.confidence)
+                    );
+                    assert_eq!(ml.metrics().summary().total_commits, 0);
+                    assert_eq!(ml.light_profile().lang_prior, prior);
+                    assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+                    let boundary = key(&mut ml, Key::Space);
+                    assert!(!boundary
+                        .iter()
+                        .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+                    assert_eq!(ml.metrics().summary().total_commits, 1);
+                    assert_eq!(
+                        ml.light_profile().lang_prior,
+                        prior,
+                        "mixed/inferred word did not become direct proof"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_control_semantic_prefix_has_explicit_en_raw_default() {
+        let mut ml = core(false);
+        let bg = "Искам да благодаря ";
+        ml.set_surrounding_text(Some(bg.to_string()), Some(bg.chars().count()));
+        key(&mut ml, Key::Char('а'));
+        let before = ml.core.detected_language();
+        let actions = key(&mut ml, Key::RawCode(26));
+        assert_eq!(ml.current_word(), "а[");
+        assert!(actions.contains(&Action::CommitText("[".to_string())));
+        assert!(!actions.contains(&Action::ForwardKey));
+        let after = ml.core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence)
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+    }
+
+    #[test]
+    fn hybrid_control_literal_handoff_resists_legacy_transliteration() {
+        let setup = || {
+            let mut ml = core(false);
+            ml.load_word_lang("question", 2_000_000, LangId::En);
+            ml.load_word_lang("яа", 1_000_000, LangId::Bg);
+            ml
+        };
+        let mut ml = setup();
+        handoff(&mut ml);
+        assert_eq!(ml.current_word(), "qa");
+        let actions = key(&mut ml, Key::Char('a'));
+        assert_eq!(ml.current_word(), "qaa");
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        let mut direct = setup();
+        key(&mut direct, Key::Char('q'));
+        let actions = key(&mut direct, Key::Char('a'));
+        assert_eq!(
+            direct.current_word(),
+            "яа",
+            "semantic-only legacy policy is unchanged"
+        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { text, .. } if text == "яа")));
+    }
+
+    #[test]
+    fn hybrid_control_resets_and_empty_backspace_restore_raw_composition() {
+        for exit in [0, 1, 2] {
+            let mut ml = core(false);
+            handoff(&mut ml);
+            match exit {
+                0 => {
+                    ml.reset();
+                }
+                1 => {
+                    ml.focus_lost();
+                }
+                _ => {
+                    key(&mut ml, Key::Left);
+                }
+            }
+            assert_eq!(ml.current_word(), "");
+            let actions = key(&mut ml, Key::RawCode(16));
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, Action::ShowComposing { .. })),
+                "exit={exit}: {actions:?}"
+            );
+            assert!(!actions.iter().any(|a| matches!(a, Action::CommitText(_))));
+        }
+        let mut escaped = core(false);
+        handoff(&mut escaped);
+        key(&mut escaped, Key::Escape);
+        assert_eq!(
+            escaped.current_word(),
+            "qa",
+            "Escape dismisses, not cancels, a delivered token"
+        );
+        assert!(key(&mut escaped, Key::RawCode(45)).contains(&Action::CommitText("x".to_string())));
+        assert_eq!(escaped.current_word(), "qax");
+        let mut ml = core(false);
+        handoff(&mut ml);
+        key(&mut ml, Key::Backspace);
+        key(&mut ml, Key::Backspace);
+        assert_eq!(ml.current_word(), "");
+        for ch in "123".chars() {
+            key(&mut ml, Key::Char(ch));
+        }
+        key(&mut ml, Key::Space);
+        for (actual, expected) in ml
+            .light_profile()
+            .lang_prior
+            .iter()
+            .zip([0.3234, 0.3332, 0.3434])
+        {
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "editing baseline survives handoff and deletion"
+            );
+        }
+        let prior = ml.light_profile().lang_prior;
+        key(&mut ml, Key::Space);
+        assert_eq!(ml.light_profile().lang_prior, prior);
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert!(key(&mut ml, Key::RawCode(16))
+            .iter()
+            .any(|a| matches!(a, Action::ShowComposing { .. })));
+    }
+
+    #[test]
+    fn hybrid_control_hidden_handoff_prediction_cannot_be_accepted() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: true,
+            space_accept: true,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("qabc", 1_000_000, LangId::En);
+        handoff(&mut ml);
+        assert_eq!(ml.current_word(), "qa");
+        assert!(!ml.has_ghost() && ml.predictions().is_empty());
+        assert!(ml.last_shown_ghost.is_none());
+        let tab = key(&mut ml, Key::Tab);
+        assert_eq!(tab, vec![Action::HideGhost, Action::ForwardKey]);
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        let boundary = key(&mut ml, Key::Space);
+        assert!(boundary.contains(&Action::ForwardKey));
+        assert!(!boundary.iter().any(|a| matches!(a, Action::CommitText(_))));
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+    }
+
+    #[test]
+    fn hybrid_control_next_raw_prediction_partial_right_and_full_accept_once() {
+        for partial in [false, true] {
+            let mut ml = core(true);
+            ml.load_word_lang("qaxyz", 1_000_000, LangId::En);
+            handoff(&mut ml);
+            key(&mut ml, Key::RawCode(45));
+            assert_eq!(ml.current_word(), "qax");
+            assert!(ml.has_ghost());
+            if partial {
+                let actions = key(&mut ml, Key::Right);
+                assert_eq!(ml.current_word(), "qaxy");
+                assert!(actions.contains(&Action::CommitText("y".to_string())));
+                assert_eq!(ml.metrics().summary().total_commits, 0);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+            let actions = key(&mut ml, if partial { Key::Right } else { Key::Tab });
+            assert!(actions.contains(&Action::CommitText(
+                if partial { "z" } else { "yz" }.to_string()
+            )));
+            assert_eq!(ml.current_word(), "");
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+            assert_eq!(
+                key(&mut ml, Key::Space)
+                    .iter()
+                    .filter(|a| matches!(a, Action::CommitText(_)))
+                    .count(),
+                0
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_punctuation_parity_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    #[test]
+    fn hybrid_punctuation_matches_existing_nondual_semantic_token_policy() {
+        for raw in [false, true] {
+            let mut ml = MasterLoop::new(InputConfig {
+                ghost_text: false,
+                ..InputConfig::default()
+            });
+            for key in [
+                if raw {
+                    Key::RawCode(16)
+                } else {
+                    Key::Char('q')
+                },
+                Key::Char('a'),
+                if raw {
+                    Key::RawCode(26)
+                } else {
+                    Key::Char('[')
+                },
+            ] {
+                ml.handle_key(KeyEvent {
+                    key,
+                    modifiers: Modifiers::empty(),
+                });
+            }
+            assert_eq!(ml.current_word(), "qa[");
+            assert_eq!(ml.metrics().summary().total_commits, 0);
+            let actions = ml.handle_key(KeyEvent {
+                key: Key::Space,
+                modifiers: Modifiers::empty(),
+            });
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::CommitText(_)))
+                    .count(),
+                0
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_space_regained_ghost_tests {
+    use super::*;
+    use crate::input::{Action, Key};
+
+    fn run(space: Key) {
+        for hybrid in [true, false] {
+            let mut ml = MasterLoop::new(InputConfig {
+                ghost_text: true,
+                space_accept: true,
+                ..InputConfig::default()
+            });
+            ml.load_word_lang("qaxyz", 1_000_000, LangId::En);
+            let keys = [
+                Key::RawCode(16),
+                if hybrid {
+                    Key::Char('a')
+                } else {
+                    Key::RawCode(30)
+                },
+                Key::RawCode(45),
+            ];
+            let (mut delivered, mut preedit, mut trace) =
+                (String::new(), String::new(), Vec::new());
+            for key in keys {
+                let actions = ml.handle_key(KeyEvent {
+                    key: key.clone(),
+                    modifiers: Modifiers::empty(),
+                });
+                super::hybrid_delivery_contract_tests::project(
+                    &actions,
+                    &key,
+                    &mut delivered,
+                    &mut preedit,
+                );
+                trace.push(format!(
+                    "{key:?}: {actions:?}; word={:?}; delivered={delivered:?}",
+                    ml.current_word()
+                ));
+                assert_eq!(ml.metrics().summary().total_commits, 0);
+            }
+            assert_eq!(ml.current_word(), "qax");
+            assert_eq!(ml.ghost_text(), "yz", "visible regained ghost is required");
+            assert!(
+                ml.space_display_identity_ok(),
+                "display attribution must actually match"
+            );
+            assert_eq!(ml.debug_state().0, !hybrid);
+            assert_eq!(ml.core.space_accept_armed(), !hybrid);
+            assert_eq!(delivered, if hybrid { "qax" } else { "" });
+            let actions = ml.handle_key(KeyEvent {
+                key: space.clone(),
+                modifiers: Modifiers::empty(),
+            });
+            super::hybrid_delivery_contract_tests::project(
+                &actions,
+                &space,
+                &mut delivered,
+                &mut preedit,
+            );
+            trace.push(format!("{space:?}: {actions:?}; delivered={delivered:?}"));
+            eprintln!("hybrid={hybrid}; trace={trace:#?}");
+            let commits = actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                commits,
+                if hybrid { vec![] } else { vec!["qaxyz "] },
+                "{trace:#?}"
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::ForwardKey))
+                    .count(),
+                usize::from(hybrid)
+            );
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+            assert_eq!(delivered, if hybrid { "qax " } else { "qaxyz " });
+            assert!(
+                ml.current_word().is_empty() && ml.ghost_text().is_empty() && preedit.is_empty()
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(
+                ml.metrics().summary().accepted_predictions,
+                u64::from(!hybrid)
+            );
+            assert!(!ml
+                .handle_key(KeyEvent {
+                    key: space.clone(),
+                    modifiers: Modifiers::empty()
+                })
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_))));
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(
+                ml.metrics().summary().accepted_predictions,
+                u64::from(!hybrid)
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_space_regained_ghost_raw_boundary_is_literal() {
+        run(Key::RawCode(57));
+    }
+
+    #[test]
+    fn hybrid_space_regained_ghost_semantic_boundary_is_literal() {
+        run(Key::Space);
+    }
+}
+
+#[cfg(test)]
+mod delivered_tab_boundary_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn run(prefix: &[Key], composed: bool) {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        let (mut client, mut preedit) = (String::new(), String::new());
+        for key in prefix {
+            let actions = press(&mut ml, key.clone());
+            super::hybrid_delivery_contract_tests::project(
+                &actions,
+                key,
+                &mut client,
+                &mut preedit,
+            );
+        }
+        assert_eq!(ml.current_word(), "qa");
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        let tab = press(&mut ml, Key::Tab);
+        // Bounded client projection: this text client inserts a forwarded Tab.
+        super::hybrid_delivery_contract_tests::project(
+            &tab,
+            &Key::Char('\t'),
+            &mut client,
+            &mut preedit,
+        );
+        let commits = tab
+            .iter()
+            .filter_map(|action| match action {
+                Action::CommitText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(commits, if composed { vec!["qa"] } else { vec![] });
+        assert_eq!(
+            tab.iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert_eq!(
+            client, "qa\t",
+            "Tab must never redeliver an owned prefix: {tab:?}"
+        );
+        assert!(preedit.is_empty());
+        assert_eq!(
+            ml.current_word(),
+            "",
+            "Tab ended the delivered token: {tab:?}"
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert_eq!(ml.core.context_words().0, Some("qa"));
+        assert_eq!(ml.core.export_personal_profile().cvm.words, ["qa"]);
+
+        let next = press(&mut ml, Key::RawCode(45));
+        super::hybrid_delivery_contract_tests::project(
+            &next,
+            &Key::RawCode(45),
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(
+            ml.current_word(),
+            "x",
+            "new raw input must start a fresh token"
+        );
+        assert_eq!(format!("{client}{preedit}"), "qa\tx");
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        let boundary = press(&mut ml, Key::Space);
+        super::hybrid_delivery_contract_tests::project(
+            &boundary,
+            &Key::Space,
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(client, "qa\tx ");
+        assert!(preedit.is_empty() && ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 2);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        let words = ml.core.export_personal_profile().cvm.words;
+        assert_eq!(words.iter().filter(|w| w.as_str() == "qa").count(), 1);
+        assert_eq!(words.iter().filter(|w| w.as_str() == "x").count(), 1);
+        eprintln!("prefix={prefix:?}; tab={tab:?}; next={next:?}; boundary={boundary:?}; client={client:?}");
+    }
+
+    #[test]
+    fn delivered_tab_boundary_hybrid_finishes_without_recommit() {
+        run(&[Key::RawCode(16), Key::Char('a')], false);
+    }
+
+    #[test]
+    fn delivered_tab_boundary_semantic_finishes_without_recommit() {
+        run(&[Key::Char('q'), Key::Char('a')], false);
+    }
+
+    #[test]
+    fn delivered_tab_boundary_raw_preedit_commits_once() {
+        run(&[Key::RawCode(16), Key::RawCode(30)], true);
+    }
+
+    #[test]
+    fn delivered_tab_boundary_empty_forwards_without_learning() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        assert_eq!(press(&mut ml, Key::Tab), [Action::ForwardKey]);
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        assert!(ml.current_word().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hybrid_active_transliteration_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    pub(super) fn legacy_prefix() -> (MasterLoop, String, String) {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        let (mut client, mut preedit) = (String::new(), String::new());
+        let first = press(&mut ml, Key::Char('z'));
+        super::hybrid_delivery_contract_tests::project(
+            &first,
+            &Key::Char('z'),
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(client, "z");
+        let second = press(&mut ml, Key::Char('d'));
+        assert!(
+            second.contains(&Action::ReplaceWord {
+                replace_len: 1,
+                text: "зд".to_string(),
+            }),
+            "must exercise the actual legacy transliteration producer: {second:?}"
+        );
+        assert!(!second
+            .iter()
+            .any(|a| matches!(a, Action::ForwardKey | Action::CommitText(_))));
+        // The real replacement consumes d and replaces the earlier forwarded z.
+        client.pop();
+        client.push_str("зд");
+        preedit.clear();
+        assert_eq!(ml.current_word(), "зд");
+        assert!(!ml.debug_state().0);
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        eprintln!(
+            "legacy producer={second:?}; client={client:?}; word={:?}",
+            ml.current_word()
+        );
+        (ml, client, preedit)
+    }
+
+    #[test]
+    fn hybrid_active_transliteration_raw_continuation_preserves_layout_without_new_evidence() {
+        let (mut ml, mut client, mut preedit) = legacy_prefix();
+        let detector = ml.detected_language();
+        let prior = ml.light_profile().lang_prior;
+        for (code, glyph, word) in [(19, "р", "здр"), (30, "а", "здра")] {
+            let actions = press(&mut ml, Key::RawCode(code));
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::ForwardKey | Action::ReplaceWord { .. })));
+            super::hybrid_delivery_contract_tests::project(
+                &actions,
+                &Key::RawCode(code),
+                &mut client,
+                &mut preedit,
+            );
+            let after = ml.detected_language();
+            eprintln!("raw={code}; actions={actions:?}; word={:?}; client={client:?}; detector={:?}->{:?}; prior={prior:?}->{:?}", ml.current_word(), (detector.lang, detector.confidence), (after.lang, after.confidence), ml.light_profile().lang_prior);
+            assert!(
+                actions.contains(&Action::CommitText(glyph.to_string())),
+                "{actions:?}"
+            );
+            assert_eq!(ml.current_word(), word);
+            assert_eq!(client, word);
+            assert!(!ml.debug_state().0 && preedit.is_empty());
+            assert_eq!(
+                (after.lang, after.confidence),
+                (detector.lang, detector.confidence)
+            );
+            assert_eq!(ml.light_profile().lang_prior, prior);
+            assert_eq!(ml.metrics().summary().total_commits, 0);
+            assert!(ml.core.export_personal_profile().cvm.words.is_empty());
+            assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+        }
+        let backspace = press(&mut ml, Key::Backspace);
+        super::hybrid_delivery_contract_tests::project(
+            &backspace,
+            &Key::Backspace,
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(client, "здр");
+        assert_eq!(ml.current_word(), "здр");
+        let next = press(&mut ml, Key::RawCode(18));
+        assert!(next.contains(&Action::CommitText("е".to_string())));
+        super::hybrid_delivery_contract_tests::project(
+            &next,
+            &Key::RawCode(18),
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(ml.current_word(), "здре");
+        assert_eq!(client, "здре");
+        let boundary = press(&mut ml, Key::Space);
+        super::hybrid_delivery_contract_tests::project(
+            &boundary,
+            &Key::Space,
+            &mut client,
+            &mut preedit,
+        );
+        assert_eq!(boundary, [Action::HideGhost, Action::ForwardKey]);
+        assert_eq!(client, "здре ");
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn hybrid_active_transliteration_empty_backspace_or_reset_releases_delivery_snapshot() {
+        for reset in [false, true] {
+            let (mut ml, mut client, mut preedit) = legacy_prefix();
+            let raw = press(&mut ml, Key::RawCode(19));
+            assert!(raw.contains(&Action::CommitText("р".to_string())));
+            super::hybrid_delivery_contract_tests::project(
+                &raw,
+                &Key::RawCode(19),
+                &mut client,
+                &mut preedit,
+            );
+            if reset {
+                assert_eq!(ml.reset(), [Action::HideGhost]);
+            } else {
+                for _ in 0..3 {
+                    let actions = press(&mut ml, Key::Backspace);
+                    super::hybrid_delivery_contract_tests::project(
+                        &actions,
+                        &Key::Backspace,
+                        &mut client,
+                        &mut preedit,
+                    );
+                }
+            }
+            assert!(ml.current_word().is_empty());
+            if !reset {
+                assert!(client.is_empty());
+            }
+            let fresh = press(&mut ml, Key::RawCode(26));
+            assert!(
+                ml.debug_state().0,
+                "first raw after empty must start a fresh dual buffer"
+            );
+            assert!(fresh
+                .iter()
+                .any(|a| matches!(a, Action::ShowComposing { .. })));
+            assert!(!fresh
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ForwardKey)));
+            assert_eq!(ml.metrics().summary().total_commits, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_followup_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn step(
+        ml: &mut MasterLoop,
+        client: &mut String,
+        preedit: &mut String,
+        key: Key,
+    ) -> Vec<Action> {
+        let actions = ml.handle_key(KeyEvent {
+            key: key.clone(),
+            modifiers: Modifiers::empty(),
+        });
+        super::hybrid_delivery_contract_tests::project(&actions, &key, client, preedit);
+        actions
+    }
+
+    fn visible_ghost() -> (MasterLoop, String, String) {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: true,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("qaxyz", 1_000_000, LangId::En);
+        let (mut client, mut preedit) = (String::new(), String::new());
+        for key in [
+            Key::RawCode(16),
+            Key::Char('a'),
+            Key::RawCode(45),
+            Key::RawCode(21),
+        ] {
+            step(&mut ml, &mut client, &mut preedit, key);
+        }
+        assert_eq!(ml.current_word(), "qaxy");
+        assert_eq!(client, "qaxy");
+        assert_eq!(ml.ghost_text(), "z");
+        assert!(ml.last_shown_ghost.is_some());
+        (ml, client, preedit)
+    }
+
+    #[test]
+    fn hybrid_followup_consumed_hide_retires_attribution_before_backspace() {
+        let (mut ml, mut client, mut preedit) = visible_ghost();
+        let finished = step(&mut ml, &mut client, &mut preedit, Key::RawCode(44));
+        assert_eq!(
+            finished,
+            [Action::CommitText("z".to_string()), Action::HideGhost]
+        );
+        assert_eq!(ml.current_word(), "qaxyz");
+        assert_eq!(client, "qaxyz");
+        let hidden_attribution = ml.last_shown_ghost.clone();
+        let backspace = step(&mut ml, &mut client, &mut preedit, Key::Backspace);
+        eprintln!("finished={finished:?}; hidden={hidden_attribution:?}; backspace={backspace:?}; client={client:?}; rejections={}", ml.rejection_prefix_count());
+        assert_eq!(ml.current_word(), "qaxy");
+        assert_eq!(client, "qaxy");
+        assert_eq!(
+            ml.rejection_prefix_count(),
+            0,
+            "editing a manually finished word must not reject an invisible ghost"
+        );
+        assert!(hidden_attribution.is_none());
+        assert_eq!(ml.ghost_text(), "z");
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+    }
+
+    #[test]
+    fn hybrid_followup_manual_completion_edits_never_suppress_the_valid_ghost() {
+        let (mut ml, mut client, mut preedit) = visible_ghost();
+        for _ in 0..3 {
+            let finished = step(&mut ml, &mut client, &mut preedit, Key::RawCode(44));
+            let edited = step(&mut ml, &mut client, &mut preedit, Key::Backspace);
+            eprintln!("finished={finished:?}; edited={edited:?}; client={client:?}; ghost={:?}; suppressed={}", ml.ghost_text(), ml.is_ghost_suppressed("qaxy", "qaxyz"));
+            assert_eq!(client, "qaxy");
+            assert_eq!(ml.current_word(), "qaxy");
+        }
+        assert_eq!(
+            ml.ghost_text(),
+            "z",
+            "manual edits must not train suppression"
+        );
+        assert!(!ml.is_ghost_suppressed("qaxy", "qaxyz"));
+        assert_eq!(ml.rejection_prefix_count(), 0);
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn hybrid_followup_backspace_over_a_visible_ghost_still_records_rejection() {
+        let (mut ml, mut client, mut preedit) = visible_ghost();
+        step(&mut ml, &mut client, &mut preedit, Key::Backspace);
+        assert_eq!(ml.rejection_prefix_count(), 1);
+        assert!(!ml.is_ghost_suppressed("qaxy", "qaxyz"));
+        assert_eq!(ml.current_word(), "qax");
+        assert_eq!(client, "qax");
+    }
+
+    #[test]
+    fn hybrid_followup_active_transliteration_survives_raw_then_semantic() {
+        let (mut ml, mut client, mut preedit) =
+            super::hybrid_active_transliteration_tests::legacy_prefix();
+        step(&mut ml, &mut client, &mut preedit, Key::RawCode(19));
+        assert_eq!(client, "здр");
+        let semantic = step(&mut ml, &mut client, &mut preedit, Key::Char('a'));
+        eprintln!(
+            "semantic={semantic:?}; current={:?}; client={client:?}",
+            ml.current_word()
+        );
+        assert_eq!(ml.current_word(), "здра");
+        assert_eq!(client, "здра");
+        assert_eq!(
+            semantic,
+            [Action::CommitText("а".to_string()), Action::HideGhost]
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        assert!(ml.core.export_personal_profile().cvm.words.is_empty());
+        step(&mut ml, &mut client, &mut preedit, Key::Space);
+        assert_eq!(client, "здра ");
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert!(ml.core.export_personal_profile().confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn hybrid_followup_raw_handoff_retires_stale_transliteration_latch() {
+        let (mut ml, mut client, mut preedit) =
+            super::hybrid_active_transliteration_tests::legacy_prefix();
+        for _ in 0..2 {
+            step(&mut ml, &mut client, &mut preedit, Key::Backspace);
+        }
+        assert!(ml.current_word().is_empty() && client.is_empty());
+        step(&mut ml, &mut client, &mut preedit, Key::RawCode(44));
+        assert_eq!(ml.current_word(), "з");
+        assert!(ml.debug_state().0 && client.is_empty());
+        let handoff = step(&mut ml, &mut client, &mut preedit, Key::Char('a'));
+        eprintln!(
+            "handoff={handoff:?}; current={:?}; client={client:?}",
+            ml.current_word()
+        );
+        assert_eq!(
+            ml.current_word(),
+            "зa",
+            "fresh raw handoff owns its literal semantic key"
+        );
+        assert_eq!(client, "зa");
+        assert_eq!(
+            handoff
+                .iter()
+                .filter_map(|a| match a {
+                    Action::CommitText(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["з"]
+        );
+        assert_eq!(
+            handoff
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert_eq!(ml.metrics().summary().total_commits, 0);
+        step(&mut ml, &mut client, &mut preedit, Key::Space);
+        assert_eq!(client, "зa ");
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+    }
+}
+
+#[cfg(test)]
+mod external_rewrite_delegation_tests {
+    use super::*;
+    use crate::input::{Key, KeyEvent, Modifiers};
+
+    fn press(ml: &mut MasterLoop, ch: char) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key: Key::Char(ch),
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    #[test]
+    fn external_rewrite_master_loop_false_delegates_before_legacy_mutation() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        ml.set_external_rewrite_supported(false);
+        press(&mut ml, 'z');
+        let a = press(&mut ml, 'd');
+        eprintln!(
+            "MasterLoop unsupported legacy: {a:?}; word={:?}",
+            ml.current_word()
+        );
+        assert!(!a.iter().any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(ml.current_word(), "zd");
+    }
+
+    #[test]
+    fn external_rewrite_master_loop_true_preserves_legacy_producer() {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        ml.set_external_rewrite_supported(true);
+        press(&mut ml, 'z');
+        let a = press(&mut ml, 'd');
+        assert!(a.contains(&Action::ReplaceWord {
+            replace_len: 1,
+            text: "зд".into()
+        }));
+        assert_eq!(ml.current_word(), "зд");
+    }
+}
+
+#[cfg(test)]
+mod sentence_modifier_review_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn send(ml: &mut MasterLoop, key: Key, modifiers: Modifiers) -> Vec<Action> {
+        ml.handle_key(KeyEvent { key, modifiers })
+    }
+
+    fn plain(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        send(ml, key, Modifiers::empty())
+    }
+
+    // Core/native tests cover every identity. These exercise the ML paths.
+    fn modifiers() -> [(Key, Modifiers); 3] {
+        [
+            (Key::RawCode(29), Modifiers::CTRL),
+            (Key::Other(0xffea), Modifiers::ALT),
+            (Key::RawCode(126), Modifiers::SUPER),
+        ]
+    }
+
+    fn sentence(confirmed: bool, space_accept: bool) -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_min_confidence: 0.0,
+            ghost_text_separation_margin: 0.0,
+            space_accept,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("hello", 1_000_000, LangId::En);
+        ml.load_word_lang("world", 1_000_000, LangId::En);
+        for code in [35, 18, 38, 38, 24, 52] {
+            plain(&mut ml, Key::RawCode(code));
+        }
+        if confirmed {
+            plain(&mut ml, Key::Space);
+        }
+        assert!(ml.current_word().is_empty());
+        assert_eq!(ml.metrics().summary().total_commits, 1);
+        ml
+    }
+
+    fn prediction(ml: &mut MasterLoop) -> String {
+        plain(ml, Key::RawCode(17));
+        ml.predictions()[0].word.clone()
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_taps_preserve_pending_and_confirmed_hints() {
+        for (key, held) in modifiers() {
+            for confirmed in [false, true] {
+                let mut ml = sentence(confirmed, false);
+                let prior = ml.light_profile.lang_prior;
+                assert_eq!(send(&mut ml, key.clone(), held), [Action::ForwardKey]);
+                assert_eq!(
+                    send(&mut ml, key.clone(), held | Modifiers::RELEASE),
+                    [Action::ForwardKey]
+                );
+                assert_eq!(ml.light_profile.lang_prior, prior);
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                if !confirmed {
+                    plain(&mut ml, Key::Space);
+                }
+                assert_eq!(
+                    prediction(&mut ml),
+                    "World",
+                    "{key:?}, confirmed={confirmed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_shortcuts_withdraw_but_releases_preserve() {
+        for confirmed in [false, true] {
+            for (key, held) in [
+                (Key::RawCode(46), Modifiers::CTRL),
+                (Key::Char('c'), Modifiers::ALT),
+            ] {
+                let mut ml = sentence(confirmed, false);
+                assert_eq!(send(&mut ml, key, held), [Action::ForwardKey]);
+                if !confirmed {
+                    plain(&mut ml, Key::Space);
+                }
+                assert_eq!(prediction(&mut ml), "world");
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+            let mut ml = sentence(confirmed, false);
+            assert_eq!(
+                send(
+                    &mut ml,
+                    Key::RawCode(29),
+                    Modifiers::CTRL | Modifiers::RELEASE
+                ),
+                [Action::ForwardKey]
+            );
+            if !confirmed {
+                plain(&mut ml, Key::Space);
+            }
+            assert_eq!(prediction(&mut ml), "World");
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_super_space_and_kill_keep_existing_contracts() {
+        let mut ml = sentence(true, true);
+        assert_eq!(prediction(&mut ml), "World");
+        let actions = send(&mut ml, Key::RawCode(57), Modifiers::SUPER);
+        assert_eq!(
+            actions,
+            [
+                Action::HideGhost,
+                Action::CommitText("w".into()),
+                Action::ForwardKey
+            ]
+        );
+        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        assert_eq!(ml.metrics().summary().total_commits, 2);
+        let mut ml = sentence(true, false);
+        assert_eq!(
+            send(&mut ml, Key::Escape, Modifiers::SUPER),
+            [Action::HideGhost]
+        );
+        assert!(!ml.is_enabled());
+        assert_eq!(
+            send(&mut ml, Key::Escape, Modifiers::SUPER | Modifiers::RELEASE),
+            [Action::ForwardKey]
+        );
+        assert!(!ml.is_enabled());
+        send(&mut ml, Key::Escape, Modifiers::SUPER);
+        assert!(ml.is_enabled());
+        assert_eq!(prediction(&mut ml), "world");
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_tap_keeps_visible_space_acceptance_attributable() {
+        let mut control = sentence(true, true);
+        assert_eq!(prediction(&mut control), "World");
+        assert!(control.core.space_accept_armed());
+        assert_eq!(
+            plain(&mut control, Key::Space),
+            [Action::HideGhost, Action::CommitText("world ".into())]
+        );
+        assert_eq!(control.metrics().summary().accepted_predictions, 1);
+        let mut ml = sentence(true, true);
+        assert_eq!(prediction(&mut ml), "World");
+        assert_eq!(ml.ghost_text(), "orld");
+        assert!(ml.last_shown_ghost.is_some());
+        send(&mut ml, Key::RawCode(29), Modifiers::CTRL);
+        send(
+            &mut ml,
+            Key::RawCode(29),
+            Modifiers::CTRL | Modifiers::RELEASE,
+        );
+        assert_eq!(
+            plain(&mut ml, Key::Space),
+            [Action::HideGhost, Action::CommitText("world ".into())]
+        );
+        assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+        assert_eq!(ml.metrics().summary().total_commits, 2);
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_after_tab_retires_immediate_backspace_attribution() {
+        for (key, held) in modifiers() {
+            let mut ml = sentence(true, false);
+            assert_eq!(prediction(&mut ml), "World");
+            assert!(plain(&mut ml, Key::Tab).contains(&Action::CommitText("world".into())));
+            assert!(ml.last_prediction_accept.is_some());
+            assert_eq!(send(&mut ml, key.clone(), held), [Action::ForwardKey]);
+            assert!(ml.last_prediction_accept.is_none(), "{key:?}");
+            assert!(ml.last_shown_ghost.is_none(), "{key:?}");
+            send(&mut ml, key, held | Modifiers::RELEASE);
+            let deleted = plain(&mut ml, Key::Backspace);
+            assert!(!deleted
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+            assert_eq!(ml.rejection_prefix_count(), 0);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 1);
+            assert_eq!(ml.metrics().summary().total_commits, 2);
+        }
+    }
+
+    mod surrounding_refresh_review_tests {
+        use super::*;
+
+        fn fresh(post: bool) -> MasterLoop {
+            let mut ml = MasterLoop::new(InputConfig {
+                ghost_text_min_confidence: 0.0,
+                ghost_text_separation_margin: 0.0,
+                post_commit_autocorrect: post,
+                ..InputConfig::default()
+            });
+            ml.load_word_lang("hello", 1_000_000, LangId::En);
+            ml.load_word_lang("world", 1_000_000, LangId::En);
+            ml
+        }
+
+        fn report(ml: &mut MasterLoop, text: &str, cursor: usize) {
+            ml.set_surrounding_text(Some(text.into()), Some(cursor));
+        }
+
+        // Synthetic document projection, not a GTK/GUI claim. These default-mode
+        // controls project only actual CommitText and the supplied original key on
+        // ForwardKey. Preedit is absent from document text; Replace is not guessed.
+        fn own_sentence(
+            prefix: &str,
+            tail: &str,
+            space: bool,
+        ) -> (MasterLoop, String, usize, Vec<(String, usize)>) {
+            let mut ml = fresh(false);
+            let mut text = format!("{prefix}{tail}");
+            let mut cursor = prefix.chars().count();
+            report(&mut ml, &text, cursor);
+            let mut echoes = vec![(text.clone(), cursor)];
+            let mut keys = vec![
+                (35, 'h'),
+                (18, 'e'),
+                (38, 'l'),
+                (38, 'l'),
+                (24, 'o'),
+                (52, '.'),
+            ];
+            if space {
+                keys.push((57, ' '));
+            }
+            for (raw, original) in keys {
+                for action in plain(&mut ml, Key::RawCode(raw)) {
+                    let inserted = match action {
+                        Action::CommitText(text) => Some(text),
+                        Action::ForwardKey => Some(original.to_string()),
+                        Action::ReplaceWord { .. } => {
+                            panic!("unexpected rewrite in default-mode projection")
+                        }
+                        _ => None,
+                    };
+                    if let Some(inserted) = inserted {
+                        let byte = text
+                            .char_indices()
+                            .nth(cursor)
+                            .map(|(i, _)| i)
+                            .unwrap_or(text.len());
+                        text.insert_str(byte, &inserted);
+                        cursor += inserted.chars().count();
+                        echoes.push((text.clone(), cursor));
+                    }
+                }
+            }
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            (ml, text, cursor, echoes)
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_external_word_reconciles_prediction() {
+            let mut ml = sentence(false, false);
+            // The adapter refreshes before Space: anticipation can cache the
+            // punctuation-bearing old token, independently of the local hint.
+            report(&mut ml, "hello.", 6);
+            plain(&mut ml, Key::Space);
+            let prior = ml.light_profile.lang_prior;
+            report(&mut ml, "hello. seed ", 12);
+            assert_eq!(ml.light_profile.lang_prior, prior);
+            assert_eq!(prediction(&mut ml), "world");
+            assert_eq!(ml.current_word(), "w");
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert!(!ml
+                .core
+                .export_personal_profile()
+                .cvm
+                .words
+                .iter()
+                .any(|word| word == "seed"));
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_external_word_prevents_optin_postcap() {
+            let mut ml = fresh(true);
+            for code in [35, 18, 38, 38, 24, 52, 57] {
+                plain(&mut ml, Key::RawCode(code));
+            }
+            report(&mut ml, "hello. seed ", 12);
+            for code in [17, 24, 19, 38, 32] {
+                plain(&mut ml, Key::RawCode(code));
+            }
+            let actions = plain(&mut ml, Key::Space);
+            assert_eq!(
+                actions,
+                [
+                    Action::HideGhost,
+                    Action::CommitText("world".into()),
+                    Action::ForwardKey
+                ]
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 2);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            assert!(!ml
+                .core
+                .export_personal_profile()
+                .cvm
+                .words
+                .iter()
+                .any(|word| word == "seed"));
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_identical_delayed_and_final_own_echoes_preserve_hint() {
+            // Four actual projected images: baseline, Commithello, Forwarddot,
+            // ForwardSpace. Each fixture observes only one forward prefix of them.
+            for count in [1, 2, 4] {
+                let (mut ml, text, cursor, echoes) = own_sentence("prior seed ", "", true);
+                assert_eq!(echoes.len(), 4);
+                assert_eq!(text, "prior seed hello. ");
+                for (observed, position) in echoes.iter().take(count) {
+                    report(&mut ml, observed, *position);
+                }
+                if count == 4 {
+                    report(&mut ml, &text, cursor);
+                }
+                assert_eq!(prediction(&mut ml), "World", "own echo prefix {count}");
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_external_edit_preserves_active_preedit_and_learning() {
+            let mut ml = sentence(true, false);
+            plain(&mut ml, Key::RawCode(17));
+            plain(&mut ml, Key::RawCode(24));
+            assert_eq!(ml.current_word(), "wo");
+            assert!(ml.debug_state().0);
+            report(&mut ml, "hello. seed ", 12);
+            assert_eq!(ml.current_word(), "wo");
+            assert!(ml.debug_state().0);
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            plain(&mut ml, Key::RawCode(19));
+            assert_eq!(ml.current_word(), "wor");
+            assert_eq!(ml.predictions()[0].word, "world");
+            assert!(!ml
+                .core
+                .export_personal_profile()
+                .cvm
+                .words
+                .iter()
+                .any(|word| word == "seed"));
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_cursor_only_move_uses_character_positions() {
+            // Emoji is English-compatible in this sampler, while its UTF-8 byte
+            // length differs from the client's Unicode character cursor.
+            for prefix in ["", "😀 "] {
+                let (mut ml, text, cursor, _) = own_sentence(prefix, "seed ", true);
+                assert_eq!(cursor, prefix.chars().count() + 7);
+                report(&mut ml, &text, cursor);
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w", "fixture layout, prefix={prefix:?}");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some("World"),
+                    "fixture prediction, prefix={prefix:?}"
+                );
+                plain(&mut ml, Key::Backspace); // Local preedit only, not client text.
+                assert!(ml.current_word().is_empty());
+                report(&mut ml, &text, text.chars().count());
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w", "fixture layout, prefix={prefix:?}");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some("world"),
+                    "cursor moved past seed, prefix={prefix:?}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_observed_return_and_tab_keep_opaque_start() {
+            let mut ml = fresh(false);
+            report(&mut ml, "prior seed ", 11);
+            for code in [35, 18, 38, 38, 24] {
+                plain(&mut ml, Key::RawCode(code));
+            }
+            assert_eq!(
+                plain(&mut ml, Key::Return),
+                [
+                    Action::HideGhost,
+                    Action::CommitText("hello".into()),
+                    Action::ForwardKey
+                ]
+            );
+            // Actual commit-only delayed echo.
+            report(&mut ml, "prior seed hello", 16);
+            // Explicit client report, not a guessed Return glyph.
+            report(&mut ml, "prior seed hello\n", 17);
+            assert_eq!(prediction(&mut ml), "World");
+            let (mut ml, text, cursor, _) = own_sentence("prior seed ", "", false);
+            assert_eq!(plain(&mut ml, Key::Tab), [Action::ForwardKey]);
+            let reported = format!("{text}\t");
+            report(&mut ml, &reported, cursor + 1);
+            assert_eq!(prediction(&mut ml), "World");
+            for (separator, glyph) in [(Key::Tab, '\t'), (Key::Space, ' ')] {
+                let (mut ml, text, cursor, _) = own_sentence("prior seed ", "", false);
+                plain(&mut ml, separator);
+                plain(&mut ml, Key::Return);
+                // Actual reported whitespace, not an assumed Return glyph.
+                report(&mut ml, &format!("{text}{glyph}\n"), cursor + 2);
+                assert_eq!(prediction(&mut ml), "World");
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_empty_and_whitespace_reports_keep_raw_geometry_only() {
+            for (text, cursor) in [("", 0), (" \t\n", 3)] {
+                let mut ml = fresh(false);
+                report(&mut ml, text, cursor);
+                assert_eq!(ml.surrounding_text.as_deref(), Some(text));
+                assert_eq!(ml.surrounding_cursor_pos, Some(cursor));
+                let analysis = ml.cached_surrounding_analysis();
+                assert!(analysis.is_none());
+                assert_eq!(ml.terminal_context_language(analysis.as_ref()), None);
+            }
+            let mut ml = fresh(false);
+            ml.set_surrounding_text(None, None);
+            assert!(ml.surrounding_text.is_none());
+            assert!(ml.surrounding_cursor_pos.is_none());
+            assert!(ml.cached_surrounding_analysis().is_none());
+            assert_eq!(ml.terminal_context_language(None), None);
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_coalesced_optin_echoes_exclude_internal_states() {
+            for (observed, cursor, expected) in [
+                ("prior seed Hello. ", 18, "World"),
+                ("prior seed hello", 16, "world"),
+                ("prior seed ", 11, "world"),
+            ] {
+                let mut ml = fresh(true);
+                report(&mut ml, "prior seed ", 11);
+                for code in [35, 18, 38, 38, 24] {
+                    plain(&mut ml, Key::RawCode(code));
+                }
+                let actions = plain(&mut ml, Key::RawCode(52));
+                assert!(actions.contains(&Action::CommitText("hello".into())));
+                assert!(actions.contains(&Action::ReplaceWord {
+                    replace_len: 5,
+                    text: "Hello".into(),
+                }));
+                plain(&mut ml, Key::Space);
+                // A baseline report is legitimate until final delivery is
+                // acknowledged. Lowercase hello was never a wire image.
+                if observed == "prior seed " {
+                    report(&mut ml, "prior seed Hello. ", 18);
+                }
+                report(&mut ml, observed, cursor);
+                assert_eq!(prediction(&mut ml), expected, "{observed:?}");
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+
+            let mut echoes = SentenceEchoes::new("prior seed hello", 16).unwrap();
+            assert!(echoes.record(
+                &KeyEvent {
+                    key: Key::RawCode(52),
+                    modifiers: Modifiers::empty(),
+                },
+                &[
+                    Action::ReplaceWord {
+                        replace_len: 5,
+                        text: "Hello".into(),
+                    },
+                    Action::ForwardKey,
+                ],
+                false,
+            ));
+            // Standalone SURROUNDING replacement really can report deletion.
+            assert!(echoes.acknowledge("prior seed ", 11));
+            assert!(echoes.acknowledge("prior seed Hello.", 17));
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_acknowledged_images_cannot_rewind() {
+            let (mut ml, text, cursor, echoes) = own_sentence("prior seed ", "", true);
+            report(&mut ml, &text, cursor);
+            assert_eq!(prediction(&mut ml), "World");
+            plain(&mut ml, Key::Backspace);
+            report(&mut ml, &echoes[1].0, echoes[1].1);
+            assert_eq!(prediction(&mut ml), "world");
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_unavailable_reports_cannot_lift_negative() {
+            for report_kind in [0, 1, 2] {
+                let mut ml = sentence(false, false);
+                report(&mut ml, "hello.", 6);
+                plain(&mut ml, Key::Space);
+                report(&mut ml, "hello. seed ", 12);
+                match report_kind {
+                    0 => ml.set_surrounding_text(None, None),
+                    1 => ml.set_surrounding_text(Some("hello.".into()), None),
+                    _ => report(&mut ml, "hello.", 99),
+                }
+                assert_eq!(prediction(&mut ml), "world");
+            }
+            let mut ml = sentence(true, false);
+            // No pre-edit report was available: a first valid report is not
+            // proof that the unknown base was empty, even if it looks familiar.
+            report(&mut ml, "hello. ", 7);
+            assert_eq!(prediction(&mut ml), "world");
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_return_requires_observed_linebreak() {
+            let mut ml = fresh(false);
+            report(&mut ml, "prior seed ", 11);
+            for code in [35, 18, 38, 38, 24] {
+                plain(&mut ml, Key::RawCode(code));
+            }
+            plain(&mut ml, Key::Return);
+            report(&mut ml, "prior seed hello ", 17);
+            assert_eq!(prediction(&mut ml), "world");
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_overflow_preserves_canonical_word() {
+            let (mut ml, _, _, _) = own_sentence("prior seed ", "", true);
+            assert!(ml.core.has_sentence_boundary_hint());
+            let mut typed = String::new();
+            for _ in 0..MAX_SENTENCE_ECHOES {
+                plain(&mut ml, Key::Char('a'));
+                typed.push('a');
+                assert_eq!(ml.current_word(), typed);
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+            assert!(ml.sentence_echoes.is_none());
+            assert!(!ml.core.has_sentence_boundary_hint());
+            assert!(ml.core.take_commit_learning().words.is_empty());
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_lifecycle_does_not_restore_old_hint() {
+            let (mut ml, text, cursor, _) = own_sentence("prior seed ", "", true);
+            plain(&mut ml, Key::RawCode(17));
+            assert_eq!(
+                plain(&mut ml, Key::Escape),
+                [Action::ShowComposing {
+                    typed: "w".into(),
+                    ghost: String::new(),
+                }]
+            );
+            assert_eq!(ml.current_word(), "w");
+            report(&mut ml, &text, cursor);
+            assert!(ml.core.has_sentence_boundary_hint());
+            assert!(ml.sentence_echoes.is_some());
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+
+            for transition in [0, 1, 2, 3, 4] {
+                let (mut ml, text, cursor, _) = own_sentence("prior seed ", "", true);
+                match transition {
+                    0 => {
+                        ml.reset();
+                    }
+                    1 => {
+                        ml.focus_lost();
+                    }
+                    2 => {
+                        send(&mut ml, Key::Char('c'), Modifiers::CTRL);
+                    }
+                    3 => {
+                        ml.focus_gained();
+                    }
+                    _ => {
+                        assert_eq!(plain(&mut ml, Key::Escape), [Action::ForwardKey]);
+                    }
+                }
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+                report(&mut ml, &text, cursor);
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+            }
+        }
+
+        fn fresh_snapshot_after_sentence(post: bool, text: &str) -> MasterLoop {
+            let mut ml = fresh(post);
+            // Explicit empty report is a real anchor, never an inferred base.
+            report(&mut ml, "", 0);
+            for code in [35, 18, 38, 38, 24, 52, 57] {
+                plain(&mut ml, Key::RawCode(code));
+            }
+            let prior = ml.light_profile.lang_prior;
+            report(&mut ml, text, text.chars().count());
+            assert_eq!(ml.light_profile.lang_prior, prior);
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            ml
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_terminal_prediction_matches_current_report() {
+            for (text, expected) in [
+                ("hello. seed ", "world"),
+                ("hello. seed.", "world"), // Adjacent input has no separator.
+                ("hello. seed. ", "World"),
+            ] {
+                let mut ml = fresh_snapshot_after_sentence(false, text);
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected),
+                    "fresh report {text:?}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_pending_terminator_requires_real_space() {
+            let mut ml = fresh_snapshot_after_sentence(false, "hello. seed.");
+            assert_eq!(
+                plain(&mut ml, Key::Space),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            plain(&mut ml, Key::RawCode(17));
+            assert_eq!(ml.current_word(), "w");
+            assert_eq!(
+                ml.predictions().first().map(|p| p.word.as_str()),
+                Some("World")
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_terminal_controls_optin_postcaps() {
+            for (text, capitalize) in [("hello. seed ", false), ("hello. seed. ", true)] {
+                let mut ml = fresh_snapshot_after_sentence(true, text);
+                for code in [17, 24, 19, 38, 32] {
+                    plain(&mut ml, Key::RawCode(code));
+                }
+                let actions = plain(&mut ml, Key::Space);
+                let mut expected = vec![
+                    Action::HideGhost,
+                    Action::CommitText("world".into()),
+                    Action::ForwardKey,
+                ];
+                if capitalize {
+                    expected.push(Action::ReplaceWord {
+                        replace_len: 5,
+                        text: "World".into(),
+                    });
+                }
+                assert_eq!(actions, expected, "fresh report {text:?}");
+                assert!(ml.current_word().is_empty());
+                assert_eq!(ml.metrics().summary().total_commits, 2);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_reports_reconcile_both_directions() {
+            for (first, second, expected) in [
+                ("hello. seed. ", "hello. seed. other ", "world"),
+                ("hello. seed ", "hello. seed. ", "World"),
+            ] {
+                let mut ml = fresh_snapshot_after_sentence(false, first);
+                let prior = ml.light_profile.lang_prior;
+                report(&mut ml, second, second.chars().count());
+                assert_eq!(ml.light_profile.lang_prior, prior);
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected),
+                    "{first:?} -> {second:?}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_reports_preserve_preedit_and_user_case() {
+            for (upper, text, word) in
+                [(true, "hello. seed ", "Wo"), (false, "hello. seed. ", "wo")]
+            {
+                let mut ml = fresh_snapshot_after_sentence(false, "hello. ");
+                send(
+                    &mut ml,
+                    Key::RawCode(17),
+                    if upper {
+                        Modifiers::SHIFT
+                    } else {
+                        Modifiers::empty()
+                    },
+                );
+                plain(&mut ml, Key::RawCode(24));
+                assert_eq!(ml.current_word(), word);
+                let prior = ml.light_profile.lang_prior;
+                report(&mut ml, text, text.chars().count());
+                assert_eq!(ml.current_word(), word);
+                assert!(ml.debug_state().0);
+                assert_eq!(ml.light_profile.lang_prior, prior);
+                plain(&mut ml, Key::RawCode(19));
+                assert_eq!(ml.current_word(), if upper { "Wor" } else { "wor" });
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some("World")
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_observed_linebreak_with_indent_starts_sentence() {
+            let mut ml = fresh_snapshot_after_sentence(false, "hello. seed\n  ");
+            plain(&mut ml, Key::RawCode(17));
+            assert_eq!(ml.current_word(), "w");
+            assert_eq!(
+                ml.predictions().first().map(|p| p.word.as_str()),
+                Some("World")
+            );
+            assert_eq!(ml.metrics().summary().total_commits, 1);
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_own_forwarded_word_echo_keeps_token_start_decision() {
+            for (base, expected) in [("hello. ", "World"), ("hello. seed ", "world")] {
+                let mut ml = fresh_snapshot_after_sentence(false, base);
+                let mut document = base.to_string();
+                for ch in ['w', 'o'] {
+                    let actions = plain(&mut ml, Key::Char(ch));
+                    assert_eq!(
+                        actions
+                            .iter()
+                            .filter(|a| matches!(a, Action::ForwardKey))
+                            .count(),
+                        1
+                    );
+                    assert!(!actions
+                        .iter()
+                        .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+                    // Actual semantic Forward delivers this original glyph;
+                    // ShowGhost is preedit, not document text.
+                    document.push(ch);
+                    report(&mut ml, &document, document.chars().count());
+                }
+                assert_eq!(ml.current_word(), "wo");
+                plain(&mut ml, Key::RawCode(19));
+                assert_eq!(ml.current_word(), "wor");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected)
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_lease_retires_on_client_edits_and_word_completion() {
+            for text in ["hello. seed. ", "hello. seed "] {
+                for transition in [0, 1, 2, 3] {
+                    let mut ml = fresh_snapshot_after_sentence(false, text);
+                    assert!(ml.sentence_echoes.is_some());
+                    match transition {
+                        0 => {
+                            plain(&mut ml, Key::Other(0xff63));
+                        }
+                        1 => {
+                            send(&mut ml, Key::Char('v'), Modifiers::CTRL);
+                        }
+                        2 => {
+                            assert_eq!(
+                                plain(&mut ml, Key::Backspace),
+                                [Action::HideGhost, Action::ForwardKey]
+                            );
+                            assert!(ml.current_word().is_empty());
+                            assert_eq!(ml.metrics().summary().total_commits, 1);
+                            assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                            if text == "hello. seed. " {
+                                // The observed plain Space was removed, leaving
+                                // the original dot pending rather than opaque.
+                                assert!(ml.sentence_echoes.is_some());
+                                assert!(ml.core.has_sentence_boundary_hint());
+                                report(&mut ml, "hello. seed.", 12);
+                                assert!(ml.sentence_echoes.is_some());
+                                assert!(ml.core.has_sentence_boundary_hint());
+                                // Public behavior distinguishes pending from a
+                                // confirmed start without a new Core test API.
+                                let mut adjacent = fresh_snapshot_after_sentence(false, text);
+                                plain(&mut adjacent, Key::Backspace);
+                                plain(&mut adjacent, Key::RawCode(17));
+                                assert_eq!(adjacent.current_word(), "w");
+                                assert_eq!(
+                                    adjacent.predictions().first().map(|p| p.word.as_str()),
+                                    Some("world")
+                                );
+                                assert_eq!(
+                                    plain(&mut ml, Key::Backspace),
+                                    [Action::HideGhost, Action::ForwardKey]
+                                );
+                            }
+                        }
+                        _ => {
+                            for code in [17, 24, 19, 38, 32] {
+                                plain(&mut ml, Key::RawCode(code));
+                            }
+                            plain(&mut ml, Key::Space);
+                            assert_eq!(ml.metrics().summary().total_commits, 2);
+                        }
+                    }
+                    assert!(ml.current_word().is_empty());
+                    assert!(ml.sentence_echoes.is_none());
+                    assert!(!ml.core.has_sentence_boundary_hint());
+                    // A discarded lease cannot be recreated just because an
+                    // old report has a sentence-looking suffix or a false veto.
+                    report(&mut ml, "hello. seed. ", 13);
+                    assert!(ml.sentence_echoes.is_none());
+                    assert!(!ml.core.has_sentence_boundary_hint());
+                    if transition != 3 {
+                        plain(&mut ml, Key::RawCode(17));
+                        assert_eq!(ml.current_word(), "w");
+                        assert_eq!(
+                            ml.predictions().first().map(|p| p.word.as_str()),
+                            Some("world")
+                        );
+                        assert_eq!(ml.metrics().summary().total_commits, 1);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_lease_ignores_unavailable_geometry() {
+            for (text, expected) in [("hello. seed. ", "World"), ("hello. seed ", "world")] {
+                for unavailable in [0, 1] {
+                    let mut ml = fresh_snapshot_after_sentence(false, text);
+                    assert!(ml.sentence_echoes.is_some());
+                    if unavailable == 0 {
+                        ml.set_surrounding_text(None, None);
+                    } else {
+                        report(&mut ml, "ordinary ", 999);
+                    }
+                    assert!(ml.sentence_echoes.is_some());
+                    plain(&mut ml, Key::RawCode(17));
+                    assert_eq!(ml.current_word(), "w");
+                    assert_eq!(
+                        ml.predictions().first().map(|p| p.word.as_str()),
+                        Some(expected)
+                    );
+                    assert_eq!(ml.metrics().summary().total_commits, 1);
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_fresh_lease_kill_and_reenable_retire_authority() {
+            for text in ["hello. seed. ", "hello. seed "] {
+                let mut ml = fresh_snapshot_after_sentence(false, text);
+                assert!(ml.sentence_echoes.is_some());
+                assert!(ml.is_enabled());
+                assert_eq!(
+                    send(&mut ml, Key::Escape, Modifiers::SUPER),
+                    [Action::HideGhost]
+                );
+                assert!(!ml.is_enabled());
+                assert!(ml.current_word().is_empty());
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+                report(&mut ml, "hello. seed. other. ", 20);
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+                assert_eq!(
+                    send(&mut ml, Key::Escape, Modifiers::SUPER),
+                    [Action::HideGhost]
+                );
+                assert!(ml.is_enabled());
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+                report(&mut ml, text, text.chars().count());
+                assert!(ml.sentence_echoes.is_none());
+                assert!(!ml.core.has_sentence_boundary_hint());
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_observed_two_spaces_one_delete_keeps_prediction() {
+            for own_echo in [false, true] {
+                let mut document = "hello. seed.  ".to_string();
+                let mut ml = fresh_snapshot_after_sentence(false, &document);
+                assert_eq!(
+                    plain(&mut ml, Key::Backspace),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                assert!(ml.current_word().is_empty());
+                document.pop(); // Explicit synthetic client applies the forwarded Backspace.
+                if own_echo {
+                    report(&mut ml, &document, document.chars().count());
+                }
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some("World"),
+                    "own delete echo={own_echo}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_observed_space_delete_keeps_owned_postcaps() {
+            let mut ml = fresh_snapshot_after_sentence(true, "hello. seed.  ");
+            assert_eq!(
+                plain(&mut ml, Key::Backspace),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            for code in [17, 24, 19, 38, 32] {
+                plain(&mut ml, Key::RawCode(code));
+            }
+            assert_eq!(
+                plain(&mut ml, Key::Space),
+                [
+                    Action::HideGhost,
+                    Action::CommitText("world".into()),
+                    Action::ForwardKey,
+                    Action::ReplaceWord {
+                        replace_len: 5,
+                        text: "World".into()
+                    },
+                ]
+            );
+            assert!(ml.current_word().is_empty());
+            assert_eq!(ml.metrics().summary().total_commits, 2);
+            assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_observed_space_removal_and_reinsert_track_boundary() {
+            for (deletions, separator, expected) in [
+                (2, false, "world"), // No separator: adjacent input stays lowercase.
+                (3, true, "world"),  // The original dot was removed too.
+                (2, true, "World"),  // Surviving dot becomes a start on real Space.
+            ] {
+                let mut ml = fresh_snapshot_after_sentence(false, "hello. seed.  ");
+                for _ in 0..deletions {
+                    assert_eq!(
+                        plain(&mut ml, Key::Backspace),
+                        [Action::HideGhost, Action::ForwardKey]
+                    );
+                }
+                if separator {
+                    assert_eq!(
+                        plain(&mut ml, Key::Space),
+                        [Action::HideGhost, Action::ForwardKey]
+                    );
+                }
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected),
+                    "deleted={deletions}, separator={separator}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_observed_closers_and_repeated_terminators_retract() {
+            for (text, tail_count) in [
+                ("hello. seed.!)]  ", 3),
+                ("hello. seed.!)]”  ", 4), // Count Unicode characters, not bytes.
+                ("hello. seed)!  ", 0),    // The closer precedes the first terminator.
+            ] {
+                for (remove_first, expected) in [(true, "world"), (false, "World")] {
+                    let mut ml = fresh_snapshot_after_sentence(false, text);
+                    let deletions = 2 + tail_count + usize::from(remove_first);
+                    // Remove both Spaces and all characters AFTER the first
+                    // terminator; only remove that terminator in the negative arm.
+                    for _ in 0..deletions {
+                        assert_eq!(
+                            plain(&mut ml, Key::Backspace),
+                            [Action::HideGhost, Action::ForwardKey]
+                        );
+                    }
+                    assert_eq!(
+                        plain(&mut ml, Key::Space),
+                        [Action::HideGhost, Action::ForwardKey]
+                    );
+                    plain(&mut ml, Key::RawCode(17));
+                    assert_eq!(ml.current_word(), "w");
+                    assert_eq!(
+                        ml.predictions().first().map(|p| p.word.as_str()),
+                        Some(expected),
+                        "text={text:?}, deleted={deletions}"
+                    );
+                    assert_eq!(ml.metrics().summary().total_commits, 1);
+                    assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_mixed_observed_whitespace_requires_known_linebreak() {
+            for (whitespace, expected) in [
+                ("\t  ", "world"),
+                ("\u{00a0}  ", "world"),
+                ("\r\n  ", "World"), // A bound observed linebreak survives this deletion.
+            ] {
+                let mut ml =
+                    fresh_snapshot_after_sentence(false, &format!("hello. seed.{whitespace}"));
+                assert_eq!(
+                    plain(&mut ml, Key::Backspace),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                assert_eq!(
+                    plain(&mut ml, Key::Space),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected),
+                    "opaque whitespace={whitespace:?}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_empty_space_keeps_fallback_veto_after_shortcut() {
+            for shortcut in [false, true] {
+                let mut ml = fresh(false);
+                report(&mut ml, "", 0);
+                for code in [35, 18, 38, 38, 24, 52] {
+                    plain(&mut ml, Key::RawCode(code));
+                }
+                // Adapter refresh before Space makes anticipation cache the
+                // punctuation-bearing old token, separate from the local hint.
+                report(&mut ml, "hello.", 6);
+                plain(&mut ml, Key::Space);
+                report(&mut ml, "hello. seed.  ", 14);
+                assert_eq!(
+                    plain(&mut ml, Key::Space),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                if shortcut {
+                    assert_eq!(
+                        send(&mut ml, Key::Char('v'), Modifiers::CTRL),
+                        [Action::ForwardKey]
+                    );
+                }
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                let expected = if shortcut { "world" } else { "World" };
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(expected),
+                    "shortcut={shortcut}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_known_linebreak_indent_deletion_keeps_prediction() {
+            for (prefix, linebreak, suffix) in [
+                ("", "\n", ""),
+                ("", "\r\n", ""),
+                ("", "\n\n", ""),
+                ("😀 ", "\n", " unchanged"),
+            ] {
+                for deletions in [1, 2] {
+                    for own_echo in [false, true] {
+                        let before = format!("{prefix}hello. seed.{linebreak}  ");
+                        let mut text = format!("{before}{suffix}");
+                        let mut cursor = before.chars().count();
+                        let mut ml = fresh_snapshot_after_sentence(false, &text);
+                        report(&mut ml, &text, cursor);
+                        assert!(ml.core.has_sentence_boundary_hint());
+                        assert!(ml.sentence_echoes.is_some());
+                        for _ in 0..deletions {
+                            assert_eq!(
+                                plain(&mut ml, Key::Backspace),
+                                [Action::HideGhost, Action::ForwardKey]
+                            );
+                            let byte = text.char_indices().nth(cursor - 1).unwrap().0;
+                            text.remove(byte); // Explicit client applies one Unicode-char deletion.
+                            cursor -= 1;
+                            assert!(text.ends_with(suffix));
+                            if own_echo {
+                                report(&mut ml, &text, cursor);
+                            }
+                        }
+                        plain(&mut ml, Key::RawCode(17));
+                        assert_eq!(ml.current_word(), "w");
+                        assert_eq!(
+                            ml.predictions().first().map(|p| p.word.as_str()),
+                            Some("World"),
+                            "linebreak={linebreak:?}, deleted={deletions}, own_echo={own_echo}, prefix={prefix:?}"
+                        );
+                        assert_eq!(ml.metrics().summary().total_commits, 1);
+                        assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_known_linebreak_removal_reveals_literal_dot() {
+            for linebreak in ["\n", "\r\n", "\n\n"] {
+                for (remove_dot, separator, expected) in [
+                    (false, false, "world"), // The surviving dot still needs whitespace.
+                    (false, true, "World"),
+                    (true, true, "world"),
+                ] {
+                    let mut text = format!("hello. seed.{linebreak}  ");
+                    let mut ml = fresh_snapshot_after_sentence(false, &text);
+                    for _ in 0..2 + linebreak.chars().count() + usize::from(remove_dot) {
+                        assert_eq!(
+                            plain(&mut ml, Key::Backspace),
+                            [Action::HideGhost, Action::ForwardKey]
+                        );
+                        text.pop();
+                        report(&mut ml, &text, text.chars().count());
+                    }
+                    assert_eq!(
+                        text,
+                        if remove_dot {
+                            "hello. seed"
+                        } else {
+                            "hello. seed."
+                        }
+                    );
+                    assert_eq!(ml.core.has_sentence_boundary_hint(), !remove_dot);
+                    if separator {
+                        assert_eq!(
+                            plain(&mut ml, Key::Space),
+                            [Action::HideGhost, Action::ForwardKey]
+                        );
+                    }
+                    plain(&mut ml, Key::RawCode(17));
+                    assert_eq!(ml.current_word(), "w");
+                    assert_eq!(
+                        ml.predictions().first().map(|p| p.word.as_str()),
+                        Some(expected),
+                        "linebreak={linebreak:?}, remove_dot={remove_dot}, separator={separator}"
+                    );
+                    assert_eq!(ml.metrics().summary().total_commits, 1);
+                    assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                }
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_known_linebreak_delete_keeps_owned_postcaps_once() {
+            for own_echo in [false, true] {
+                let mut ml = fresh_snapshot_after_sentence(true, "hello. seed.\n  ");
+                assert_eq!(
+                    plain(&mut ml, Key::Backspace),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                if own_echo {
+                    report(&mut ml, "hello. seed.\n ", 14);
+                }
+                for code in [17, 24, 19, 38, 32] {
+                    plain(&mut ml, Key::RawCode(code));
+                }
+                assert_eq!(ml.current_word(), "world");
+                assert_eq!(
+                    plain(&mut ml, Key::Space),
+                    [
+                        Action::HideGhost,
+                        Action::CommitText("world".into()),
+                        Action::ForwardKey,
+                        Action::ReplaceWord {
+                            replace_len: 5,
+                            text: "World".into()
+                        },
+                    ],
+                    "own_echo={own_echo}"
+                );
+                assert!(ml.current_word().is_empty());
+                assert_eq!(ml.metrics().summary().total_commits, 2);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+                assert!(ml.core.take_commit_learning().words.is_empty());
+            }
+        }
+
+        #[test]
+        fn sentence_boundary_surrounding_known_blank_deletion_and_revalidation_fences() {
+            for fence in [0, 1, 2, 3, 4, 5] {
+                let mut ml = match fence {
+                    0 => fresh_snapshot_after_sentence(false, "hello\nseed "),
+                    1 => {
+                        let mut unbound = sentence(true, false);
+                        report(&mut unbound, "hello. seed.\n  ", 15);
+                        assert!(unbound.sentence_echoes.is_none());
+                        unbound
+                    }
+                    2 => {
+                        let mut retired = fresh_snapshot_after_sentence(false, "hello. seed.\n  ");
+                        send(&mut retired, Key::Char('v'), Modifiers::CTRL);
+                        report(&mut retired, "hello. seed.\n  ", 15);
+                        assert!(retired.sentence_echoes.is_none());
+                        retired
+                    }
+                    3 => {
+                        let mut invalid = fresh_snapshot_after_sentence(false, "ordinary ");
+                        report(&mut invalid, "hello. seed.\n  ", 999);
+                        invalid
+                    }
+                    _ => {
+                        let mut opaque = fresh_snapshot_after_sentence(false, "hello. seed.\n  ");
+                        plain(&mut opaque, if fence == 4 { Key::Tab } else { Key::Return });
+                        opaque // No client ACK makes either separator a known literal image.
+                    }
+                };
+                assert_eq!(
+                    plain(&mut ml, Key::Backspace),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                assert!(ml.current_word().is_empty());
+                assert!(ml.sentence_echoes.is_none(), "fence={fence}");
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some("world"),
+                    "fence={fence}"
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+
+            // Deleting an already delivered semantic token is not an empty-token edit.
+            let mut delivered = fresh_snapshot_after_sentence(false, "hello. seed.\n  ");
+            let typed = plain(&mut delivered, Key::Char('a'));
+            assert!(typed.contains(&Action::ForwardKey));
+            assert_eq!(delivered.current_word(), "a");
+            plain(&mut delivered, Key::Backspace);
+            assert!(delivered.current_word().is_empty());
+            assert!(delivered.sentence_echoes.is_none());
+            plain(&mut delivered, Key::RawCode(17));
+            assert_eq!(delivered.current_word(), "w");
+            assert_eq!(
+                delivered.predictions().first().map(|p| p.word.as_str()),
+                Some("world")
+            );
+            assert_eq!(delivered.metrics().summary().total_commits, 1);
+            assert_eq!(delivered.metrics().summary().accepted_predictions, 0);
+
+            // Local preedit deletion never forwards a client Backspace or consumes the linebreak.
+            let mut preedit = fresh_snapshot_after_sentence(false, "hello. seed.\n  ");
+            plain(&mut preedit, Key::RawCode(17));
+            assert_eq!(preedit.current_word(), "w");
+            assert_eq!(
+                preedit.predictions().first().map(|p| p.word.as_str()),
+                Some("World")
+            );
+            assert_eq!(plain(&mut preedit, Key::Backspace), [Action::HideGhost]);
+            assert!(preedit.current_word().is_empty());
+            assert!(preedit.sentence_echoes.is_some());
+            plain(&mut preedit, Key::RawCode(17));
+            assert_eq!(preedit.current_word(), "w");
+            assert_eq!(
+                preedit.predictions().first().map(|p| p.word.as_str()),
+                Some("World")
+            );
+            assert_eq!(preedit.metrics().summary().total_commits, 1);
+            assert_eq!(preedit.metrics().summary().accepted_predictions, 0);
+
+            for deletions in [1, 2, 3] {
+                let mut ml = fresh_snapshot_after_sentence(false, "  ");
+                for _ in 0..deletions {
+                    assert_eq!(
+                        plain(&mut ml, Key::Backspace),
+                        [Action::HideGhost, Action::ForwardKey]
+                    );
+                }
+                if deletions == 3 {
+                    assert!(ml.sentence_echoes.is_none(), "past known document start");
+                }
+                plain(&mut ml, Key::RawCode(17));
+                assert_eq!(ml.current_word(), "w");
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(if deletions < 3 { "World" } else { "world" })
+                );
+                assert_eq!(ml.metrics().summary().total_commits, 1);
+                assert_eq!(ml.metrics().summary().accepted_predictions, 0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_handoff_tests {
+    use super::*;
+    use crate::input::Key;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn native_popup_fixture() -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("hello", 1_000_000, LangId::En);
+        for word in ["one", "two", "three", "four", "five"] {
+            for ch in word.chars() {
+                ml.handle_key(press(Key::Char(ch)));
+            }
+            ml.handle_key(press(Key::Space));
+        }
+        for code in [35, 18, 38] {
+            ml.handle_key(press(Key::RawCode(code)));
+        }
+        assert_eq!(ml.current_word(), "hel");
+        assert_eq!(ml.ghost_text(), "lo");
+        ml.handoff_preedit_for_native_completion();
+        ml.set_surrounding_text(Some("😀 seed hel".into()), Some(10));
+        assert!(!ml.reconcile_native_completion_word(true));
+        ml
+    }
+
+    #[test]
+    fn native_sentence_boundaries_follow_actual_forwarded_delivery_without_learning() {
+        for (event, suffix, needs_space) in [
+            (press(Key::Return), "\n", false),
+            (press(Key::RawCode(28)), "\n", false),
+            (press(Key::Char('.')), ".", true),
+            (press(Key::Char('!')), "!", true),
+            (press(Key::Char('?')), "?", true),
+            (press(Key::RawCode(52)), ".", true),
+            (
+                KeyEvent {
+                    key: Key::RawCode(2),
+                    modifiers: Modifiers::SHIFT,
+                },
+                "!",
+                true,
+            ),
+            (
+                KeyEvent {
+                    key: Key::RawCode(53),
+                    modifiers: Modifiers::SHIFT,
+                },
+                "?",
+                true,
+            ),
+        ] {
+            for inserted in [true, false] {
+                let mut ml = native_popup_fixture();
+                ml.load_word_lang("world", 1_000_000, LangId::En);
+                let learned = ml.core.learned_state_for_test();
+                let light = serde_json::to_value(&ml.light_profile).unwrap();
+                let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+                assert_eq!(
+                    ml.handle_key(event.clone()),
+                    [Action::HideGhost, Action::ForwardKey]
+                );
+                assert!(!ml.native_completion_owned());
+                assert!(ml.current_word().is_empty());
+                // The native word itself was never observed. A fresh report
+                // can confirm or retract only the known delimiter's delivery.
+                let mut document = format!("😀 seed hello{}", if inserted { suffix } else { "" });
+                ml.set_surrounding_text(Some(document.clone()), Some(document.chars().count()));
+                if needs_space {
+                    ml.handle_key(press(Key::Space));
+                    document.push(' ');
+                    ml.set_surrounding_text(Some(document.clone()), Some(document.chars().count()));
+                }
+                assert_eq!(ml.core.learned_state_for_test(), learned);
+                assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+                assert_eq!(
+                    serde_json::to_value(ml.metrics().summary()).unwrap(),
+                    metrics
+                );
+                ml.handle_key(press(Key::RawCode(17)));
+                assert_eq!(
+                    ml.predictions().first().map(|p| p.word.as_str()),
+                    Some(if inserted { "World" } else { "world" }),
+                    "{event:?}, inserted={inserted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_popup_accept_keys_preserve_all_models_before_client_acceptance() {
+        for key in [
+            Key::Tab,
+            Key::Return,
+            Key::RawCode(15),
+            Key::RawCode(28),
+            Key::Space,
+            Key::RawCode(57),
+            Key::Char('('),
+            Key::Char('.'),
+            Key::Char('1'),
+            Key::RawCode(52),
+            Key::RawCode(2),
+            Key::RawCode(26),
+        ] {
+            let mut ml = native_popup_fixture();
+            let all_learned = ml.core.learned_state_for_test();
+            let learned =
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            let actions = ml.handle_key(press(key.clone()));
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned,
+                "{key:?}"
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert!(ml.current_word().is_empty());
+            assert!(!ml.native_completion_owned());
+            assert_eq!(ml.phase(), Phase::Anticipating);
+            assert!(!ml.anticipated);
+            assert!(ml.last_prediction_accept.is_none() && ml.last_shown_ghost.is_none());
+            assert_eq!(ml.core.learned_state_for_test(), all_learned);
+            // Observing the client's later selection must not lazily teach
+            // either the old prefix or a native candidate.
+            ml.set_surrounding_text(Some("😀 seed hello(".into()), Some(13));
+            assert!(!ml.reconcile_native_completion_word(true));
+            ml.handle_key(press(Key::Space));
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(ml.core.learned_state_for_test(), all_learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+        }
+    }
+
+    #[test]
+    fn native_popup_vertical_navigation_waits_for_matching_or_moved_report() {
+        for key in [
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::RawCode(103),
+            Key::RawCode(108),
+            Key::RawCode(104),
+            Key::RawCode(109),
+        ] {
+            let mut ml = native_popup_fixture();
+            let all_learned = ml.core.learned_state_for_test();
+            let learned =
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            assert_eq!(ml.handle_key(press(key)), [Action::ForwardKey]);
+            assert_eq!(ml.current_word(), "hel");
+            assert!(ml.core.native_completion_owned());
+            assert!(ml.predictions().is_empty() && !ml.has_ghost());
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            ml.set_surrounding_text(Some("😀 seed hel".into()), Some(10));
+            assert!(!ml.reconcile_native_completion_word(true));
+            assert_eq!(ml.core.learned_state_for_test(), all_learned);
+            assert_eq!(
+                ml.handle_key(press(Key::RawCode(38))),
+                [Action::CommitText("l".into()), Action::HideGhost]
+            );
+            assert_eq!(ml.current_word(), "hell");
+            assert!(ml.predictions().is_empty() && !ml.has_ghost());
+            ml.set_surrounding_text(Some("😀 seed hell".into()), Some(2));
+            assert!(ml.reconcile_native_completion_word(true));
+            assert!(ml.current_word().is_empty());
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+        }
+    }
+
+    #[test]
+    fn native_popup_observed_caret_move_clears_context_like_ordinary_navigation() {
+        for key in [
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::RawCode(103),
+            Key::RawCode(108),
+            Key::RawCode(104),
+            Key::RawCode(109),
+        ] {
+            let mut deferred = native_popup_fixture();
+            let mut direct = native_popup_fixture();
+            let learned =
+                crate::ensemble::learned_profile_for_test(deferred.core.export_personal_profile());
+            let light = serde_json::to_value(&deferred.light_profile).unwrap();
+            let metrics = serde_json::to_value(deferred.metrics().summary()).unwrap();
+            let engine_before_move = deferred.core.learned_state_for_test();
+            assert_eq!(deferred.core.context_words(), (Some("five"), Some("four")));
+            assert!(deferred.detected_language().confidence > 0.0);
+
+            assert_eq!(deferred.handle_key(press(key)), [Action::ForwardKey]);
+            assert_eq!(
+                direct.handle_key(press(Key::Left)),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            assert_ne!(
+                direct.core.learned_state_for_test(),
+                engine_before_move,
+                "ordinary navigation must actually clear this fixture's session cache"
+            );
+            // Same client text, but the Unicode character cursor moved away
+            // from the delivered token: this is text navigation, not a popup.
+            deferred.set_surrounding_text(Some("😀 seed hel".into()), Some(2));
+            assert!(deferred.reconcile_native_completion_word(true));
+            assert_eq!(deferred.core.context_words(), (None, None));
+            assert_eq!(
+                deferred.core.learned_state_for_test(),
+                direct.core.learned_state_for_test(),
+                "transient session state must match ordinary navigation"
+            );
+            assert_eq!(
+                deferred.detected_language().lang,
+                direct.detected_language().lang
+            );
+            assert_eq!(
+                deferred.detected_language().confidence,
+                direct.detected_language().confidence
+            );
+            assert_eq!(deferred.phase(), Phase::Anticipating);
+            assert!(!deferred.anticipated);
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(deferred.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(
+                serde_json::to_value(&deferred.light_profile).unwrap(),
+                light
+            );
+            assert_eq!(
+                serde_json::to_value(deferred.metrics().summary()).unwrap(),
+                metrics
+            );
+
+            // Exercise the consumer after the move as well: old Markov,
+            // detector and session-cache state must yield the same predictions
+            // as the established ordinary-navigation path at the new caret.
+            for ml in [&mut deferred, &mut direct] {
+                ml.set_surrounding_text(Some("😀 seed hel".into()), Some(2));
+                ml.handle_key(press(Key::Char('h')));
+                ml.handle_key(press(Key::Char('e')));
+            }
+            let predictions = |ml: &MasterLoop| {
+                ml.predictions()
+                    .iter()
+                    .map(|p| (p.word.clone(), p.score, p.confidence))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(predictions(&deferred), predictions(&direct));
+            assert_eq!(deferred.ghost_text(), direct.ghost_text());
+        }
+    }
+
+    #[test]
+    fn native_popup_escape_does_not_reject_smartkey_prediction_on_next_semantic_char() {
+        for key in [Key::Escape, Key::RawCode(1)] {
+            let mut ml = native_popup_fixture();
+            let learned =
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            assert_eq!(ml.handle_key(press(key)), [Action::ForwardKey]);
+            assert_eq!(ml.current_word(), "hel");
+            assert!(!ml.core.native_completion_owned());
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            let actions = ml.handle_key(press(Key::Char('l')));
+            assert_eq!(ml.current_word(), "hell");
+            assert!(actions.contains(&Action::ForwardKey));
+            assert!(!actions.iter().any(|action| matches!(
+                action,
+                Action::CommitText(_) | Action::ShowComposing { .. } | Action::ReplaceWord { .. }
+            )));
+            assert_eq!(ml.ghost_text(), "o");
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                learned
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(ml.suppress_countdown, 0);
+        }
+    }
+
+    #[test]
+    fn native_word_report_retirement_preserves_profile_and_learning_attribution() {
+        for (report, collapsed) in [("hel ", true), ("hello", true), ("hel", false)] {
+            let mut ml = MasterLoop::new(InputConfig::default());
+            for word in ["one", "two", "three", "four", "five"] {
+                for ch in word.chars() {
+                    ml.handle_key(press(Key::Char(ch)));
+                }
+                ml.handle_key(press(Key::Space));
+            }
+            ml.load_word_lang("hello", 1_000_000, LangId::En);
+            for code in [35, 18, 38] {
+                ml.handle_key(press(Key::RawCode(code)));
+            }
+            let profile =
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            ml.handoff_preedit_for_native_completion();
+            ml.set_surrounding_text(Some(report.into()), Some(report.chars().count()));
+            assert!(ml.reconcile_native_completion_word(collapsed));
+            assert!(ml.current_word().is_empty());
+            assert!(ml.last_prediction_accept.is_none() && ml.last_shown_ghost.is_none());
+            ml.handle_key(press(Key::Space));
+            assert_eq!(
+                crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+                profile
+            );
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+        }
+    }
+
+    #[test]
+    fn layout_handoff_invalidates_choice_without_profile_or_acceptance_learning() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("top", 1_000_000, LangId::En);
+        ml.load_word_lang("топ", 1_000_000, LangId::Bg);
+        ml.set_language_choice_supported(true);
+        ml.set_surrounding_text(Some("earlier client context ".into()), Some(23));
+        for code in [20, 24, 25] {
+            ml.handle_key(press(Key::RawCode(code)));
+        }
+        let choice = ml
+            .language_choice_offer()
+            .expect("real ambiguous whole word");
+        let typed = ml.current_word().to_string();
+        let profile = crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile());
+        let light_profile = serde_json::to_value(&ml.light_profile).unwrap();
+        let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+        assert_eq!(
+            ml.flush_preedit_for_layout(),
+            [Action::CommitText(typed), Action::HideGhost]
+        );
+        assert_eq!(
+            crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile()),
+            profile
+        );
+        assert_eq!(
+            serde_json::to_value(&ml.light_profile).unwrap(),
+            light_profile
+        );
+        assert_eq!(
+            serde_json::to_value(ml.metrics().summary()).unwrap(),
+            metrics
+        );
+        assert!(ml.language_choice_offer().is_none());
+        assert!(ml
+            .accept_language_choice(choice.revision, LangId::Bg)
+            .is_none());
+        assert!(ml.surrounding_text.is_none() && ml.surrounding_cursor_pos.is_none());
+        assert!(ml.last_shown_ghost.is_none() && ml.sentence_echoes.is_none());
+        assert!(!ml.anticipated);
+        assert_eq!(ml.flush_preedit_for_layout(), [Action::HideGhost]);
+        ml.focus_gained();
+        ml.handle_key(press(Key::Space));
+        assert_eq!(
+            serde_json::to_value(&ml.light_profile).unwrap(),
+            light_profile,
+            "resuming must not consume the partial word as stale commit evidence"
+        );
+        assert_eq!(
+            serde_json::to_value(ml.metrics().summary()).unwrap(),
+            metrics
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_identifier_tests {
+    use super::*;
+
+    fn press(ml: &mut MasterLoop, key: Key) -> Vec<Action> {
+        ml.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn fixture(separator: char) -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("food", 1_000_000, LangId::En);
+        ml.load_word_lang("bar", 1_000_000, LangId::En);
+        for code in [33, 24, 24] {
+            press(&mut ml, Key::RawCode(code));
+        }
+        assert_eq!(ml.current_word(), "foo");
+        let actions = ml.handle_key(KeyEvent {
+            key: Key::RawCode(if separator == '_' { 12 } else { 2 }),
+            modifiers: if separator == '_' {
+                Modifiers::SHIFT
+            } else {
+                Modifiers::empty()
+            },
+        });
+        assert!(actions.contains(&Action::CommitText("foo".into())));
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(ml.current_word().is_empty());
+        for code in [48, 30] {
+            press(&mut ml, Key::RawCode(code));
+        }
+        assert_eq!(ml.current_word(), "ba");
+        assert_eq!(ml.ghost_text(), "r");
+        ml
+    }
+
+    fn handoff(ml: &mut MasterLoop, text: Option<&str>, cursor: Option<usize>, collapsed: bool) {
+        ml.set_surrounding_text(text.map(str::to_owned), cursor);
+        assert!(!ml.reconcile_native_completion_word(collapsed));
+        assert_eq!(
+            ml.handoff_preedit_for_native_completion(),
+            [Action::HideGhost, Action::CommitText("ba".into())]
+        );
+    }
+
+    fn profile(ml: &MasterLoop) -> serde_json::Value {
+        crate::ensemble::learned_profile_for_test(ml.core.export_personal_profile())
+    }
+
+    #[test]
+    fn native_identifier_delimiters_keep_matching_prefix_through_refinement() {
+        for separator in ['_', '1'] {
+            let mut ml = fixture(separator);
+            let learned = profile(&ml);
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            let document = format!("😀 seed foo{separator}ba");
+            // An ordinary preedit report may include its visible ghost on the right.
+            handoff(
+                &mut ml,
+                Some(&format!("{document}r")),
+                Some(document.chars().count()),
+                true,
+            );
+            ml.set_surrounding_text(Some(document.clone()), Some(document.chars().count()));
+            assert!(!ml.reconcile_native_completion_word(true), "{document}");
+            assert_eq!(
+                press(&mut ml, Key::RawCode(19)),
+                [Action::CommitText("r".into()), Action::HideGhost]
+            );
+            assert_eq!(ml.current_word(), "bar");
+            assert_eq!(profile(&ml), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+        }
+    }
+
+    #[test]
+    fn native_identifier_reports_omitting_owned_preedit_keep_prefix_through_refinement() {
+        for (separator, before, after) in [
+            ('_', "😀 seed foo_", "😀 seed foo_ba"),
+            ('1', "😀 seed foo1", "😀 seed foo1ba"),
+            // A bounded client excerpt may contain only the delimiter. Its
+            // character cursor is shorter than the preedit being delivered.
+            ('_', "_", "_ba"),
+        ] {
+            let mut ml = fixture(separator);
+            let learned = ml.core.learned_state_for_test();
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            assert!(ml.debug_state().0, "ba is actually owned preedit");
+            handoff(&mut ml, Some(before), Some(before.chars().count()), true);
+            ml.set_surrounding_text(Some(after.into()), Some(after.chars().count()));
+            assert!(!ml.reconcile_native_completion_word(true), "{before:?}");
+            assert_eq!(
+                press(&mut ml, Key::RawCode(19)),
+                [Action::CommitText("r".into()), Action::HideGhost]
+            );
+            assert_eq!(ml.current_word(), "bar");
+            assert!(ml.native_completion_owned());
+            assert_eq!(ml.core.learned_state_for_test(), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+        }
+    }
+
+    #[test]
+    fn native_identifier_omitted_preedit_anchor_requires_known_collapsed_delimiter() {
+        for (before, cursor, collapsed, after) in [
+            ("foo_", Some(4), false, "foo_ba"),
+            ("foo_", None, true, "foo_ba"),
+            ("foo_", Some(99), true, "foo_ba"),
+            ("foo", Some(3), true, "fooba"),
+            ("foo١", Some(4), true, "foo١ba"),
+        ] {
+            let mut ml = fixture('_');
+            let learned = profile(&ml);
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            handoff(&mut ml, Some(before), cursor, collapsed);
+            ml.set_surrounding_text(Some(after.into()), Some(after.chars().count()));
+            assert!(ml.reconcile_native_completion_word(true), "{before:?}");
+            assert!(ml.current_word().is_empty());
+            assert_eq!(profile(&ml), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            assert!(ml.core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_identifier_semantic_delivered_word_cannot_borrow_omitted_preedit_anchor() {
+        let mut ml = MasterLoop::new(InputConfig::default());
+        ml.load_word_lang("bar", 1_000_000, LangId::En);
+        press(&mut ml, Key::Char('b'));
+        press(&mut ml, Key::Char('a'));
+        assert_eq!(ml.current_word(), "ba");
+        assert!(!ml.debug_state().0);
+        let learned = profile(&ml);
+        let light = serde_json::to_value(&ml.light_profile).unwrap();
+        let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+        ml.set_surrounding_text(Some("foo_".into()), Some(4));
+        assert!(!ml.reconcile_native_completion_word(true));
+        assert_eq!(
+            ml.handoff_preedit_for_native_completion(),
+            [Action::HideGhost]
+        );
+        ml.set_surrounding_text(Some("foo_ba".into()), Some(6));
+        assert!(ml.reconcile_native_completion_word(true));
+        assert!(ml.current_word().is_empty());
+        assert_eq!(profile(&ml), learned);
+        assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+        assert_eq!(
+            serde_json::to_value(ml.metrics().summary()).unwrap(),
+            metrics
+        );
+    }
+
+    #[test]
+    fn native_identifier_omitted_preedit_anchor_cannot_be_recaptured_or_accept_right_tail() {
+        for (after, cursor, repeated_handoff) in [("x_ba", 4, true), ("foo_bar", 6, false)] {
+            let mut ml = fixture('_');
+            let learned = profile(&ml);
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            handoff(&mut ml, Some("foo_"), Some(4), true);
+            // Establish that the omission form captured the original scope.
+            ml.set_surrounding_text(Some("foo_ba".into()), Some(6));
+            assert!(!ml.reconcile_native_completion_word(true));
+            ml.set_surrounding_text(Some(after.into()), Some(cursor));
+            if repeated_handoff {
+                assert_eq!(
+                    ml.handoff_preedit_for_native_completion(),
+                    [Action::HideGhost]
+                );
+            }
+            assert!(ml.reconcile_native_completion_word(true));
+            assert!(ml.current_word().is_empty());
+            assert_eq!(profile(&ml), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            assert!(ml.core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_identifier_prefix_change_or_disappearance_retires_without_learning() {
+        for replacement in ["x_ba", "ba", "foo1ba"] {
+            let mut ml = fixture('_');
+            let learned = profile(&ml);
+            let light = serde_json::to_value(&ml.light_profile).unwrap();
+            let metrics = serde_json::to_value(ml.metrics().summary()).unwrap();
+            handoff(&mut ml, Some("foo_ba"), Some(6), true);
+            ml.set_surrounding_text(Some(replacement.into()), Some(replacement.chars().count()));
+            assert!(ml.reconcile_native_completion_word(true), "{replacement}");
+            assert!(ml.current_word().is_empty());
+            assert_eq!(profile(&ml), learned);
+            assert_eq!(serde_json::to_value(&ml.light_profile).unwrap(), light);
+            assert_eq!(
+                serde_json::to_value(ml.metrics().summary()).unwrap(),
+                metrics
+            );
+            assert!(ml.core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_identifier_capture_requires_known_collapsed_suffix_and_core_delimiter() {
+        for (initial, cursor, collapsed, later) in [
+            (Some("fooba"), Some(5), true, "fooba"),
+            (None, None, true, "foo_ba"),
+            (Some("foo_ba"), None, true, "foo_ba"),
+            (Some("foo_ba"), Some(99), true, "foo_ba"),
+            (Some("foo_ba"), Some(6), false, "foo_ba"),
+            (Some("foo_bar"), Some(7), true, "foo_ba"),
+            (Some("foo١ba"), Some(6), true, "foo١ba"),
+        ] {
+            let mut ml = fixture('_');
+            let learned = profile(&ml);
+            handoff(&mut ml, initial, cursor, collapsed);
+            ml.set_surrounding_text(Some(later.into()), Some(later.chars().count()));
+            assert!(
+                ml.reconcile_native_completion_word(true),
+                "{initial:?}/{cursor:?}/{collapsed}"
+            );
+            assert!(ml.current_word().is_empty());
+            assert_eq!(profile(&ml), learned);
+        }
+    }
+
+    #[test]
+    fn native_identifier_repeated_handoff_cannot_adopt_replaced_prefix() {
+        let mut ml = fixture('_');
+        let learned = profile(&ml);
+        handoff(&mut ml, Some("foo_ba"), Some(6), true);
+        ml.set_surrounding_text(Some("x_ba".into()), Some(4));
+        assert_eq!(
+            ml.handoff_preedit_for_native_completion(),
+            [Action::HideGhost]
+        );
+        assert!(ml.reconcile_native_completion_word(true));
+        assert!(ml.current_word().is_empty());
+        assert_eq!(profile(&ml), learned);
+    }
+
+    #[test]
+    fn native_identifier_right_lexical_tail_is_only_tolerated_before_handoff() {
+        let mut ml = fixture('_');
+        let learned = profile(&ml);
+        handoff(&mut ml, Some("foo_bar"), Some(6), true);
+        ml.set_surrounding_text(Some("foo_bar".into()), Some(6));
+        assert!(ml.reconcile_native_completion_word(true));
+        assert!(ml.current_word().is_empty());
+        assert_eq!(profile(&ml), learned);
+    }
+
+    #[test]
+    fn native_identifier_lifecycle_does_not_transfer_anchor_to_next_token() {
+        for end in 0..9 {
+            let mut ml = fixture('_');
+            handoff(&mut ml, Some("foo_ba"), Some(6), true);
+            match end {
+                0 => {
+                    ml.reset();
+                }
+                1 => {
+                    ml.focus_lost();
+                }
+                2 => ml.focus_gained(),
+                3 => {
+                    ml.flush_preedit_for_layout();
+                }
+                4 => {
+                    press(&mut ml, Key::Backspace);
+                    press(&mut ml, Key::Backspace);
+                }
+                5 => {
+                    press(&mut ml, Key::Space);
+                }
+                6 => {
+                    press(&mut ml, Key::Tab);
+                }
+                7 => {
+                    press(&mut ml, Key::Return);
+                }
+                _ => {
+                    press(&mut ml, Key::Escape);
+                }
+            }
+            if ml.current_word().is_empty() {
+                for code in [48, 30] {
+                    press(&mut ml, Key::RawCode(code));
+                }
+            }
+            assert_eq!(ml.current_word(), "ba");
+            ml.set_surrounding_text(Some("ba".into()), Some(2));
+            assert!(!ml.reconcile_native_completion_word(true));
+            ml.handoff_preedit_for_native_completion();
+            ml.set_surrounding_text(Some("ba".into()), Some(2));
+            assert!(!ml.reconcile_native_completion_word(true), "endpoint {end}");
+            assert_eq!(
+                press(&mut ml, Key::RawCode(19)),
+                [Action::CommitText("r".into()), Action::HideGhost]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_display_regression_tests {
+    use super::*;
+    use crate::input::{Key, Modifiers};
+
+    fn key(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+    fn fixture() -> MasterLoop {
+        let mut ml = MasterLoop::new(InputConfig {
+            space_accept: true,
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        ml.load_word_lang("hello", 10000, LangId::En);
+        ml
+    }
+    fn type_prefix(ml: &mut MasterLoop) {
+        for code in [35, 18, 38] {
+            ml.handle_key(key(Key::RawCode(code)));
+        }
+        assert_eq!(ml.current_word(), "hel");
+    }
+
+    #[test]
+    fn direct_display_hidden_space_does_not_accept_or_learn_completion() {
+        let mut ml = fixture();
+        type_prefix(&mut ml);
+        assert_eq!(ml.ghost_text(), "lo");
+        ml.set_completion_display_supported(false);
+        let accepted = ml.core.metrics().summary().accepted_predictions;
+        let actions = ml.handle_key(key(Key::Space));
+        assert!(
+            actions.contains(&Action::CommitText("hel".into())),
+            "{actions:?}"
+        );
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, accepted);
+        assert_eq!(ml.core.context_words(), (Some("hel"), None));
+        assert!(ml.last_shown_ghost.is_none());
+    }
+
+    #[test]
+    fn direct_display_disables_generation_and_restores_user_acceptance() {
+        let mut ml = fixture();
+        ml.set_completion_display_supported(false);
+        type_prefix(&mut ml);
+        assert_eq!(ml.ghost_text(), "");
+        assert!(ml.last_shown_ghost.is_none());
+        assert!(ml.core.apply_prediction_override("hello").is_none());
+        ml.reset();
+        ml.set_completion_display_supported(true);
+        type_prefix(&mut ml);
+        assert_eq!(ml.ghost_text(), "lo");
+        let actions = ml.handle_key(key(Key::Space));
+        assert!(
+            actions.contains(&Action::CommitText("hello ".into())),
+            "{actions:?}"
+        );
+        assert_eq!(ml.core.metrics().summary().accepted_predictions, 1);
+    }
+    #[test]
+    fn direct_display_handoff_edits_do_not_train_profile_or_feedback() {
+        for boundary in [Key::Space, Key::RawCode(51), Key::Escape, Key::Left] {
+            let mut ml = fixture();
+            type_prefix(&mut ml);
+            ml.handoff_preedit_for_delivery();
+            let learned = ml.core.learned_state_for_test();
+            let light = serde_json::to_value(ml.light_profile()).unwrap();
+            ml.handle_key(key(Key::Backspace));
+            ml.handle_key(key(Key::RawCode(38)));
+            ml.handle_key(key(boundary));
+            assert_eq!(ml.core.learned_state_for_test(), learned);
+            assert_eq!(serde_json::to_value(ml.light_profile()).unwrap(), light);
+            assert_eq!(ml.current_word(), "");
+            assert!(ml.last_shown_ghost.is_none());
+            assert!(ml.last_prediction_accept.is_none());
+            assert!(ml.last_accepted_prediction.is_none());
+        }
     }
 }

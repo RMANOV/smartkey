@@ -824,7 +824,7 @@ def test_lifecycle_password_declaration_is_sticky_across_focus():
     # The declaration survives a focus round-trip (IBus deduplicates it).
     core.calls.clear()
     eng.do_focus_out()
-    assert ("focus_lost",) in core.calls
+    assert ("focus_lost",) not in core.calls, "the hard stop never flushes the core"
     assert ("save_personal",) not in core.calls
     eng.do_focus_in()
     assert ("focus_gained",) in core.calls

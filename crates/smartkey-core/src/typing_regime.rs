@@ -127,6 +127,18 @@ impl RegimeDetector {
     /// - `is_flip`: true when this word triggered a dual-buffer layout flip.
     /// - `lang`: the language detected for this word.
     pub fn observe_word(&mut self, word_len: usize, is_oov: bool, is_flip: bool, lang: LangId) {
+        self.observe_word_with_evidence(word_len, is_oov, is_flip, Some(lang));
+    }
+
+    /// Update delivered-word statistics without inventing a language vote
+    /// when a physical-key interpretation has no independent evidence.
+    pub fn observe_word_with_evidence(
+        &mut self,
+        word_len: usize,
+        is_oov: bool,
+        is_flip: bool,
+        language: Option<LangId>,
+    ) {
         let now = std::time::Instant::now();
         let alpha = self.ema_alpha;
 
@@ -160,13 +172,13 @@ impl RegimeDetector {
 
         // ── Language ratio ────────────────────────────────────────────────
         // EN → 1.0, BG → 0.0, Tech → hold current ratio (neutral).
-        let lang_signal = match lang {
-            LangId::En => 1.0,
-            LangId::Bg => 0.0,
-            LangId::Tech => self.lang_ratio_ema, // No update for tech symbols
+        let lang_signal = match language {
+            Some(LangId::En) => Some(1.0),
+            Some(LangId::Bg) => Some(0.0),
+            Some(LangId::Tech) | None => None,
         };
-        if lang != LangId::Tech {
-            self.lang_ratio_ema = ema_update(self.lang_ratio_ema, lang_signal, alpha);
+        if let Some(signal) = lang_signal {
+            self.lang_ratio_ema = ema_update(self.lang_ratio_ema, signal, alpha);
         }
 
         self.word_count += 1;

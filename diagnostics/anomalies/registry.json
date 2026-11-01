@@ -22,11 +22,11 @@
         "before": "искаш",
         "after": null
       },
-      "recorded_utc": "2026-08-25T16:11Z",
+      "recorded_utc": "2026-10-15T08:57:46Z",
       "first_seen_utc": "2026-08-23T18:07Z",
-      "last_seen_utc": "2026-08-23T18:14Z",
+      "last_seen_utc": "2026-10-15T07:24:03Z",
       "repeat": true,
-      "occurrence_count": 2,
+      "occurrence_count": 3,
       "environment": {
         "app_surface": "unknown (operator live text)",
         "os": "linux",
@@ -52,23 +52,60 @@
           "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
           "surface": "offline probe",
           "note": "audit: ли renders as li in every probed context on 7b9901a; fix candidates F4-a / F4-c named"
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:73248b9dae2eac720fa6aa10b4077b52c02a04fbe7895b5854ae371e1e592fb2",
+          "observed_utc": "2026-10-15T07:24:03Z",
+          "build_sha": "8d4973698df7c8cc65be8caf80118a33c472e3cc",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED failed probe session; frozen current copies, not historical byte custody."
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:1d20769205f7543b0c0bc7a211feb6e1c9c663e0c38249430d9c058ec1f892fd",
+          "observed_utc": "2026-10-15T08:01:43Z",
+          "build_sha": "5813178ed4c303a27f1ab6f4c4d8c33e227739a6",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED post-fix probe passes before and at delimiter; original GUI not exercised."
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:abe7b18184b66f3d5e9e5d64458ffaf1cb02a7c0991106f386c02ca0a461af5c",
+          "observed_utc": "2026-10-15T08:55:39Z",
+          "build_sha": "ba3e8999e628cdb603c9579f2ef3c826eb86194e",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED accepted artifact verification; copied inputs unchanged; original GUI not exercised."
         }
       ],
-      "status": "reproduced",
+      "status": "fixed",
       "suspected_layer": "dual_buffer_short_word",
       "reproducer": {
         "kind": "offline_probe",
-        "ref": "ledger f09e9917b91f",
-        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
-        "summary": "ли -> li in every probed context on 7b9901a"
+        "ref": "sha256:73248b9dae2eac720fa6aa10b4077b52c02a04fbe7895b5854ae371e1e592fb2",
+        "build_sha": "8d4973698df7c8cc65be8caf80118a33c472e3cc",
+        "summary": "CURRENT_RECONSTRUCTED offline PyO3 contract with fresh defaults, no personal data and frozen current inputs. Known BG-intent target remains Latin on N; original historical bytes and client state are unknown."
       },
-      "red_test": null,
+      "red_test": {
+        "path": "ibus/test_native_language_evidence.py",
+        "name": "test_native_shortword_soft_context_selects_live_reading_before_literal_space",
+        "commit": "6aa9727651ae79d053a8ce95a46820b0409f07dc"
+      },
       "red_test_waiver": null,
-      "fix_commit": null,
-      "verification": null,
+      "fix_commit": "6aa9727651ae79d053a8ce95a46820b0409f07dc",
+      "verification": {
+        "build_sha": "ba3e8999e628cdb603c9579f2ef3c826eb86194e",
+        "evidence_refs": [
+          "sha256:abe7b18184b66f3d5e9e5d64458ffaf1cb02a7c0991106f386c02ca0a461af5c",
+          "sha256:316183bb503292b1cbed57bf200bf2a92a074b1eef3d1283ea67940778c88dab",
+          "sha256:1d20769205f7543b0c0bc7a211feb6e1c9c663e0c38249430d9c058ec1f892fd"
+        ],
+        "surface": "offline PyO3 current contract",
+        "summary": "PARTIAL CURRENT_RECONSTRUCTED accepted C replay passes BG preedit and commit; no-context Latin control unchanged. Exactly one commit and delimiter forward, no replace. The original reported live surface remains unverified."
+      },
       "closure_reason": null,
       "privacy_classification": "public_token",
-      "notes": "F1 exposes context-free short-word scoring. F4 remains RED-only: no fix has landed; this record must not be used to widen F4."
+      "notes": "PARTIAL current offline PyO3 evidence for the implemented fix. The original reported live surface remains unverified; historical inputs and source refs are preserved."
     },
     {
       "id": "anom-658c49a8621c",
@@ -89,11 +126,11 @@
         "before": null,
         "after": null
       },
-      "recorded_utc": "2026-08-25T16:11Z",
+      "recorded_utc": "2026-10-15T08:57:46Z",
       "first_seen_utc": "2026-08-23T18:14Z",
-      "last_seen_utc": "2026-08-23T18:14Z",
+      "last_seen_utc": "2026-10-15T08:03:03Z",
       "repeat": true,
-      "occurrence_count": 2,
+      "occurrence_count": 4,
       "environment": {
         "app_surface": "offline probe",
         "os": "linux",
@@ -119,23 +156,59 @@
           "build_sha": "d8b01c076babc24881632739ebe4d4da763be86d",
           "surface": "offline probe",
           "note": "pre-existing: ви -> wi also on d8b01c0"
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:78ddb936caca35178a13ebbbf6b14fdec806c4e6264af119510360629b7700ed",
+          "observed_utc": "2026-10-15T07:57:01Z",
+          "build_sha": "8d4973698df7c8cc65be8caf80118a33c472e3cc",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED synthetic BG-intent probe fails; separate observational no-context arm."
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:7dacff09ca826c8b7a4a1711268a038e83ca22822a67e889708cd5ccb881fd6f",
+          "observed_utc": "2026-10-15T08:03:03Z",
+          "build_sha": "5813178ed4c303a27f1ab6f4c4d8c33e227739a6",
+          "surface": "offline PyO3 current contract",
+          "note": "Identical CURRENT_RECONSTRUCTED probe still fails on accepted S; no promotion or closure."
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:383ed443c0319c11671f493bbba77581a710d917856a90743e9ba9cb89cf9765",
+          "observed_utc": "2026-10-15T08:55:56Z",
+          "build_sha": "ba3e8999e628cdb603c9579f2ef3c826eb86194e",
+          "surface": "offline PyO3 current contract",
+          "note": "CURRENT_RECONSTRUCTED accepted artifact verification; copied inputs unchanged; original GUI not exercised."
         }
       ],
-      "status": "reproduced",
+      "status": "fixed",
       "suspected_layer": "dual_buffer_short_word",
       "reproducer": {
         "kind": "offline_probe",
-        "ref": "ledger f09e9917b91f",
-        "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
-        "summary": "ви -> wi reproduces on both 7b9901a and d8b01c0 (not introduced by F1)"
+        "ref": "sha256:7dacff09ca826c8b7a4a1711268a038e83ca22822a67e889708cd5ccb881fd6f",
+        "build_sha": "5813178ed4c303a27f1ab6f4c4d8c33e227739a6",
+        "summary": "CURRENT_RECONSTRUCTED offline PyO3 known BG-intent contract using public synthetic context, fresh defaults, no personal data and frozen copied corpus files. S retains and commits Latin. Original historical inputs are unknown."
       },
-      "red_test": null,
+      "red_test": {
+        "path": "ibus/test_native_language_evidence.py",
+        "name": "test_native_terminal_context_uses_exact_word_without_accepting_ghost",
+        "commit": "168bb187db9462142400e8d10622053cdbe8f764"
+      },
       "red_test_waiver": null,
-      "fix_commit": null,
-      "verification": null,
+      "fix_commit": "168bb187db9462142400e8d10622053cdbe8f764",
+      "verification": {
+        "build_sha": "ba3e8999e628cdb603c9579f2ef3c826eb86194e",
+        "evidence_refs": [
+          "sha256:383ed443c0319c11671f493bbba77581a710d917856a90743e9ba9cb89cf9765",
+          "sha256:316183bb503292b1cbed57bf200bf2a92a074b1eef3d1283ea67940778c88dab"
+        ],
+        "surface": "offline PyO3 current contract",
+        "summary": "PARTIAL CURRENT_RECONSTRUCTED accepted C terminal replay with synthetic BG context: preboundary Latin remains; delimiter commits the intended BG token once with one forward and no replace. No-context output is an unchanged observational control. The original context is unknown and not bound by this probe; original GUI acceptance was not run."
+      },
       "closure_reason": null,
       "privacy_classification": "public_token",
-      "notes": "Expected form ви recorded per audit instruction; confidence is low only in the sense that a genuine Latin wi is conceivable in mixed text. Not seen live yet; probe-only."
+      "notes": "PARTIAL current offline terminal evidence for the implemented fix; preboundary Latin remains. The original context is unknown, and synthetic BG success does not bind that historical report. Historical refs are preserved."
     },
     {
       "id": "anom-36d659523143",
@@ -433,18 +506,43 @@
           "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
           "surface": "live, app unknown",
           "note": "темплейтът -> templejtyt in the operator sentence"
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "observed_utc": "2026-10-16T05:41:59Z",
+          "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+          "surface": "offline PyO3 explicit-choice contract",
+          "note": "CURRENT_RECONSTRUCTED user policy: display both readings without automatic switching; native choice cases pass. F real-corpus replay is separately qualified in verification."
         }
       ],
-      "status": "open_suspected_smartkey",
+      "status": "fixed",
       "suspected_layer": "dual_buffer_prefix_lock",
-      "reproducer": null,
-      "red_test": null,
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "sha256:4e7a9317a8d30a51e2556eca20db9658906c079b403b7369101fcdb2da305853",
+        "build_sha": "unknown",
+        "summary": "CURRENT_RECONSTRUCTED raw-key public Rust contract produced no whole-word offer before this feature. Frozen RED source hashes and 13 failed/3 passing cases are in the receipt; this is not an original physical-input/client-state reconstruction."
+      },
+      "red_test": {
+        "path": "crates/smartkey-core/tests/language_choice.rs",
+        "name": "language_choice_offers_complete_templejtyt_without_rewriting",
+        "commit": "64fa229201ce6ff5730cccd572e77733b4fec00d"
+      },
       "red_test_waiver": null,
-      "fix_commit": null,
-      "verification": null,
+      "fix_commit": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+      "verification": {
+        "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+        "evidence_refs": [
+          "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "sha256:871b7130888eacd7d59049df67e049facb8ac4dd17746bfe6921eaf3eaae49a2"
+        ],
+        "surface": "offline PyO3 explicit-choice contract",
+        "summary": "PARTIAL CURRENT_RECONSTRUCTED: current reading is preserved on Space; exact BG reading commits only by explicit choice. G native cases pass; 14 public-corpus arms ran on F with identical Rust/PyO3 sources. Original reported GUI episode remains unverified."
+      },
       "closure_reason": null,
       "privacy_classification": "public_token",
-      "notes": "Live sighting only; no offline reproduction recorded yet. Hypothesis: Latin-plausible prefix (templ-)."
+      "notes": "Live sighting only; no offline reproduction recorded yet. Hypothesis: Latin-plausible prefix (templ-). PARTIAL CURRENT_RECONSTRUCTED fix under the 2026-10-16 operator policy: show a choice without automatic switching. Space keeps the current ambiguous reading. Original live surface and original physical input remain unverified; historical provenance is retained."
     },
     {
       "id": "anom-b253e3d1599f",
@@ -649,18 +747,43 @@
           "build_sha": "7b9901af178eac38c050ef2c2ddc05ecee8a7ae2",
           "surface": "live, app unknown",
           "note": "тн -> tn in the operator sentence (abbreviation)"
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "observed_utc": "2026-10-16T05:41:59Z",
+          "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+          "surface": "offline PyO3 explicit-choice contract",
+          "note": "CURRENT_RECONSTRUCTED user policy: display both readings without automatic switching; native choice cases pass. F real-corpus replay is separately qualified in verification."
         }
       ],
-      "status": "open_suspected_smartkey",
+      "status": "fixed",
       "suspected_layer": "dual_buffer_short_word",
-      "reproducer": null,
-      "red_test": null,
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "sha256:4e7a9317a8d30a51e2556eca20db9658906c079b403b7369101fcdb2da305853",
+        "build_sha": "unknown",
+        "summary": "CURRENT_RECONSTRUCTED raw-key public Rust contract produced no whole-word offer before this feature. Frozen RED source hashes and 13 failed/3 passing cases are in the receipt; this is not an original physical-input/client-state reconstruction."
+      },
+      "red_test": {
+        "path": "crates/smartkey-core/tests/language_choice.rs",
+        "name": "language_choice_offers_both_supported_tn_without_rewriting",
+        "commit": "64fa229201ce6ff5730cccd572e77733b4fec00d"
+      },
       "red_test_waiver": null,
-      "fix_commit": null,
-      "verification": null,
+      "fix_commit": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+      "verification": {
+        "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+        "evidence_refs": [
+          "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "sha256:871b7130888eacd7d59049df67e049facb8ac4dd17746bfe6921eaf3eaae49a2"
+        ],
+        "surface": "offline PyO3 explicit-choice contract",
+        "summary": "PARTIAL CURRENT_RECONSTRUCTED: current reading is preserved on Space; exact BG reading commits only by explicit choice. G native cases pass; 14 public-corpus arms ran on F with identical Rust/PyO3 sources. Original reported GUI episode remains unverified."
+      },
       "closure_reason": null,
       "privacy_classification": "public_token",
-      "notes": "Two-letter abbreviation; same short-word class as li and но. No offline reproduction recorded yet."
+      "notes": "Two-letter abbreviation; same short-word class as li and но. No offline reproduction recorded yet. PARTIAL CURRENT_RECONSTRUCTED fix under the 2026-10-16 operator policy: show a choice without automatic switching. Space keeps the current ambiguous reading. Original live surface and original physical input remain unverified; historical provenance is retained."
     },
     {
       "id": "anom-8f7f14473be3",
@@ -701,9 +824,17 @@
           "build_sha": "unknown",
           "surface": "offline probe",
           "note": "surfaced by the offline reproduction of the operator sentence; not seen live"
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "observed_utc": "2026-10-16T05:41:59Z",
+          "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+          "surface": "offline PyO3 explicit-choice contract",
+          "note": "CURRENT_RECONSTRUCTED user policy: display both readings without automatic switching; native choice cases pass. F real-corpus replay is separately qualified in verification."
         }
       ],
-      "status": "reproduced",
+      "status": "fixed",
       "suspected_layer": "dual_buffer_short_word",
       "reproducer": {
         "kind": "offline_probe",
@@ -711,13 +842,25 @@
         "build_sha": "unknown",
         "summary": "топ -> top in the offline reproduction of the operator sentence"
       },
-      "red_test": null,
+      "red_test": {
+        "path": "crates/smartkey-core/tests/language_choice.rs",
+        "name": "language_choice_offers_both_supported_top_without_rewriting",
+        "commit": "64fa229201ce6ff5730cccd572e77733b4fec00d"
+      },
       "red_test_waiver": null,
-      "fix_commit": null,
-      "verification": null,
+      "fix_commit": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+      "verification": {
+        "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+        "evidence_refs": [
+          "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "sha256:871b7130888eacd7d59049df67e049facb8ac4dd17746bfe6921eaf3eaae49a2"
+        ],
+        "surface": "offline PyO3 explicit-choice contract",
+        "summary": "PARTIAL CURRENT_RECONSTRUCTED: current reading is preserved on Space; exact BG reading commits only by explicit choice. G native cases pass; 14 public-corpus arms ran on F with identical Rust/PyO3 sources. Original reported GUI episode remains unverified."
+      },
       "closure_reason": null,
       "privacy_classification": "public_token",
-      "notes": "Probe-only sighting; build of the probe is not stated in the ledger summary and is recorded as unknown."
+      "notes": "Probe-only sighting; build of the probe is not stated in the ledger summary and is recorded as unknown. PARTIAL CURRENT_RECONSTRUCTED fix under the 2026-10-16 operator policy: show a choice without automatic switching. Space keeps the current ambiguous reading. Original live surface and original physical input remain unverified; historical provenance is retained."
     },
     {
       "id": "anom-27ef05568e53",
@@ -1042,18 +1185,44 @@
           "build_sha": "unknown",
           "surface": null,
           "note": "operator text seen by ADVOCATE; app, build and time not recorded"
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "observed_utc": "2026-10-16T05:41:59Z",
+          "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+          "surface": "offline PyO3 explicit-choice contract",
+          "note": "CURRENT_RECONSTRUCTED user policy: display both readings without automatic switching; native choice cases pass. F real-corpus replay is separately qualified in verification."
         }
       ],
-      "status": "open_suspected_smartkey",
+      "status": "fixed",
       "suspected_layer": "unknown",
-      "reproducer": null,
-      "red_test": null,
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "sha256:4e7a9317a8d30a51e2556eca20db9658906c079b403b7369101fcdb2da305853",
+        "build_sha": "unknown",
+        "summary": "CURRENT_RECONSTRUCTED raw-key public Rust contract produced no whole-word offer before this feature. Frozen RED source hashes and 13 failed/3 passing cases are in the receipt; this is not an original physical-input/client-state reconstruction."
+      },
+      "red_test": {
+        "path": "crates/smartkey-core/tests/language_choice.rs",
+        "name": "language_choice_offers_complete_draftyt_without_rewriting",
+        "commit": "64fa229201ce6ff5730cccd572e77733b4fec00d"
+      },
       "red_test_waiver": null,
-      "fix_commit": null,
-      "verification": null,
+      "fix_commit": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+      "verification": {
+        "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+        "evidence_refs": [
+          "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "sha256:871b7130888eacd7d59049df67e049facb8ac4dd17746bfe6921eaf3eaae49a2",
+          "sha256:8f0dae75541b91198a38e518145d0873d9c70d5e44fbbb4043efadb39944082c"
+        ],
+        "surface": "offline PyO3 explicit-choice contract + private GTK3/X11 stock panel",
+        "summary": "PARTIAL CURRENT_RECONSTRUCTED: current reading is preserved on Space; exact BG reading commits only by explicit choice. G native cases pass; 14 public-corpus arms ran on F with identical Rust/PyO3 sources. G private GTK3 stock-panel trial also passed: 17 keys, 34 callbacks, exact draftyt драфтът. Original reported GUI episode remains unverified."
+      },
       "closure_reason": null,
       "privacy_classification": "public_token",
-      "notes": "Provenance unknown beyond the gate message; recorded as unknown rather than inferred."
+      "notes": "Provenance unknown beyond the gate message; recorded as unknown rather than inferred. PARTIAL CURRENT_RECONSTRUCTED fix under the 2026-10-16 operator policy: show a choice without automatic switching. Space keeps the current ambiguous reading. Original live surface and original physical input remain unverified; historical provenance is retained."
     },
     {
       "id": "anom-7fe22c88b977",
@@ -1094,18 +1263,43 @@
           "build_sha": "unknown",
           "surface": null,
           "note": "operator text seen by ADVOCATE; app, build and time not recorded"
+        },
+        {
+          "kind": "probe",
+          "ref": "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "observed_utc": "2026-10-16T05:41:59Z",
+          "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+          "surface": "offline PyO3 explicit-choice contract",
+          "note": "CURRENT_RECONSTRUCTED user policy: display both readings without automatic switching; native choice cases pass. F real-corpus replay is separately qualified in verification."
         }
       ],
-      "status": "open_suspected_smartkey",
+      "status": "fixed",
       "suspected_layer": "unknown",
-      "reproducer": null,
-      "red_test": null,
+      "reproducer": {
+        "kind": "offline_probe",
+        "ref": "sha256:4e7a9317a8d30a51e2556eca20db9658906c079b403b7369101fcdb2da305853",
+        "build_sha": "unknown",
+        "summary": "CURRENT_RECONSTRUCTED raw-key public Rust contract produced no whole-word offer before this feature. Frozen RED source hashes and 13 failed/3 passing cases are in the receipt; this is not an original physical-input/client-state reconstruction."
+      },
+      "red_test": {
+        "path": "crates/smartkey-core/tests/language_choice.rs",
+        "name": "language_choice_offers_complete_markdaun_without_rewriting",
+        "commit": "64fa229201ce6ff5730cccd572e77733b4fec00d"
+      },
       "red_test_waiver": null,
-      "fix_commit": null,
-      "verification": null,
+      "fix_commit": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+      "verification": {
+        "build_sha": "b6cebb84dd258a2de58df77bb467c66124f0352a",
+        "evidence_refs": [
+          "sha256:d46a1db06908d96174454b817ebec449410b73003f9968a26e6b27d9dd4c3c02",
+          "sha256:871b7130888eacd7d59049df67e049facb8ac4dd17746bfe6921eaf3eaae49a2"
+        ],
+        "surface": "offline PyO3 explicit-choice contract",
+        "summary": "PARTIAL CURRENT_RECONSTRUCTED: current reading is preserved on Space; exact BG reading commits only by explicit choice. G native cases pass; 14 public-corpus arms ran on F with identical Rust/PyO3 sources. Original reported GUI episode remains unverified."
+      },
       "closure_reason": null,
       "privacy_classification": "public_token",
-      "notes": "Provenance unknown beyond the gate message; recorded as unknown rather than inferred."
+      "notes": "Provenance unknown beyond the gate message; recorded as unknown rather than inferred. PARTIAL CURRENT_RECONSTRUCTED fix under the 2026-10-16 operator policy: show a choice without automatic switching. Space keeps the current ambiguous reading. Original live surface and original physical input remain unverified; historical provenance is retained."
     },
     {
       "id": "anom-6af125957474",

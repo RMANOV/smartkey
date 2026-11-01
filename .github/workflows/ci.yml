@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, integration/smartkey-exec.ZUDHA2Ey]
+    branches: [main, master]
   pull_request:
     branches: [main, master]
 
@@ -37,10 +37,45 @@ jobs:
           SMARTKEY_BUILD_GIT_SHA="$build_sha" \
             SMARTKEY_BUILD_GIT_DIRTY=0 \
             maturin develop -m crates/smartkey-py/Cargo.toml
+          test_root="$RUNNER_TEMP/smartkey-tests"
+          mkdir -p "$test_root/home" "$test_root/config" "$test_root/data" \
+            "$test_root/state" "$test_root/cache" "$test_root/tmp" \
+            "$test_root/phasea" "$test_root/debug"
+          export HOME="$test_root/home" XDG_CONFIG_HOME="$test_root/config" \
+            XDG_DATA_HOME="$test_root/data" XDG_STATE_HOME="$test_root/state" \
+            XDG_CACHE_HOME="$test_root/cache" TMPDIR="$test_root/tmp" \
+            SMARTKEY_PHASEA_DATA="$test_root/phasea" SMARTKEY_DEBUG_DIR="$test_root/debug" \
+            SMARTKEY_DEBUG=off PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+          native_root="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          native_extension="$(python -c 'import pathlib,sysconfig; paths=list((pathlib.Path(sysconfig.get_path("purelib"))/"smartkey_py").glob("*.so")); assert len(paths)==1, paths; print(paths[0])')"
+          native_sha="$(sha256sum "$native_extension" | cut -d ' ' -f 1)"
+          printf 'synthetic-readonly-canary\n' > "$test_root/readonly-canary"
+          chmod 400 "$test_root/readonly-canary"
           SMARTKEY_EXPECT_BUILD_GIT_SHA="$build_sha" \
             SMARTKEY_EXPECT_BUILD_GIT_DIRTY=0 \
+            SMARTKEY_NATIVE_AUDIT_REQUIRED=1 \
+            SMARTKEY_NATIVE_MODULE_DIR="$native_root" \
+            SMARTKEY_NATIVE_EXTENSION="$native_extension" \
+            SMARTKEY_NATIVE_EXTENSION_SHA256="$native_sha" \
+            SMARTKEY_NATIVE_READONLY_CANARY="$test_root/readonly-canary" \
             PYTHONDONTWRITEBYTECODE=1 \
-            python -m pytest -q -p no:cacheprovider
+            python -m pytest -q -p no:cacheprovider \
+              ibus/test_native_space_accept.py ibus/test_native_lang_prior.py \
+              ibus/test_native_privacy_boundaries.py ibus/test_native_key_contract.py \
+              ibus/test_native_profile_persistence.py \
+              ibus/test_native_language_evidence.py ibus/test_native_language_choice.py
+          SMARTKEY_EXPECT_BUILD_GIT_SHA="$build_sha" \
+            SMARTKEY_EXPECT_BUILD_GIT_DIRTY=0 \
+            SMARTKEY_TEST_NATIVE_MODULE="$native_extension" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            python -m pytest -q -p no:cacheprovider \
+              --ignore=ibus/test_native_space_accept.py \
+              --ignore=ibus/test_native_lang_prior.py \
+              --ignore=ibus/test_native_privacy_boundaries.py \
+              --ignore=ibus/test_native_key_contract.py \
+              --ignore=ibus/test_native_profile_persistence.py \
+              --ignore=ibus/test_native_language_evidence.py \
+              --ignore=ibus/test_native_language_choice.py
 
   s02-offline:
     name: S02 offline import safety

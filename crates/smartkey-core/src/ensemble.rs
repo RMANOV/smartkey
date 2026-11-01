@@ -11,10 +11,12 @@ use crate::hedge::HedgeMixer;
 use crate::input::InputConfig;
 use crate::lang_cvm::LangCvmTracks;
 use crate::lang_detect::{LangId, LanguageDetector};
-use crate::lang_model::LanguageModelBank;
+use crate::lang_model::{LanguageModel, LanguageModelBank};
 use crate::markov::MarkovChain;
-use crate::ngram::WordEntry;
-use crate::personal::{extract_markov_snapshot, AdaptiveWeightsSnapshot, PersonalProfile};
+use crate::ngram::{FuzzyMatch, WordEntry};
+use crate::personal::{
+    extract_markov_snapshot, AdaptiveWeightsSnapshot, ConfirmedWord, PersonalProfile,
+};
 use crate::reranker::NeuralReranker;
 use crate::session_cache::SessionCacheLM;
 use crate::tech_vocab::TechVocab;
@@ -37,6 +39,30 @@ fn fold_case(s: &str) -> std::borrow::Cow<'_, str> {
     } else {
         std::borrow::Cow::Borrowed(s)
     }
+}
+
+/// Frequency used to score a prediction, never to establish language evidence.
+/// A trusted terminal in any selected model takes precedence over every
+/// unconfirmed copy of the same word, including copies in other languages.
+fn prediction_component_frequency(models: &[&LanguageModel], word: &str) -> Option<u32> {
+    models
+        .iter()
+        .filter_map(|m| m.trusted_exact_frequency(word))
+        .max()
+        .or_else(|| {
+            models
+                .iter()
+                .filter_map(|m| m.prediction_only_trie.exact_frequency(word))
+                .max()
+        })
+}
+
+fn sort_prediction_candidates(candidates: &mut [WordEntry]) {
+    candidates.sort_unstable_by(|a, b| {
+        b.frequency
+            .cmp(&a.frequency)
+            .then_with(|| a.word.cmp(&b.word))
+    });
 }
 
 /// Default blend factor for personal Markov vs corpus Markov.
@@ -118,7 +144,59 @@ pub struct SmartKeyEngine {
     use_reranker: bool,
 }
 
+/// Includes transient learned state omitted by the persisted profile.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct LearnedStateSnapshot {
+    profile: serde_json::Value,
+    session: crate::session_cache::SessionCacheSnapshot,
+    higher_ngrams: crate::markov::HigherNgramData,
+    unconfirmed_words: Vec<(LangId, Vec<crate::ngram::WordEntry>)>,
+}
+
+#[cfg(test)]
+pub(crate) fn learned_profile_for_test(mut profile: PersonalProfile) -> serde_json::Value {
+    // Export time and elapsed ages advance without learning. Compare all
+    // model fields, with the unordered vocabulary/Markov collections sorted.
+    profile.cvm.words.sort_unstable();
+    profile.cvm.age_secs.clear();
+    profile.cvm.saved_at_unix = 0.0;
+    if let Some(tracks) = profile.lang_cvm.as_mut() {
+        for (_, snapshot) in &mut tracks.tracks {
+            snapshot.words.sort_unstable();
+            snapshot.age_secs.clear();
+            snapshot.saved_at_unix = 0.0;
+        }
+    }
+    profile.markov_bigrams.sort_unstable();
+    profile.markov_trigrams.sort_unstable();
+    serde_json::to_value(profile).unwrap()
+}
+
 impl SmartKeyEngine {
+    #[cfg(test)]
+    pub(crate) fn learned_state_for_test(&self) -> LearnedStateSnapshot {
+        let mut unconfirmed_words: Vec<_> = self
+            .lang_models
+            .all_models()
+            .map(|model| {
+                (
+                    model.lang,
+                    model
+                        .prediction_only_trie
+                        .prefix_search("", model.prediction_only_trie.len()),
+                )
+            })
+            .collect();
+        unconfirmed_words.sort_unstable_by_key(|(lang, _)| *lang as u8);
+        LearnedStateSnapshot {
+            profile: learned_profile_for_test(self.export_personal_profile()),
+            session: self.session_cache.snapshot_for_test(),
+            higher_ngrams: self.personal_markov.higher_ngrams_raw().clone(),
+            unconfirmed_words,
+        }
+    }
+
     /// Create a new engine with default weights `(0.50, 0.30, 0.20)` and a
     /// CVM counter sized `(500, 5000)`.
     pub fn new() -> Self {
@@ -326,17 +404,36 @@ impl SmartKeyEngine {
         self.session_cache.observe(word);
     }
 
-    /// Learn an OOV word by adding it to the language model trie (F11).
+    /// Keep an unconfirmed OOV word available for future predictions (F11).
     ///
-    /// When the user types a word not in the corpus, add it with a low
-    /// initial frequency so it appears in future prefix searches. Also
-    /// trains the Markov unigram for frequency-weighted backoff.
+    /// Its candidate language is only a routing choice. The sparse prediction
+    /// trie cannot supply language/correction evidence or train corpus models.
     pub fn learn_oov_word(&mut self, word: &str, lang: LangId) {
         // Use a modest initial frequency — enough to appear in candidates
         // but not dominate corpus words. Will grow via CVM learning.
         const OOV_INITIAL_FREQ: u32 = 5;
-        self.lang_models.load_word(word, OOV_INITIAL_FREQ, lang);
+        self.lang_models
+            .get_mut_or_create(lang)
+            .prediction_only_trie
+            .insert(word, OOV_INITIAL_FREQ);
         self.cache.borrow_mut().invalidate();
+    }
+
+    /// Promote an independently confirmed full word to trusted vocabulary.
+    ///
+    /// Callers must provide direct-script or full-acceptance confirmation;
+    /// support for a prefix alone does not confirm a new terminal. Existing
+    /// corpus frequencies and corpus Markov/PPM models remain unchanged.
+    pub fn confirm_word(&mut self, word: &str, lang: LangId) {
+        let Some(confirmed) = ConfirmedWord::new(word, lang) else {
+            return;
+        };
+        let model = self.lang_models.get_mut_or_create(lang);
+        let frequency = model.trie.exact_frequency(&confirmed.word).unwrap_or(5);
+        if model.confirmed_trie.exact_frequency(&confirmed.word) != Some(frequency) {
+            model.confirmed_trie.insert(&confirmed.word, frequency);
+            self.cache.borrow_mut().invalidate();
+        }
     }
 
     /// Clear the session cache (e.g. on session restart).
@@ -424,6 +521,18 @@ impl SmartKeyEngine {
     /// Identifies the dominant scoring component for the accepted word and
     /// shifts weights toward it using an EMA update.
     pub fn on_prediction_accepted(&mut self, word: &str, context: &[&str]) {
+        self.on_prediction_accepted_with_lang(word, context, None);
+    }
+
+    /// Update acceptance weights using the language scope of the prediction.
+    /// Pass the language supplied to `predict`, rather than a detector value
+    /// recomputed after the displayed completion was generated.
+    pub fn on_prediction_accepted_with_lang(
+        &mut self,
+        word: &str,
+        context: &[&str],
+        lang: Option<LangId>,
+    ) {
         let prev1 = context.last().copied();
         let prev2 = if context.len() >= 2 {
             Some(context[context.len() - 2])
@@ -431,20 +540,11 @@ impl SmartKeyEngine {
             None
         };
 
-        // Recompute raw scores for the accepted word (search all language models).
-        let corpus_score = self
-            .lang_models
-            .all_models()
-            .filter_map(|m| {
-                m.trie
-                    .prefix_search(word, 1)
-                    .first()
-                    .map(|e| e.frequency as f64)
-            })
-            .fold(0.0_f64, f64::max);
-        let markov_score = self
-            .lang_models
-            .all_models()
+        // Recompute raw scores in the same model scope as the prediction.
+        let models = self.lang_models.get_or_all(lang);
+        let corpus_score = prediction_component_frequency(&models, word).map_or(0.0, f64::from);
+        let markov_score = models
+            .iter()
             .map(|m| m.markov.score_with_backoff(word, prev1, prev2))
             .fold(1e-6_f64, f64::max);
         let personal_score = self.personal.frequency_score(word);
@@ -452,9 +552,8 @@ impl SmartKeyEngine {
         if self.use_hedge {
             // F16: Hedge/Exp3 multiplicative weights update with 5 signals.
             // Compute PPM and tech scores for the accepted word.
-            let ppm_score = self
-                .lang_models
-                .all_models()
+            let ppm_score = models
+                .iter()
                 .filter_map(|m| m.ppm.as_ref())
                 .map(|ppm| ppm.score_candidate("", word))
                 .fold(0.0_f64, f64::max);
@@ -603,12 +702,35 @@ impl SmartKeyEngine {
             commit_count: self.commit_count,
         });
         let lang_cvm = self.personal_tracks.to_snapshot();
-        PersonalProfile::with_lang_cvm(cvm, markov, weights, lang_cvm)
+        let mut profile = PersonalProfile::with_lang_cvm(cvm, markov, weights, lang_cvm);
+        profile.confirmed_words = self
+            .lang_models
+            .all_models()
+            .flat_map(|model| {
+                model
+                    .confirmed_trie
+                    .prefix_search("", model.confirmed_trie.len())
+                    .into_iter()
+                    .filter_map(|entry| ConfirmedWord::new(&entry.word, model.lang))
+            })
+            .collect();
+        profile.confirmed_words.sort_unstable_by(|a, b| {
+            a.language
+                .cmp(&b.language)
+                .then_with(|| a.word.cmp(&b.word))
+        });
+        profile
     }
 
     /// Import a full personal profile (CVM + Markov + weights + lang CVM).
     pub fn import_personal_profile(&mut self, profile: &PersonalProfile) {
         self.personal = CvmCounter::from_snapshot(&profile.cvm);
+        self.replace_personal_vocabulary(&profile.cvm);
+        for confirmed in &profile.confirmed_words {
+            if let Some(lang) = confirmed.language.lang() {
+                self.confirm_word(&confirmed.word, lang);
+            }
+        }
 
         // Restore per-language CVM tracks if present (v3).
         if let Some(ref lang_snap) = profile.lang_cvm {
@@ -644,17 +766,43 @@ impl SmartKeyEngine {
     /// Replace the personal CVM layer from a snapshot (backward compat).
     pub fn import_personal(&mut self, snapshot: &CvmSnapshot) {
         self.personal = CvmCounter::from_snapshot(snapshot);
+        self.replace_personal_vocabulary(snapshot);
         self.cache.borrow_mut().invalidate();
+    }
+
+    /// Replace both personal vocabulary layers. Generic historical words are
+    /// candidates only; positive confirmations are restored separately when
+    /// explicitly present. Original corpus data remains untouched.
+    fn replace_personal_vocabulary(&mut self, snapshot: &CvmSnapshot) {
+        for model in self.lang_models.models_mut() {
+            model.prediction_only_trie = crate::ngram::NgramTrie::new();
+            model.confirmed_trie = crate::ngram::NgramTrie::new();
+        }
+        for word in &snapshot.words {
+            if word.chars().count() >= 3 {
+                self.learn_oov_word(&word.to_lowercase(), Self::detect_word_lang(word));
+            }
+        }
     }
 
     /// Fast candidate count for a prefix (without full scoring).
     ///
     /// Searches across all language models.
     pub fn candidate_count(&self, prefix: &str, limit: usize) -> usize {
-        self.lang_models
-            .all_models()
-            .map(|m| m.trie.prefix_search(prefix, limit).len())
-            .sum()
+        if limit == 0 {
+            return 0;
+        }
+        let mut words = HashSet::new();
+        for model in self.lang_models.all_models() {
+            for entry in model
+                .trusted_prefix_search(prefix, limit)
+                .into_iter()
+                .chain(model.prediction_only_trie.prefix_search(prefix, limit))
+            {
+                words.insert(entry.word);
+            }
+        }
+        words.len()
     }
 
     /// Return the corpus frequency of the top trie candidate for `prefix`.
@@ -663,7 +811,11 @@ impl SmartKeyEngine {
     pub fn max_prefix_frequency(&self, prefix: &str) -> u32 {
         self.lang_models
             .all_models()
-            .filter_map(|m| m.trie.prefix_search(prefix, 1).first().map(|e| e.frequency))
+            .filter_map(|m| {
+                m.trusted_prefix_search(prefix, 1)
+                    .first()
+                    .map(|e| e.frequency)
+            })
             .max()
             .unwrap_or(0)
     }
@@ -703,7 +855,7 @@ impl SmartKeyEngine {
     pub fn word_frequency(&self, word: &str, lang: LangId) -> f64 {
         self.lang_models
             .get(lang)
-            .and_then(|m| m.trie.exact_frequency(word))
+            .and_then(|m| m.trusted_exact_frequency(word))
             .map_or(0.0, f64::from)
     }
 
@@ -721,8 +873,7 @@ impl SmartKeyEngine {
             .lang_models
             .get(LangId::En)
             .and_then(|m| {
-                m.trie
-                    .prefix_search(&en_prefix, 1)
+                m.trusted_prefix_search(&en_prefix, 1)
                     .first()
                     .map(|e| e.frequency as f64)
             })
@@ -731,8 +882,7 @@ impl SmartKeyEngine {
             .lang_models
             .get(LangId::Bg)
             .and_then(|m| {
-                m.trie
-                    .prefix_search(&bg_prefix, 1)
+                m.trusted_prefix_search(&bg_prefix, 1)
                     .first()
                     .map(|e| e.frequency as f64)
             })
@@ -752,7 +902,7 @@ impl SmartKeyEngine {
         let exact = |lang: LangId, word: &str| -> f64 {
             self.lang_models
                 .get(lang)
-                .and_then(|m| m.trie.exact_frequency(word))
+                .and_then(|m| m.trusted_exact_frequency(word))
                 .map_or(0.0, f64::from)
         };
         (exact(LangId::En, &en_word), exact(LangId::Bg, &bg_word))
@@ -784,7 +934,11 @@ impl SmartKeyEngine {
         }
 
         // Check cache first.
-        if let Some(cached) = self.cache.borrow_mut().get(prefix, context) {
+        if let Some(cached) = self
+            .cache
+            .borrow_mut()
+            .get_scoped(prefix, context, Some(limit), lang)
+        {
             return cached;
         }
 
@@ -800,7 +954,6 @@ impl SmartKeyEngine {
 
         let candidates = {
             let mut result: Vec<WordEntry> = Vec::new();
-            let mut seen = HashSet::new();
 
             if ppm_guided {
                 for model in &models {
@@ -809,23 +962,44 @@ impl SmartKeyEngine {
                         let per_char_pool = candidate_pool / next_chars.len().max(1);
                         for (ch, _) in &next_chars {
                             let extended = format!("{}{}", prefix, ch);
-                            for entry in model.trie.prefix_search(&extended, per_char_pool) {
-                                if seen.insert(entry.word.clone()) {
-                                    result.push(entry);
-                                }
-                            }
+                            result.extend(model.trusted_prefix_search(&extended, per_char_pool));
                         }
                     }
                 }
             }
             // Regular prefix search from all relevant models.
             for model in &models {
-                for entry in model.trie.prefix_search(prefix, candidate_pool) {
-                    if seen.insert(entry.word.clone()) {
-                        result.push(entry);
-                    }
-                }
+                result.extend(model.trusted_prefix_search(prefix, candidate_pool));
             }
+            // Finish every trusted model before considering any overlay. Sorting
+            // before dedup makes cross-model frequency and tie handling stable.
+            for entry in &mut result {
+                entry.frequency =
+                    prediction_component_frequency(&models, &entry.word).unwrap_or(entry.frequency);
+            }
+            sort_prediction_candidates(&mut result);
+            let mut seen = HashSet::new();
+            result.retain(|entry| seen.insert(entry.word.clone()));
+
+            let mut overlay: Vec<WordEntry> = models
+                .iter()
+                .flat_map(|model| {
+                    model
+                        .prediction_only_trie
+                        .prefix_search(prefix, candidate_pool)
+                })
+                .collect();
+            for entry in &mut overlay {
+                entry.frequency =
+                    prediction_component_frequency(&models, &entry.word).unwrap_or(entry.frequency);
+            }
+            sort_prediction_candidates(&mut overlay);
+            overlay.retain(|entry| seen.insert(entry.word.clone()));
+            // Keep the existing trusted pools intact; online additions have a
+            // separate bounded allowance, independent of overlay vocabulary size.
+            overlay.truncate(candidate_pool);
+            result.extend(overlay);
+            sort_prediction_candidates(&mut result);
             result
         };
 
@@ -843,25 +1017,55 @@ impl SmartKeyEngine {
             let fuzzy_slots = candidate_pool.saturating_sub(candidates.len());
             let exact_words: HashSet<&str> = candidates.iter().map(|c| c.word.as_str()).collect();
 
-            let mut discount_map: HashMap<String, f64> = HashMap::new();
-            let mut merged: Vec<WordEntry> = Vec::new();
+            let mut trusted_matches: Vec<FuzzyMatch> = Vec::new();
             for model in &models {
-                let fuzzy_matches =
-                    model
-                        .trie
-                        .fuzzy_search(prefix, self.fuzzy_max_edits, fuzzy_slots);
-                for fm in &fuzzy_matches {
-                    if exact_words.contains(fm.word.as_str()) || discount_map.contains_key(&fm.word)
-                    {
-                        continue;
-                    }
-                    let discount = self.fuzzy_discounts[fm.edit_distance.min(2) as usize];
-                    discount_map.insert(fm.word.clone(), discount);
-                    merged.push(WordEntry {
-                        word: fm.word.clone(),
-                        frequency: fm.frequency,
-                    });
+                trusted_matches.extend(model.trusted_fuzzy_search(
+                    prefix,
+                    self.fuzzy_max_edits,
+                    fuzzy_slots,
+                ));
+            }
+            let order_matches = |matches: &mut Vec<FuzzyMatch>| {
+                for fm in matches.iter_mut() {
+                    fm.frequency =
+                        prediction_component_frequency(&models, &fm.word).unwrap_or(fm.frequency);
                 }
+                matches.sort_unstable_by(|a, b| {
+                    a.edit_distance
+                        .cmp(&b.edit_distance)
+                        .then_with(|| b.frequency.cmp(&a.frequency))
+                        .then_with(|| a.word.cmp(&b.word))
+                });
+            };
+            order_matches(&mut trusted_matches);
+            let mut seen: HashSet<String> = exact_words.iter().map(|w| (*w).to_owned()).collect();
+            trusted_matches.retain(|fm| seen.insert(fm.word.clone()));
+
+            let mut overlay_matches: Vec<FuzzyMatch> = models
+                .iter()
+                .flat_map(|model| {
+                    model.prediction_only_trie.fuzzy_search(
+                        prefix,
+                        self.fuzzy_max_edits,
+                        fuzzy_slots,
+                    )
+                })
+                .collect();
+            order_matches(&mut overlay_matches);
+            overlay_matches.retain(|fm| seen.insert(fm.word.clone()));
+            overlay_matches.truncate(fuzzy_slots);
+            trusted_matches.extend(overlay_matches);
+            order_matches(&mut trusted_matches);
+
+            let mut discount_map = HashMap::new();
+            let mut merged = Vec::new();
+            for fm in trusted_matches {
+                let discount = self.fuzzy_discounts[fm.edit_distance.min(2) as usize];
+                discount_map.insert(fm.word.clone(), discount);
+                merged.push(WordEntry {
+                    word: fm.word,
+                    frequency: fm.frequency,
+                });
             }
             (merged, discount_map)
         } else {
@@ -889,7 +1093,13 @@ impl SmartKeyEngine {
                             }
                         }
                         preds.truncate(limit);
-                        self.cache.borrow_mut().put(prefix, context, preds.clone());
+                        self.cache.borrow_mut().put_scoped(
+                            prefix,
+                            context,
+                            Some(limit),
+                            lang,
+                            preds.clone(),
+                        );
                         return preds;
                     }
                 }
@@ -915,7 +1125,13 @@ impl SmartKeyEngine {
                     }
                 }
                 preds.truncate(limit);
-                self.cache.borrow_mut().put(prefix, context, preds.clone());
+                self.cache.borrow_mut().put_scoped(
+                    prefix,
+                    context,
+                    Some(limit),
+                    lang,
+                    preds.clone(),
+                );
                 return preds;
             }
 
@@ -1066,7 +1282,9 @@ impl SmartKeyEngine {
 
         // When PPM is active, borrow a share from β (markov) for short prefixes.
         // When FastCoding, tech gets δ = 0.15 borrowed proportionally from α, β, γ.
-        let has_ppm = models.iter().any(|m| m.ppm.is_some());
+        // Borrow only when the pool passes the same PPM contribution gate used
+        // below; an allocated model with a gated-zero score gets no budget.
+        let has_ppm = max_ppm > 1e-6;
         let (eff_alpha, eff_beta, eff_gamma, eff_delta, eff_tech) = if has_ppm && prefix.len() <= 1
         {
             // Short prefix: PPM gets 0.15 borrowed from markov.
@@ -1244,7 +1462,9 @@ impl SmartKeyEngine {
         }
 
         // Store in cache before returning.
-        self.cache.borrow_mut().put(prefix, context, scored.clone());
+        self.cache
+            .borrow_mut()
+            .put_scoped(prefix, context, Some(limit), lang, scored.clone());
 
         scored
     }
@@ -1268,6 +1488,643 @@ impl Default for SmartKeyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unconfirmed_oov_keeps_prediction_without_trusted_language_evidence() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word_lang("qxtrusted", 2, LangId::En);
+        engine.learn_oov_word("qxnovel", LangId::En);
+        engine.learn_oov_word("qxnovel", LangId::En);
+
+        assert_eq!(engine.word_frequency("qxnovel", LangId::En), 0.0);
+        assert_eq!(engine.score_exact_both("qxnovel", ""), (0.0, 0.0));
+        assert_eq!(engine.score_both("qxnov", ""), (0.0, 0.0));
+        assert_eq!(engine.max_prefix_frequency("qx"), 2);
+        assert_eq!(engine.candidate_count("qx", 5), 2);
+        assert_eq!(engine.candidate_count("qxnov", 5), 1);
+        assert!(engine
+            .predict("qxnov", &[], 5, Some(LangId::En))
+            .iter()
+            .any(|p| p.word == "qxnovel"));
+    }
+
+    #[test]
+    fn unconfirmed_oov_does_not_train_corpus_markov_or_ppm() {
+        let config = InputConfig {
+            use_ppm: true,
+            ..InputConfig::default()
+        };
+        let mut engine = SmartKeyEngine::from_config(&config);
+        engine.load_word_lang("hello", 20, LangId::En);
+        let before = engine.lang_models.get(LangId::En).unwrap();
+        let unigram_total = before.markov.total_unigram_count();
+        let ppm_nodes = before.ppm.as_ref().unwrap().node_count();
+
+        engine.learn_oov_word("qxunobserved", LangId::En);
+
+        let after = engine.lang_models.get(LangId::En).unwrap();
+        assert_eq!(after.markov.total_unigram_count(), unigram_total);
+        assert!(!after
+            .markov
+            .unigram_counts_raw()
+            .contains_key("qxunobserved"));
+        assert_eq!(after.ppm.as_ref().unwrap().node_count(), ppm_nodes);
+    }
+
+    #[test]
+    fn unconfirmed_oov_remains_a_fuzzy_prediction_candidate() {
+        let mut engine = SmartKeyEngine::new();
+        engine.learn_oov_word("qxnovel", LangId::En);
+
+        let predictions = engine.predict("qxnoev", &[], 5, Some(LangId::En));
+        assert!(predictions.iter().any(|p| p.word == "qxnovel"));
+    }
+
+    #[test]
+    fn unconfirmed_oov_cannot_replace_trusted_frequency_in_another_model() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word_lang("qxshared", 2, LangId::En);
+        engine.learn_oov_word("qxshared", LangId::Bg);
+
+        assert_eq!(engine.max_prefix_frequency("qxsh"), 2);
+        assert_eq!(engine.candidate_count("qxsh", 5), 1);
+        assert_eq!(
+            prediction_component_frequency(&engine.lang_models.get_or_all(None), "qxshared"),
+            Some(2)
+        );
+        let predictions = engine.predict("qxsh", &[], 5, None);
+        assert_eq!(
+            predictions.iter().filter(|p| p.word == "qxshared").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unconfirmed_oov_cannot_replace_trusted_frequency_in_its_own_model() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word_lang("qxshared", 2, LangId::En);
+        engine.learn_oov_word("qxshared", LangId::En);
+
+        assert_eq!(engine.word_frequency("qxshared", LangId::En), 2.0);
+        assert_eq!(
+            prediction_component_frequency(&engine.lang_models.get_or_all(None), "qxshared"),
+            Some(2)
+        );
+        assert_eq!(engine.candidate_count("qxsh", 5), 1);
+    }
+
+    #[test]
+    fn unconfirmed_oov_acceptance_rewards_its_prediction_frequency_component() {
+        let mut engine = SmartKeyEngine::new();
+        engine.learn_oov_word("qxnovel", LangId::En);
+        let before = engine.weights();
+
+        engine.on_prediction_accepted("qxnovel", &[]);
+
+        assert!(engine.weights().0 > before.0);
+        assert_eq!(engine.word_frequency("qxnovel", LangId::En), 0.0);
+    }
+
+    #[test]
+    fn accepted_overlay_rewards_the_language_used_for_prediction() {
+        fn engine() -> SmartKeyEngine {
+            let mut engine = SmartKeyEngine::from_config(&InputConfig {
+                use_hedge: false,
+                ..InputConfig::default()
+            });
+            engine.load_word_lang("qxshared", 2, LangId::En);
+            // A deterministic personal score of 4 lies between the trusted
+            // EN frequency 2 and the selected BG prediction frequency 5.
+            engine.import_personal(&CvmSnapshot {
+                version: 1,
+                saved_at_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64(),
+                capacity: 500,
+                max_capacity: 5000,
+                round: 2,
+                decay_lambda: 0.0,
+                words: vec!["qxshared".into()],
+                age_secs: [("qxshared".into(), 0.0)].into(),
+            });
+            // Import replaces old overlays; establish this test's explicit
+            // BG candidate route only after the profile has been restored.
+            engine.learn_oov_word("qxshared", LangId::Bg);
+            engine
+        }
+
+        let mut selected = engine();
+        assert_eq!(selected.personal.frequency_score("qxshared"), 4.0);
+        assert_eq!(
+            prediction_component_frequency(
+                &selected.lang_models.get_or_all(Some(LangId::Bg)),
+                "qxshared"
+            ),
+            Some(5)
+        );
+        let before = selected.weights();
+        selected.on_prediction_accepted_with_lang("qxshared", &[], Some(LangId::Bg));
+        assert!(selected.weights().0 > before.0);
+        assert!(selected.weights().2 < before.2);
+
+        // Existing callers retain the original all-model reward scope.
+        let mut legacy = engine();
+        legacy.on_prediction_accepted("qxshared", &[]);
+        assert!(legacy.weights().2 > before.2);
+        let mut explicit_all = engine();
+        explicit_all.on_prediction_accepted_with_lang("qxshared", &[], None);
+        assert_eq!(legacy.weights(), explicit_all.weights());
+    }
+
+    #[test]
+    fn review_cache_separates_alternating_language_scopes() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word_lang("qxenglish", 100, LangId::En);
+        engine.load_word_lang("qxshared", 2, LangId::En);
+        engine.load_word_lang("qxbulgarian", 100, LangId::Bg);
+        engine.learn_oov_word("qxshared", LangId::Bg);
+        for (language, expected) in [
+            (Some(LangId::En), vec!["qxenglish", "qxshared"]),
+            (Some(LangId::Bg), vec!["qxbulgarian", "qxshared"]),
+            (None, vec!["qxbulgarian", "qxenglish", "qxshared"]),
+            (Some(LangId::En), vec!["qxenglish", "qxshared"]),
+        ] {
+            let predictions = engine.predict("qx", &[], 5, language);
+            let mut words: Vec<&str> = predictions.iter().map(|p| p.word.as_str()).collect();
+            words.sort_unstable();
+            assert_eq!(
+                words, expected,
+                "cached model scope must match the scoring producer"
+            );
+        }
+    }
+
+    #[test]
+    fn review_cache_separates_requested_limits_in_both_orders() {
+        for limits in [[1, 5], [5, 1]] {
+            let mut engine = SmartKeyEngine::new();
+            for (word, frequency) in [
+                ("qxa", 60),
+                ("qxb", 50),
+                ("qxc", 40),
+                ("qxd", 30),
+                ("qxe", 20),
+            ] {
+                engine.load_word_lang(word, frequency, LangId::En);
+            }
+            for limit in limits {
+                assert_eq!(
+                    engine.predict("qx", &[], limit, Some(LangId::En)).len(),
+                    limit,
+                    "a cached smaller or larger request cannot determine this result count"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_profile_roundtrip_rebuilds_only_unconfirmed_name_candidates() {
+        for legacy in [false, true] {
+            let mut original = SmartKeyEngine::new();
+            original.learn("зориван");
+            original.learn_oov_word("зориван", LangId::Bg);
+            let mut restored = SmartKeyEngine::new();
+            if legacy {
+                restored.import_personal(&original.export_personal());
+            } else {
+                restored.import_personal_profile(&original.export_personal_profile());
+            }
+            assert!(restored
+                .predict("зори", &[], 5, Some(LangId::Bg))
+                .iter()
+                .any(|p| p.word == "зориван"));
+            assert_eq!(restored.word_frequency("зориван", LangId::Bg), 0.0);
+            assert_eq!(restored.score_both("zori", "зори"), (0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn review_replacement_profile_removes_previous_overlay_and_preserves_corpus() {
+        for legacy in [false, true] {
+            let mut engine = SmartKeyEngine::new();
+            engine.load_word_lang("зорица", 20, LangId::Bg);
+            engine.learn("зориван");
+            engine.learn_oov_word("зориван", LangId::Bg);
+            let empty = SmartKeyEngine::new();
+            if legacy {
+                engine.import_personal(&empty.export_personal());
+            } else {
+                engine.import_personal_profile(&empty.export_personal_profile());
+            }
+            assert!(!engine
+                .predict("зори", &[], 5, Some(LangId::Bg))
+                .iter()
+                .any(|p| p.word == "зориван"));
+            assert_eq!(engine.word_frequency("зорица", LangId::Bg), 20.0);
+            assert_eq!(engine.word_frequency("зориван", LangId::Bg), 0.0);
+        }
+    }
+
+    #[test]
+    fn review_confirmation_json_roundtrip_retains_exact_word_language_evidence() {
+        for (word, prefix, lang) in [
+            ("qxnovel", "qxnov", LangId::En),
+            ("зориван", "зори", LangId::Bg),
+        ] {
+            let mut original = SmartKeyEngine::new();
+            original.learn(word);
+            original.learn_oov_word(word, lang);
+            original.confirm_word(word, lang);
+            let json = serde_json::to_string(&original.export_personal_profile()).unwrap();
+            let saved = crate::personal::load_personal_json(&json).unwrap();
+            let mut restored = SmartKeyEngine::new();
+            restored.import_personal_profile(&saved);
+
+            assert_eq!(original.word_frequency(word, lang), 5.0);
+            assert_eq!(
+                restored.word_frequency(word, lang),
+                5.0,
+                "explicit full-word confirmation must survive JSON save/reload"
+            );
+            assert_eq!(restored.max_prefix_frequency(prefix), 5);
+            let expected = if lang == LangId::En {
+                (5.0, 0.0)
+            } else {
+                (0.0, 5.0)
+            };
+            assert_eq!(restored.score_exact_both(word, word), expected);
+            assert_eq!(restored.score_both(prefix, prefix), expected);
+            assert!(restored
+                .predict(prefix, &[], 5, Some(lang))
+                .iter()
+                .any(|p| p.word == word));
+        }
+    }
+
+    #[test]
+    fn review_confirmation_snapshot_does_not_depend_on_generic_cvm_membership() {
+        let mut original = SmartKeyEngine::new();
+        original.confirm_word("qxproof", LangId::En);
+        assert!(!original
+            .export_personal()
+            .words
+            .iter()
+            .any(|word| word == "qxproof"));
+        let json = serde_json::to_string(&original.export_personal_profile()).unwrap();
+        let saved = crate::personal::load_personal_json(&json).unwrap();
+        let mut restored = SmartKeyEngine::new();
+        restored.import_personal_profile(&saved);
+        assert_eq!(
+            restored.word_frequency("qxproof", LangId::En),
+            5.0,
+            "positive word proof outlives generic CVM sampling/eviction"
+        );
+        assert_eq!(restored.candidate_count("qxpro", 5), 1);
+    }
+
+    #[test]
+    fn review_confirmation_full_profile_replacement_clears_previous_personal_proof() {
+        for different_profile in [false, true] {
+            let mut engine = SmartKeyEngine::new();
+            engine.load_word_lang("qxbase", 2, LangId::En);
+            engine.learn("qxold");
+            engine.learn_oov_word("qxold", LangId::En);
+            engine.confirm_word("qxold", LangId::En);
+            // Populate the cache before replacing the entire personal profile.
+            assert!(engine
+                .predict("qxold", &[], 5, Some(LangId::En))
+                .iter()
+                .any(|p| p.word == "qxold"));
+            let mut replacement = SmartKeyEngine::new();
+            if different_profile {
+                replacement.learn("qxfresh");
+                replacement.learn_oov_word("qxfresh", LangId::En);
+            }
+            engine.import_personal_profile(&replacement.export_personal_profile());
+            assert_eq!(
+                engine.word_frequency("qxold", LangId::En),
+                0.0,
+                "profile replacement must replace confirmed personal words too"
+            );
+            assert!(engine
+                .predict("qxold", &[], 5, Some(LangId::En))
+                .iter()
+                .all(|p| p.word != "qxold"));
+            assert_eq!(engine.word_frequency("qxbase", LangId::En), 2.0);
+            assert_eq!(engine.word_frequency("qxfresh", LangId::En), 0.0);
+            if different_profile {
+                assert!(engine
+                    .predict("qxfre", &[], 5, Some(LangId::En))
+                    .iter()
+                    .any(|p| p.word == "qxfresh"));
+            }
+        }
+    }
+
+    #[test]
+    fn review_confirmation_bare_cvm_replacement_clears_previous_personal_proof() {
+        let mut engine = SmartKeyEngine::new();
+        engine.load_word_lang("qxbase", 2, LangId::En);
+        engine.confirm_word("qxold", LangId::En);
+        engine.import_personal(&SmartKeyEngine::new().export_personal());
+        assert_eq!(
+            engine.word_frequency("qxold", LangId::En),
+            0.0,
+            "legacy bare-CVM replacement has no positive confirmation metadata"
+        );
+        assert_eq!(engine.candidate_count("qxold", 5), 0);
+        assert_eq!(engine.word_frequency("qxbase", LangId::En), 2.0);
+    }
+
+    #[test]
+    fn review_confirmation_absent_optional_v4_field_never_infers_or_retains_proof() {
+        let mut historical = SmartKeyEngine::new();
+        historical.learn("qxhistory");
+        historical.learn_with_lang("qxhistory", LangId::En);
+        let mut json = serde_json::to_value(historical.export_personal_profile()).unwrap();
+        json.as_object_mut().unwrap().remove("confirmed_words");
+        let saved =
+            crate::personal::load_personal_json(&serde_json::to_string(&json).unwrap()).unwrap();
+        assert_eq!(saved.version, 4);
+        let mut restored = SmartKeyEngine::new();
+        restored.import_personal_profile(&saved);
+        assert_eq!(restored.word_frequency("qxhistory", LangId::En), 0.0);
+        assert!(restored
+            .predict("qxhist", &[], 5, Some(LangId::En))
+            .iter()
+            .any(|p| p.word == "qxhistory"));
+
+        restored.confirm_word("qxhistory", LangId::En);
+        restored.import_personal_profile(&saved);
+        assert_eq!(
+            restored.word_frequency("qxhistory", LangId::En),
+            0.0,
+            "absence replaces old personal proof; historical CVM is not confirmation"
+        );
+        assert_eq!(restored.max_prefix_frequency("qxhist"), 0);
+    }
+
+    #[test]
+    fn review_confirmation_unknown_future_language_keeps_valid_profile_learning() {
+        let mut historical = SmartKeyEngine::new();
+        historical.learn("qxhistory");
+        let mut json = serde_json::to_value(historical.export_personal_profile()).unwrap();
+        json["confirmed_words"] = serde_json::json!([
+            {"word": "qxproof", "language": "en"},
+            {"word": "qxunknown", "language": "future-language"}
+        ]);
+        let saved =
+            crate::personal::load_personal_json(&serde_json::to_string(&json).unwrap()).unwrap();
+        let mut restored = SmartKeyEngine::new();
+        restored.import_personal_profile(&saved);
+        assert!(restored
+            .export_personal()
+            .words
+            .iter()
+            .any(|word| word == "qxhistory"));
+        assert_eq!(restored.word_frequency("qxhistory", LangId::En), 0.0);
+        assert_eq!(restored.word_frequency("qxproof", LangId::En), 5.0);
+        for lang in [LangId::En, LangId::Bg, LangId::Tech] {
+            assert_eq!(restored.word_frequency("qxunknown", lang), 0.0);
+        }
+    }
+
+    #[test]
+    fn review_confirmation_preserves_low_frequency_corpus_and_duplicate_reward() {
+        let mut original = SmartKeyEngine::new();
+        original.load_word_lang("qxbase", 2, LangId::En);
+        original.learn_oov_word("qxbase", LangId::Bg);
+        original.confirm_word("QxBase", LangId::En);
+        original.confirm_word("qxbase", LangId::En);
+        assert_eq!(original.word_frequency("qxbase", LangId::En), 2.0);
+        assert_eq!(
+            prediction_component_frequency(&original.lang_models.get_or_all(None), "qxbase"),
+            Some(2)
+        );
+        let saved = crate::personal::load_personal_json(
+            &serde_json::to_string(&original.export_personal_profile()).unwrap(),
+        )
+        .unwrap();
+        let mut restored = SmartKeyEngine::new();
+        restored.load_word_lang("qxbase", 2, LangId::En);
+        restored.import_personal_profile(&saved);
+        restored.learn_oov_word("qxbase", LangId::Bg);
+        assert_eq!(restored.word_frequency("qxbase", LangId::En), 2.0);
+        assert_eq!(
+            prediction_component_frequency(&restored.lang_models.get_or_all(None), "qxbase"),
+            Some(2)
+        );
+        assert_eq!(restored.candidate_count("qxbase", 5), 1);
+    }
+
+    #[test]
+    fn review_confirmation_later_corpus_load_keeps_effective_top_k_and_prefix_evidence() {
+        let mut engine = SmartKeyEngine::new();
+        // Confirm all four first, then load three base terminals at a lower frequency.
+        // A sparse personal query must not select shadowed 5s before rescoring to 2.
+        for word in ["qxaaa", "qxaab", "qxaac", "qxzzz"] {
+            engine.confirm_word(word, LangId::En);
+        }
+        for word in ["qxaaa", "qxaab", "qxaac"] {
+            engine.load_word_lang(word, 2, LangId::En);
+        }
+        assert_eq!(engine.max_prefix_frequency("qx"), 5);
+        assert_eq!(engine.score_both("qx", ""), (5.0, 0.0));
+        for word in ["qxaaa", "qxaab", "qxaac"] {
+            assert_eq!(engine.word_frequency(word, LangId::En), 2.0);
+        }
+        let result = engine.predict("qx", &[], 1, Some(LangId::En));
+        assert_eq!(result[0].word, "qxzzz");
+    }
+
+    #[test]
+    fn review_confirmation_import_filters_invalid_records_and_preserves_generic_learning() {
+        let mut historical = SmartKeyEngine::new();
+        historical.learn("qxhistory");
+        let mut json = serde_json::to_value(historical.export_personal_profile()).unwrap();
+        json["confirmed_words"] = serde_json::json!([
+            {"word": "Qx-name2", "language": "en"},
+            {"word": "qx-name2", "language": "en"},
+            {"word": "Зор-иван2", "language": "bg"},
+            {"word": "qxwrong", "language": "bg"},
+            {"word": "qxслово", "language": "en"},
+            {"word": "qxé", "language": "en"},
+            {"word": "qx word", "language": "en"},
+            {"word": "qx\u{0000}word", "language": "en"},
+            {"word": "123", "language": "en"},
+            {"word": "___", "language": "en"},
+            {"word": "qxtech", "language": "tech"}
+        ]);
+        let profile =
+            crate::personal::load_personal_json(&serde_json::to_string(&json).unwrap()).unwrap();
+        let mut restored = SmartKeyEngine::new();
+        restored.import_personal_profile(&profile);
+        assert_eq!(restored.word_frequency("qx-name2", LangId::En), 5.0);
+        assert_eq!(restored.word_frequency("зор-иван2", LangId::Bg), 5.0);
+        let exported = restored.export_personal_profile();
+        assert_eq!(exported.confirmed_words.len(), 2);
+        assert_eq!(exported.confirmed_words[0].word, "зор-иван2");
+        assert_eq!(exported.confirmed_words[1].word, "qx-name2");
+        assert!(exported.cvm.words.iter().any(|word| word == "qxhistory"));
+        for word in [
+            "qxwrong",
+            "qxслово",
+            "qxé",
+            "qx word",
+            "qx\u{0000}word",
+            "123",
+            "___",
+            "qxtech",
+        ] {
+            for lang in [LangId::En, LangId::Bg, LangId::Tech] {
+                assert_eq!(
+                    restored.word_frequency(word, lang),
+                    0.0,
+                    "invalid imported evidence: {word:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_confirmation_preserves_original_corpus_and_does_not_train_corpus_models() {
+        let config = InputConfig {
+            use_ppm: true,
+            ..InputConfig::default()
+        };
+        let mut engine = SmartKeyEngine::from_config(&config);
+        engine.load_word_lang("зорница", 2, LangId::Bg);
+        let model = engine.lang_models.get(LangId::Bg).unwrap();
+        let before = (
+            model.trie.len(),
+            model.markov.total_unigram_count(),
+            model.ppm.as_ref().unwrap().node_count(),
+            model.morphology.stem_count(),
+        );
+        engine.confirm_word("зориван", LangId::Bg);
+        engine.confirm_word("зорница", LangId::Bg);
+        let json = serde_json::to_string(&engine.export_personal_profile()).unwrap();
+        let saved = crate::personal::load_personal_json(&json).unwrap();
+        engine.import_personal_profile(&saved);
+        let model = engine.lang_models.get(LangId::Bg).unwrap();
+        assert_eq!(
+            (
+                model.trie.len(),
+                model.markov.total_unigram_count(),
+                model.ppm.as_ref().unwrap().node_count(),
+                model.morphology.stem_count()
+            ),
+            before
+        );
+        assert_eq!(model.trie.exact_frequency("зориван"), None);
+        assert_eq!(model.trie.exact_frequency("зорница"), Some(2));
+        assert_eq!(engine.word_frequency("зориван", LangId::Bg), 5.0);
+    }
+
+    #[test]
+    fn review_confirmation_prediction_frequency_matches_reward_scope_before_and_after_reload() {
+        let mut original = SmartKeyEngine::new();
+        original.confirm_word("qxproof", LangId::En);
+        original.learn_oov_word("qxproof", LangId::Bg);
+        let mut restored = SmartKeyEngine::new();
+        restored.import_personal_profile(&original.export_personal_profile());
+        restored.learn_oov_word("qxproof", LangId::Bg);
+        for scope in [Some(LangId::En), Some(LangId::Bg), None] {
+            assert_eq!(
+                prediction_component_frequency(&original.lang_models.get_or_all(scope), "qxproof"),
+                Some(5)
+            );
+            assert_eq!(original.predict("qxpro", &[], 3, scope)[0].word, "qxproof");
+            assert_eq!(restored.predict("qxpro", &[], 3, scope)[0].word, "qxproof");
+            original.on_prediction_accepted_with_lang("qxproof", &[], scope);
+            restored.on_prediction_accepted_with_lang("qxproof", &[], scope);
+            assert_eq!(original.weights(), restored.weights());
+        }
+    }
+
+    #[test]
+    fn acceptance_language_scope_excludes_foreign_markov_and_ppm_rewards() {
+        fn engine(foreign_corpus: bool) -> SmartKeyEngine {
+            let config = InputConfig {
+                use_ppm: true,
+                use_hedge: true,
+                ..InputConfig::default()
+            };
+            let mut engine = SmartKeyEngine::from_config(&config);
+            engine.learn_oov_word("qxshared", LangId::Bg);
+            if foreign_corpus {
+                engine.load_word_lang("qxshared", 2, LangId::En);
+                engine.load_bigram_lang("prior", "qxshared", 50, LangId::En);
+            }
+            engine
+        }
+
+        let mut isolated = engine(false);
+        let mut with_foreign = engine(true);
+        isolated.on_prediction_accepted_with_lang("qxshared", &["prior"], Some(LangId::Bg));
+        with_foreign.on_prediction_accepted_with_lang("qxshared", &["prior"], Some(LangId::Bg));
+
+        assert_eq!(isolated.weights(), with_foreign.weights());
+        assert_eq!(
+            isolated.hedge.as_ref().unwrap().weights_five(),
+            with_foreign.hedge.as_ref().unwrap().weights_five()
+        );
+    }
+
+    #[test]
+    fn full_word_confirmation_is_case_folded_idempotent_and_trie_only() {
+        let config = InputConfig {
+            use_ppm: true,
+            ..InputConfig::default()
+        };
+        let mut engine = SmartKeyEngine::from_config(&config);
+        engine.load_word_lang("qxtrusted", 2, LangId::En);
+        engine.learn_oov_word("qxnovel", LangId::En);
+        let before = engine.lang_models.get(LangId::En).unwrap();
+        let unigram_total = before.markov.total_unigram_count();
+        let ppm_nodes = before.ppm.as_ref().unwrap().node_count();
+
+        engine.confirm_word("QxNovel", LangId::En);
+        engine.confirm_word("qxnovel", LangId::En);
+        engine.confirm_word("qxtrusted", LangId::En);
+
+        assert_eq!(engine.word_frequency("qxnovel", LangId::En), 5.0);
+        assert_eq!(engine.word_frequency("qxtrusted", LangId::En), 2.0);
+        assert_eq!(engine.candidate_count("qxnov", 5), 1);
+        let after = engine.lang_models.get(LangId::En).unwrap();
+        assert_eq!(after.markov.total_unigram_count(), unigram_total);
+        assert_eq!(after.ppm.as_ref().unwrap().node_count(), ppm_nodes);
+    }
+
+    #[test]
+    fn merged_prediction_ties_are_deterministic_across_model_insert_order() {
+        fn engine(reverse: bool) -> SmartKeyEngine {
+            let mut engine = SmartKeyEngine::new();
+            let mut trusted = [("qxalpha", LangId::En), ("qxbravo", LangId::Bg)];
+            if reverse {
+                trusted.reverse();
+            }
+            for (word, lang) in trusted {
+                engine.load_word_lang(word, 5, lang);
+            }
+            engine.learn_oov_word("qxdelta", LangId::En);
+            engine.learn_oov_word("qxcharlie", LangId::Bg);
+            engine
+        }
+
+        let first = engine(false);
+        let second = engine(true);
+        let words = |engine: &SmartKeyEngine| {
+            engine
+                .predict("qx", &[], 4, None)
+                .into_iter()
+                .map(|p| p.word)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(words(&first), words(&second));
+        assert_eq!(words(&first).len(), 4);
+    }
 
     #[test]
     fn score_exact_both_is_case_folded_and_language_separated() {

@@ -6,6 +6,20 @@ keep it available for machine removal. Source/native acceptance status is
 recorded separately in the supplied manifests; actual typing still needs a
 Windows desktop check.
 
+## November refresh
+
+This candidate incorporates the shared-core changes through 31 October 2026.
+Automatic word correction remains off by default. Pending typed text is delivered
+before application shortcuts, without accepting the displayed completion; the
+shortcut itself is forwarded. No pause-based commit timer is introduced on Windows.
+The explicit administrator installation and reversible user commands are retained.
+The exact build source and file hashes are in `artifact-source-manifest.json`.
+
+Installation tests and desktop typing are separate checks. Before relying on this
+candidate, try synthetic BG/EN text, Tab acceptance, Ctrl+C/Ctrl+V after a partial
+word, navigation, Win+Space and a real sign-out/sign-in in the intended applications.
+Do not infer those results from the CI installation checks.
+
 ## Install once on a permitted computer
 
 If an older SmartKey Windows version is installed, remove that version before
@@ -36,8 +50,9 @@ Each additional permitted user runs this normal step in their own account.
 
 Press **Win+Space** and choose SmartKey. Press **Win+Space** again to select your
 ordinary keyboard. Existing layouts and your default choice remain available.
-Open a new text app after installation. SmartKey is available at the user's next
-Windows login; it does not force itself to become the default keyboard.
+Open a new text app after installation. The login entry is intended to restore
+availability at the user's next Windows login; verify this in the desktop pilot.
+SmartKey does not force itself to become the default keyboard.
 
 Start menu > SmartKey provides **Status**, **Enable**, **Disable** and **Uninstall**.
 Disable removes this user's SmartKey login entry. Enable restores availability

@@ -65,11 +65,48 @@ pub enum Key {
     Other(u32),
 }
 
+impl Key {
+    pub(crate) fn is_pure_modifier(&self) -> bool {
+        matches!(
+            self,
+            Self::RawCode(29 | 42 | 54 | 56 | 58 | 97 | 100 | 125 | 126)
+                | Self::Other(0xffe1..=0xffee)
+        )
+    }
+}
+
 /// A single key event delivered by the platform.
 #[derive(Debug, Clone)]
 pub struct KeyEvent {
     pub key: Key,
     pub modifiers: Modifiers,
+}
+
+impl KeyEvent {
+    /// Resolve physical special keys before either input layer classifies the
+    /// event. Letter codes stay raw so the dual buffer can interpret layouts.
+    pub(crate) fn normalize_special_key(mut self) -> Self {
+        if let Key::RawCode(code) = self.key {
+            if let Some(special) = keymap::scancode_to_special(code) {
+                self.key = match special {
+                    keymap::SpecialKey::Tab => Key::Tab,
+                    keymap::SpecialKey::Escape => Key::Escape,
+                    keymap::SpecialKey::Backspace => Key::Backspace,
+                    keymap::SpecialKey::Return => Key::Return,
+                    keymap::SpecialKey::Space => Key::Space,
+                    keymap::SpecialKey::Left => Key::Left,
+                    keymap::SpecialKey::Right => Key::Right,
+                    keymap::SpecialKey::Up => Key::Up,
+                    keymap::SpecialKey::Down => Key::Down,
+                    keymap::SpecialKey::Home => Key::Home,
+                    keymap::SpecialKey::End => Key::End,
+                    keymap::SpecialKey::PageUp => Key::PageUp,
+                    keymap::SpecialKey::PageDown => Key::PageDown,
+                };
+            }
+        }
+        self
+    }
 }
 
 // ======================================================================
@@ -434,18 +471,147 @@ impl InputConfig {
 // InputMethodCore
 // ======================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitCause {
+    Boundary,
+    FocusFlush,
+    AcceptedCompletion,
+    PartialCompletionFallback,
+    AcceptedLanguageChoice,
+}
+
+impl CommitCause {
+    fn is_prediction_accept(self) -> bool {
+        matches!(
+            self,
+            Self::AcceptedCompletion | Self::PartialCompletionFallback
+        )
+    }
+}
+
+/// Language evidence is word-specific; it does not carry typed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitObservation {
+    pub language: Option<LangId>,
+}
+
+/// One public core operation's learning events. Replaced on the next operation
+/// even when a standalone consumer never drains it.
+#[derive(Debug, Default)]
+pub(crate) struct CommitLearningBatch {
+    pub words: Vec<CommitObservation>,
+    pub accepted_prediction: bool,
+}
+
+/// A correction carries the exact model which justified its target text.
+#[derive(Debug)]
+struct LanguageCorrection {
+    replace_len: usize,
+    text: String,
+    language: LangId,
+}
+
+impl LanguageCorrection {
+    fn into_action(self) -> Action {
+        Action::ReplaceWord {
+            replace_len: self.replace_len,
+            text: self.text,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct WordEvidence {
+    language: Option<LangId>,
+    confirmed_word: Option<LangId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordCharOrigin {
+    Direct(char),
+    Derived(char),
+}
+
+impl WordCharOrigin {
+    fn character(self) -> char {
+        match self {
+            Self::Direct(ch) | Self::Derived(ch) => ch,
+        }
+    }
+}
+
+enum WordDetectorBaseline {
+    Unstarted,
+    Captured(LanguageDetector),
+    Invalid,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SentenceBoundaryHint {
+    None,
+    /// Literal closers/repeated terminators following the original terminator.
+    AwaitingWhitespace {
+        tail_count: usize,
+    },
+    /// Known trailing plain Spaces; zero means opaque Tab/Return whitespace.
+    SentenceStart {
+        spaces: usize,
+        tail_count: usize,
+    },
+}
+
+impl SentenceBoundaryHint {
+    fn after_forwarded_key(key: &Key) -> Self {
+        match key {
+            Key::Return => Self::SentenceStart {
+                spaces: 0,
+                tail_count: 0,
+            },
+            Key::Char('.' | '!' | '?') => Self::AwaitingWhitespace { tail_count: 0 },
+            _ => Self::None,
+        }
+    }
+
+    fn is_sentence_start(self) -> bool {
+        matches!(self, Self::SentenceStart { .. })
+    }
+}
+
 /// The core state machine shared by all platform adapters.
 ///
 /// Platform code feeds key events via [`handle_key`] and executes the
 /// returned [`Action`]s (show ghost text, commit text, etc.).
 pub struct InputMethodCore {
     engine: SmartKeyEngine,
+    commit_learning: CommitLearningBatch,
+    /// Exact rendered characters and their retractable observation origins.
+    word_origins: Vec<WordCharOrigin>,
+    /// Editing-segment baseline, retained across deletion to an empty word.
+    word_detector_baseline: WordDetectorBaseline,
     config: InputConfig,
     current_word: String,
     ghost: String,
     context: VecDeque<String>,
+    /// Presentation evidence for forwarded delimiters, never model context.
+    sentence_boundary: SentenceBoundaryHint,
+    /// Current-position casing reconciliation, independent of lexical hints.
+    sentence_presentation_override: Option<bool>,
     enabled: bool,
+    /// Whether the current host can replace text already delivered to its client.
+    /// Ephemeral transport capability; never part of config or personal state.
+    external_rewrite_supported: bool,
+    /// Whether the host keeps composing text revisable until its final commit.
+    /// Direct delivery may append early and must not use this ownership shortcut.
+    composing_rewrite_supported: bool,
+    /// Ephemeral host UI capability, independent of language configuration.
+    language_choice_supported: bool,
+    /// Whether the host actually displays completion suffixes.
+    completion_display_supported: bool,
+    /// Keep ambiguous boundary policy after the offer is dismissed or hidden.
+    language_choice_token_policy: bool,
     last_predictions: Vec<Prediction>,
+    /// Model selection used for the displayed prediction's scoring components.
+    last_prediction_language: Option<LangId>,
     /// Prediction quality and performance metrics (v0.4.0).
     metrics: PredictionMetrics,
     /// Character trigram language detector (v0.4.0).
@@ -455,6 +621,13 @@ pub struct InputMethodCore {
     /// Dual-interpretation buffer for layout-agnostic input (v0.5.0).
     /// `Some` when active (after first `Key::RawCode` in a word), `None` otherwise.
     dual_buffer: Option<DualBuffer>,
+    /// Rendering layout after a token leaves preedit; never language evidence.
+    word_delivery_layout: Option<keymap::Layout>,
+    /// This delivered token belongs to the client's native completion UI.
+    /// Keep its rendering layout, but never offer an IBus completion for it.
+    native_completion_owned: bool,
+    /// Early delivery fixes an unconfirmed token: preserve rendering, never learn it.
+    direct_delivery_owned: bool,
     /// Typing regime detector (v0.5+) — gates tech vocab δ weight in the ensemble.
     regime_detector: RegimeDetector,
     /// True when the current word triggered a dual-buffer layout flip (for regime detection).
@@ -463,6 +636,8 @@ pub struct InputMethodCore {
     caps_engine: CapsEngine,
     /// Hints injected by MasterLoop (v0.6: proactive anticipation).
     active_hints: Option<crate::master_loop::Hints>,
+    /// Latest client context for terminal routing; never detector evidence.
+    terminal_context_lang: Option<LangId>,
     /// True when an anticipatory (next-word) ghost is showing, not a prefix ghost.
     /// Used to distinguish Tab-accept behavior.
     anticipatory_ghost_active: bool,
@@ -476,20 +651,35 @@ impl InputMethodCore {
         let enabled = config.enabled;
         Self {
             engine: SmartKeyEngine::from_config(&config),
+            commit_learning: CommitLearningBatch::default(),
+            word_origins: Vec::new(),
+            word_detector_baseline: WordDetectorBaseline::Unstarted,
             lang_detector: LanguageDetector::new(),
             metrics: PredictionMetrics::new(),
             config,
             current_word: String::new(),
             ghost: String::new(),
             context: VecDeque::with_capacity(CONTEXT_SIZE),
+            sentence_boundary: SentenceBoundaryHint::None,
+            sentence_presentation_override: None,
             enabled,
+            external_rewrite_supported: true,
+            composing_rewrite_supported: true,
+            language_choice_supported: false,
+            completion_display_supported: true,
+            language_choice_token_policy: false,
             last_predictions: Vec::new(),
+            last_prediction_language: None,
             transliteration_active: false,
             dual_buffer: None,
+            word_delivery_layout: None,
+            native_completion_owned: false,
+            direct_delivery_owned: false,
             regime_detector: RegimeDetector::new(),
             current_word_had_flip: false,
             caps_engine: CapsEngine::new(),
             active_hints: None,
+            terminal_context_lang: None,
             anticipatory_ghost_active: false,
             space_accept_display_attested: false,
         }
@@ -506,7 +696,161 @@ impl InputMethodCore {
     /// Clear any active hints (on word boundary).
     pub fn clear_hints(&mut self) {
         self.active_hints = None;
+        self.terminal_context_lang = None;
         self.lang_detector.clear_prior();
+    }
+
+    /// Update the host's ability to replace already-delivered client text.
+    pub fn set_external_rewrite_supported(&mut self, supported: bool) {
+        self.external_rewrite_supported = supported;
+    }
+
+    /// Update the host's ability to revise its own composing text.
+    pub fn set_composing_rewrite_supported(&mut self, supported: bool) {
+        self.composing_rewrite_supported = supported;
+    }
+
+    /// Transport capability, independent of the user's completion preference.
+    pub fn set_completion_display_supported(&mut self, supported: bool) {
+        self.completion_display_supported = supported;
+        if !supported {
+            self.clear_ghost();
+            self.last_predictions.clear();
+            self.last_prediction_language = None;
+            self.space_accept_display_attested = false;
+        }
+    }
+
+    pub(crate) fn direct_delivery_owned(&self) -> bool {
+        self.direct_delivery_owned
+    }
+
+    fn retire_direct_delivery(&mut self) -> Vec<Action> {
+        self.reset_word();
+        self.context.clear();
+        self.lang_detector.reset();
+        self.clear_hints();
+        vec![Action::HideGhost]
+    }
+
+    pub(crate) fn set_language_choice_supported(&mut self, supported: bool) {
+        self.latch_language_choice_policy();
+        self.language_choice_supported = supported;
+        self.latch_language_choice_policy();
+    }
+
+    /// Read the current complete physical alternatives without selecting one.
+    pub(crate) fn language_choice_readings(&self) -> Option<(LangId, &str, &str)> {
+        let db = self.dual_buffer.as_ref()?;
+        if !self.enabled
+            || self.current_word.is_empty()
+            || db.is_explicitly_locked()
+            || db.len() < self.config.min_prefix_length
+            || self.current_word != db.winner_text()
+            || db.en_text() == db.bg_text()
+            || !db.en_text().chars().all(char::is_alphabetic)
+            || !db.bg_text().chars().all(char::is_alphabetic)
+        {
+            return None;
+        }
+        let (en, bg) = self.engine.score_exact_both(db.en_text(), db.bg_text());
+        if (en > 0.0) != (bg > 0.0) {
+            return None;
+        }
+        Some((db.winner_lang(), db.en_text(), db.bg_text()))
+    }
+
+    pub(crate) fn latch_language_choice_policy(&mut self) {
+        if self.language_choice_supported && self.language_choice_readings().is_some() {
+            self.language_choice_token_policy = true;
+        }
+    }
+
+    fn language_choice_policy_active(&self) -> bool {
+        (self.language_choice_supported || self.language_choice_token_policy)
+            && self.language_choice_readings().is_some()
+    }
+
+    /// Commit exactly the selected whole reading, without accepting a ghost
+    /// or running a later automatic replacement over the explicit choice.
+    pub(crate) fn accept_language_choice(&mut self, language: LangId) -> Option<Vec<Action>> {
+        let (_, en, bg) = self.language_choice_readings()?;
+        let selected = match language {
+            LangId::En => en.to_owned(),
+            LangId::Bg => bg.to_owned(),
+            LangId::Tech => return None,
+        };
+        self.commit_learning = CommitLearningBatch::default();
+        self.commit_word_internal(&selected, CommitCause::AcceptedLanguageChoice);
+        self.reset_word();
+        Some(vec![Action::HideGhost, Action::CommitText(selected)])
+    }
+
+    pub(crate) fn set_terminal_context_lang(&mut self, lang: Option<LangId>) {
+        self.terminal_context_lang = lang.filter(|lang| matches!(lang, LangId::En | LangId::Bg));
+    }
+
+    /// Local delimiter projection only, independent of a reconciliation veto.
+    pub(crate) fn has_sentence_boundary_hint(&self) -> bool {
+        self.sentence_boundary != SentenceBoundaryHint::None
+    }
+
+    /// A contradictory client report also vetoes stale lexical casing hints.
+    pub(crate) fn withdraw_sentence_boundary_hint(&mut self) {
+        self.sentence_boundary = SentenceBoundaryHint::None;
+        self.sentence_presentation_override = Some(false);
+    }
+
+    /// Reconcile a valid current-position report, never lexical context.
+    pub(crate) fn reconcile_sentence_boundary_hint(&mut self, before_cursor: &str) {
+        let trimmed = before_cursor.trim_end();
+        let whitespace = &before_cursor[trimmed.len()..];
+        self.sentence_boundary = if trimmed.is_empty() || whitespace.contains(['\r', '\n']) {
+            SentenceBoundaryHint::SentenceStart {
+                spaces: 0,
+                tail_count: 0,
+            }
+        } else if CapsEngine::requires_capitalization(trimmed) {
+            // Count characters after the earliest terminator in this literal suffix.
+            let mut tail_count = 0;
+            for (offset, ch) in trimmed
+                .chars()
+                .rev()
+                .take_while(|&ch| {
+                    CapsEngine::is_closing_punctuation(ch) || matches!(ch, '.' | '!' | '?')
+                })
+                .enumerate()
+            {
+                if matches!(ch, '.' | '!' | '?') {
+                    tail_count = offset;
+                }
+            }
+            if whitespace.is_empty() {
+                SentenceBoundaryHint::AwaitingWhitespace { tail_count }
+            } else {
+                SentenceBoundaryHint::SentenceStart {
+                    spaces: if whitespace.bytes().all(|byte| byte == b' ') {
+                        whitespace.len()
+                    } else {
+                        0
+                    },
+                    tail_count,
+                }
+            }
+        } else {
+            SentenceBoundaryHint::None
+        };
+        // A fresh positive lives in the enum. If an uncertain edit withdraws
+        // it, stale lexical casing must not reappear through the fallback.
+        self.sentence_presentation_override = Some(false);
+    }
+
+    fn sentence_start_override(&self) -> Option<bool> {
+        // A genuine new local boundary supersedes an older external veto.
+        self.sentence_boundary
+            .is_sentence_start()
+            .then_some(true)
+            .or(self.sentence_presentation_override)
     }
 
     // -- passive calibration tap (delegates to the engine) --------------
@@ -623,10 +967,17 @@ impl InputMethodCore {
 
     /// Process a key event and return actions for the platform to execute.
     pub fn handle_key(&mut self, event: KeyEvent) -> Vec<Action> {
-        let is_kill = event.key == Key::Escape && event.modifiers.contains(Modifiers::SUPER);
+        self.commit_learning = CommitLearningBatch::default();
+        let event = event.normalize_special_key();
         // The display attestation covers exactly this key event (one-shot).
         let display_attested = std::mem::take(&mut self.space_accept_display_attested);
 
+        // A release cannot activate the kill switch, including while disabled.
+        if event.modifiers.contains(Modifiers::RELEASE) {
+            return vec![Action::ForwardKey];
+        }
+
+        let is_kill = event.key == Key::Escape && event.modifiers.contains(Modifiers::SUPER);
         // Disabled state — only the kill switch can re-enable.
         if !self.enabled {
             if is_kill {
@@ -643,19 +994,109 @@ impl InputMethodCore {
             return vec![Action::HideGhost];
         }
 
-        // Ignore key-release events.
-        if event.modifiers.contains(Modifiers::RELEASE) {
+        if event.key.is_pure_modifier() {
             return vec![Action::ForwardKey];
         }
 
-        // Ignore events with Ctrl or Alt held.
+        if self.direct_delivery_owned {
+            let character = self.native_completion_character(&event);
+            let boundary = event
+                .modifiers
+                .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+                || match event.key {
+                    Key::Backspace => false,
+                    Key::Char(_) | Key::RawCode(_) => {
+                        character.is_none_or(|ch| !ch.is_alphabetic())
+                    }
+                    _ => true,
+                };
+            if boundary {
+                let resolved_key = character.map_or_else(|| event.key.clone(), Key::Char);
+                let mut actions = self.retire_direct_delivery();
+                self.sentence_boundary = SentenceBoundaryHint::after_forwarded_key(&resolved_key);
+                actions.push(Action::ForwardKey);
+                return actions;
+            }
+        }
+
+        // Ignore shortcuts with Ctrl or Alt held, not the modifier key itself.
         if event.modifiers.intersects(Modifiers::CTRL | Modifiers::ALT) {
+            self.sentence_boundary = SentenceBoundaryHint::None;
             return vec![Action::ForwardKey];
+        }
+
+        if self.native_completion_owned {
+            // The forwarded boundary may accept a different native candidate.
+            // Its resulting client word is not observable before delivery.
+            if self.native_completion_boundary_event(&event) {
+                let key = self
+                    .native_completion_character(&event)
+                    .map_or_else(|| event.key.clone(), Key::Char);
+                let next_boundary = SentenceBoundaryHint::after_forwarded_key(&key);
+                let mut actions = self.reset();
+                self.sentence_boundary = next_boundary;
+                actions.push(Action::ForwardKey);
+                return actions;
+            }
+            match event.key {
+                // Native popup navigation does not imply a moved text caret.
+                // A later surrounding report reconciles any actual movement.
+                Key::Up | Key::Down | Key::PageUp | Key::PageDown => {
+                    return vec![Action::ForwardKey]
+                }
+                Key::Escape => {
+                    self.native_completion_owned = false;
+                    return vec![Action::ForwardKey];
+                }
+                _ => {}
+            }
+        }
+
+        // A literal closing tail belongs to the forwarded terminator, not a
+        // new lexical token. Raw keys qualify only when both layouts agree.
+        if matches!(
+            self.sentence_boundary,
+            SentenceBoundaryHint::AwaitingWhitespace { .. }
+        ) && self.current_word.is_empty()
+            && self.dual_buffer.is_none()
+        {
+            let tail = match event.key {
+                Key::Char(ch) => Some(ch),
+                Key::RawCode(code) => keymap::scancode_to_both_with_caps(
+                    code,
+                    event.modifiers.contains(Modifiers::SHIFT),
+                    event.modifiers.contains(Modifiers::CAPS_LOCK),
+                )
+                .and_then(|(en, bg)| (en == bg).then_some(en)),
+                _ => None,
+            };
+            if tail.is_some_and(|ch| {
+                CapsEngine::is_closing_punctuation(ch) || matches!(ch, '.' | '!' | '?')
+            }) {
+                if let SentenceBoundaryHint::AwaitingWhitespace { tail_count } =
+                    &mut self.sentence_boundary
+                {
+                    *tail_count = tail_count.saturating_add(1);
+                }
+                return vec![Action::ForwardKey];
+            }
+        }
+
+        // An adjacent printable character is not the whitespace required after
+        // a forwarded terminator (decimal/technical tokens included). Withdraw
+        // the pending hint before any prediction for that character.
+        if matches!(
+            self.sentence_boundary,
+            SentenceBoundaryHint::AwaitingWhitespace { .. }
+        ) && matches!(event.key, Key::Char(_) | Key::RawCode(_))
+        {
+            self.sentence_boundary = SentenceBoundaryHint::None;
         }
 
         // ── Resolve RawCode (v0.5.0) ─────────────────────────────────
-        // Convert hardware scancode to either a dual-buffer operation or
-        // a regular Key before entering the main match.
+        // Special identities were resolved above; remaining hardware codes
+        // become either a dual-buffer operation or a regular character.
+        let mut inferred_raw_char = false;
         let event = if let Key::RawCode(code) = event.key {
             // Caps Lock inverts Shift, but only on letter keys — the lock latch
             // must never uppercase digits or punctuation.  Which keys are
@@ -663,40 +1104,42 @@ impl InputMethodCore {
             // Bulgarian), so the latch is applied per layout by the keymap.
             let shift_held = event.modifiers.contains(Modifiers::SHIFT);
             let caps_lock = event.modifiers.contains(Modifiers::CAPS_LOCK);
-            // Special keys (Tab, Space, etc.) → rewrite to their Key variant.
-            if let Some(special) = keymap::scancode_to_special(code) {
-                let key = match special {
-                    keymap::SpecialKey::Tab => Key::Tab,
-                    keymap::SpecialKey::Escape => Key::Escape,
-                    keymap::SpecialKey::Backspace => Key::Backspace,
-                    keymap::SpecialKey::Return => Key::Return,
-                    keymap::SpecialKey::Space => Key::Space,
-                    keymap::SpecialKey::Left => Key::Left,
-                    keymap::SpecialKey::Right => Key::Right,
-                    keymap::SpecialKey::Up => Key::Up,
-                    keymap::SpecialKey::Down => Key::Down,
-                    keymap::SpecialKey::Home => Key::Home,
-                    keymap::SpecialKey::End => Key::End,
-                    keymap::SpecialKey::PageUp => Key::PageUp,
-                    keymap::SpecialKey::PageDown => Key::PageDown,
-                };
-                KeyEvent {
-                    key,
-                    modifiers: event.modifiers,
-                }
-            } else if let Some((en_ch, bg_ch)) =
+            if let Some((en_ch, bg_ch)) =
                 keymap::scancode_to_both_with_caps(code, shift_held, caps_lock)
             {
                 if en_ch != bg_ch && self.config.dual_buffer.enabled {
+                    let layout = self.word_delivery_layout.or_else(|| {
+                        (self.dual_buffer.is_none() && !self.current_word.is_empty()).then_some(
+                            if self.transliteration_active {
+                                keymap::Layout::Bg
+                            } else {
+                                keymap::Layout::En
+                            },
+                        )
+                    });
+                    if let Some(layout) = layout {
+                        // A semantic prefix is already in the client. Keep it
+                        // intact and retain any active legacy transliteration.
+                        // Unconverted semantic prefixes keep the EN fallback.
+                        self.word_delivery_layout = Some(layout);
+                        let ch = match layout {
+                            keymap::Layout::En => en_ch,
+                            keymap::Layout::Bg => bg_ch,
+                        };
+                        return self.append_delivered_raw_char(ch);
+                    }
                     // Dual-interpretable character → handle via dual buffer.
                     return self.handle_dual_buffer_key(en_ch, bg_ch);
                 }
-                // Same char on both layouts → treat as regular Char.
+                // Shared glyphs are direct. With composition disabled, the
+                // EN fallback keeps its ambiguity for learning provenance.
+                inferred_raw_char = en_ch != bg_ch;
                 KeyEvent {
                     key: Key::Char(en_ch),
                     modifiers: event.modifiers,
                 }
             } else {
+                self.sentence_boundary = SentenceBoundaryHint::None;
                 return vec![Action::ForwardKey];
             }
         } else {
@@ -713,10 +1156,26 @@ impl InputMethodCore {
                     // so commit it before forwarding Tab — otherwise a locked
                     // dual buffer would forward Tab and abandon the typed word.
                     let prefix = self.current_word.clone();
-                    self.commit_word_internal(&prefix, true);
+                    self.commit_word_internal(&prefix, CommitCause::Boundary);
                     self.reset_word();
                     vec![Action::HideGhost, commit, Action::ForwardKey]
+                } else if !self.current_word.is_empty() {
+                    // Semantic and handed-off text is already in the client.
+                    // Tab ends its token without inserting the prefix again.
+                    let word = self.current_word.clone();
+                    self.commit_word_internal(&word, CommitCause::Boundary);
+                    self.reset_word();
+                    vec![Action::HideGhost, Action::ForwardKey]
                 } else {
+                    // This empty-word branch forwards Tab without a word commit.
+                    // Tab may focus, complete, or insert nothing: later Backspace
+                    // cannot safely restore the preceding counted Space/tail.
+                    if self.sentence_boundary != SentenceBoundaryHint::None {
+                        self.sentence_boundary = SentenceBoundaryHint::SentenceStart {
+                            spaces: 0,
+                            tail_count: 0,
+                        };
+                    }
                     vec![Action::ForwardKey]
                 }
             }
@@ -745,23 +1204,29 @@ impl InputMethodCore {
                         // cannot remain synchronized.  Fail safely by accepting
                         // the already-visible word atomically, without a partial
                         // mutation.
-                        return self.accept_ghost_completion();
+                        return self.accept_ghost_completion_with_cause(
+                            CommitCause::PartialCompletionFallback,
+                        );
                     }
 
                     self.ghost.remove(0);
-                    self.current_word = self
+                    let word = self
                         .dual_buffer
                         .as_ref()
                         .expect("dual buffer accepted the character")
                         .winner_text()
                         .to_string();
+                    self.replace_word_with_derived(word);
                     vec![Action::ShowComposing {
                         typed: self.current_word.clone(),
                         ghost: self.ghost.clone(),
                     }]
                 } else if !self.ghost.is_empty() {
+                    if self.ghost.chars().count() == 1 {
+                        return self.accept_ghost_completion();
+                    }
                     let ch = self.ghost.remove(0);
-                    self.current_word.push(ch);
+                    self.push_word_char(ch, false);
                     if self.ghost.is_empty() {
                         vec![Action::CommitText(ch.to_string()), Action::HideGhost]
                     } else {
@@ -808,6 +1273,7 @@ impl InputMethodCore {
                     // cannot be re-committed by the aggressive unique-match
                     // Space path right after the user rejected it.
                     self.last_predictions.clear();
+                    self.last_prediction_language = None;
                     self.anticipatory_ghost_active = false;
                     if self.dual_buffer.is_some() && !self.current_word.is_empty() {
                         // Composing: re-show the preedit with the typed word only.
@@ -820,8 +1286,13 @@ impl InputMethodCore {
                     }
                 } else if self.in_hypothesis_phase() {
                     // Hypothesis phase, no completion shown: cancel the
-                    // preedit, nothing was committed.
+                    // preedit, nothing was committed. The client's preceding
+                    // delimiter was not edited by this local cancellation.
+                    let sentence_boundary = self.sentence_boundary;
+                    let sentence_presentation_override = self.sentence_presentation_override;
                     self.reset_word();
+                    self.sentence_boundary = sentence_boundary;
+                    self.sentence_presentation_override = sentence_presentation_override;
                     vec![Action::HideGhost]
                 } else {
                     vec![Action::ForwardKey]
@@ -848,21 +1319,61 @@ impl InputMethodCore {
                 // atomic `typed+ghost+" "` commit with the key consumed.  With
                 // the flag off, or without an eligible ghost, both keys stay
                 // exactly literal (the unchanged paths below).
-                if matches!(event.key, Key::Space)
+                if Self::is_space_event(&event)
                     && self.config.space_accept
                     && display_attested
                     && self.space_accept_eligible()
                 {
                     return self.accept_ghost_with_delimiter();
                 }
+                // Capture whole-word ownership before taking/resetting the token.
+                let rewrite_allowed = !self.native_completion_owned
+                    && (self.external_rewrite_supported
+                        || (self.composing_rewrite_supported && self.dual_buffer.is_some()));
+                let sentence_start = self.sentence_start_override();
+                // Empty Space does not finish a word; retain its current-position
+                // decision. Return instead establishes a new local boundary.
+                let next_presentation_override =
+                    if event.key == Key::Space && self.current_word.is_empty() {
+                        self.sentence_presentation_override
+                    } else {
+                        None
+                    };
+                let next_boundary = if event.key == Key::Return {
+                    SentenceBoundaryHint::after_forwarded_key(&event.key)
+                } else if self.current_word.is_empty() {
+                    match self.sentence_boundary {
+                        SentenceBoundaryHint::AwaitingWhitespace { tail_count } => {
+                            SentenceBoundaryHint::SentenceStart {
+                                spaces: 1,
+                                tail_count,
+                            }
+                        }
+                        SentenceBoundaryHint::SentenceStart { spaces, tail_count } => {
+                            SentenceBoundaryHint::SentenceStart {
+                                spaces: if spaces > 0 {
+                                    spaces.saturating_add(1)
+                                } else {
+                                    0
+                                },
+                                tail_count,
+                            }
+                        }
+                        SentenceBoundaryHint::None => SentenceBoundaryHint::None,
+                    }
+                } else {
+                    SentenceBoundaryHint::None
+                };
                 if self.dual_buffer.is_some() && !self.current_word.is_empty() {
                     // Full-word composing: commit entire preedit word at once.
                     // The word has been in composing mode the whole time — the
                     // user sees the displayed script; the boundary resolves
                     // exact one-sided evidence before anything is learned.
                     let word = self.resolve_word_boundary();
-                    self.commit_word_internal(&word, true);
+                    let correction = self.commit_boundary_word(&word, rewrite_allowed);
                     self.reset_word();
+                    self.sentence_boundary = next_boundary;
+                    self.sentence_presentation_override = next_presentation_override;
                     let mut actions = vec![
                         Action::HideGhost,
                         Action::CommitText(word.clone()),
@@ -873,30 +1384,52 @@ impl InputMethodCore {
                     // preedit in the same batch races that delimiter: GTK,
                     // Electron and browser clients can apply the Space/Return
                     // to the new ghost instead of to the committed word.
-                    actions.extend(self.post_commit_pipeline(&word, false));
+                    actions.extend(self.post_commit_pipeline(
+                        &word,
+                        false,
+                        correction,
+                        rewrite_allowed,
+                        sentence_start,
+                    ));
                     return actions;
                 }
                 let committed = if !self.current_word.is_empty() {
                     let word = std::mem::take(&mut self.current_word);
-                    self.commit_word_internal(&word, true);
-                    Some(word)
+                    let correction = self.commit_boundary_word(&word, rewrite_allowed);
+                    Some((word, correction))
                 } else {
                     None
                 };
                 self.reset_word();
+                self.sentence_boundary = next_boundary;
+                self.sentence_presentation_override = next_presentation_override;
                 let mut actions = vec![Action::HideGhost, Action::ForwardKey];
                 // Post-commit intelligence pipeline: auto-correct, auto-caps, next-word ghost.
-                if let Some(ref word) = committed {
+                if let Some((word, correction)) = committed {
                     // Same client-ordering rule as the composing branch above:
                     // never install a fresh preedit in front of the forwarded
                     // Space/Return.
-                    actions.extend(self.post_commit_pipeline(word, false));
+                    actions.extend(self.post_commit_pipeline(
+                        &word,
+                        false,
+                        correction,
+                        rewrite_allowed,
+                        sentence_start,
+                    ));
                 }
                 actions
             }
 
             // Backspace: trim the current word.
             Key::Backspace => {
+                let lang_prior = self
+                    .active_hints
+                    .as_ref()
+                    .and_then(|h| h.lang_prior)
+                    .or_else(|| self.lang_detector.momentum_lang());
+                if !self.current_word.is_empty() {
+                    self.begin_word_edit();
+                }
                 if let Some(ref mut db) = self.dual_buffer {
                     if !db.is_empty() {
                         db.pop();
@@ -904,6 +1437,10 @@ impl InputMethodCore {
                             // All chars deleted — clear preedit entirely.
                             self.dual_buffer = None;
                             self.current_word.clear();
+                            self.word_origins.clear();
+                            self.terminal_context_lang = None;
+                            self.word_delivery_layout = None;
+                            self.language_choice_token_policy = false;
                             self.ghost.clear();
                             return vec![Action::HideGhost];
                         }
@@ -918,8 +1455,19 @@ impl InputMethodCore {
                         if !db.is_locked() {
                             let (ef, bf) = self.engine.score_both(db.en_text(), db.bg_text());
                             db.update_scores(ef, bf);
+                            db.apply_soft_context_prior(lang_prior);
+                            // The surviving corpus rescore replaces deleted
+                            // detector evidence before choosing a ghost model.
+                            if self.config.lang_detection
+                                && db.evidence_origin()
+                                    == crate::dual_buffer::EvidenceOrigin::Corpus
+                            {
+                                self.lang_detector
+                                    .feed_dual_result(db.winner_lang(), db.confidence());
+                            }
                         }
-                        self.current_word = db.winner_text().to_string();
+                        let word = db.winner_text().to_string();
+                        self.replace_word_with_derived(word);
                         let ghost = self.compute_ghost_suffix();
                         return vec![Action::ShowComposing {
                             typed: self.current_word.clone(),
@@ -927,8 +1475,43 @@ impl InputMethodCore {
                         }];
                     }
                 }
+                // Only an empty token lets this provisional event projection
+                // trim a known literal tail. A delivered word or opaque whitespace
+                // requires conservative invalidation. Local preedit deletion
+                // above, including to empty, retains the complete hint payload.
+                self.sentence_boundary = if self.current_word.is_empty() {
+                    match self.sentence_boundary {
+                        SentenceBoundaryHint::SentenceStart { spaces, tail_count }
+                            if spaces > 1 =>
+                        {
+                            SentenceBoundaryHint::SentenceStart {
+                                spaces: spaces - 1,
+                                tail_count,
+                            }
+                        }
+                        SentenceBoundaryHint::SentenceStart {
+                            spaces: 1,
+                            tail_count,
+                        } => SentenceBoundaryHint::AwaitingWhitespace { tail_count },
+                        SentenceBoundaryHint::AwaitingWhitespace { tail_count }
+                            if tail_count > 0 =>
+                        {
+                            SentenceBoundaryHint::AwaitingWhitespace {
+                                tail_count: tail_count - 1,
+                            }
+                        }
+                        _ => SentenceBoundaryHint::None,
+                    }
+                } else {
+                    SentenceBoundaryHint::None
+                };
                 if !self.current_word.is_empty() {
-                    self.current_word.pop();
+                    self.pop_word_char();
+                }
+                if self.current_word.is_empty() {
+                    self.terminal_context_lang = None;
+                    self.word_delivery_layout = None;
+                    self.direct_delivery_owned = false;
                 }
                 let ghost_action = self.update_predictions();
                 vec![ghost_action, Action::ForwardKey]
@@ -942,29 +1525,58 @@ impl InputMethodCore {
                 // bypass the dual buffer, so they would clear the preedit via
                 // HideGhost without committing the composed text — losing the
                 // user's typed letters.  Commit the composed word first.
-                if self.dual_buffer.is_some()
+                if (self.dual_buffer.is_some() || self.native_completion_owned)
                     && !self.current_word.is_empty()
                     && !ch.is_alphabetic()
                 {
+                    let composing = self.dual_buffer.is_some();
+                    let rewrite_allowed = !self.native_completion_owned
+                        && (self.external_rewrite_supported
+                            || (self.composing_rewrite_supported && composing));
+                    let sentence_start = self.sentence_start_override();
                     let word = self.resolve_word_boundary();
-                    self.commit_word_internal(&word, true);
+                    let correction = self.commit_boundary_word(&word, rewrite_allowed);
                     self.reset_word();
-                    let mut actions = vec![Action::HideGhost, Action::CommitText(word.clone())];
+                    let mut actions = vec![Action::HideGhost];
+                    if composing {
+                        actions.push(Action::CommitText(word.clone()));
+                    }
                     // The punctuation key is forwarded only after the adapter
                     // finishes this batch.  Never install a fresh preedit in
                     // front of it; otherwise characters such as `!` can be
                     // consumed by the replacement preedit in some clients.
-                    actions.extend(self.post_commit_pipeline(&word, false));
+                    actions.extend(self.post_commit_pipeline(
+                        &word,
+                        false,
+                        correction,
+                        rewrite_allowed,
+                        sentence_start,
+                    ));
+                    // Record the delimiter only after processing the word it
+                    // terminates; punctuation never enters lexical learning.
+                    if matches!(ch, '.' | '!' | '?') {
+                        self.sentence_boundary =
+                            SentenceBoundaryHint::after_forwarded_key(&Key::Char(ch));
+                    }
                     actions.push(Action::ForwardKey);
                     return actions;
                 }
+
+                // Semantic letters are exact glyphs, not physical pairs. Deliver
+                // the old preedit once, then keep this entire token in the
+                // noncomposing path without committing a word or its evidence.
+                let mut actions = if ch.is_alphabetic() {
+                    self.handoff_preedit()
+                } else {
+                    Vec::new()
+                };
 
                 // Clear anticipatory ghost if active — user is typing a new word.
                 if self.anticipatory_ghost_active {
                     self.anticipatory_ghost_active = false;
                     self.ghost.clear();
                 }
-                self.current_word.push(ch);
+                self.push_word_char(ch, !inferred_raw_char);
 
                 // v0.4.1: detection BEFORE prediction (instant classify).
                 if self.config.lang_detection {
@@ -975,8 +1587,8 @@ impl InputMethodCore {
                 // the user is on the wrong keyboard layout.
                 if self.transliteration_active {
                     if let Some(cyrillic) = lang_detect::phonetic_map(ch) {
-                        self.current_word.pop(); // Remove the Latin char
-                        self.current_word.push(cyrillic);
+                        self.pop_word_char(); // Remove the observed Latin char.
+                        self.push_word_char(cyrillic, false);
                         let ghost_action = self.update_predictions();
                         // The Latin key was consumed by SmartKey (not forwarded
                         // to the app), so just commit the Cyrillic char directly
@@ -986,7 +1598,9 @@ impl InputMethodCore {
                 }
 
                 // Check for wrong layout on 2nd+ Latin char.
-                if !self.transliteration_active
+                if self.external_rewrite_supported
+                    && self.word_delivery_layout.is_none()
+                    && !self.transliteration_active
                     && self.current_word.chars().count() >= 2
                     && self.check_wrong_layout()
                 {
@@ -996,7 +1610,7 @@ impl InputMethodCore {
                     // The current char that triggered detection was consumed (not forwarded),
                     // so subtract 1.
                     let replace_len = self.current_word.chars().count() - 1;
-                    self.current_word = transliterated;
+                    self.replace_word_with_derived(transliterated);
                     let ghost_action = self.update_predictions();
                     return vec![
                         Action::ReplaceWord {
@@ -1008,13 +1622,28 @@ impl InputMethodCore {
                 }
 
                 let ghost_action = self.update_predictions();
-                vec![ghost_action, Action::ForwardKey]
+                if actions.is_empty() {
+                    actions.push(ghost_action);
+                } else {
+                    // The adapter drops a fresh ghost before this forwarded
+                    // letter lands. Do not attest or accept that hidden pair.
+                    self.ghost.clear();
+                    self.last_predictions.clear();
+                    self.last_prediction_language = None;
+                    self.space_accept_display_attested = false;
+                    actions.push(Action::HideGhost);
+                }
+                actions.push(Action::ForwardKey);
+                actions
             }
 
             // RawCode is resolved before this match — unreachable.
             Key::RawCode(_) => unreachable!("RawCode resolved before match"),
-            // Unknown key: pass through.
-            Key::Other(_) => vec![Action::ForwardKey],
+            // An unknown forwarded press may edit the client (e.g. paste).
+            Key::Other(_) => {
+                self.sentence_boundary = SentenceBoundaryHint::None;
+                vec![Action::ForwardKey]
+            }
         }
     }
 
@@ -1055,11 +1684,14 @@ impl InputMethodCore {
     /// Sensitive fields and focus/cursor transitions never reach this point:
     /// the adapter bypasses the core, and `reset_word()` clears the ghost.
     fn space_accept_eligible(&self) -> bool {
-        if self.dual_buffer.is_none()
+        if !self.completion_display_supported
+            || self.direct_delivery_owned
+            || self.dual_buffer.is_none()
             || self.current_word.is_empty()
             || self.ghost.is_empty()
             || self.anticipatory_ghost_active
             || self.transliteration_active
+            || self.language_choice_policy_active()
         {
             return false;
         }
@@ -1097,12 +1729,16 @@ impl InputMethodCore {
         self.config.space_accept && self.space_accept_eligible()
     }
 
-    /// Whether this event is a Space press, on either entry path: the keyval
+    /// Whether this event is a plain Space press (Caps Lock latch allowed),
+    /// on either entry path: the keyval
     /// path (`Key::Space`) or the raw-scancode path the live adapter uses for
     /// every key (`Key::RawCode` that the keymap resolves to Space).  The
     /// master loop must not match `Key::Space` alone — raw codes are resolved
     /// only inside `handle_key`, so a raw Space would never be attested.
     pub fn is_space_event(event: &KeyEvent) -> bool {
+        if !event.modifiers.difference(Modifiers::CAPS_LOCK).is_empty() {
+            return false;
+        }
         match event.key {
             Key::Space => true,
             Key::RawCode(code) => matches!(
@@ -1202,12 +1838,27 @@ impl InputMethodCore {
     ///
     /// Caller precondition: `!self.ghost.is_empty()`.
     fn accept_ghost_completion(&mut self) -> Vec<Action> {
+        self.accept_ghost_completion_with_cause(CommitCause::AcceptedCompletion)
+    }
+
+    fn accept_ghost_completion_with_cause(&mut self, cause: CommitCause) -> Vec<Action> {
         let full_text = format!("{}{}", self.current_word, self.ghost);
         // F8: multi-word ghost may contain spaces — split into words.
         let words: Vec<&str> = full_text.split_whitespace().collect();
         let first_word = words.first().copied().unwrap_or(&full_text);
 
         let prefix_in_preedit = self.dual_buffer.is_some();
+        // A suffix-only or multiword commit cannot replace an externally owned
+        // whole token. Capture this before confirmation, learning and reset.
+        let rewrite_allowed = self.external_rewrite_supported
+            || (self.composing_rewrite_supported && prefix_in_preedit && words.len() == 1);
+        // Conserve the exact shown composition. First-word phrase casing belongs
+        // in its pre-display producer, not this final-word post-commit pipeline.
+        let sentence_start = if words.len() == 1 {
+            self.sentence_start_override()
+        } else {
+            None
+        };
         let commit_text = if prefix_in_preedit {
             full_text.clone()
         } else {
@@ -1220,7 +1871,11 @@ impl InputMethodCore {
         if let Some(top) = self.last_predictions.first() {
             self.engine.observe_calibration(top.confidence, true);
         }
-        self.engine.on_prediction_accepted(first_word, &ctx);
+        self.engine.on_prediction_accepted_with_lang(
+            first_word,
+            &ctx,
+            self.last_prediction_language,
+        );
         // Record acceptance metrics: find rank in last_predictions.
         let rank = self
             .last_predictions
@@ -1230,30 +1885,175 @@ impl InputMethodCore {
             .unwrap_or(1);
         self.metrics
             .record_acceptance(rank, self.ghost.chars().count(), full_text.chars().count());
-        // Commit each word separately for correct context/Markov tracking.
-        for word in &words {
-            self.commit_word_internal(word, false);
-        }
         let last_word = words.last().copied().unwrap_or("").to_string();
+        // A fully accepted word's dictionary confirmation precedes the
+        // accepted correction decision, while generic/profile learning occurs
+        // exactly once for the text that will actually remain in the client.
+        if cause == CommitCause::AcceptedCompletion && self.config.lang_detection {
+            for word in &words {
+                if word.chars().count() >= 3 {
+                    if let Some(language) = Self::word_script(word) {
+                        self.engine.confirm_word(&word.to_lowercase(), language);
+                    }
+                }
+            }
+        }
+        let correction = (self.config.post_commit_autocorrect && rewrite_allowed)
+            .then(|| self.prepare_language_correction(&last_word))
+            .flatten();
+        for (index, word) in words.iter().enumerate() {
+            if index + 1 == words.len() {
+                if let Some(prepared) = correction.as_ref() {
+                    self.commit_corrected_word(prepared, cause);
+                    continue;
+                }
+            }
+            self.commit_word_internal(word, cause);
+        }
         self.reset_word();
-        // After accept: corrections still run, but NO anticipatory ghost —
-        // an instant re-arm turns repeated Tabs into a word machine gun (S4).
+        // Keep the existing accepted correction timing and no anticipatory rearm.
         let mut actions = actions;
-        actions.extend(self.post_commit_pipeline(&last_word, false));
+        actions.extend(self.post_commit_pipeline(
+            &last_word,
+            false,
+            correction.map(LanguageCorrection::into_action),
+            rewrite_allowed,
+            sentence_start,
+        ));
         actions
     }
 
     // -- focus / reset --------------------------------------------------
 
+    /// Deliver only the typed preedit, retaining this word's selected layout.
+    /// Native completion owns presentation until this token ends or is retired.
+    pub fn handoff_preedit_for_native_completion(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
+        let mut actions = self.handoff_preedit();
+        self.native_completion_owned = !self.current_word.is_empty();
+        self.clear_ghost();
+        self.last_predictions.clear();
+        self.last_prediction_language = None;
+        self.space_accept_display_attested = false;
+        if actions.is_empty() {
+            actions.push(Action::HideGhost);
+        }
+        actions
+    }
+
+    /// Deliver the composing word early and keep it open (direct delivery: the
+    /// operator paused or pressed a shortcut modifier).  The dual buffer's
+    /// boundary choice fixes the word's script: later keys append in it, a
+    /// BackSpace is forwarded, and the boundary types nothing again. This
+    /// speculative token never contributes learning or lexical context.
+    pub fn handoff_preedit_for_delivery(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
+        // The same complete prefix must choose the same script as Space. The
+        // prefix scoring winner alone may differ from the exact-word resolver.
+        let resolved = self.resolve_word_boundary();
+        let selected_layout = self.dual_buffer.as_ref().map(|db| {
+            if resolved == db.bg_text() {
+                keymap::Layout::Bg
+            } else {
+                keymap::Layout::En
+            }
+        });
+        let mut actions = self.handoff_preedit();
+        if let Some(layout) = selected_layout {
+            self.word_delivery_layout = Some(layout);
+        }
+        self.direct_delivery_owned = !self.current_word.is_empty();
+        self.clear_ghost();
+        self.last_predictions.clear();
+        self.last_prediction_language = None;
+        self.space_accept_display_attested = false;
+        if actions.is_empty() {
+            actions.push(Action::HideGhost);
+        }
+        actions
+    }
+
+    pub(crate) fn native_completion_owned(&self) -> bool {
+        self.native_completion_owned
+    }
+
+    /// A client-owned boundary cannot attest the final native candidate.
+    /// Resolve raw glyphs in the retained delivery layout so Bulgarian letters
+    /// on physical bracket keys remain refinements rather than boundaries.
+    pub(crate) fn native_completion_boundary_event(&self, event: &KeyEvent) -> bool {
+        matches!(event.key, Key::Tab | Key::Return | Key::Space)
+            || self
+                .native_completion_character(event)
+                .is_some_and(|ch| !ch.is_alphabetic())
+    }
+
+    fn native_completion_character(&self, event: &KeyEvent) -> Option<char> {
+        match event.key {
+            Key::Char(ch) => Some(ch),
+            Key::RawCode(code) => keymap::scancode_to_both_with_caps(
+                code,
+                event.modifiers.contains(Modifiers::SHIFT),
+                event.modifiers.contains(Modifiers::CAPS_LOCK),
+            )
+            .map(|(en, bg)| {
+                // Match the dispatcher's EN resolution when dual input is off,
+                // before its later legacy transliteration can process a glyph.
+                if !self.config.dual_buffer.enabled {
+                    return en;
+                }
+                match self
+                    .word_delivery_layout
+                    .unwrap_or(if self.transliteration_active {
+                        keymap::Layout::Bg
+                    } else {
+                        keymap::Layout::En
+                    }) {
+                    keymap::Layout::En => en,
+                    keymap::Layout::Bg => bg,
+                }
+            }),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn learned_state_for_test(&self) -> crate::ensemble::LearnedStateSnapshot {
+        self.engine.learned_state_for_test()
+    }
+
+    /// Deliver owned preedit before handing input to a manually selected layout.
+    ///
+    /// A layout switch is not a word boundary: the user may continue the same
+    /// word outside this core. Keep previously learned state, but discard the
+    /// old composition and context without accepting or learning a completion.
+    pub fn flush_preedit_for_layout(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
+        let mut actions = Vec::from_iter(self.flush_preedit());
+        self.reset_word();
+        self.context.clear();
+        self.lang_detector.reset();
+        self.clear_hints();
+        self.space_accept_display_attested = false;
+        actions.push(Action::HideGhost);
+        actions
+    }
+
     /// Called when the input field loses focus.
     pub fn focus_lost(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
+        if self.direct_delivery_owned {
+            return self.retire_direct_delivery();
+        }
+        if self.native_completion_owned {
+            return self.reset();
+        }
         // Flush the preedit to the application BEFORE learning from it —
         // the lock gate that used to sit here made the engine learn a word
         // the application never received.
         let mut actions = Vec::from_iter(self.flush_preedit());
         if !self.current_word.is_empty() {
             let word = std::mem::take(&mut self.current_word);
-            self.commit_word_internal(&word, true);
+            self.commit_word_internal(&word, CommitCause::FocusFlush);
         }
         self.reset_word();
         actions.push(Action::HideGhost);
@@ -1262,7 +2062,12 @@ impl InputMethodCore {
 
     /// Called when the input field gains focus.
     pub fn focus_gained(&mut self) {
-        // Nothing to do — ready for new input.
+        self.commit_learning = CommitLearningBatch::default();
+        if self.native_completion_owned {
+            self.reset_word();
+        }
+        self.sentence_boundary = SentenceBoundaryHint::None;
+        self.sentence_presentation_override = None;
     }
 
     /// Called when the cursor moves away from the current typing location.
@@ -1271,6 +2076,7 @@ impl InputMethodCore {
     /// session cache so stale predictions do not bleed into the new cursor
     /// location after navigation.
     pub fn cursor_moved(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
         // The in-flight word lives ONLY in the preedit; clearing state without
         // flushing it destroys characters the application never received.
         let mut actions = Vec::from_iter(self.flush_preedit());
@@ -1303,8 +2109,16 @@ impl InputMethodCore {
     /// worktree alone, because the core change and the adapter that executes its
     /// actions live in different worktrees.
     pub fn reset(&mut self) -> Vec<Action> {
+        self.commit_learning = CommitLearningBatch::default();
+        if self.direct_delivery_owned {
+            return self.retire_direct_delivery();
+        }
         self.reset_word();
         vec![Action::HideGhost]
+    }
+
+    pub(crate) fn take_commit_learning(&mut self) -> CommitLearningBatch {
+        std::mem::take(&mut self.commit_learning)
     }
 
     // -- read-only accessors --------------------------------------------
@@ -1438,7 +2252,11 @@ impl InputMethodCore {
     /// Returns a replacement display action when the correction can be shown
     /// for the current prefix; otherwise leaves state unchanged.
     pub fn apply_prediction_override(&mut self, replacement: &str) -> Option<Action> {
-        if self.current_word.is_empty() {
+        if self.current_word.is_empty()
+            || self.native_completion_owned
+            || self.direct_delivery_owned
+            || !self.completion_display_supported
+        {
             return None;
         }
 
@@ -1489,12 +2307,221 @@ impl InputMethodCore {
 
     // -- internal helpers -----------------------------------------------
 
-    /// Shared commit logic. `record_commit_metric` is false for Tab-accepted
-    /// words (already recorded via `record_acceptance`).
-    fn commit_word_internal(&mut self, word: &str, record_commit_metric: bool) {
+    fn handoff_preedit(&mut self) -> Vec<Action> {
+        let Some(db) = self.dual_buffer.take() else {
+            return Vec::new();
+        };
+        // This raw preedit owns the literal semantic key. A legacy latch from
+        // an erased token must not map it or bypass delivery of the prefix.
+        self.transliteration_active = false;
+        self.word_delivery_layout = Some(match db.winner_lang() {
+            LangId::Bg => keymap::Layout::Bg,
+            LangId::En | LangId::Tech => keymap::Layout::En,
+        });
+        vec![
+            Action::HideGhost,
+            Action::CommitText(self.current_word.clone()),
+        ]
+    }
+
+    fn append_delivered_raw_char(&mut self, ch: char) -> Vec<Action> {
+        self.push_word_char(ch, false);
+        let ghost = self.update_predictions();
+        // ForwardKey delivers the original keyval, which need not match this
+        // rendering layout. Consume the key and insert the selected glyph.
+        vec![Action::CommitText(ch.to_string()), ghost]
+    }
+
+    fn begin_word_edit(&mut self) {
+        if !self
+            .word_origins
+            .iter()
+            .map(|origin| origin.character())
+            .eq(self.current_word.chars())
+        {
+            // Missing or externally replaced text cannot borrow observations
+            // from another spelling, even after subsequent suffix deletion.
+            self.word_origins = self
+                .current_word
+                .chars()
+                .map(WordCharOrigin::Derived)
+                .collect();
+            self.word_detector_baseline = WordDetectorBaseline::Invalid;
+        }
+        if matches!(
+            &self.word_detector_baseline,
+            WordDetectorBaseline::Unstarted
+        ) {
+            self.word_detector_baseline =
+                WordDetectorBaseline::Captured(self.lang_detector.clone());
+        }
+    }
+
+    fn push_word_char(&mut self, ch: char, direct: bool) {
+        self.begin_word_edit();
+        self.current_word.push(ch);
+        self.word_origins.push(if direct {
+            WordCharOrigin::Direct(ch)
+        } else {
+            WordCharOrigin::Derived(ch)
+        });
+    }
+
+    fn pop_word_char(&mut self) {
+        self.begin_word_edit();
+        self.current_word.pop();
+        self.word_origins.pop();
+        if self.current_word.is_empty() {
+            self.language_choice_token_policy = false;
+            self.native_completion_owned = false;
+        }
+    }
+
+    fn replace_word_with_derived(&mut self, word: String) {
+        self.begin_word_edit();
+        self.word_origins = word.chars().map(WordCharOrigin::Derived).collect();
+        self.current_word = word;
+    }
+
+    fn word_is_directly_observed(&self, word: &str) -> bool {
+        !word.is_empty()
+            && self
+                .word_origins
+                .iter()
+                .copied()
+                .eq(word.chars().map(WordCharOrigin::Direct))
+    }
+
+    /// Script of the complete rendered word. This is evidence only when
+    /// characters were directly observed or the full completion was accepted.
+    fn word_script(word: &str) -> Option<LangId> {
+        let mut script = None;
+        for ch in word.chars().filter(|ch| ch.is_alphabetic()) {
+            let lang = LanguageDetector::instant_classify(ch)?;
+            match script {
+                None => script = Some(lang),
+                Some(previous) if previous == lang => {}
+                _ => return None,
+            }
+        }
+        script
+    }
+
+    /// Candidate routing is independent of learning eligibility. Inferred
+    /// display words remain suggestible without becoming language evidence.
+    fn candidate_language(&self, word: &str) -> LangId {
+        Self::word_script(word).unwrap_or_else(|| self.lang_detector.detected().lang)
+    }
+
+    fn word_language_evidence(&self, word: &str, cause: CommitCause) -> WordEvidence {
+        if !self.config.lang_detection {
+            return WordEvidence::default();
+        }
+        let script = Self::word_script(word);
+        let directly_observed = self.word_is_directly_observed(word);
+        if matches!(
+            cause,
+            CommitCause::AcceptedCompletion | CommitCause::AcceptedLanguageChoice
+        ) || (directly_observed && script.is_some())
+        {
+            return WordEvidence {
+                language: script,
+                confirmed_word: script,
+            };
+        }
+
+        // Direct digits/symbols carry real detector evidence without an
+        // unambiguous script. Priors, inferred text and partial accepts cannot
+        // attest a complete Tech token or promote it to a trusted word.
+        if directly_observed
+            && word
+                .chars()
+                .all(|ch| self.lang_detector.has_positive_tech_signal(ch))
+            && matches!(&self.word_detector_baseline, WordDetectorBaseline::Captured(start)
+                if start.replay_word_detection(word, &self.lang_detector).lang == LangId::Tech)
+        {
+            return WordEvidence {
+                language: Some(LangId::Tech),
+                confirmed_word: None,
+            };
+        }
+
+        // Query the CURRENT rendered full word, never a stored prefix lock or
+        // derived winner. This also follows an exact boundary correction and
+        // an unmappable-character delivery fallback without fabricating an
+        // observed script for either one.
+        let (en_support, bg_support) = if cause == CommitCause::PartialCompletionFallback {
+            self.engine.score_exact_both(word, word)
+        } else {
+            self.engine.score_both(word, word)
+        };
+        let language = match script {
+            Some(LangId::En) if en_support > 0.0 => Some(LangId::En),
+            Some(LangId::Bg) if bg_support > 0.0 => Some(LangId::Bg),
+            _ => None,
+        };
+        WordEvidence {
+            language,
+            confirmed_word: None,
+        }
+    }
+
+    /// Generic learning applies to every delivered word; commit cause and
+    /// independently established language/word confirmation have separate roles.
+    fn commit_word_internal(&mut self, word: &str, cause: CommitCause) {
+        let evidence = self.word_language_evidence(word, cause);
+        self.commit_word_with_evidence(word, cause, evidence);
+    }
+
+    /// An ordinary boundary cannot change its correction decision by learning
+    /// from itself. A prepared replacement has its own exact corpus evidence;
+    /// the original character observation does not attest the replacement.
+    fn commit_boundary_word(&mut self, word: &str, rewrite_allowed: bool) -> Option<Action> {
+        let correction = (self.config.post_commit_autocorrect
+            && rewrite_allowed
+            && !self.language_choice_policy_active())
+        .then(|| self.prepare_language_correction(word))
+        .flatten();
+        if let Some(prepared) = correction.as_ref() {
+            self.commit_corrected_word(prepared, CommitCause::Boundary);
+        } else {
+            self.commit_word_internal(word, CommitCause::Boundary);
+        }
+        correction.map(LanguageCorrection::into_action)
+    }
+
+    fn commit_corrected_word(&mut self, correction: &LanguageCorrection, cause: CommitCause) {
+        let language = (self.config.lang_detection
+            && self
+                .engine
+                .word_frequency(&correction.text.to_lowercase(), correction.language)
+                > 0.0)
+            .then_some(correction.language);
+        if let Some(language) = language {
+            self.lang_detector.feed_dual_result(language, 1.0);
+        }
+        self.commit_word_with_evidence(
+            &correction.text,
+            cause,
+            WordEvidence {
+                language,
+                confirmed_word: None,
+            },
+        );
+    }
+
+    fn commit_word_with_evidence(
+        &mut self,
+        word: &str,
+        cause: CommitCause,
+        evidence: WordEvidence,
+    ) {
         if !word.is_empty() {
+            let candidate_route = self.candidate_language(word);
+            let word_lower = word.to_lowercase();
+            let is_oov = self.engine.word_frequency(&word_lower, candidate_route) == 0.0;
             let word_char_len = word.chars().count();
-            if record_commit_metric {
+            if !cause.is_prediction_accept() {
                 self.metrics.record_commit(word_char_len);
             }
 
@@ -1506,7 +2533,6 @@ impl InputMethodCore {
                 None
             };
 
-            let word_lower = word.to_lowercase();
             self.engine.learn(&word_lower);
             self.engine.learn_online_markov(prev1, prev2, &word_lower);
 
@@ -1522,35 +2548,33 @@ impl InputMethodCore {
                 }
             }
 
-            // Feed word to per-language CVM track + momentum.
-            let lang = if self.config.lang_detection {
-                let l = self.lang_detector.detected().lang;
-                self.engine.learn_with_lang(&word_lower, l);
-                self.lang_detector.record_commit(l);
-                l
-            } else {
-                crate::lang_detect::LangId::En // Default when lang detection disabled
-            };
+            if let Some(language) = evidence.language {
+                self.engine.learn_with_lang(&word_lower, language);
+                self.lang_detector.record_commit(language);
+            }
 
             // Feed word to session cache LM for burstiness tracking.
             if self.config.use_session_cache_lm {
                 self.engine.observe_session(&word_lower);
             }
 
-            // Feed word stats to regime detector (v0.5+).
-            // is_oov: word not found in the trie (zero prefix-search candidates).
-            let is_oov = self.engine.candidate_count(word, 1) == 0;
-
-            // F11: Online corpus expansion — add OOV words to the trie so they
-            // appear in future predictions. Only for words ≥ 3 chars to avoid
-            // noise from typos and abbreviations.
-            if is_oov && word_char_len >= 3 {
-                self.engine.learn_oov_word(&word_lower, lang);
+            // Prefix support can prove language without confirming a new
+            // exact word. Only direct/full acceptance promotes trusted words.
+            if word_char_len >= 3 {
+                if let Some(language) = evidence.confirmed_word {
+                    self.engine.confirm_word(&word_lower, language);
+                } else if is_oov {
+                    self.engine.learn_oov_word(&word_lower, candidate_route);
+                }
             }
 
             let is_flip = self.current_word_had_flip;
-            self.regime_detector
-                .observe_word(word_char_len, is_oov, is_flip, lang);
+            self.regime_detector.observe_word_with_evidence(
+                word_char_len,
+                is_oov,
+                is_flip,
+                evidence.language,
+            );
             // Propagate the current regime to the engine so predict() can gate δ.
             let (regime, _conf) = self.regime_detector.regime();
             self.engine.set_regime(regime);
@@ -1559,7 +2583,11 @@ impl InputMethodCore {
                 self.context.pop_front();
             }
             // Store lowercase for Markov context matching (corpus trained lowercase).
-            self.context.push_back(word.to_lowercase());
+            self.context.push_back(word_lower);
+            self.commit_learning.words.push(CommitObservation {
+                language: evidence.language,
+            });
+            self.commit_learning.accepted_prediction |= cause.is_prediction_accept();
         }
     }
 
@@ -1574,7 +2602,7 @@ impl InputMethodCore {
     ///
     /// Transliterates the word via phonetic map and compares corpus frequencies.
     /// If the transliterated version is 10x+ more frequent → auto-correct.
-    fn try_language_correction(&self, word: &str) -> Option<Action> {
+    fn prepare_language_correction(&self, word: &str) -> Option<LanguageCorrection> {
         use crate::lang_detect::{reverse_transliterate, transliterate, LangId};
 
         let typed_chars = word.chars().count();
@@ -1616,9 +2644,10 @@ impl InputMethodCore {
         // Only correct if the other language is overwhelmingly more likely.
         // Safety: if both exist, don't correct (ambiguous).
         if other_freq > 0.0 && (typed_freq < 1.0 || other_freq / typed_freq.max(1.0) >= 5.0) {
-            return Some(Action::ReplaceWord {
+            return Some(LanguageCorrection {
                 replace_len: typed_chars,
                 text: other_word,
+                language: other_lang,
             });
         }
 
@@ -1628,7 +2657,7 @@ impl InputMethodCore {
     /// Step 2: Auto-capitalize if previous context requires it.
     ///
     /// Fires after sentence-ending punctuation (. ! ? \n) and for proper nouns.
-    fn try_auto_capitalize(&self, word: &str) -> Option<Action> {
+    fn try_auto_capitalize(&self, word: &str, sentence_start: Option<bool>) -> Option<Action> {
         if word.is_empty() {
             return None;
         }
@@ -1638,12 +2667,15 @@ impl InputMethodCore {
             return None; // Already capitalized.
         }
 
-        // Check sentence-start: previous committed word ends with .!?\n
-        let needs_cap = if let Some(prev) = self.context.back() {
-            CapsEngine::requires_capitalization(prev)
-        } else {
-            true // Start of input.
-        };
+        // The current word is already appended; inspect the preceding committed
+        // word for sentence-ending punctuation (.!?\n).
+        let needs_cap = sentence_start.unwrap_or_else(|| {
+            if let Some(prev) = self.context.iter().rev().nth(1) {
+                CapsEngine::requires_capitalization(prev)
+            } else {
+                true // Start of input.
+            }
+        });
 
         // Check proper noun.
         let is_proper = self.caps_engine.is_proper_noun(word);
@@ -1666,6 +2698,9 @@ impl InputMethodCore {
     /// Predicts the most likely next word with empty prefix. If confidence
     /// is above threshold, shows it as ghost text. Tab accepts, typing clears.
     fn try_anticipatory_ghost(&mut self) -> Option<Action> {
+        if !self.completion_display_supported || self.direct_delivery_owned {
+            return None;
+        }
         let lang = if self.config.lang_detection {
             Some(self.lang_detector.detected().lang)
         } else {
@@ -1685,6 +2720,7 @@ impl InputMethodCore {
         if let Some(word) = show {
             self.ghost.clone_from(&word);
             self.last_predictions = preds;
+            self.last_prediction_language = lang;
             self.anticipatory_ghost_active = true;
             return Some(Action::ShowGhost(word));
         }
@@ -1714,6 +2750,9 @@ impl InputMethodCore {
         &mut self,
         committed_word: &str,
         show_anticipatory: bool,
+        language_correction: Option<Action>,
+        rewrite_allowed: bool,
+        sentence_start: Option<bool>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut effective_word = committed_word.to_string();
@@ -1721,9 +2760,9 @@ impl InputMethodCore {
         // Steps 1 and 2 rewrite text that is already committed.  Keep them
         // behind an explicit opt-in so Space/Return can never silently replace
         // the raw word the user typed (live-falsified on Bulgarian ч/ш/щ).
-        if self.config.post_commit_autocorrect {
+        if self.config.post_commit_autocorrect && rewrite_allowed {
             // Step 1: Language auto-correction.
-            if let Some(correction) = self.try_language_correction(&effective_word) {
+            if let Some(correction) = language_correction {
                 if let Action::ReplaceWord { ref text, .. } = correction {
                     effective_word = text.clone();
                 }
@@ -1731,7 +2770,7 @@ impl InputMethodCore {
             }
 
             // Step 2: Auto-capitalization.
-            if let Some(cap_action) = self.try_auto_capitalize(&effective_word) {
+            if let Some(cap_action) = self.try_auto_capitalize(&effective_word, sentence_start) {
                 actions.push(cap_action);
             }
         }
@@ -1750,29 +2789,53 @@ impl InputMethodCore {
     ///
     /// The display lock is a scoring signal on the PREFIX; it must not decide
     /// the committed word when the full physical word has exact corpus
-    /// support on exactly one side.  Only that one-sided case switches the
-    /// reading (S03/P3a): both-supported words keep the existing evidence
-    /// decision, unsupported words keep the displayed reading, and a `Tech`
-    /// winner is left alone.  When the reading switches, the language
-    /// detector is realigned BEFORE `commit_word_internal` so learning,
-    /// momentum and the regime observation all see the selected script.
+    /// support on exactly one side. Both-supported words may switch only
+    /// while unlocked, when exact-frequency dominance and current client
+    /// context agree. Unsupported words and a `Tech` winner are left alone.
+    /// Only one-sided evidence realigns the detector here; client context
+    /// never supplies detector confidence or confirms a new trusted word.
     fn resolve_word_boundary(&mut self) -> String {
+        // A visible choice leaves genuinely ambiguous readings to the user.
+        // Re-check the full token: an early unsupported offer must not block
+        // the existing one-sided completed-word correction.
+        if self.language_choice_policy_active() {
+            return self.current_word.clone();
+        }
         let Some(db) = self.dual_buffer.as_ref() else {
             return self.current_word.clone();
         };
+        // Semantic input may extend the rendered token without extending the
+        // physical buffer. A shorter buffer cannot attest the complete word.
+        if self.current_word != db.winner_text() {
+            return self.current_word.clone();
+        }
         let (en_exact, bg_exact) = self.engine.score_exact_both(db.en_text(), db.bg_text());
+        let one_sided = (en_exact > 0.0) != (bg_exact > 0.0);
         let selected = match (en_exact > 0.0, bg_exact > 0.0, db.winner_lang()) {
             (true, false, LangId::Bg) => LangId::En,
             (false, true, LangId::En) => LangId::Bg,
+            (true, true, LangId::En | LangId::Bg) if !db.is_locked() => {
+                let dominant = if en_exact > bg_exact {
+                    LangId::En
+                } else if bg_exact > en_exact {
+                    LangId::Bg
+                } else {
+                    return self.current_word.clone();
+                };
+                if self.terminal_context_lang != Some(dominant) || dominant == db.winner_lang() {
+                    return self.current_word.clone();
+                }
+                dominant
+            }
             _ => return self.current_word.clone(),
         };
         let word = match selected {
             LangId::En => db.en_text().to_string(),
             LangId::Bg | LangId::Tech => db.bg_text().to_string(),
         };
-        self.current_word = word.clone();
+        self.replace_word_with_derived(word.clone());
         self.current_word_had_flip = true;
-        if self.config.lang_detection {
+        if self.config.lang_detection && one_sided {
             // Normalised one-sided exact evidence, not a calibrated probability.
             self.lang_detector.feed_dual_result(selected, 1.0);
         }
@@ -1803,11 +2866,21 @@ impl InputMethodCore {
     }
 
     fn reset_word(&mut self) {
+        self.sentence_boundary = SentenceBoundaryHint::None;
+        self.sentence_presentation_override = None;
         self.current_word.clear();
+        self.terminal_context_lang = None;
+        self.word_origins.clear();
+        self.word_detector_baseline = WordDetectorBaseline::Unstarted;
         self.ghost.clear();
         self.last_predictions.clear();
+        self.last_prediction_language = None;
         self.transliteration_active = false;
         self.dual_buffer = None;
+        self.word_delivery_layout = None;
+        self.native_completion_owned = false;
+        self.direct_delivery_owned = false;
+        self.language_choice_token_policy = false;
         self.current_word_had_flip = false;
         self.anticipatory_ghost_active = false;
     }
@@ -1820,6 +2893,7 @@ impl InputMethodCore {
     /// commits the winner character. On confidence flip, emits `ReplaceWord`
     /// to fix previously committed characters.
     fn handle_dual_buffer_key(&mut self, en_ch: char, bg_ch: char) -> Vec<Action> {
+        self.begin_word_edit();
         // Initialize dual buffer on first dual-interpretable key in this word.
         if self.dual_buffer.is_none() {
             self.dual_buffer = Some(DualBuffer::from_config(&self.config.dual_buffer));
@@ -1831,16 +2905,28 @@ impl InputMethodCore {
         let was_locked = db.is_locked();
         db.push(en_ch, bg_ch);
 
-        // Score both interpretations (skip if already locked — perf win).
-        if !was_locked {
+        // An inferred prefix lock can outlive its corpus support as the word
+        // grows. Recover only when the current side has none and the other
+        // still has support; explicit acceptance and ambiguity stay unchanged.
+        let mut rescored = false;
+        if !db.is_explicitly_locked() {
             let (en_freq, bg_freq) = self.engine.score_both(db.en_text(), db.bg_text());
-            db.update_scores(en_freq, bg_freq);
-            let lang_prior = self
-                .active_hints
-                .as_ref()
-                .and_then(|h| h.lang_prior)
-                .or_else(|| self.lang_detector.momentum_lang());
-            db.apply_prior_lock_hint(lang_prior);
+            let unsupported_winner = match db.winner_lang() {
+                LangId::En => en_freq == 0.0 && bg_freq > 0.0,
+                LangId::Bg => bg_freq == 0.0 && en_freq > 0.0,
+                LangId::Tech => false,
+            };
+            if !was_locked || unsupported_winner {
+                db.update_scores(en_freq, bg_freq);
+                let lang_prior = self
+                    .active_hints
+                    .as_ref()
+                    .and_then(|h| h.lang_prior)
+                    .or_else(|| self.lang_detector.momentum_lang());
+                db.apply_prior_lock_hint(lang_prior);
+                db.apply_soft_context_prior(lang_prior);
+                rescored = true;
+            }
         }
 
         // Propagate flip detection from dual buffer to regime detector flag.
@@ -1849,22 +2935,20 @@ impl InputMethodCore {
             db.clear_flip();
         }
 
-        self.current_word = db.winner_text().to_string();
+        let word = db.winner_text().to_string();
 
-        // Compute winner char once — reused for lang detection and locked-phase commit.
-        let winner_char = match db.winner_lang() {
-            LangId::En => en_ch,
-            LangId::Bg | LangId::Tech => bg_ch,
-        };
-
-        // Feed language detection.
-        if self.config.lang_detection {
-            self.lang_detector.feed_char_instant(winner_char);
-            if !was_locked {
-                self.lang_detector
-                    .feed_dual_result(db.winner_lang(), db.confidence());
-            }
+        // The winner is derived from physical-key interpretations, never an
+        // observed Unicode script. Only current corpus scoring may feed it
+        // back as independent evidence; a prior/fallback or sticky display
+        // lock cannot attest a new character.
+        if self.config.lang_detection
+            && rescored
+            && db.evidence_origin() == crate::dual_buffer::EvidenceOrigin::Corpus
+        {
+            self.lang_detector
+                .feed_dual_result(db.winner_lang(), db.confidence());
         }
+        self.replace_word_with_derived(word);
 
         // ═══ FULL-WORD COMPOSING ═══
         // Keep the ENTIRE word in preedit until Space/Enter commits it.
@@ -1983,9 +3067,14 @@ impl InputMethodCore {
     /// then applies the user's capitalization pattern to predictions.
     fn compute_ghost_suffix(&mut self) -> String {
         // MasterLoop hint: suppress ghost entirely.
-        if self.active_hints.as_ref().is_some_and(|h| h.suppress_ghost) {
+        if self.native_completion_owned
+            || self.direct_delivery_owned
+            || !self.completion_display_supported
+            || self.active_hints.as_ref().is_some_and(|h| h.suppress_ghost)
+        {
             self.ghost.clear();
             self.last_predictions.clear();
+            self.last_prediction_language = None;
             return String::new();
         }
 
@@ -1997,6 +3086,7 @@ impl InputMethodCore {
         if self.current_word.chars().count() < effective_min {
             self.ghost.clear();
             self.last_predictions.clear();
+            self.last_prediction_language = None;
             return String::new();
         }
 
@@ -2034,6 +3124,7 @@ impl InputMethodCore {
         if !self.current_word.chars().any(char::is_alphabetic) {
             self.ghost.clear();
             self.last_predictions.clear();
+            self.last_prediction_language = None;
             return String::new();
         }
 
@@ -2060,6 +3151,7 @@ impl InputMethodCore {
         let search_prefix = self.current_word.to_lowercase();
 
         let t0 = Instant::now();
+        self.last_prediction_language = lang;
         self.last_predictions =
             self.engine
                 .predict(&search_prefix, &ctx_refs, self.config.max_candidates, lang);
@@ -2075,7 +3167,9 @@ impl InputMethodCore {
             .unwrap_or(false);
 
         let prev_token = ctx_refs.last().copied().unwrap_or("");
-        let force_sentence_start = CapsEngine::requires_capitalization(prev_token);
+        let force_sentence_start = self
+            .sentence_start_override()
+            .unwrap_or_else(|| CapsEngine::requires_capitalization(prev_token));
 
         for pred in &mut self.last_predictions {
             pred.word = CapsEngine::apply_caps(&pred.word, regime);
@@ -2263,7 +3357,22 @@ mod tests {
         let actions = core.handle_key(press(Key::Right));
         assert!(has_action(&actions, &Action::HideGhost));
         assert!(has_action(&actions, &Action::CommitText("o".to_string())));
-        assert_eq!(core.current_word(), "hello");
+        assert!(
+            core.current_word().is_empty(),
+            "final Right completes and resets the word"
+        );
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        let batch = core.take_commit_learning();
+        assert!(batch.accepted_prediction);
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::En)
+            }]
+        );
+        core.handle_key(press(Key::Space));
+        assert!(core.take_commit_learning().words.is_empty());
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
     }
 
     #[test]
@@ -2784,9 +3893,23 @@ mod tests {
             });
             core.current_word = typed.to_string();
             let actions = core.handle_key(press(Key::Space));
-            assert!(!actions
+            let replacements: Vec<_> = actions
                 .iter()
-                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+                .filter_map(|a| match a {
+                    Action::ReplaceWord { replace_len, text } => {
+                        Some((*replace_len, text.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            // The shared opt-in also enables first-word capitalization; it
+            // must not permit an unsupported language/layout substitution.
+            let expected = if typed == "шщчю" {
+                vec![(4, "Шщчю")]
+            } else {
+                vec![]
+            };
+            assert_eq!(replacements, expected);
         }
     }
 
@@ -2807,9 +3930,21 @@ mod tests {
             );
             core.current_word = typed.to_string();
             let actions = core.handle_key(press(Key::Space));
-            assert!(!actions
+            let replacements: Vec<_> = actions
                 .iter()
-                .any(|a| matches!(a, Action::ReplaceWord { .. })));
+                .filter_map(|a| match a {
+                    Action::ReplaceWord { replace_len, text } => {
+                        Some((*replace_len, text.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let expected = if typed == "шщчю" {
+                vec![(4, "Шщчю")]
+            } else {
+                vec![]
+            };
+            assert_eq!(replacements, expected);
         }
     }
 
@@ -3571,14 +4706,11 @@ mod tests {
 
     // ── Backspace vs the dual-buffer lock (FIX 2) ────────────────────
 
-    /// A LOCKED buffer must never be re-scored on Backspace.  `update_scores`
-    /// rewrites `locked_lang` when the shorter prefix has a different winner,
-    /// so one deletion flipped the alphabet of the entire word.  Live trace:
-    /// 15 mid-word script flips on BackSpace, 9 of them locked→locked.
-    /// `handle_dual_buffer_key` already gates the identical call on
-    /// `!was_locked`; the Backspace arm did not.
+    /// An explicitly accepted buffer keeps its selected alphabet on Backspace.
+    /// Unlike inferred prefix confidence, this pin comes from a user accepting
+    /// a displayed character; it remains sticky until the token is cleared.
     #[test]
-    fn test_backspace_under_lock_keeps_locked_alphabet() {
+    fn test_backspace_under_explicit_lock_keeps_locked_alphabet() {
         let mut core = InputMethodCore::new(InputConfig::default());
         // 4-char prefix: BG-only.  3-char prefix: EN too — so deleting one
         // character is exactly the case that used to flip the word.
@@ -3586,10 +4718,11 @@ mod tests {
         core.load_word_lang("zdn", 5_000_000, LangId::En);
 
         let mut db = DualBuffer::from_config(&core.config.dual_buffer);
-        for (en, bg) in [('z', 'з'), ('d', 'д'), ('n', 'н'), ('k', 'к')] {
+        for (en, bg) in [('z', 'з'), ('d', 'д'), ('n', 'н')] {
             db.push(en, bg);
         }
         db.update_scores(0.0, 5_000_000.0);
+        assert!(db.push_winner_char('к'));
         assert!(db.is_locked(), "precondition: buffer must lock");
         assert_eq!(
             db.winner_text(),
@@ -4235,6 +5368,51 @@ mod space_accept_tests {
 
     const FLAG_ON: &str = r#"{"accept": {"space_accept": true}}"#;
     const FLAG_ABSENT: &str = "{}";
+
+    #[test]
+    fn space_event_requires_a_plain_press_but_allows_caps_lock() {
+        for key in [Key::Space, Key::RawCode(57)] {
+            for modifiers in [Modifiers::empty(), Modifiers::CAPS_LOCK] {
+                assert!(InputMethodCore::is_space_event(&KeyEvent {
+                    key: key.clone(),
+                    modifiers,
+                }));
+            }
+            for modifiers in [
+                Modifiers::SHIFT,
+                Modifiers::SUPER,
+                Modifiers::CTRL,
+                Modifiers::ALT,
+                Modifiers::RELEASE,
+                Modifiers::SHIFT | Modifiers::CAPS_LOCK,
+            ] {
+                assert!(
+                    !InputMethodCore::is_space_event(&KeyEvent {
+                        key: key.clone(),
+                        modifiers,
+                    }),
+                    "{key:?} with {modifiers:?}"
+                );
+            }
+        }
+        assert!(!InputMethodCore::is_space_event(&press(Key::Return)));
+    }
+
+    #[test]
+    fn modified_space_cannot_accept_even_with_display_attestation() {
+        for key in [Key::Space, Key::RawCode(57)] {
+            for modifiers in [Modifiers::SHIFT, Modifiers::SUPER] {
+                let mut core = core_with(FLAG_ON);
+                composing(&mut core, "hel", "lo", true);
+                let actions = core.handle_key(KeyEvent {
+                    key: key.clone(),
+                    modifiers,
+                });
+                assert_eq!(commits(&actions), vec!["hel".to_string()]);
+                assert!(has(&actions, &Action::ForwardKey));
+            }
+        }
+    }
 
     // ── Delimiter folding vs post-commit replacement (bd9219aa448c B) ────
 
@@ -5088,15 +6266,15 @@ mod lang_prior_tests {
         assert_eq!(core.current_word(), "");
     }
 
-    /// Flush paths are outside this cycle: focus loss still delivers the
-    /// displayed reading.  Characterization of an explicit later task, not a
-    /// desired-output assertion.
+    /// Focus loss delivers the displayed reading; prefix recovery has already
+    /// selected Bulgarian before this flush, which makes no new layout choice.
     #[test]
     fn focus_lost_flush_keeps_the_displayed_reading() {
         let mut core = one_sided_exact_core();
         type_word(&mut core, &STATIQ);
+        assert_eq!(core.current_word(), "статия");
         let (commits, forwards, replaces) = delimiter_shape(&core.focus_lost());
-        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(commits, vec!["статия".to_string()]);
         assert_eq!(forwards, 0);
         assert_eq!(replaces, 0);
         assert_eq!(core.current_word(), "");
@@ -5112,30 +6290,32 @@ mod lang_prior_tests {
         core
     }
 
-    /// Tab without a ghost flushes the displayed reading (no boundary
-    /// resolution on this path).  Characterization of the later flush task.
+    /// Tab without a ghost flushes the already-recovered displayed reading,
+    /// without accepting a prediction or making another boundary selection.
     #[test]
     fn tab_flush_keeps_the_displayed_reading() {
         let mut core = one_sided_exact_core_without_ghost();
         type_word(&mut core, &STATIQ);
+        assert_eq!(core.current_word(), "статия");
         assert!(core.ghost.is_empty(), "precondition: no ghost to accept");
         let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_key(Key::Tab)));
-        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(commits, vec!["статия".to_string()]);
         assert_eq!(forwards, 1);
         assert_eq!(replaces, 0);
         assert_eq!(core.current_word(), "");
     }
 
-    /// Right without a ghost is a cursor move: flush the displayed reading,
-    /// then reset the word, context and detector.  Characterization.
+    /// Right without a ghost is a cursor move: flush the recovered reading,
+    /// then reset the word, context and detector.
     #[test]
     fn right_without_ghost_flushes_and_resets_context() {
         let mut core = one_sided_exact_core_without_ghost();
         type_word(&mut core, &STATIQ);
+        assert_eq!(core.current_word(), "статия");
         assert!(core.ghost.is_empty(), "precondition: no ghost to accept");
         let (commits, forwards, replaces) =
             delimiter_shape(&core.handle_key(press_key(Key::Right)));
-        assert_eq!(commits, vec!["statiq".to_string()]);
+        assert_eq!(commits, vec!["статия".to_string()]);
         assert_eq!(forwards, 1);
         assert_eq!(replaces, 0);
         assert_eq!(core.current_word(), "");
@@ -5166,21 +6346,32 @@ mod lang_prior_tests {
         core
     }
 
-    /// Desired: a typed word that exists (7) is not auto-corrected to a
+    /// Desired: a typed word that exists (7) is not language-corrected to a
     /// transliteration that is merely 20/7 ≈ 2.9× more frequent (below the
     /// 5× rule).  RED today: `word_frequency("stat")` is shadowed to 0.0, so
     /// the correction fires and a ReplaceWord("стат") follows the commit.
     #[test]
-    fn shadowed_typed_word_is_not_auto_corrected_on_the_public_path() {
+    fn shadowed_typed_word_is_not_language_corrected_on_the_public_path() {
         let mut core = shadowed_exact_core();
         type_word(&mut core, &STATIQ[..4]);
         assert_eq!(core.current_word(), "stat");
         assert_eq!(core.engine.score_exact_both("stat", "стат"), (7.0, 20.0));
 
-        let (commits, forwards, replaces) = delimiter_shape(&core.handle_key(press_raw(57)));
+        let actions = core.handle_key(press_raw(57));
+        let (commits, forwards, replaces) = delimiter_shape(&actions);
         assert_eq!(commits, vec!["stat".to_string()]);
         assert_eq!(forwards, 1);
-        assert_eq!(replaces, 0);
+        assert_eq!(replaces, 1);
+        let replacements: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ReplaceWord { replace_len, text } => Some((*replace_len, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        // First-word capitalization is enabled by the same opt-in; the
+        // exact action must preserve the typed language and whole word.
+        assert_eq!(replacements, vec![(4, "Stat")]);
         assert_eq!(core.current_word(), "");
     }
 
@@ -5192,7 +6383,8 @@ mod lang_prior_tests {
         // Physical phonetic spelling of the same supported BG word "ви".
         assert_eq!(crate::lang_detect::transliterate("wi"), "ви");
         assert_eq!(
-            core.try_language_correction("wi"),
+            core.prepare_language_correction("wi")
+                .map(LanguageCorrection::into_action),
             Some(Action::ReplaceWord {
                 replace_len: 2,
                 text: "ви".to_string(),
@@ -5565,12 +6757,10 @@ mod lang_prior_tests {
         assert_eq!(db.evidence_origin(), EvidenceOrigin::UnsupportedBoth);
     }
 
-    /// R11 (test_gap, expected PASS today — U2 F6): the detector is fed the
-    /// inherited winner with confidence 0.5 as if it were corpus evidence
-    /// (`feed_dual_result` on every unlocked character).  Flips when D5
-    /// (skip Initial/UnsupportedBoth/PriorOnly) lands as its own phase.
+    /// R11: an unsupported inherited winner is a display fallback, not a
+    /// detector observation. The initial detector state must remain unchanged.
     #[test]
-    fn test_gap_detector_reads_an_unsupported_winner_as_half_confidence_evidence() {
+    fn unsupported_winner_does_not_feed_detector_evidence() {
         let mut core = InputMethodCore::new(no_ghost_config());
         assert!(core.config.lang_detection, "premise: detection on");
         core.handle_key(press_raw(16)); // q / я
@@ -5578,8 +6768,4140 @@ mod lang_prior_tests {
         let det = core.lang_detector.detected();
         assert_eq!(det.lang, LangId::En);
         assert!(
-            (det.confidence - 0.5).abs() < 1e-9,
-            "today: feed_dual_result(En, 0.5) reports the inherited winner as evidence"
+            det.confidence.abs() < 1e-9,
+            "an unsupported inherited winner must not manufacture confidence"
         );
+    }
+}
+
+#[cfg(test)]
+mod review_tech_language_evidence_tests {
+    use super::*;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn fresh() -> InputMethodCore {
+        InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        })
+    }
+
+    fn assert_tech_commit(core: &mut InputMethodCore, word: &str, boundary: Key, confidence: f64) {
+        assert_eq!(core.current_word(), word);
+        let detected = core.detected_language();
+        assert_eq!(detected.lang, LangId::Tech);
+        assert!((detected.confidence - confidence).abs() < 1e-12);
+        let actions = core.handle_key(press(boundary));
+        assert!(actions.contains(&Action::ForwardKey));
+        assert!(core.current_word().is_empty());
+        let batch = core.take_commit_learning();
+        assert!(!batch.accepted_prediction);
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::Tech)
+            }],
+            "positive direct Tech input must retain its language observation"
+        );
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::Tech));
+        let tracks = core.export_personal_profile().lang_cvm.unwrap().tracks;
+        assert!(tracks
+            .iter()
+            .any(|(language, track)| language == "tech" && track.words.iter().any(|w| w == word)));
+        assert_eq!(
+            core.engine.word_frequency(word, LangId::Tech),
+            0.0,
+            "a Tech language observation does not confirm a new corpus terminal"
+        );
+    }
+
+    fn assert_unconfirmed_boundary(core: &mut InputMethodCore) {
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+        assert_eq!(core.lang_detector.momentum_lang(), None);
+        assert!(core
+            .export_personal_profile()
+            .lang_cvm
+            .unwrap()
+            .tracks
+            .is_empty());
+    }
+
+    // Break caught: instant_classify(None) discards independently observed
+    // positive Tech symbols before language CVM, momentum and receipt learning.
+    #[test]
+    fn review_tech_direct_symbols_keep_language_learning() {
+        let mut core = fresh();
+        for ch in "___".chars() {
+            assert!(core
+                .handle_key(press(Key::Char(ch)))
+                .contains(&Action::ForwardKey));
+        }
+        assert_tech_commit(&mut core, "___", Key::Space, 0.9);
+    }
+
+    #[test]
+    fn review_tech_direct_digits_keep_return_language_learning() {
+        let mut core = fresh();
+        for ch in "123".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_tech_commit(&mut core, "123", Key::Return, 0.9);
+    }
+
+    #[test]
+    fn review_tech_shared_physical_shift_key_keeps_language_learning() {
+        let mut core = fresh();
+        for _ in 0..3 {
+            core.handle_key(KeyEvent {
+                key: Key::RawCode(12),
+                modifiers: Modifiers::SHIFT,
+            });
+        }
+        assert_tech_commit(&mut core, "___", Key::RawCode(57), 0.9);
+    }
+
+    fn nondual() -> InputMethodCore {
+        let mut config = InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        };
+        config.dual_buffer.enabled = false;
+        InputMethodCore::new(config)
+    }
+
+    #[test]
+    fn review_tech_deleted_script_does_not_shadow_direct_tech_remainder() {
+        let mut core = fresh();
+        for key in [
+            Key::Char('_'),
+            Key::Char('a'),
+            Key::Backspace,
+            Key::Char('!'),
+            Key::Char('!'),
+        ] {
+            core.handle_key(press(key));
+        }
+        assert_tech_commit(&mut core, "_!!", Key::Space, 0.5335);
+    }
+
+    #[test]
+    fn review_tech_nondual_ambiguous_raw_symbols_are_not_direct_evidence() {
+        let mut core = nondual();
+        for _ in 0..3 {
+            assert!(core
+                .handle_key(press(Key::RawCode(26)))
+                .contains(&Action::ForwardKey));
+        }
+        assert_eq!(core.current_word(), "[[[");
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert!((core.detected_language().confidence - 0.95).abs() < 1e-12);
+        assert_unconfirmed_boundary(&mut core);
+        assert!(core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|w| w == "[[["));
+    }
+
+    #[test]
+    fn review_tech_nondual_inferred_suffix_invalidates_direct_tech_provenance() {
+        let mut core = nondual();
+        core.handle_key(press(Key::Char('_')));
+        core.handle_key(press(Key::RawCode(26)));
+        assert_eq!(core.current_word(), "_[");
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_nondual_raw_letters_do_not_manufacture_english_evidence() {
+        let mut core = nondual();
+        for code in [16, 45, 44] {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+        assert_eq!(core.current_word(), "qxz");
+        assert_eq!(core.detected_language().lang, LangId::En);
+        assert_eq!(core.detected_language().confidence, 1.0);
+        assert_unconfirmed_boundary(&mut core);
+        assert!(core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|w| w == "qxz"));
+        assert_eq!(core.engine.word_frequency("qxz", LangId::En), 0.0);
+    }
+
+    #[test]
+    fn review_tech_nondual_shared_glyph_retains_direct_evidence() {
+        let mut core = nondual();
+        for _ in 0..3 {
+            core.handle_key(KeyEvent {
+                key: Key::RawCode(12),
+                modifiers: Modifiers::SHIFT,
+            });
+        }
+        assert_tech_commit(&mut core, "___", Key::RawCode(57), 0.9);
+    }
+
+    #[test]
+    fn review_tech_prior_with_neutral_punctuation_is_not_evidence() {
+        let mut core = fresh();
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(LangId::Tech),
+            ..Default::default()
+        });
+        for ch in "???".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_unobserved_synthetic_word_is_not_evidence() {
+        let mut core = fresh();
+        core.lang_detector.feed_char_instant('_');
+        core.current_word = "___".into();
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_raw_unknown_fallback_is_not_evidence() {
+        let mut core = fresh();
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(LangId::Tech),
+            ..Default::default()
+        });
+        for code in [16, 45, 44] {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_partial_right_is_not_direct_character_evidence() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.handle_key(press(Key::Char('_')));
+        assert!(core.apply_prediction_override("___").is_some());
+        core.handle_key(press(Key::Right));
+        assert_eq!(core.current_word(), "__");
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_disabled_language_detection_is_not_evidence() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            lang_detection: false,
+            ..InputConfig::default()
+        });
+        for ch in "___".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_complete_token_must_have_only_positive_tech_characters() {
+        let mut core = fresh();
+        for ch in "_?".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(core.detected_language().lang, LangId::Tech);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_positive_character_needs_actual_tech_detection() {
+        let mut core = fresh();
+        core.lang_detector.feed_char_instant('a');
+        core.handle_key(press(Key::Char('_')));
+        assert_eq!(core.current_word(), "_");
+        assert_eq!(core.detected_language().lang, LangId::En);
+        assert_unconfirmed_boundary(&mut core);
+    }
+
+    #[test]
+    fn review_tech_deleted_observation_does_not_attest_a_later_word() {
+        let mut core = fresh();
+        core.handle_key(press(Key::Char('_')));
+        core.handle_key(press(Key::Backspace));
+        assert!(core.current_word().is_empty());
+        core.current_word = "___".into();
+        assert_unconfirmed_boundary(&mut core);
+    }
+}
+
+#[cfg(test)]
+mod retraction_word_evidence_tests {
+    use super::*;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn fresh() -> InputMethodCore {
+        let mut config = InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        };
+        config.dual_buffer.enabled = false;
+        InputMethodCore::new(config)
+    }
+
+    fn assert_surviving_tech_commit(core: &mut InputMethodCore, word: &str, boundary: Key) {
+        assert_eq!(core.current_word(), word);
+        let before = core.detected_language();
+        let actions = core.handle_key(press(boundary));
+        assert!(actions.contains(&Action::ForwardKey));
+        let batch = core.take_commit_learning();
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::Tech)
+            }]
+        );
+        assert!(!batch.accepted_prediction);
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::Tech));
+        assert!(core
+            .export_personal_profile()
+            .lang_cvm
+            .unwrap()
+            .tracks
+            .iter()
+            .any(|(lang, track)| lang == "tech" && track.words.iter().any(|text| text == word)));
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence),
+            "word proof must not mutate the global detector used for display routing"
+        );
+    }
+
+    #[test]
+    fn retraction_deleted_inferred_raw_suffix_restores_direct_tech_evidence() {
+        let mut core = fresh();
+        for key in [
+            Key::Char('_'),
+            Key::RawCode(26),
+            Key::Backspace,
+            Key::Char('_'),
+            Key::Char('_'),
+        ] {
+            core.handle_key(press(key));
+        }
+        assert_surviving_tech_commit(&mut core, "___", Key::Space);
+    }
+
+    #[test]
+    fn retraction_deleted_script_replays_surviving_tech_from_word_start() {
+        let mut core = fresh();
+        for ch in "123a".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(
+            core.detected_language().lang,
+            LangId::En,
+            "the display detector still reflects the deleted character"
+        );
+        assert_surviving_tech_commit(&mut core, "123", Key::Return);
+    }
+
+    #[test]
+    fn retraction_deleted_entire_prefix_cannot_seed_the_next_direct_token() {
+        let mut core = fresh();
+        core.handle_key(press(Key::Char('a')));
+        core.handle_key(press(Key::Backspace));
+        assert!(core.current_word().is_empty());
+        for ch in "123".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_surviving_tech_commit(&mut core, "123", Key::Space);
+    }
+
+    #[test]
+    fn retraction_deleted_inferred_suffix_restores_direct_script_proof() {
+        for (word, language) in [("abc", LangId::En), ("зор", LangId::Bg)] {
+            let mut core = fresh();
+            for ch in word.chars() {
+                core.handle_key(press(Key::Char(ch)));
+            }
+            core.handle_key(press(Key::RawCode(26)));
+            core.handle_key(press(Key::Backspace));
+            assert_eq!(core.current_word(), word);
+            core.handle_key(press(Key::Space));
+            assert_eq!(
+                core.take_commit_learning().words,
+                vec![CommitObservation {
+                    language: Some(language)
+                }]
+            );
+            assert!(core.engine.word_frequency(word, language) > 0.0);
+        }
+    }
+
+    #[test]
+    fn retraction_surviving_inferred_prefix_cannot_borrow_deleted_observation() {
+        let mut core = fresh();
+        for _ in 0..3 {
+            core.handle_key(press(Key::RawCode(26)));
+        }
+        core.handle_key(press(Key::Char('_')));
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "[[[");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+        assert!(core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|word| word == "[[["));
+    }
+
+    #[test]
+    fn retraction_removing_all_partial_right_chars_restores_direct_prefix() {
+        let mut core = fresh();
+        core.config.ghost_text = true;
+        for _ in 0..3 {
+            core.handle_key(press(Key::Char('_')));
+        }
+        assert!(core.apply_prediction_override("_____").is_some());
+        core.handle_key(press(Key::Right));
+        assert_eq!(core.current_word(), "____");
+        core.handle_key(press(Key::Backspace));
+        assert_surviving_tech_commit(&mut core, "___", Key::Space);
+    }
+
+    #[test]
+    fn retraction_surviving_partial_right_char_still_blocks_direct_proof() {
+        let mut core = fresh();
+        core.config.ghost_text = true;
+        core.handle_key(press(Key::Char('_')));
+        assert!(core.apply_prediction_override("_____").is_some());
+        core.handle_key(press(Key::Right));
+        core.handle_key(press(Key::Right));
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "__");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+    }
+
+    #[test]
+    fn retraction_unicode_pop_retracts_one_scalar_observation() {
+        let mut core = fresh();
+        for ch in "здравей".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        for _ in 0..4 {
+            core.handle_key(press(Key::Backspace));
+        }
+        assert_eq!(core.current_word(), "здр");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Bg)
+            }]
+        );
+    }
+
+    #[test]
+    fn retraction_same_length_replacement_cannot_borrow_observations() {
+        let mut core = fresh();
+        for _ in 0..2 {
+            core.handle_key(press(Key::Char('_')));
+        }
+        core.current_word = "a_".into();
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "a");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+    }
+
+    #[test]
+    fn retraction_missing_trace_after_external_clear_does_not_recapture_history() {
+        let mut core = fresh();
+        core.handle_key(press(Key::Char('_')));
+        core.current_word.clear();
+        core.handle_key(press(Key::Char('1')));
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+    }
+
+    #[test]
+    fn retraction_supported_dual_to_empty_keeps_pre_dual_detector_baseline() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("hello", 1_000_000, LangId::En);
+        for code in [35, 18] {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+        assert_eq!(core.detected_language().lang, LangId::En);
+        for _ in 0..2 {
+            core.handle_key(press(Key::Backspace));
+        }
+        assert!(core.current_word().is_empty());
+        for ch in "123".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_surviving_tech_commit(&mut core, "123", Key::Space);
+    }
+
+    #[test]
+    fn retraction_dual_backspace_rebuild_does_not_create_direct_observations() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        for code in [16, 45, 44] {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "qx");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+    }
+
+    #[test]
+    fn retraction_true_boundary_starts_a_new_baseline_with_committed_context() {
+        let mut core = fresh();
+        for ch in "hello".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        core.handle_key(press(Key::Space));
+        core.take_commit_learning();
+        core.handle_key(press(Key::Char('_')));
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::En));
+    }
+
+    #[test]
+    fn retraction_focus_flush_uses_detached_word_observations() {
+        let mut core = fresh();
+        for ch in "123a".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        core.handle_key(press(Key::Backspace));
+        core.focus_lost();
+        assert!(core.current_word().is_empty());
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Tech)
+            }]
+        );
+    }
+
+    #[test]
+    fn retraction_transliterated_and_edited_rendering_stays_unconfirmed() {
+        let mut core = fresh();
+        core.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        for ch in "zdra".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(core.current_word(), "здра");
+        core.handle_key(press(Key::Backspace));
+        assert_eq!(core.current_word(), "здр");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Bg)
+            }]
+        );
+        assert_eq!(
+            core.engine.word_frequency("здр", LangId::Bg),
+            0.0,
+            "corpus prefix evidence does not turn transliterated text into a confirmed exact word"
+        );
+    }
+}
+
+#[cfg(test)]
+mod language_evidence_contract_tests {
+    use super::*;
+    use crate::dual_buffer::EvidenceOrigin;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn fresh(ghost_text: bool) -> InputMethodCore {
+        InputMethodCore::new(InputConfig {
+            ghost_text,
+            ..InputConfig::default()
+        })
+    }
+
+    fn prior(core: &mut InputMethodCore, lang: LangId) {
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(lang),
+            ..Default::default()
+        });
+    }
+
+    fn raw(core: &mut InputMethodCore, codes: &[u16]) {
+        for &code in codes {
+            core.handle_key(press(Key::RawCode(code)));
+        }
+    }
+
+    fn assert_no_language_words(core: &InputMethodCore) {
+        let profile = core.export_personal_profile();
+        assert!(
+            profile.lang_cvm.unwrap().tracks.is_empty(),
+            "an unconfirmed inferred word must not enter a language CVM track"
+        );
+    }
+
+    // Break caught: feeding a derived dual winner through the observed-script
+    // classifier or accepting UnsupportedBoth as independent detector evidence.
+    #[test]
+    fn unsupported_push_preserves_detector_state_and_literal_display() {
+        let mut core = fresh(false);
+        let before = core.detected_language();
+        raw(&mut core, &[16, 45]); // synthetic qx / яь, no corpus
+        assert_eq!(core.current_word(), "qx");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::UnsupportedBoth
+        );
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence),
+            "inferred fallback display is not a new detector observation"
+        );
+    }
+
+    #[test]
+    fn prior_only_push_preserves_detector_state_and_inherited_display() {
+        let mut core = fresh(false);
+        prior(&mut core, LangId::Bg);
+        let before = core.detected_language();
+        core.handle_key(press(Key::RawCode(16)));
+        assert_eq!(core.current_word(), "я");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::PriorOnly
+        );
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence),
+            "a surrounding prior may choose display without becoming a new vote"
+        );
+    }
+
+    #[test]
+    fn ordinary_delimiter_keeps_generic_learning_without_language_cvm() {
+        let mut core = fresh(false);
+        core.context.push_back("seed".into());
+        prior(&mut core, LangId::Bg);
+        raw(&mut core, &[16, 45, 44]); // synthetic novel Cyrillic name яьз
+        let actions = core.handle_key(press(Key::Space));
+        assert!(actions.contains(&Action::CommitText("яьз".into())));
+        let profile = core.export_personal_profile();
+        assert!(
+            profile.cvm.words.iter().any(|word| word == "яьз"),
+            "generic vocabulary still learns"
+        );
+        assert!(
+            profile
+                .markov_bigrams
+                .iter()
+                .any(|(ctx, word, count)| ctx == "seed" && word == "яьз" && *count == 1),
+            "generic Markov still learns"
+        );
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn ordinary_delimiter_does_not_manufacture_momentum() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.lang_detector.momentum_lang(),
+            None,
+            "a delimiter confirms text delivery, not the inferred script"
+        );
+    }
+
+    #[test]
+    fn ordinary_delimiter_does_not_manufacture_regime_language_ratio() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.regime_detector.lang_ratio(),
+            0.5,
+            "non-language word statistics may update while language ratio stays neutral"
+        );
+    }
+
+    #[test]
+    fn repeated_unconfirmed_word_does_not_become_corpus_evidence() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        raw(&mut core, &[16, 45, 44]);
+        assert_eq!(core.current_word(), "qxz");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::UnsupportedBoth,
+            "prediction-only self-insertion cannot attest its own script"
+        );
+    }
+
+    #[test]
+    fn prediction_only_word_is_excluded_from_exact_and_correction_frequency() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        assert_eq!(core.engine.score_exact_both("qxz", "яьз"), (0.0, 0.0));
+        assert_eq!(core.engine.word_frequency("qxz", LangId::En), 0.0);
+    }
+
+    #[test]
+    fn lower_ranked_trusted_prefix_is_not_hidden_by_prediction_candidate() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        core.load_word_lang("qxtrusted", 2, LangId::En);
+        assert_eq!(core.engine.score_both("qx", "яь"), (2.0, 0.0),
+            "trusted prefix search must ignore the higher-frequency unconfirmed candidate and still find trusted evidence");
+    }
+
+    #[test]
+    fn unsupported_suffix_after_a_corpus_lock_does_not_gain_commit_language() {
+        let mut core = fresh(false);
+        core.load_word_lang("мама", 100_000, LangId::Bg);
+        raw(&mut core, &[50, 30, 50, 30]);
+        assert!(
+            core.debug_state().1,
+            "premise: trusted prefix locked the display"
+        );
+        raw(&mut core, &[45]);
+        assert_eq!(core.current_word(), "мамаь");
+        assert_eq!(
+            core.engine.score_both("mamax", "мамаь"),
+            (0.0, 0.0),
+            "premise: current full word has no trusted support"
+        );
+        core.handle_key(press(Key::Space));
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn focus_flush_is_unconfirmed_language() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        assert!(core
+            .focus_lost()
+            .contains(&Action::CommitText("qxz".into())));
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn tab_without_ghost_is_unconfirmed_language() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        assert!(core
+            .handle_key(press(Key::Tab))
+            .contains(&Action::CommitText("qxz".into())));
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn partial_right_then_delimiter_is_unconfirmed_language() {
+        let mut core = fresh(true);
+        raw(&mut core, &[16, 45]);
+        assert!(core.apply_prediction_override("qxzz").is_some());
+        core.handle_key(press(Key::Right));
+        assert_eq!(core.current_word(), "qxz");
+        assert_eq!(core.ghost_text(), "z");
+        let actions = core.handle_key(press(Key::Space));
+        assert!(actions.contains(&Action::CommitText("qxz".into())));
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn unmappable_partial_right_keeps_delivery_without_full_word_confirmation() {
+        let mut core = fresh(true);
+        prior(&mut core, LangId::Bg);
+        raw(&mut core, &[16, 45]);
+        assert_eq!(core.current_word(), "яь");
+        assert!(core.apply_prediction_override("яьѝя").is_some());
+        let actions = core.handle_key(press(Key::Right));
+        assert!(
+            actions.contains(&Action::CommitText("яьѝя".into())),
+            "preserve the existing unmappable-character full delivery fallback"
+        );
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        assert_no_language_words(&core);
+        assert_eq!(
+            core.engine.word_frequency("яьѝя", LangId::Bg),
+            0.0,
+            "partial Right did not explicitly confirm the full visible completion"
+        );
+        let batch = core.take_commit_learning();
+        assert!(
+            batch.accepted_prediction,
+            "physical acceptance feedback remains positive"
+        );
+        assert_eq!(batch.words, vec![CommitObservation { language: None }]);
+    }
+
+    #[test]
+    fn unmappable_partial_right_requires_exact_trust_not_just_a_known_prefix() {
+        for exact in [false, true] {
+            let mut core = fresh(true);
+            core.load_word_lang(if exact { "яьѝя" } else { "яьѝяз" }, 100, LangId::Bg);
+            raw(&mut core, &[16, 45]);
+            assert_eq!(core.current_word(), "яь");
+            assert!(core.apply_prediction_override("яьѝя").is_some());
+            core.handle_key(press(Key::Right));
+            let batch = core.take_commit_learning();
+            assert!(batch.accepted_prediction);
+            assert_eq!(
+                batch.words,
+                vec![CommitObservation {
+                    language: if exact { Some(LangId::Bg) } else { None }
+                }]
+            );
+            assert_eq!(
+                core.engine.word_frequency("яьѝя", LangId::Bg),
+                if exact { 100.0 } else { 0.0 }
+            );
+        }
+    }
+
+    // Guards protect useful learning and real evidence from a skip-everything fix.
+    #[test]
+    fn novel_bg_name_remains_available_for_prediction() {
+        let mut core = fresh(false);
+        prior(&mut core, LangId::Bg);
+        raw(&mut core, &[44, 24, 19, 23, 17, 30, 49]); // synthetic зориван
+        assert_eq!(core.current_word(), "зориван");
+        core.handle_key(press(Key::Space));
+        assert!(
+            core.engine
+                .predict("зори", &[], 5, Some(LangId::Bg))
+                .iter()
+                .any(|p| p.word == "зориван"),
+            "unknown names need candidate generation as well as personal Markov"
+        );
+    }
+
+    #[test]
+    fn corpus_prefix_language_does_not_confirm_a_new_exact_word() {
+        let mut core = fresh(false);
+        core.load_word_lang("зориван", 100_000, LangId::Bg);
+        raw(&mut core, &[44, 24, 19, 23]);
+        assert_eq!(core.current_word(), "зори");
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.lang_detector.momentum_lang(),
+            Some(LangId::Bg),
+            "trusted prefix still supplies real language evidence"
+        );
+        assert!(
+            core.engine
+                .predict("зор", &[], 5, Some(LangId::Bg))
+                .iter()
+                .any(|p| p.word == "зори"),
+            "the newly typed shorter word must remain a prediction candidate"
+        );
+        assert_eq!(
+            core.engine.score_exact_both("zori", "зори"),
+            (0.0, 0.0),
+            "prefix language evidence must not manufacture exact word confirmation"
+        );
+    }
+
+    #[test]
+    fn direct_observed_script_can_confirm_a_new_exact_word_below_a_known_prefix() {
+        let mut core = fresh(false);
+        core.load_word_lang("зориван", 100_000, LangId::Bg);
+        for ch in "зори".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        core.handle_key(press(Key::Space));
+        assert!(core.engine.score_exact_both("zori", "зори").1 > 0.0,
+            "direct observed script confirms this exact new word independently of the corpus prefix");
+    }
+
+    #[test]
+    fn unobserved_current_word_state_cannot_confirm_an_exact_word() {
+        let mut core = fresh(false);
+        core.current_word = "qxz".into();
+        core.handle_key(press(Key::Space));
+        assert_eq!(core.engine.score_exact_both("qxz", "яьз"), (0.0, 0.0));
+        assert_no_language_words(&core);
+    }
+
+    #[test]
+    fn direct_observed_prefix_keeps_existing_opt_in_correction_output() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("шщчюха", 1, LangId::Bg);
+        core.load_word_lang("[]`\\", 20, LangId::En);
+        for ch in "шщчю".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert_eq!(core.current_word(), "шщчю");
+        assert_eq!(core.engine.score_exact_both("[]`\\", "шщчю"), (20.0, 0.0));
+        let actions = core.handle_key(press(Key::Space));
+        assert!(actions.contains(&Action::ReplaceWord { replace_len: 4, text: "[]`\\".into() }),
+            "the existing opt-in pipeline replaces this exact-OOV trusted prefix before any new exact confirmation: {actions:?}");
+        let batch = core.take_commit_learning();
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::En)
+            }]
+        );
+        assert_eq!(core.context_words().0, Some("[]`\\"));
+        let profile = core.export_personal_profile();
+        assert!(profile.cvm.words.iter().any(|word| word == "[]`\\"));
+        assert!(!profile.cvm.words.iter().any(|word| word == "шщчю"));
+        assert_eq!(core.engine.score_exact_both("[]`\\", "шщчю"), (20.0, 0.0));
+    }
+
+    #[test]
+    fn full_visible_accept_can_promote_word_specific_language_evidence() {
+        let mut core = fresh(true);
+        raw(&mut core, &[16, 45]);
+        assert!(core.apply_prediction_override("qxz").is_some());
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(actions.contains(&Action::CommitText("qxz".into())));
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::En));
+        assert!(core.engine.score_exact_both("qxz", "яьз").0 > 0.0);
+        let before = core.metrics().commit_count();
+        core.handle_key(press(Key::Tab));
+        assert_eq!(
+            core.metrics().commit_count(),
+            before,
+            "second Tab has no acceptance to learn"
+        );
+    }
+
+    #[test]
+    fn review_accepted_post_confirmation_correction_receipt_follows_effective_word() {
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("car", 100, LangId::En);
+        core.handle_key(press(Key::Char('ц')));
+        assert!(core.apply_prediction_override("цар").is_some());
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(actions.contains(&Action::ReplaceWord {
+            replace_len: 3,
+            text: "car".into()
+        }));
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        let batch = core.take_commit_learning();
+        assert!(batch.accepted_prediction);
+        assert_eq!(
+            batch.words,
+            vec![CommitObservation {
+                language: Some(LangId::En)
+            }]
+        );
+        assert_eq!(core.context_words().0, Some("car"));
+        let profile = core.export_personal_profile();
+        assert!(profile.cvm.words.iter().any(|word| word == "car"));
+        assert!(!profile.cvm.words.iter().any(|word| word == "цар"));
+        assert_eq!(
+            core.engine.word_frequency("цар", LangId::Bg),
+            5.0,
+            "full visible confirmation still precedes the accepted correction decision"
+        );
+    }
+
+    #[test]
+    fn accepted_two_character_word_keeps_existing_confirmation_threshold() {
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: true,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("ca", 20, LangId::En);
+        core.handle_key(press(Key::Char('ц')));
+        assert!(core.apply_prediction_override("ца").is_some());
+        let actions = core.handle_key(press(Key::Tab));
+        assert!(actions.contains(&Action::ReplaceWord {
+            replace_len: 2,
+            text: "ca".into()
+        }));
+        assert_eq!(core.engine.word_frequency("ца", LangId::Bg), 0.0);
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::En)
+            }]
+        );
+    }
+
+    #[test]
+    fn final_right_on_direct_text_records_one_full_acceptance() {
+        let mut core = fresh(true);
+        for ch in "qx".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert!(core.apply_prediction_override("qxz").is_some());
+        let actions = core.handle_key(press(Key::Right));
+        assert!(
+            actions.contains(&Action::CommitText("z".into())),
+            "the direct prefix is already delivered"
+        );
+        assert_eq!(
+            core.metrics().summary().accepted_predictions,
+            1,
+            "the last Right consumes the full visible completion"
+        );
+        assert!(core.current_word().is_empty());
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::En));
+    }
+
+    #[test]
+    fn multiword_full_accept_records_word_specific_language_tracks() {
+        let mut core = fresh(true);
+        for ch in "hel".chars() {
+            core.handle_key(press(Key::Char(ch)));
+        }
+        assert!(core.apply_prediction_override("hello здравей").is_some());
+        core.handle_key(press(Key::Tab));
+        let tracks = core.export_personal_profile().lang_cvm.unwrap().tracks;
+        let en = tracks.iter().find(|(lang, _)| lang == "en").unwrap();
+        assert!(en.1.words.iter().any(|word| word == "hello"));
+        assert!(
+            !en.1.words.iter().any(|word| word == "здравей"),
+            "each accepted word needs its own script evidence"
+        );
+        let bg = tracks
+            .iter()
+            .find(|(lang, _)| lang == "bg")
+            .expect("accepted Cyrillic word belongs in Bg");
+        assert!(bg.1.words.iter().any(|word| word == "здравей"));
+    }
+
+    #[test]
+    fn genuine_corpus_tie_still_reaches_detector_at_half_confidence() {
+        let mut core = fresh(false);
+        core.load_word_lang("qx", 100, LangId::En);
+        core.load_word_lang("яь", 100, LangId::Bg);
+        raw(&mut core, &[16, 45]);
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::Corpus
+        );
+        let detected = core.detected_language();
+        assert_eq!((detected.lang, detected.confidence), (LangId::En, 0.5));
+    }
+
+    #[test]
+    fn commit_batch_is_consumed_once_and_replaced_by_the_next_operation() {
+        let mut core = fresh(false);
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        let batch = core.take_commit_learning();
+        assert_eq!(batch.words, vec![CommitObservation { language: None }]);
+        assert!(!batch.accepted_prediction);
+        assert!(core.take_commit_learning().words.is_empty());
+
+        raw(&mut core, &[16, 45, 44]);
+        core.handle_key(press(Key::Space));
+        // A standalone core user deliberately leaves that batch undrained.
+        core.handle_key(press(Key::Space));
+        assert!(core.take_commit_learning().words.is_empty());
+        core.focus_lost();
+        assert!(core.take_commit_learning().words.is_empty());
+    }
+
+    #[test]
+    fn final_right_is_one_full_accept_for_dual_and_direct_semantic_and_raw_keys() {
+        for dual in [false, true] {
+            for right in [Key::Right, Key::RawCode(106)] {
+                let mut core = fresh(true);
+                if dual {
+                    raw(&mut core, &[16, 45]);
+                } else {
+                    for ch in "qx".chars() {
+                        core.handle_key(press(Key::Char(ch)));
+                    }
+                }
+                assert!(core.apply_prediction_override("qxzz").is_some());
+                let released = core.handle_key(KeyEvent {
+                    key: right.clone(),
+                    modifiers: Modifiers::RELEASE,
+                });
+                assert_eq!(released, vec![Action::ForwardKey]);
+                assert_eq!(core.ghost_text(), "zz");
+                assert!(core.take_commit_learning().words.is_empty());
+                let partial = core.handle_key(press(right.clone()));
+                assert_eq!(core.current_word(), "qxz");
+                assert_eq!(core.metrics().summary().accepted_predictions, 0);
+                assert!(core.take_commit_learning().words.is_empty());
+                if !dual {
+                    assert!(partial.contains(&Action::CommitText("z".into())));
+                }
+                let final_actions = core.handle_key(press(right));
+                let commits: Vec<&str> = final_actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        Action::CommitText(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(commits, if dual { vec!["qxzz"] } else { vec!["z"] });
+                assert!(core.current_word().is_empty());
+                assert_eq!(core.metrics().summary().accepted_predictions, 1);
+                let batch = core.take_commit_learning();
+                assert!(batch.accepted_prediction);
+                assert_eq!(
+                    batch.words,
+                    vec![CommitObservation {
+                        language: Some(LangId::En)
+                    }]
+                );
+                assert!(core.take_commit_learning().words.is_empty());
+                core.handle_key(press(Key::Space));
+                assert!(core.take_commit_learning().words.is_empty());
+                assert_eq!(core.metrics().summary().accepted_predictions, 1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shortword_routing_contract_tests {
+    use super::*;
+    use crate::dual_buffer::EvidenceOrigin;
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn reduced(prior: Option<LangId>) -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        // Reduced from the frozen current corpus JSON facts. The native replay
+        // remains authoritative for the separately loaded binary corpus.
+        core.load_word_lang("like", 2_570_395, LangId::En);
+        core.load_word_lang("li", 17_782, LangId::En);
+        core.load_word_lang("ли", 2_511_886, LangId::Bg);
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: prior,
+            ..Default::default()
+        });
+        core
+    }
+
+    #[test]
+    fn shortword_bg_context_selects_live_supported_particle_without_lock() {
+        let mut core = reduced(Some(LangId::Bg));
+        core.handle_key(raw(38));
+        assert_eq!(core.current_word(), "л");
+        let actions = core.handle_key(raw(23));
+        assert_eq!(core.current_word(), "ли");
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, Action::ShowComposing { typed, .. } if typed == "ли")));
+        assert_eq!(core.debug_state(), (true, false, true));
+        let actions = core.handle_key(raw(57));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::CommitText(word) if word == "ли"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::ReplaceWord { .. })));
+    }
+
+    #[test]
+    fn shortword_context_selection_is_not_independent_detector_confidence() {
+        let mut core = reduced(Some(LangId::Bg));
+        let before = core.detected_language();
+        core.handle_key(raw(38));
+        core.handle_key(raw(23));
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::PriorOnly
+        );
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence)
+        );
+        core.handle_key(raw(57));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Bg)
+            }]
+        );
+        assert!(
+            core.export_personal_profile().confirmed_words.is_empty(),
+            "routing does not confirm a new exact word"
+        );
+        assert_eq!(core.engine.word_frequency("li", LangId::En), 17_782.0);
+        assert_eq!(core.engine.word_frequency("ли", LangId::Bg), 2_511_886.0);
+    }
+
+    #[test]
+    fn shortword_no_context_and_english_context_keep_english() {
+        for prior in [None, Some(LangId::En)] {
+            let mut core = reduced(prior);
+            core.handle_key(raw(38));
+            core.handle_key(raw(23));
+            assert_eq!(core.current_word(), "li");
+            assert_eq!(
+                core.dual_buffer.as_ref().unwrap().evidence_origin(),
+                EvidenceOrigin::Corpus
+            );
+            let actions = core.handle_key(raw(57));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, Action::CommitText(word) if word == "li"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn shortword_strong_english_recovers_after_bg_context_and_semantic_chars_stay_direct() {
+        let mut core = reduced(Some(LangId::Bg));
+        for code in [38, 23, 37, 18] {
+            core.handle_key(raw(code));
+        }
+        assert_eq!(core.current_word(), "like");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::Corpus
+        );
+
+        let mut core = reduced(Some(LangId::Bg));
+        for ch in "li".chars() {
+            core.handle_key(KeyEvent {
+                key: Key::Char(ch),
+                modifiers: Modifiers::empty(),
+            });
+        }
+        assert_eq!(core.current_word(), "li");
+        assert!(core.dual_buffer.is_none());
+    }
+
+    #[test]
+    fn shortword_backspace_rescores_fresh_without_compounding_prior() {
+        let mut core = reduced(Some(LangId::Bg));
+        core.handle_key(raw(38));
+        core.handle_key(raw(23));
+        assert_eq!(core.current_word(), "ли");
+        let confidence = core.dual_buffer.as_ref().unwrap().confidence();
+        for _ in 0..4 {
+            core.handle_key(raw(37));
+            assert_eq!(core.current_word(), "lik");
+            core.handle_key(raw(14));
+            assert_eq!(core.current_word(), "ли");
+            assert_eq!(core.dual_buffer.as_ref().unwrap().confidence(), confidence);
+            assert!(!core.dual_buffer.as_ref().unwrap().is_locked());
+        }
+    }
+
+    #[test]
+    fn shortword_unsupported_context_does_not_create_language_evidence() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            ..Default::default()
+        });
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(LangId::Bg),
+            ..Default::default()
+        });
+        let before = core.detected_language();
+        core.handle_key(raw(38));
+        core.handle_key(raw(23));
+        assert_eq!(core.current_word(), "ли");
+        assert_eq!(
+            core.dual_buffer.as_ref().unwrap().evidence_origin(),
+            EvidenceOrigin::UnsupportedBoth
+        );
+        core.handle_key(raw(57));
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation { language: None }]
+        );
+        let after = core.detected_language();
+        assert_eq!(
+            (after.lang, after.confidence),
+            (before.lang, before.confidence)
+        );
+        assert!(core.export_personal_profile().confirmed_words.is_empty());
+        assert_eq!(core.engine.word_frequency("ли", LangId::Bg), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod terminal_context_evidence_tests {
+    use super::*;
+
+    fn raw(code: u16) -> KeyEvent {
+        KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn terminal_context_exact_selection_does_not_create_detector_confidence_or_trust() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("with", 7_079_457, LangId::En);
+        core.load_word_lang("wi", 12_302, LangId::En);
+        core.load_word_lang("ви", 2_137_962, LangId::Bg);
+        core.set_terminal_context_lang(Some(LangId::Bg));
+        core.handle_key(raw(17));
+        core.handle_key(raw(23));
+        assert_eq!(core.current_word(), "wi");
+        let detected = core.detected_language();
+
+        let actions = core.handle_key(raw(57));
+
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(word) if word == "ви")));
+        assert_eq!(core.detected_language().lang, detected.lang);
+        assert_eq!(core.detected_language().confidence, detected.confidence);
+        assert_eq!(
+            core.take_commit_learning().words,
+            vec![CommitObservation {
+                language: Some(LangId::Bg)
+            }]
+        );
+        assert_eq!(core.lang_detector.momentum_lang(), Some(LangId::Bg));
+        assert!(core.export_personal_profile().confirmed_words.is_empty());
+        assert_eq!(core.engine.word_frequency("wi", LangId::En), 12_302.0);
+        assert_eq!(core.engine.word_frequency("ви", LangId::Bg), 2_137_962.0);
+        assert_eq!(core.terminal_context_lang, None);
+    }
+
+    #[test]
+    fn terminal_context_agreement_with_current_word_does_not_mark_a_flip() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("wi", 1_000_000, LangId::En);
+        core.load_word_lang("ви", 1, LangId::Bg);
+        core.set_terminal_context_lang(Some(LangId::En));
+        core.handle_key(raw(17));
+        core.handle_key(raw(23));
+        assert!(!core.current_word_had_flip);
+        let origins = core.word_origins.clone();
+
+        assert_eq!(core.resolve_word_boundary(), "wi");
+
+        assert!(!core.current_word_had_flip);
+        assert!(core.word_origins == origins);
+    }
+}
+
+#[cfg(test)]
+mod hybrid_space_eligibility_tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_space_regained_ghost_attestation_cannot_bypass_delivery_guard() {
+        for space in [Key::Space, Key::RawCode(57)] {
+            let mut core = InputMethodCore::new(InputConfig {
+                ghost_text: true,
+                space_accept: true,
+                ..InputConfig::default()
+            });
+            core.load_word("qaxyz", 1_000_000);
+            for key in [Key::RawCode(16), Key::Char('a'), Key::RawCode(45)] {
+                core.handle_key(KeyEvent {
+                    key,
+                    modifiers: Modifiers::empty(),
+                });
+            }
+            assert_eq!(core.current_word(), "qax");
+            assert_eq!(core.ghost_text(), "yz");
+            assert!(core.dual_buffer.is_none());
+            assert!(!core.space_accept_armed());
+            core.attest_space_accept_display(true);
+            let actions = core.handle_key(KeyEvent {
+                key: space,
+                modifiers: Modifiers::empty(),
+            });
+            assert_eq!(actions, vec![Action::HideGhost, Action::ForwardKey]);
+            let batch = core.take_commit_learning();
+            assert_eq!(batch.words.len(), 1);
+            assert!(!batch.accepted_prediction);
+            assert!(core.current_word().is_empty() && !core.has_ghost());
+        }
+    }
+}
+
+#[cfg(test)]
+mod caps_context_followup_tests {
+    use super::*;
+
+    fn fresh(opt_in: bool) -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: opt_in,
+            ghost_text: false,
+            ..InputConfig::default()
+        });
+        for word in ["hello", "there", "london"] {
+            core.load_word_lang(word, 1_000, LangId::En);
+        }
+        core
+    }
+
+    fn press(core: &mut InputMethodCore, key: Key) -> Vec<Action> {
+        core.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn type_semantic(core: &mut InputMethodCore, word: &str) {
+        for ch in word.chars() {
+            let actions = press(core, Key::Char(ch));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::ForwardKey))
+                    .count(),
+                1,
+                "semantic character must reach the client once: {actions:?}"
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })),
+                "fixture must use literal semantic typing, not an injected rewrite: {actions:?}"
+            );
+        }
+        assert_eq!(core.current_word(), word);
+    }
+
+    fn boundary(core: &mut InputMethodCore) -> Vec<Action> {
+        let actions = press(core, Key::Space);
+        eprintln!("semantic Space: {actions:?}");
+        assert!(core.current_word().is_empty());
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::ForwardKey))
+                .count(),
+            1
+        );
+        assert!(!actions.iter().any(|a| matches!(a, Action::CommitText(_))));
+        actions
+    }
+
+    fn replacements(actions: &[Action]) -> Vec<(usize, String)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::ReplaceWord { replace_len, text } => Some((*replace_len, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn caps_context_followup_start_of_input_capitalizes_real_committed_word() {
+        let mut core = fresh(true);
+        type_semantic(&mut core, "hello");
+        assert_eq!(
+            replacements(&boundary(&mut core)),
+            vec![(5, "Hello".into())]
+        );
+    }
+
+    #[test]
+    fn caps_context_followup_previous_ordinary_word_keeps_middle_lowercase() {
+        let mut core = fresh(true);
+        type_semantic(&mut core, "there");
+        boundary(&mut core);
+        type_semantic(&mut core, "hello");
+        assert!(replacements(&boundary(&mut core)).is_empty());
+    }
+
+    #[test]
+    fn caps_context_followup_current_punctuation_does_not_capitalize_middle_word() {
+        let mut core = fresh(true);
+        type_semantic(&mut core, "there");
+        boundary(&mut core);
+        type_semantic(&mut core, "hello!");
+        assert!(replacements(&boundary(&mut core)).is_empty());
+    }
+
+    #[test]
+    fn caps_context_followup_previous_semantic_sentence_end_capitalizes_next_word() {
+        let mut core = fresh(true);
+        type_semantic(&mut core, "there!");
+        boundary(&mut core);
+        type_semantic(&mut core, "hello");
+        assert_eq!(
+            replacements(&boundary(&mut core)),
+            vec![(5, "Hello".into())]
+        );
+    }
+
+    #[test]
+    fn caps_context_followup_default_off_never_rewrites_these_boundaries() {
+        assert!(!InputConfig::default().post_commit_autocorrect);
+        let mut core = fresh(false);
+        for word in ["hello", "there!", "hello"] {
+            type_semantic(&mut core, word);
+            assert!(replacements(&boundary(&mut core)).is_empty());
+        }
+    }
+
+    #[test]
+    fn caps_context_followup_registered_proper_noun_capitalizes_in_middle() {
+        let mut core = fresh(true);
+        let dir =
+            std::env::temp_dir().join(format!("smartkey-caps-context-noun-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let corpus = dir.join("proper.json");
+        std::fs::write(
+            &corpus,
+            r#"{"unigrams":{"london":1000},"proper_nouns":["London"]}"#,
+        )
+        .unwrap();
+        core.load_corpus_file(&corpus).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        type_semantic(&mut core, "there");
+        boundary(&mut core);
+        type_semantic(&mut core, "london");
+        assert_eq!(
+            replacements(&boundary(&mut core)),
+            vec![(6, "London".into())]
+        );
+    }
+}
+
+#[cfg(test)]
+mod external_rewrite_contract_tests {
+    use super::*;
+
+    fn fresh(external: bool, post: bool, ghost: bool) -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: post,
+            ghost_text: ghost,
+            ..InputConfig::default()
+        });
+        assert!(
+            core.external_rewrite_supported,
+            "other hosts retain the default"
+        );
+        core.set_external_rewrite_supported(external);
+        core
+    }
+
+    fn key(core: &mut InputMethodCore, key: Key) -> Vec<Action> {
+        core.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    fn replacements(actions: &[Action]) -> Vec<(usize, &str)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ReplaceWord { replace_len, text } => Some((*replace_len, text.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn commits(actions: &[Action]) -> Vec<&str> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::CommitText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // ForwardKey is delivered only after the entire action batch returns.
+    // Preedit/ghost text is never part of the committed client document.
+    fn project(document: &mut String, actions: &[Action], original: Option<char>) {
+        for action in actions {
+            match action {
+                Action::CommitText(text) => document.push_str(text),
+                Action::ReplaceWord { replace_len, text } => {
+                    for _ in 0..*replace_len {
+                        assert!(document.pop().is_some());
+                    }
+                    document.push_str(text);
+                }
+                _ => {}
+            }
+        }
+        if actions.iter().any(|a| matches!(a, Action::ForwardKey)) {
+            document.push(original.expect("only modeled semantic/Space events may forward"));
+        }
+    }
+
+    fn semantic(core: &mut InputMethodCore, document: &mut String, word: &str) {
+        for ch in word.chars() {
+            let a = key(core, Key::Char(ch));
+            project(document, &a, Some(ch));
+        }
+    }
+
+    fn raw(core: &mut InputMethodCore, codes: &[u16]) {
+        for code in codes {
+            key(core, Key::RawCode(*code));
+        }
+    }
+
+    fn learned_once(core: &mut InputMethodCore, expected: &[&str]) {
+        assert!(core.current_word().is_empty());
+        let batch = core.take_commit_learning();
+        assert_eq!(batch.words.len(), expected.len());
+        let profile = core.export_personal_profile();
+        for word in expected {
+            assert!(profile.cvm.words.iter().any(|w| w == word));
+        }
+        key(core, Key::Space);
+        assert!(
+            core.take_commit_learning().words.is_empty(),
+            "empty boundary cannot relearn"
+        );
+    }
+
+    #[test]
+    fn external_rewrite_legacy_false_preserves_literal_and_does_not_activate() {
+        let mut core = fresh(false, false, false);
+        core.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        let mut document = String::new();
+        semantic(&mut core, &mut document, "z");
+        let second = key(&mut core, Key::Char('d'));
+        eprintln!(
+            "unsupported legacy d: {second:?}; word={:?}",
+            core.current_word()
+        );
+        assert!(replacements(&second).is_empty());
+        project(&mut document, &second, Some('d'));
+        assert_eq!((core.current_word(), document.as_str()), ("zd", "zd"));
+        assert!(!core.transliteration_active);
+        semantic(&mut core, &mut document, "r");
+        assert_eq!((core.current_word(), document.as_str()), ("zdr", "zdr"));
+        assert!(core.export_personal_profile().cvm.words.is_empty());
+    }
+
+    #[test]
+    fn external_rewrite_legacy_true_preserves_real_replacement_producer() {
+        let mut core = fresh(true, false, false);
+        core.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        let mut document = String::new();
+        semantic(&mut core, &mut document, "z");
+        let second = key(&mut core, Key::Char('d'));
+        assert_eq!(replacements(&second), vec![(1, "зд")]);
+        project(&mut document, &second, Some('d'));
+        assert_eq!((core.current_word(), document.as_str()), ("зд", "зд"));
+        assert!(core.transliteration_active);
+    }
+
+    #[test]
+    fn external_rewrite_unowned_boundary_language_false_learns_literal_before_any_correction() {
+        let mut core = fresh(false, true, false);
+        core.load_word_lang("car", 100, LangId::En);
+        let mut document = String::new();
+        semantic(&mut core, &mut document, "цар");
+        assert_eq!(core.current_word(), "цар");
+        assert!(core.export_personal_profile().cvm.words.is_empty());
+        let a = key(&mut core, Key::Space);
+        eprintln!("unsupported language boundary: {a:?}");
+        assert!(replacements(&a).is_empty());
+        project(&mut document, &a, Some(' '));
+        assert_eq!(document, "цар ");
+        assert_eq!(core.context_words().0, Some("цар"));
+        let profile = core.export_personal_profile();
+        assert!(!profile.cvm.words.iter().any(|w| w == "car"));
+        learned_once(&mut core, &["цар"]);
+    }
+
+    #[test]
+    fn external_rewrite_unowned_boundary_caps_false_preserves_literal() {
+        let mut core = fresh(false, true, false);
+        core.load_word_lang("hello", 1_000, LangId::En);
+        let mut document = String::new();
+        semantic(&mut core, &mut document, "hello");
+        let a = key(&mut core, Key::Space);
+        eprintln!("unsupported caps boundary: {a:?}");
+        assert!(replacements(&a).is_empty());
+        project(&mut document, &a, Some(' '));
+        assert_eq!(document, "hello ");
+        learned_once(&mut core, &["hello"]);
+    }
+
+    #[test]
+    fn external_rewrite_owned_singleword_boundary_language_and_caps_remain_available() {
+        for external in [false, true] {
+            for (boundary, delimiter) in [
+                (Key::Space, ' '),
+                (Key::Return, '\n'),
+                (Key::Char('!'), '!'),
+            ] {
+                let mut core = fresh(external, true, false);
+                core.load_word_lang("царство", 1_000_000, LangId::Bg);
+                core.load_word_lang("цар", 5, LangId::Bg);
+                core.load_word_lang("car", 100, LangId::En);
+                raw(&mut core, &[46, 30, 19]);
+                assert_eq!(core.current_word(), "цар");
+                assert!(core.debug_state().0, "whole word is still owned preedit");
+                let a = key(&mut core, boundary);
+                eprintln!("owned language/caps external={external}: {a:?}");
+                assert_eq!(commits(&a), vec!["цар"]);
+                assert_eq!(replacements(&a), vec![(3, "car"), (3, "Car")]);
+                let mut document = String::new();
+                project(&mut document, &a, Some(delimiter));
+                assert_eq!(document, format!("Car{delimiter}"));
+                let profile = core.export_personal_profile();
+                assert!(!profile.cvm.words.iter().any(|w| w == "цар"));
+                learned_once(&mut core, &["car"]);
+            }
+        }
+    }
+
+    #[test]
+    fn external_rewrite_owned_singleword_caps_remain_available() {
+        let mut core = fresh(false, true, false);
+        core.load_word_lang("hello", 1_000, LangId::En);
+        raw(&mut core, &[35, 18, 38, 38, 24]);
+        assert_eq!(core.current_word(), "hello");
+        let a = key(&mut core, Key::Space);
+        assert_eq!(commits(&a), vec!["hello"]);
+        assert_eq!(replacements(&a), vec![(5, "Hello")]);
+        let mut document = String::new();
+        project(&mut document, &a, Some(' '));
+        assert_eq!(document, "Hello ");
+        learned_once(&mut core, &["hello"]);
+    }
+
+    #[test]
+    fn composing_rewrite_disabled_boundaries_preserve_delivered_learning() {
+        for boundary in [Key::Space, Key::Return, Key::Char('!')] {
+            let mut core = fresh(false, true, false);
+            core.set_composing_rewrite_supported(false);
+            core.load_word_lang("царство", 1_000_000, LangId::Bg);
+            core.load_word_lang("цар", 5, LangId::Bg);
+            core.load_word_lang("car", 100, LangId::En);
+            raw(&mut core, &[46, 30, 19]);
+            assert_eq!(core.current_word(), "цар");
+            assert!(core.debug_state().0, "the token is still composing");
+            let actions = key(&mut core, boundary);
+            assert_eq!(commits(&actions), vec!["цар"]);
+            assert!(replacements(&actions).is_empty());
+            assert_eq!(core.context_words().0, Some("цар"));
+            learned_once(&mut core, &["цар"]);
+            assert!(!core
+                .export_personal_profile()
+                .cvm
+                .words
+                .iter()
+                .any(|word| word == "car"));
+        }
+    }
+
+    #[test]
+    fn composing_rewrite_capability_restores_preedit_corrections() {
+        let mut core = fresh(false, true, false);
+        core.set_composing_rewrite_supported(false);
+        core.reset_word();
+        assert!(!core.composing_rewrite_supported);
+        core.set_composing_rewrite_supported(true);
+        core.load_word_lang("царство", 1_000_000, LangId::Bg);
+        core.load_word_lang("цар", 5, LangId::Bg);
+        core.load_word_lang("car", 100, LangId::En);
+        raw(&mut core, &[46, 30, 19]);
+        let actions = key(&mut core, Key::Space);
+        assert_eq!(replacements(&actions), vec![(3, "car"), (3, "Car")]);
+        assert_eq!(core.context_words().0, Some("car"));
+        learned_once(&mut core, &["car"]);
+    }
+
+    #[test]
+    fn composing_rewrite_disabled_accept_preserves_shown_word() {
+        let mut core = fresh(false, true, true);
+        core.set_composing_rewrite_supported(false);
+        core.load_word_lang("царство", 1_000_000, LangId::Bg);
+        core.load_word_lang("цар", 5, LangId::Bg);
+        core.load_word_lang("car", 100, LangId::En);
+        raw(&mut core, &[46]);
+        assert!(core.apply_prediction_override("цар").is_some());
+        let actions = key(&mut core, Key::Tab);
+        assert_eq!(commits(&actions), vec!["цар"]);
+        assert!(replacements(&actions).is_empty());
+        assert_eq!(core.context_words().0, Some("цар"));
+        learned_once(&mut core, &["цар"]);
+    }
+
+    #[test]
+    fn external_rewrite_suffix_only_accept_false_learns_visible_word_once() {
+        let mut core = fresh(false, true, true);
+        core.load_word_lang("hello", 1_000, LangId::En);
+        let mut document = String::new();
+        semantic(&mut core, &mut document, "hel");
+        assert_eq!((core.current_word(), core.ghost_text()), ("hel", "lo"));
+        assert!(!core.debug_state().0);
+        let a = key(&mut core, Key::Tab);
+        eprintln!("unsupported suffix accept: {a:?}");
+        assert_eq!(commits(&a), vec!["lo"]);
+        assert!(replacements(&a).is_empty());
+        project(&mut document, &a, None);
+        assert_eq!(document, "hello");
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        learned_once(&mut core, &["hello"]);
+    }
+
+    #[test]
+    fn external_rewrite_multiword_accept_false_learns_visible_phrase_not_corrected_last_word() {
+        let mut core = fresh(false, true, true);
+        core.load_word_lang("hello", 1_000, LangId::En);
+        core.load_word_lang("цар", 5, LangId::Bg);
+        core.load_word_lang("car", 100, LangId::En);
+        raw(&mut core, &[35, 18, 38]);
+        // Public override is the existing multiword producer; ordinary ghost
+        // generation is intentionally singleword. No private word/ghost writes.
+        assert!(
+            matches!(core.apply_prediction_override("hello цар"), Some(Action::ShowComposing { typed, ghost }) if typed == "hel" && ghost == "lo цар")
+        );
+        let a = key(&mut core, Key::Tab);
+        eprintln!("unsupported multiword accept: {a:?}");
+        assert_eq!(commits(&a), vec!["hello цар"]);
+        assert!(replacements(&a).is_empty());
+        let mut document = String::new();
+        project(&mut document, &a, None);
+        assert_eq!(document, "hello цар");
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        let profile = core.export_personal_profile();
+        assert!(!profile.cvm.words.iter().any(|w| w == "car"));
+        assert!(profile
+            .markov_bigrams
+            .iter()
+            .any(|(p, w, n)| p == "hello" && w == "цар" && *n == 1));
+        learned_once(&mut core, &["hello", "цар"]);
+    }
+
+    #[test]
+    fn external_rewrite_owned_singleword_accept_keeps_language_and_caps() {
+        let mut core = fresh(false, true, true);
+        core.load_word_lang("царство", 1_000_000, LangId::Bg);
+        core.load_word_lang("цар", 5, LangId::Bg);
+        core.load_word_lang("car", 100, LangId::En);
+        raw(&mut core, &[46]);
+        assert_eq!(core.current_word(), "ц");
+        assert!(matches!(
+            core.apply_prediction_override("цар"),
+            Some(Action::ShowComposing { typed, ghost }) if typed == "ц" && ghost == "ар"
+        ));
+        let a = key(&mut core, Key::Tab);
+        eprintln!("owned singleword accept: {a:?}");
+        assert_eq!(commits(&a), vec!["цар"]);
+        assert_eq!(replacements(&a), vec![(3, "car"), (3, "Car")]);
+        let mut document = String::new();
+        project(&mut document, &a, None);
+        assert_eq!(document, "Car");
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        assert!(!core
+            .export_personal_profile()
+            .cvm
+            .words
+            .iter()
+            .any(|w| w == "цар"));
+        learned_once(&mut core, &["car"]);
+    }
+
+    #[test]
+    fn external_rewrite_capability_drop_keeps_active_conversion_safe_append() {
+        let mut core = fresh(true, false, false);
+        core.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        let mut document = String::new();
+        semantic(&mut core, &mut document, "zd");
+        assert_eq!((core.current_word(), document.as_str()), ("зд", "зд"));
+        core.set_external_rewrite_supported(false);
+        for (k, glyph) in [(Key::RawCode(19), "р"), (Key::Char('a'), "а")] {
+            let a = key(&mut core, k);
+            assert!(replacements(&a).is_empty());
+            assert_eq!(commits(&a), vec![glyph]);
+            assert!(!a.iter().any(|a| matches!(a, Action::ForwardKey)));
+            project(&mut document, &a, None);
+        }
+        assert_eq!((core.current_word(), document.as_str()), ("здра", "здра"));
+        let a = key(&mut core, Key::Space);
+        project(&mut document, &a, Some(' '));
+        assert_eq!(document, "здра ");
+        learned_once(&mut core, &["здра"]);
+    }
+
+    #[test]
+    fn external_rewrite_capability_false_survives_reset_focus_and_profile_roundtrip() {
+        let mut core = fresh(false, false, false);
+        key(&mut core, Key::Char('x'));
+        core.reset();
+        assert!(!core.external_rewrite_supported);
+        core.focus_lost();
+        core.focus_gained();
+        assert!(!core.external_rewrite_supported);
+        let profile = core.export_personal_profile();
+        core.import_personal_profile(&profile);
+        assert!(!core.external_rewrite_supported);
+        core.set_external_rewrite_supported(true);
+        assert!(core.external_rewrite_supported);
+    }
+}
+
+#[cfg(test)]
+mod sentence_boundary_followup_tests {
+    use super::*;
+
+    const HELLO: &[u16] = &[35, 18, 38, 38, 24];
+    const WORLD: &[u16] = &[17, 24, 19, 38, 32];
+
+    fn fresh(post: bool) -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig {
+            post_commit_autocorrect: post,
+            lang_detection: false,
+            ..InputConfig::default()
+        });
+        for word in ["hello", "world", "seed"] {
+            core.load_word_lang(word, 1_000, LangId::En);
+        }
+        core
+    }
+
+    fn key(core: &mut InputMethodCore, key: Key) -> Vec<Action> {
+        core.handle_key(KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    // The adapter forwards the original key only after executing the batch.
+    // Composing/ghost actions never insert text into the client document.
+    fn project(document: &mut String, actions: &[Action], original: Option<char>) {
+        for action in actions {
+            match action {
+                Action::CommitText(text) => document.push_str(text),
+                Action::ReplaceWord { replace_len, text } => {
+                    for _ in 0..*replace_len {
+                        assert!(document.pop().is_some());
+                    }
+                    document.push_str(text);
+                }
+                _ => {}
+            }
+        }
+        if actions.iter().any(|a| matches!(a, Action::ForwardKey)) {
+            document.push(original.expect("modeled printable boundary"));
+        }
+    }
+
+    fn raw(core: &mut InputMethodCore, codes: &[u16]) {
+        for code in codes {
+            key(core, Key::RawCode(*code));
+        }
+    }
+
+    fn sentence(core: &mut InputMethodCore) {
+        raw(core, HELLO);
+        key(core, Key::RawCode(52));
+        key(core, Key::RawCode(57));
+    }
+
+    fn prediction(core: &mut InputMethodCore) -> String {
+        key(core, Key::RawCode(17));
+        core.predictions()
+            .first()
+            .expect("trusted world completion")
+            .word
+            .clone()
+    }
+
+    #[test]
+    fn sentence_boundary_raw_dot_owned_postcommit_caps() {
+        let mut core = fresh(true);
+        let mut client = String::new();
+        raw(&mut core, HELLO);
+        project(&mut client, &key(&mut core, Key::RawCode(52)), Some('.'));
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        raw(&mut core, WORLD);
+        let actions = key(&mut core, Key::Space);
+        eprintln!("raw-dot world boundary: {actions:?}");
+        project(&mut client, &actions, Some(' '));
+        assert_eq!(client, "Hello. World ");
+        assert_eq!(core.context_words().0, Some("world"));
+        let profile = core.export_personal_profile();
+        assert!(profile.cvm.words.iter().any(|w| w == "hello"));
+        assert!(!profile
+            .cvm
+            .words
+            .iter()
+            .any(|w| w == "." || w == "hello." || w.is_empty()));
+        assert!(profile
+            .markov_bigrams
+            .iter()
+            .any(|(p, w, n)| p == "hello" && w == "world" && *n == 1));
+        assert!(
+            profile.confirmed_words.is_empty(),
+            "caps supplies no language proof"
+        );
+    }
+
+    #[test]
+    fn sentence_boundary_raw_dot_default_prediction_caps() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_default_tab_accepts_actual_display_not_hidden_caps() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        let offer = key(&mut core, Key::RawCode(17));
+        assert!(offer.iter().any(|a| matches!(a, Action::ShowComposing { typed, ghost } if typed == "w" && ghost == "orld")));
+        let actions = key(&mut core, Key::Tab);
+        assert_eq!(
+            actions
+                .iter()
+                .filter_map(|a| if let Action::CommitText(t) = a {
+                    Some(t.as_str())
+                } else {
+                    None
+                })
+                .collect::<Vec<_>>(),
+            vec!["world"]
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplaceWord { .. })));
+        assert_eq!(core.metrics().summary().accepted_predictions, 1);
+        assert!(core.current_word().is_empty());
+    }
+
+    fn boundary_prediction(boundary: Key, modifiers: Modifiers, whitespace: bool) {
+        let mut core = fresh(false);
+        raw(&mut core, HELLO);
+        let actions = core.handle_key(KeyEvent {
+            key: boundary.clone(),
+            modifiers,
+        });
+        assert!(actions.iter().any(|a| matches!(a, Action::ForwardKey)));
+        assert!(core.current_word().is_empty());
+        if whitespace {
+            key(&mut core, Key::Space);
+        }
+        assert_eq!(prediction(&mut core), "World", "boundary {boundary:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_raw_bang_prediction() {
+        boundary_prediction(Key::RawCode(2), Modifiers::SHIFT, true);
+    }
+
+    #[test]
+    fn sentence_boundary_raw_question_prediction() {
+        boundary_prediction(Key::RawCode(53), Modifiers::SHIFT, true);
+    }
+
+    #[test]
+    fn sentence_boundary_return_prediction() {
+        boundary_prediction(Key::Return, Modifiers::empty(), false);
+    }
+
+    #[test]
+    fn sentence_boundary_local_backspace_empty_retype_and_escape_keep_hint() {
+        for erase_all in [false, true] {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            raw(&mut core, &[17, 24]);
+            key(&mut core, Key::Backspace);
+            if erase_all {
+                key(&mut core, Key::Backspace);
+            }
+            let next = if erase_all { 17 } else { 24 };
+            key(&mut core, Key::RawCode(next));
+            assert_eq!(core.predictions()[0].word, "World");
+            assert!(core.has_ghost());
+            key(&mut core, Key::Escape); // Existing dismiss-only path retains preedit.
+            assert!(!core.current_word().is_empty());
+            key(&mut core, Key::RawCode(19));
+            // Escape rejected the previous candidate; preserve sentence casing,
+            // without requiring its now-rejected word to remain top-ranked.
+            assert!(core.predictions()[0]
+                .word
+                .chars()
+                .next()
+                .is_some_and(char::is_uppercase));
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_repeated_spaces_and_release_preserve_hint() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        key(&mut core, Key::Space);
+        core.handle_key(KeyEvent {
+            key: Key::Char('v'),
+            modifiers: Modifiers::CTRL | Modifiers::RELEASE,
+        });
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_forwarded_edits_reset_focus_and_shortcuts_withdraw_hint() {
+        for kind in 0..7 {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            match kind {
+                0 => {
+                    key(&mut core, Key::Backspace);
+                }
+                1 => {
+                    raw(&mut core, &[17]);
+                    key(&mut core, Key::Backspace);
+                    key(&mut core, Key::Backspace);
+                }
+                2 => {
+                    core.reset();
+                }
+                3 => {
+                    core.focus_lost();
+                    core.focus_gained();
+                }
+                4 | 5 => {
+                    core.handle_key(KeyEvent {
+                        key: Key::Char('v'),
+                        modifiers: if kind == 4 {
+                            Modifiers::CTRL
+                        } else {
+                            Modifiers::ALT
+                        },
+                    });
+                }
+                _ => {
+                    key(&mut core, Key::Left);
+                    // A real public external-context update distinguishes invalidation
+                    // from the existing no-context start-of-input capitalization.
+                    core.apply_hints(&crate::master_loop::Hints {
+                        context_words: vec!["seed".into()],
+                        ..Default::default()
+                    });
+                }
+            }
+            assert_eq!(prediction(&mut core), "world", "withdrawal {kind}");
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_completed_numeric_technical_and_mixed_tokens_consume_hint() {
+        for token in ["12", "foo.bar", "aБ"] {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            for ch in token.chars() {
+                key(&mut core, Key::Char(ch));
+            }
+            key(&mut core, Key::Space);
+            assert_eq!(prediction(&mut core), "world", "completed {token}");
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_multiword_accept_does_not_capitalize_phrase_final_word() {
+        let mut core = fresh(true);
+        sentence(&mut core);
+        raw(&mut core, &[17]);
+        // Existing public multiword producer, distinct from the natural Tab guard.
+        assert!(core.apply_prediction_override("world seed").is_some());
+        let actions = key(&mut core, Key::Tab);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ReplaceWord { .. })),
+            "{actions:?}"
+        );
+        assert_eq!(prediction(&mut core), "world");
+    }
+
+    #[test]
+    fn sentence_boundary_plain_space_adjacent_dot_and_decimal_keep_existing_casing() {
+        for sequence in [0, 1, 2] {
+            let mut core = fresh(false);
+            if sequence == 2 {
+                for ch in "1.2".chars() {
+                    key(&mut core, Key::Char(ch));
+                }
+                key(&mut core, Key::Space);
+            } else {
+                raw(&mut core, HELLO);
+                key(
+                    &mut core,
+                    if sequence == 0 {
+                        Key::Space
+                    } else {
+                        Key::RawCode(52)
+                    },
+                );
+            }
+            assert_eq!(prediction(&mut core), "world", "control {sequence}");
+        }
+    }
+
+    // Review follow-up: these hints describe provisional key delivery, never
+    // acknowledged client deletion, lexical punctuation, or language evidence.
+    fn review_dot(core: &mut InputMethodCore, client: &mut String, spaces: usize) {
+        raw(core, HELLO);
+        project(client, &key(core, Key::RawCode(52)), Some('.'));
+        for _ in 0..spaces {
+            project(client, &key(core, Key::Space), Some(' '));
+        }
+        assert_eq!(client.as_str(), format!("hello.{}", " ".repeat(spaces)));
+    }
+
+    fn review_forwarded_backspace(core: &mut InputMethodCore, client: &mut String) {
+        let actions = key(core, Key::Backspace);
+        assert!(actions.iter().any(|a| matches!(a, Action::ForwardKey)));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+        assert!(client.pop().is_some());
+    }
+
+    fn review_only_hello_learned(core: &InputMethodCore) {
+        let profile = core.export_personal_profile();
+        assert_eq!(profile.cvm.words, vec!["hello"]);
+        assert!(profile.markov_bigrams.is_empty());
+        assert!(profile.markov_trigrams.is_empty());
+        assert!(profile.confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn sentence_boundary_review_escape_cancels_local_prefix_not_client_boundary() {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text: false,
+            lang_detection: false,
+            ..InputConfig::default()
+        });
+        for word in ["hello", "world"] {
+            core.load_word_lang(word, 1_000, LangId::En);
+        }
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 1);
+        let actions = key(&mut core, Key::RawCode(17));
+        assert!(actions.iter().any(|a| matches!(a, Action::ShowComposing { typed, ghost } if typed == "w" && ghost.is_empty())));
+        assert!(!core.has_ghost());
+        let cancelled = key(&mut core, Key::Escape);
+        assert!(matches!(cancelled.as_slice(), [Action::HideGhost]));
+        assert!(core.current_word().is_empty());
+        assert_eq!(client, "hello. ");
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_review_empty_tab_confirms_forwarded_terminator() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 0);
+        let actions = key(&mut core, Key::Tab);
+        assert!(matches!(actions.as_slice(), [Action::ForwardKey]));
+        project(&mut client, &actions, Some('\t'));
+        assert_eq!(client, "hello.\t");
+        assert!(core.current_word().is_empty());
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_review_trimming_extra_space_retains_known_separator() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 2);
+        review_forwarded_backspace(&mut core, &mut client);
+        assert_eq!(client, "hello. ");
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_review_last_space_delete_and_reinsert_restores_hint() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 1);
+        review_forwarded_backspace(&mut core, &mut client);
+        assert_eq!(client, "hello.");
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        assert_eq!(client, "hello. ");
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "World");
+    }
+
+    #[test]
+    fn sentence_boundary_review_repeated_separator_and_punctuation_deletions() {
+        // Exercise every arm even on RED; only capitalize with a surviving or
+        // reinserted separator after a terminator the model still tracks.
+        let mut mismatches = Vec::new();
+        for (spaces, deleted, reinsert, expected) in [
+            (3, 1, false, "World"),
+            (3, 2, false, "World"),
+            (3, 3, false, "world"),
+            (3, 3, true, "World"),
+            (3, 4, false, "world"),
+            (3, 4, true, "world"),
+        ] {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, spaces);
+            for _ in 0..deleted {
+                review_forwarded_backspace(&mut core, &mut client);
+            }
+            if reinsert {
+                project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            }
+            review_only_hello_learned(&core);
+            let actual = prediction(&mut core);
+            eprintln!("separator spaces={spaces} deleted={deleted} reinsert={reinsert} client={client:?} prediction={actual}");
+            if actual != expected {
+                mismatches.push((spaces, deleted, reinsert, actual, expected));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_review_opaque_tab_return_then_backspace_withdraws_hint() {
+        for (spaces, boundary, extra_space) in [
+            (0, Key::Tab, false),
+            (0, Key::Tab, true),
+            (1, Key::Tab, false),
+            (1, Key::Tab, true),
+            (0, Key::Return, false),
+            (1, Key::Return, true),
+        ] {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, spaces);
+            let glyph = if boundary == Key::Tab { '\t' } else { '\n' };
+            let actions = key(&mut core, boundary);
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::ForwardKey))
+                    .count(),
+                1
+            );
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+            project(&mut client, &actions, Some(glyph));
+            if extra_space {
+                project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            }
+            review_forwarded_backspace(&mut core, &mut client);
+            review_only_hello_learned(&core);
+            assert_eq!(prediction(&mut core), "world", "opaque client {client:?}");
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_review_space_release_cannot_inflate_separator_count() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 1);
+        let actions = core.handle_key(KeyEvent {
+            key: Key::Space,
+            modifiers: Modifiers::RELEASE,
+        });
+        assert!(matches!(actions.as_slice(), [Action::ForwardKey]));
+        // A release does not insert its key glyph into the client projection.
+        review_forwarded_backspace(&mut core, &mut client);
+        assert_eq!(client, "hello.");
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "world");
+    }
+
+    #[test]
+    fn sentence_boundary_review_forwarded_word_backspace_withdraws_hint() {
+        for handed_off in [false, true] {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 2);
+            if handed_off {
+                raw(&mut core, &[17]);
+            }
+            let actions = key(&mut core, Key::Char('a'));
+            project(&mut client, &actions, Some('a'));
+            assert_eq!(core.current_word(), if handed_off { "wa" } else { "a" });
+            assert_eq!(
+                client,
+                if handed_off {
+                    "hello.  wa"
+                } else {
+                    "hello.  a"
+                }
+            );
+            review_forwarded_backspace(&mut core, &mut client);
+            review_only_hello_learned(&core);
+            if handed_off {
+                assert_eq!(core.current_word(), "w");
+                assert_eq!(core.predictions()[0].word, "world");
+                assert_eq!(client, "hello.  w");
+            } else {
+                assert!(core.current_word().is_empty());
+                assert_eq!(prediction(&mut core), "world");
+                assert_eq!(client, "hello.  ");
+            }
+        }
+    }
+
+    const REVIEW_CLOSERS: &[char] = &[
+        '"', '\'', ')', ']', '}', '‘', '’', '“', '”', '«', '»', '‹', '›',
+    ];
+
+    fn tail_event(core: &mut InputMethodCore, event: KeyEvent, glyph: char, post: bool) -> bool {
+        let mut client = String::new();
+        raw(core, HELLO);
+        project(&mut client, &key(core, Key::RawCode(52)), Some('.'));
+        let tail = core.handle_key(event);
+        let tail_word = core.current_word().to_string();
+        project(&mut client, &tail, Some(glyph));
+        project(&mut client, &key(core, Key::Space), Some(' '));
+        if post {
+            raw(core, WORLD);
+            project(&mut client, &key(core, Key::Space), Some(' '));
+            let expected = format!("Hello.{glyph} World ");
+            eprintln!("tail={glyph:?} tailword={tail_word:?} actions={tail:?} client={client:?}");
+            // Snapshot words follow HashMap iteration, not commit order.
+            let mut learned = core.export_personal_profile().cvm.words;
+            learned.sort();
+            eprintln!("sorted learned words={learned:?}");
+            client == expected
+                && tail_word.is_empty()
+                && tail == vec![Action::ForwardKey]
+                && learned == vec!["hello", "world"]
+        } else {
+            let top = prediction(core);
+            eprintln!("tail={glyph:?} tailword={tail_word:?} actions={tail:?} prediction={top} client={client:?}");
+            let profile = core.export_personal_profile();
+            top == "World"
+                && tail_word.is_empty()
+                && tail == vec![Action::ForwardKey]
+                && profile.cvm.words == vec!["hello"]
+                && profile.markov_bigrams.is_empty()
+                && profile.markov_trigrams.is_empty()
+                && profile.confirmed_words.is_empty()
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_tail_semantic_closers_keep_pending_without_tokens() {
+        let mut failed = Vec::new();
+        for &ch in REVIEW_CLOSERS {
+            let mut core = fresh(false);
+            if !tail_event(
+                &mut core,
+                KeyEvent {
+                    key: Key::Char(ch),
+                    modifiers: Modifiers::empty(),
+                },
+                ch,
+                false,
+            ) {
+                failed.push(ch);
+            }
+        }
+        assert!(failed.is_empty(), "semantic tails: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_tail_shared_raw_closers_keep_pending_without_tokens() {
+        let mut failed = Vec::new();
+        for (code, modifiers, glyph) in [
+            (40, Modifiers::empty(), '\''),
+            (40, Modifiers::SHIFT, '"'),
+            (11, Modifiers::SHIFT, ')'),
+        ] {
+            assert_eq!(
+                keymap::scancode_to_both_with_caps(
+                    code,
+                    modifiers.contains(Modifiers::SHIFT),
+                    false
+                ),
+                Some((glyph, glyph))
+            );
+            let mut core = fresh(false);
+            if !tail_event(
+                &mut core,
+                KeyEvent {
+                    key: Key::RawCode(code),
+                    modifiers,
+                },
+                glyph,
+                false,
+            ) {
+                failed.push(glyph);
+            }
+        }
+        assert!(failed.is_empty(), "shared raw tails: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_tail_preserves_owned_postcommit_caps() {
+        let mut failed = Vec::new();
+        for (key, modifiers, glyph) in [
+            (Key::Char('”'), Modifiers::empty(), '”'),
+            (Key::RawCode(40), Modifiers::SHIFT, '"'),
+        ] {
+            let mut core = fresh(true);
+            if !tail_event(&mut core, KeyEvent { key, modifiers }, glyph, true) {
+                failed.push(glyph);
+            }
+        }
+        assert!(failed.is_empty(), "postcommit tails: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_tail_repeated_terminators_do_not_create_tokens() {
+        let mut core = fresh(false);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 0);
+        let mut clean = true;
+        for (key, modifiers, glyph) in [
+            (Key::RawCode(52), Modifiers::empty(), '.'),
+            (Key::RawCode(2), Modifiers::SHIFT, '!'),
+            (Key::RawCode(53), Modifiers::SHIFT, '?'),
+            (Key::Char('”'), Modifiers::empty(), '”'),
+        ] {
+            let a = core.handle_key(KeyEvent { key, modifiers });
+            clean &= a == vec![Action::ForwardKey] && core.current_word().is_empty();
+            project(&mut client, &a, Some(glyph));
+        }
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        assert_eq!(client, "hello..!?” ");
+        let top = prediction(&mut core);
+        eprintln!("repeated tails prediction={top} clean={clean}");
+        assert!(clean && top == "World");
+        review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_tail_adjacent_word_or_digit_withdraws_pending() {
+        let mut failed = Vec::new();
+        for digit in [false, true] {
+            let mut core = fresh(false);
+            raw(&mut core, HELLO);
+            key(&mut core, Key::RawCode(52));
+            key(&mut core, Key::Char('"'));
+            if digit {
+                key(&mut core, Key::RawCode(2));
+                key(&mut core, Key::Space);
+            }
+            key(&mut core, Key::RawCode(17));
+            let actual = core.predictions().first().map(|p| p.word.clone());
+            eprintln!(
+                "adjacent digit={digit} word={:?} prediction={actual:?}",
+                core.current_word()
+            );
+            if actual.as_deref() != Some("world") {
+                failed.push(digit);
+            }
+        }
+        assert!(failed.is_empty(), "adjacent controls: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_tail_ambiguous_raw_bracket_keeps_bg_composition() {
+        for modifiers in [Modifiers::empty(), Modifiers::SHIFT] {
+            let mut core = fresh(false);
+            core.load_word_lang("щука", 1_000_000, LangId::Bg);
+            raw(&mut core, HELLO);
+            key(&mut core, Key::RawCode(52));
+            let a = core.handle_key(KeyEvent {
+                key: Key::RawCode(27),
+                modifiers,
+            });
+            assert!(core.debug_state().0);
+            assert_eq!(
+                core.current_word(),
+                if modifiers.is_empty() { "щ" } else { "Щ" }
+            );
+            assert!(a.iter().any(|a| matches!(a, Action::ShowComposing { .. })));
+            assert!(!a.iter().any(|a| matches!(
+                a,
+                Action::ForwardKey | Action::CommitText(_) | Action::ReplaceWord { .. }
+            )));
+            review_only_hello_learned(&core);
+        }
+    }
+
+    fn unknown_withdraws(event: KeyEvent) {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        let before = core.detected_language();
+        let a = core.handle_key(event);
+        assert_eq!(a, vec![Action::ForwardKey]);
+        assert!(core.current_word().is_empty());
+        assert_eq!(core.context_words().0, Some("hello"));
+        assert_eq!(core.detected_language().lang, before.lang);
+        assert_eq!(core.detected_language().confidence, before.confidence);
+        // Public refreshed surrounding context after the forwarded operation.
+        core.apply_hints(&crate::master_loop::Hints {
+            context_words: vec!["seed".into()],
+            ..Default::default()
+        });
+        review_only_hello_learned(&core);
+        assert_eq!(prediction(&mut core), "world");
+    }
+
+    #[test]
+    fn sentence_boundary_unknown_shift_insert_raw_withdraws_hint() {
+        unknown_withdraws(KeyEvent {
+            key: Key::RawCode(110),
+            modifiers: Modifiers::SHIFT,
+        });
+    }
+
+    #[test]
+    fn sentence_boundary_unknown_shift_insert_keysym_withdraws_hint() {
+        unknown_withdraws(KeyEvent {
+            key: Key::Other(0xff63),
+            modifiers: Modifiers::SHIFT,
+        });
+    }
+
+    #[test]
+    fn sentence_boundary_unknown_keys_preserve_word_detector_and_context() {
+        let mut failed = Vec::new();
+        for key_id in [Key::Other(0xffbe), Key::RawCode(u16::MAX)] {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            raw(&mut core, &[17]);
+            let before = core.detected_language();
+            let a = key(&mut core, key_id.clone());
+            assert_eq!(a, vec![Action::ForwardKey]);
+            assert_eq!(core.current_word(), "w");
+            assert!(core.debug_state().0);
+            assert_eq!(core.context_words().0, Some("hello"));
+            assert_eq!(core.detected_language().lang, before.lang);
+            assert_eq!(core.detected_language().confidence, before.confidence);
+            raw(&mut core, &[24]);
+            if core.predictions()[0].word != "world" {
+                failed.push(key_id);
+            }
+            review_only_hello_learned(&core);
+        }
+        assert!(failed.is_empty(), "unknown forwarded keys: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_pure_modifier_identity_preserves_pending_and_confirmed() {
+        let mut failed = Vec::new();
+        for key_id in [
+            Key::RawCode(42),
+            Key::RawCode(54),
+            Key::RawCode(58),
+            Key::Other(0xffe1),
+            Key::Other(0xffe2),
+            Key::Other(0xffe5),
+        ] {
+            for confirmed in [false, true] {
+                for modifiers in [Modifiers::empty(), Modifiers::SHIFT] {
+                    let mut core = fresh(false);
+                    let mut client = String::new();
+                    review_dot(&mut core, &mut client, usize::from(confirmed));
+                    assert_eq!(
+                        core.handle_key(KeyEvent {
+                            key: key_id.clone(),
+                            modifiers
+                        }),
+                        vec![Action::ForwardKey]
+                    );
+                    if !confirmed {
+                        key(&mut core, Key::Space);
+                    }
+                    let actual = prediction(&mut core);
+                    if actual != "World" {
+                        failed.push((key_id.clone(), confirmed, modifiers, actual));
+                    }
+                    review_only_hello_learned(&core);
+                }
+            }
+        }
+        assert!(failed.is_empty(), "pure modifier controls: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_unknown_key_releases_preserve_pending_hint() {
+        for key_id in [
+            Key::RawCode(110),
+            Key::Other(0xff63),
+            Key::RawCode(42),
+            Key::Other(0xffe1),
+        ] {
+            let mut core = fresh(false);
+            raw(&mut core, HELLO);
+            key(&mut core, Key::RawCode(52));
+            assert_eq!(
+                core.handle_key(KeyEvent {
+                    key: key_id,
+                    modifiers: Modifiers::SHIFT | Modifiers::RELEASE
+                }),
+                vec![Action::ForwardKey]
+            );
+            key(&mut core, Key::Space);
+            assert_eq!(prediction(&mut core), "World");
+            review_only_hello_learned(&core);
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_stored_semantic_quote_context_prediction_caps() {
+        let mut failed = Vec::new();
+        for quote in ['"', '”', '“'] {
+            let mut core = fresh(false);
+            let stored = format!("hello.{quote}");
+            for ch in stored.chars() {
+                key(&mut core, Key::Char(ch));
+            }
+            key(&mut core, Key::Space);
+            assert_eq!(core.context_words().0, Some(stored.as_str()));
+            assert_eq!(core.export_personal_profile().cvm.words, vec![stored]);
+            let actual = prediction(&mut core);
+            eprintln!("stored quote={quote:?} prediction={actual}");
+            if actual != "World" {
+                failed.push(quote);
+            }
+        }
+        assert!(failed.is_empty(), "stored semantic context: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_stored_semantic_quote_context_owned_postcommit_caps() {
+        for quote in ['"', '”'] {
+            let mut core = fresh(true);
+            let mut client = String::new();
+            for ch in format!("hello.{quote}").chars() {
+                project(&mut client, &key(&mut core, Key::Char(ch)), Some(ch));
+            }
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            raw(&mut core, WORLD);
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            assert_eq!(client, format!("Hello.{quote} World "));
+        }
+    }
+
+    fn deletion_tail(core: &mut InputMethodCore, client: &mut String, shared_raw: bool) {
+        for (key, modifiers, glyph) in if shared_raw {
+            vec![
+                (Key::RawCode(40), Modifiers::SHIFT, '"'),
+                (Key::RawCode(11), Modifiers::SHIFT, ')'),
+            ]
+        } else {
+            vec![
+                (Key::Char('”'), Modifiers::empty(), '”'),
+                (Key::Char(')'), Modifiers::empty(), ')'),
+            ]
+        } {
+            let actions = core.handle_key(KeyEvent { key, modifiers });
+            assert_eq!(actions, vec![Action::ForwardKey]);
+            assert!(core.current_word().is_empty());
+            project(client, &actions, Some(glyph));
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_preserves_surviving_terminator() {
+        let mut failed = Vec::new();
+        for shared_raw in [false, true] {
+            for (deleted, expected) in [(1, "World"), (2, "World"), (3, "world")] {
+                let mut core = fresh(false);
+                let mut client = String::new();
+                review_dot(&mut core, &mut client, 0);
+                deletion_tail(&mut core, &mut client, shared_raw);
+                for _ in 0..deleted {
+                    review_forwarded_backspace(&mut core, &mut client);
+                }
+                project(&mut client, &key(&mut core, Key::Space), Some(' '));
+                let actual = prediction(&mut core);
+                eprintln!("closer sharedraw={shared_raw} deleted={deleted} client={client:?} prediction={actual}");
+                if actual != expected {
+                    failed.push((shared_raw, deleted, actual, expected));
+                }
+                review_only_hello_learned(&core);
+            }
+        }
+        assert!(failed.is_empty(), "closer deletion: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_after_spaces_retains_full_tail() {
+        let mut failed = Vec::new();
+        for deleted in 1..=5 {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            deletion_tail(&mut core, &mut client, false);
+            for _ in 0..2 {
+                project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            }
+            for _ in 0..deleted {
+                review_forwarded_backspace(&mut core, &mut client);
+            }
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            let expected = if deleted == 5 { "world" } else { "World" };
+            let actual = prediction(&mut core);
+            eprintln!("closer spaces deleted={deleted} client={client:?} prediction={actual}");
+            if actual != expected {
+                failed.push((deleted, actual, expected));
+            }
+            review_only_hello_learned(&core);
+        }
+        assert!(failed.is_empty(), "spaced closer deletion: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_repeated_terminators_are_counted() {
+        let mut failed = Vec::new();
+        for deleted in 1..=4 {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            for ch in ['!', '?', '”'] {
+                let actions = key(&mut core, Key::Char(ch));
+                assert_eq!(actions, vec![Action::ForwardKey]);
+                project(&mut client, &actions, Some(ch));
+            }
+            for _ in 0..deleted {
+                review_forwarded_backspace(&mut core, &mut client);
+            }
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            let expected = if deleted == 4 { "world" } else { "World" };
+            let actual = prediction(&mut core);
+            if actual != expected {
+                failed.push((deleted, client, actual, expected));
+            }
+            review_only_hello_learned(&core);
+        }
+        assert!(
+            failed.is_empty(),
+            "repeated terminator deletion: {failed:?}"
+        );
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_preserves_owned_postcommit_caps() {
+        let mut core = fresh(true);
+        let mut client = String::new();
+        raw(&mut core, HELLO);
+        project(&mut client, &key(&mut core, Key::RawCode(52)), Some('.'));
+        deletion_tail(&mut core, &mut client, false);
+        review_forwarded_backspace(&mut core, &mut client);
+        review_forwarded_backspace(&mut core, &mut client);
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        raw(&mut core, WORLD);
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        assert_eq!(client, "Hello. World ");
+        let profile = core.export_personal_profile();
+        let mut words = profile.cvm.words;
+        words.sort();
+        assert_eq!(words, vec!["hello", "world"]);
+        assert_eq!(
+            profile.markov_bigrams,
+            vec![("hello".into(), "world".into(), 1)]
+        );
+        assert!(profile.markov_trigrams.is_empty());
+        assert!(profile.confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_local_backspace_escape_preserve_payload() {
+        let mut failed = Vec::new();
+        for escape in [false, true] {
+            let mut core = InputMethodCore::new(InputConfig {
+                ghost_text: false,
+                lang_detection: false,
+                ..InputConfig::default()
+            });
+            for word in ["hello", "world"] {
+                core.load_word_lang(word, 1_000, LangId::En);
+            }
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            deletion_tail(&mut core, &mut client, false);
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            let typing = key(&mut core, Key::RawCode(17));
+            assert!(typing.iter().any(|a| matches!(a, Action::ShowComposing { typed, ghost } if typed == "w" && ghost.is_empty())));
+            let local = key(&mut core, if escape { Key::Escape } else { Key::Backspace });
+            assert_eq!(local, vec![Action::HideGhost]);
+            assert!(core.current_word().is_empty());
+            assert_eq!(client, "hello.”) ");
+            // Remove the known Space and both closers, leaving the terminator.
+            for _ in 0..3 {
+                review_forwarded_backspace(&mut core, &mut client);
+            }
+            assert_eq!(client, "hello.");
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            let actual = prediction(&mut core);
+            if actual != "World" {
+                failed.push((escape, actual));
+            }
+            review_only_hello_learned(&core);
+        }
+        assert!(failed.is_empty(), "local cancellation payload: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_unknown_navigation_focus_withdraw() {
+        for invalidation in 0..4 {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            deletion_tail(&mut core, &mut client, false);
+            match invalidation {
+                0 => assert_eq!(key(&mut core, Key::Other(0xff63)), vec![Action::ForwardKey]),
+                1 => {
+                    key(&mut core, Key::Left);
+                }
+                2 => core.focus_gained(),
+                _ => {
+                    core.focus_lost();
+                }
+            }
+            // An actual surrounding-context producer may refresh after the
+            // operation. This is not a claimed observation of our projection.
+            core.apply_hints(&crate::master_loop::Hints {
+                context_words: vec!["seed".into()],
+                ..Default::default()
+            });
+            review_forwarded_backspace(&mut core, &mut client);
+            project(&mut client, &key(&mut core, Key::Space), Some(' '));
+            assert_eq!(
+                prediction(&mut core),
+                "world",
+                "invalidation={invalidation}"
+            );
+            review_only_hello_learned(&core);
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_closer_deletion_ambiguous_raw_is_not_a_literal_tail() {
+        let mut core = fresh(false);
+        core.load_word_lang("щука", 1_000_000, LangId::Bg);
+        let mut client = String::new();
+        review_dot(&mut core, &mut client, 0);
+        deletion_tail(&mut core, &mut client, false);
+        let composing = key(&mut core, Key::RawCode(27));
+        assert_eq!(core.current_word(), "щ");
+        assert!(composing
+            .iter()
+            .any(|a| matches!(a, Action::ShowComposing { .. })));
+        assert!(!composing.iter().any(|a| matches!(
+            a,
+            Action::ForwardKey | Action::CommitText(_) | Action::ReplaceWord { .. }
+        )));
+        assert_eq!(key(&mut core, Key::Backspace), vec![Action::HideGhost]);
+        project(&mut client, &key(&mut core, Key::Space), Some(' '));
+        assert_eq!(client, "hello.”) ");
+        assert_eq!(prediction(&mut core), "world");
+        review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_all_identities_preserve_pending_and_confirmed() {
+        let mut identities = vec![
+            (Key::RawCode(29), Modifiers::CTRL),
+            (Key::RawCode(97), Modifiers::CTRL),
+            (Key::RawCode(56), Modifiers::ALT),
+            (Key::RawCode(100), Modifiers::ALT),
+            (Key::RawCode(125), Modifiers::SUPER),
+            (Key::RawCode(126), Modifiers::SUPER),
+        ];
+        identities.extend((0xffe1..=0xffee).map(|code| {
+            let held = match code {
+                0xffe1 | 0xffe2 => Modifiers::SHIFT,
+                0xffe3 | 0xffe4 => Modifiers::CTRL,
+                0xffe5 | 0xffe6 => Modifiers::CAPS_LOCK,
+                0xffe9 | 0xffea => Modifiers::ALT,
+                _ => Modifiers::SUPER,
+            };
+            (Key::Other(code), held)
+        }));
+        let mut failed = Vec::new();
+        for (identity, held) in identities {
+            for confirmed in [false, true] {
+                for modifiers in [Modifiers::empty(), held] {
+                    let mut core = fresh(false);
+                    let mut client = String::new();
+                    review_dot(&mut core, &mut client, usize::from(confirmed));
+                    let before = core.detected_language();
+                    let press = core.handle_key(KeyEvent {
+                        key: identity.clone(),
+                        modifiers,
+                    });
+                    let release = core.handle_key(KeyEvent {
+                        key: identity.clone(),
+                        modifiers: modifiers | Modifiers::RELEASE,
+                    });
+                    assert_eq!(press, vec![Action::ForwardKey]);
+                    assert_eq!(release, vec![Action::ForwardKey]);
+                    assert!(core.current_word().is_empty());
+                    assert_eq!(core.context_words().0, Some("hello"));
+                    assert_eq!(core.detected_language().lang, before.lang);
+                    assert_eq!(core.detected_language().confidence, before.confidence);
+                    if !confirmed {
+                        key(&mut core, Key::Space);
+                    }
+                    let actual = prediction(&mut core);
+                    if actual != "World" {
+                        failed.push((identity.clone(), confirmed, modifiers, actual));
+                    }
+                    review_only_hello_learned(&core);
+                }
+            }
+        }
+        assert!(failed.is_empty(), "modifier-only presses: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_actual_shortcuts_and_unknown_keys_withdraw() {
+        for (identity, modifiers) in [
+            (Key::RawCode(47), Modifiers::CTRL), // Ctrl+V, not Control itself.
+            (Key::Char('a'), Modifiers::ALT),
+            (Key::Other(0xffe0), Modifiers::empty()),
+            (Key::Other(0xffef), Modifiers::empty()),
+            (Key::RawCode(110), Modifiers::SHIFT),
+        ] {
+            for confirmed in [false, true] {
+                let mut core = fresh(false);
+                let mut client = String::new();
+                review_dot(&mut core, &mut client, usize::from(confirmed));
+                let before = core.detected_language();
+                assert_eq!(
+                    core.handle_key(KeyEvent {
+                        key: identity.clone(),
+                        modifiers,
+                    }),
+                    vec![Action::ForwardKey]
+                );
+                assert!(core.current_word().is_empty());
+                assert_eq!(core.context_words().0, Some("hello"));
+                assert_eq!(core.detected_language().lang, before.lang);
+                assert_eq!(core.detected_language().confidence, before.confidence);
+                key(&mut core, Key::Space);
+                assert_eq!(prediction(&mut core), "world", "{identity:?}");
+                review_only_hello_learned(&core);
+            }
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_releases_preserve_hint_and_enabled_state() {
+        for (identity, held) in [
+            (Key::RawCode(29), Modifiers::CTRL),
+            (Key::Other(0xffe9), Modifiers::ALT),
+            (Key::Char('v'), Modifiers::CTRL),
+            (Key::Escape, Modifiers::SUPER),
+        ] {
+            let mut core = fresh(false);
+            let mut client = String::new();
+            review_dot(&mut core, &mut client, 0);
+            assert_eq!(
+                core.handle_key(KeyEvent {
+                    key: identity,
+                    modifiers: held | Modifiers::RELEASE,
+                }),
+                vec![Action::ForwardKey]
+            );
+            assert!(core.is_enabled());
+            key(&mut core, Key::Space);
+            assert_eq!(prediction(&mut core), "World");
+            review_only_hello_learned(&core);
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_modifier_super_escape_kill_switch_still_precedes_guard() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        let kill = KeyEvent {
+            key: Key::Escape,
+            modifiers: Modifiers::SUPER,
+        };
+        assert_eq!(core.handle_key(kill.clone()), vec![Action::HideGhost]);
+        assert!(!core.is_enabled());
+        assert_eq!(
+            core.handle_key(KeyEvent {
+                key: Key::Escape,
+                modifiers: Modifiers::SUPER | Modifiers::RELEASE,
+            }),
+            vec![Action::ForwardKey]
+        );
+        assert!(!core.is_enabled());
+        assert_eq!(
+            core.handle_key(KeyEvent {
+                key: Key::RawCode(125),
+                modifiers: Modifiers::SUPER,
+            }),
+            vec![Action::ForwardKey]
+        );
+        assert!(!core.is_enabled());
+        assert_eq!(core.handle_key(kill), vec![Action::HideGhost]);
+        assert!(core.is_enabled());
+        review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_reconciled_veto_keeps_explicit_uppercase_prefix() {
+        let mut core = fresh(false);
+        sentence(&mut core);
+        core.withdraw_sentence_boundary_hint();
+        let actions = core.handle_key(KeyEvent {
+            key: Key::RawCode(17),
+            modifiers: Modifiers::SHIFT,
+        });
+        assert_eq!(core.current_word(), "W");
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ShowComposing { typed, .. } if typed == "W")));
+        assert_eq!(core.predictions()[0].word, "World");
+        review_only_hello_learned(&core);
+    }
+
+    #[test]
+    fn sentence_boundary_reconciled_veto_keeps_registered_proper_noun() {
+        let mut core = fresh(true);
+        let dir = std::env::temp_dir().join(format!(
+            "smartkey-sentence-reconciliation-noun-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let corpus = dir.join("proper.json");
+        std::fs::write(
+            &corpus,
+            r#"{"unigrams":{"london":1000},"proper_nouns":["London"]}"#,
+        )
+        .unwrap();
+        core.load_corpus_file(&corpus).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        sentence(&mut core);
+        core.withdraw_sentence_boundary_hint();
+        raw(&mut core, &[38]);
+        assert_eq!(core.current_word(), "l");
+        assert_eq!(core.predictions()[0].word, "London");
+        raw(&mut core, &[24, 49, 32, 24, 49]);
+        assert_eq!(core.current_word(), "london");
+        review_only_hello_learned(&core);
+        let actions = key(&mut core, Key::Space);
+        assert_eq!(
+            actions,
+            vec![
+                Action::HideGhost,
+                Action::CommitText("london".into()),
+                Action::ForwardKey,
+                Action::ReplaceWord {
+                    replace_len: 6,
+                    text: "London".into(),
+                },
+            ]
+        );
+        assert!(core.current_word().is_empty());
+        let profile = core.export_personal_profile();
+        let mut learned = profile.cvm.words;
+        learned.sort();
+        assert_eq!(learned, vec!["hello", "london"]);
+        assert_eq!(
+            profile.markov_bigrams,
+            vec![("hello".into(), "london".into(), 1)]
+        );
+        assert!(profile.markov_trigrams.is_empty());
+        assert!(profile.confirmed_words.is_empty());
+    }
+
+    #[test]
+    fn sentence_boundary_reconciled_positive_withdrawal_keeps_false_floor() {
+        for event in [
+            None,
+            Some(KeyEvent {
+                key: Key::Other(0xff63),
+                modifiers: Modifiers::SHIFT,
+            }),
+            Some(KeyEvent {
+                key: Key::RawCode(47),
+                modifiers: Modifiers::CTRL,
+            }),
+            Some(KeyEvent {
+                key: Key::RawCode(u16::MAX),
+                modifiers: Modifiers::empty(),
+            }),
+            Some(KeyEvent {
+                key: Key::Backspace,
+                modifiers: Modifiers::empty(),
+            }),
+        ] {
+            let mut core = fresh(false);
+            sentence(&mut core);
+            // This stale lexical hint is independently overridden by the
+            // current-position decision, including after its positive expires.
+            core.apply_hints(&crate::master_loop::Hints {
+                context_words: vec!["hello.".into()],
+                ..Default::default()
+            });
+            core.reconcile_sentence_boundary_hint("hello. seed. ");
+            let expected = if let Some(event) = event {
+                let actions = core.handle_key(event);
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|a| matches!(a, Action::ForwardKey))
+                        .count(),
+                    1
+                );
+                assert!(!actions
+                    .iter()
+                    .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })));
+                assert!(core.current_word().is_empty());
+                "world"
+            } else {
+                "World"
+            };
+            assert_eq!(prediction(&mut core), expected);
+            review_only_hello_learned(&core);
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_handoff_tests {
+    use super::*;
+
+    fn press(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn raw(core: &mut InputMethodCore, text: &str) {
+        for ch in text.chars() {
+            let code = (2..=53)
+                .find(|code| {
+                    keymap::scancode_to_both(*code, false).is_some_and(|pair| pair.0 == ch)
+                })
+                .unwrap();
+            core.handle_key(press(Key::RawCode(code)));
+        }
+    }
+
+    fn seeded_core() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig {
+            ghost_text_separation_margin: 0.0,
+            ..InputConfig::default()
+        });
+        core.load_word_lang("hello", 1_000_000, LangId::En);
+        // Real committed history populates CVM, Markov (including higher
+        // n-grams), OOV vocabulary and session cache before the handoff.
+        for word in ["one", "two", "three", "four", "five"] {
+            for ch in word.chars() {
+                core.handle_key(press(Key::Char(ch)));
+            }
+            core.handle_key(press(Key::Space));
+        }
+        core
+    }
+
+    fn metrics(core: &InputMethodCore) -> serde_json::Value {
+        serde_json::to_value(core.metrics().summary()).unwrap()
+    }
+
+    #[test]
+    fn layout_handoff_delivers_only_owned_prefix_without_learning_any_word() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        assert_eq!(core.current_word(), "hel");
+        assert_eq!(core.ghost_text(), "lo");
+        let learned = core.engine.learned_state_for_test();
+        let metrics = metrics(&core);
+        assert_eq!(
+            core.flush_preedit_for_layout(),
+            [Action::CommitText("hel".into()), Action::HideGhost]
+        );
+        assert_eq!(
+            core.engine.learned_state_for_test(),
+            learned,
+            "delivery alone must not train profile, session, n-grams or OOV words"
+        );
+        assert_eq!(self::metrics(&core), metrics);
+        assert!(core.current_word().is_empty() && !core.has_ghost());
+        assert!(core.predictions().is_empty());
+        assert_eq!(core.context_words(), (None, None));
+        assert!(core.take_commit_learning().words.is_empty());
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+        assert_eq!(core.engine.learned_state_for_test(), learned);
+        core.handle_key(press(Key::Space));
+        assert_eq!(
+            core.engine.learned_state_for_test(),
+            learned,
+            "next empty boundary must not lazily learn the flushed prefix"
+        );
+    }
+
+    #[test]
+    fn native_handoff_refinement_and_abandon_preserve_all_learned_state() {
+        for boundary in 0..4 {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(
+                core.handoff_preedit_for_native_completion(),
+                [Action::HideGhost, Action::CommitText("hel".into())]
+            );
+            assert!(core.apply_prediction_override("hello").is_none());
+            assert_eq!(
+                core.handle_key(press(Key::RawCode(38))),
+                [Action::CommitText("l".into()), Action::HideGhost]
+            );
+            assert_eq!(core.current_word(), "hell");
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            match boundary {
+                0 => assert_eq!(core.reset(), [Action::HideGhost]),
+                1 => assert_eq!(core.focus_lost(), [Action::HideGhost]),
+                2 => core.focus_gained(),
+                _ => assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]),
+            }
+            assert!(core.current_word().is_empty());
+            assert!(core.take_commit_learning().words.is_empty());
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+        }
+    }
+
+    #[test]
+    fn delivery_handoff_keeps_the_word_open_in_its_script_and_never_retypes_it() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        assert_eq!(
+            core.handoff_preedit_for_delivery(),
+            [Action::HideGhost, Action::CommitText("hel".into())]
+        );
+        assert!(!core.native_completion_owned());
+        assert!(
+            !core.debug_state().0,
+            "the dual buffer is gone: the script is fixed"
+        );
+        let appended = core.handle_key(press(Key::RawCode(38)));
+        assert_eq!(appended.first(), Some(&Action::CommitText("l".into())));
+        assert_eq!(core.current_word(), "hell");
+        core.focus_gained();
+        assert_eq!(
+            core.current_word(),
+            "hell",
+            "focus-in keeps a delivered word"
+        );
+        let boundary = core.handle_key(press(Key::Space));
+        assert!(
+            !boundary
+                .iter()
+                .any(|a| matches!(a, Action::CommitText(_) | Action::ReplaceWord { .. })),
+            "the delivered word is never typed again: {boundary:?}"
+        );
+        assert!(core.current_word().is_empty());
+    }
+
+    #[test]
+    fn delivery_handoff_backspace_is_forwarded_and_removes_one_letter() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        core.handoff_preedit_for_delivery();
+        assert_eq!(
+            core.handle_key(press(Key::Backspace)).last(),
+            Some(&Action::ForwardKey)
+        );
+        assert_eq!(core.current_word(), "he");
+    }
+
+    #[test]
+    fn delivery_handoff_without_a_composing_word_only_hides_the_ghost() {
+        let mut core = seeded_core();
+        assert_eq!(core.handoff_preedit_for_delivery(), [Action::HideGhost]);
+        assert!(core.current_word().is_empty());
+    }
+
+    #[test]
+    fn native_handoff_punctuation_and_digits_retire_the_unobserved_client_outcome() {
+        for delimiter in [
+            Key::Char('.'),
+            Key::RawCode(52),
+            Key::Char('1'),
+            Key::RawCode(2),
+        ] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let before = core.metrics().summary().total_commits;
+            let actions = core.handle_key(press(delimiter));
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert!(core.current_word().is_empty());
+            assert!(!core.native_completion_owned());
+            // Forwarding may replace the prefix with a native candidate; the
+            // old immediate +1 trained an outcome the client had not produced.
+            assert_eq!(core.metrics().summary().total_commits, before);
+            let actions = core.handle_key(press(Key::RawCode(35)));
+            assert!(core.debug_state().0);
+            assert!(actions
+                .iter()
+                .any(|action| matches!(action, Action::ShowComposing { .. })));
+            assert!(!actions
+                .iter()
+                .any(|action| matches!(action, Action::CommitText(_))));
+        }
+    }
+
+    #[test]
+    fn native_popup_printable_commit_characters_preserve_all_learned_state() {
+        for event in [
+            press(Key::Char('(')),
+            press(Key::Char('.')),
+            press(Key::Char('1')),
+            press(Key::Char('_')),
+            press(Key::RawCode(52)),
+            press(Key::RawCode(2)),
+            press(Key::RawCode(26)),
+            KeyEvent {
+                key: Key::RawCode(10),
+                modifiers: Modifiers::SHIFT,
+            },
+        ] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            let actions = core.handle_key(event.clone());
+            assert_eq!(core.engine.learned_state_for_test(), learned, "{event:?}");
+            assert_eq!(self::metrics(&core), metrics, "{event:?}");
+            assert!(core.take_commit_learning().words.is_empty(), "{event:?}");
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert!(core.current_word().is_empty());
+            assert!(!core.native_completion_owned());
+            core.handle_key(press(Key::Space));
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+        }
+    }
+
+    #[test]
+    fn native_popup_space_preserves_all_learned_state() {
+        for key in [Key::Space, Key::RawCode(57)] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(
+                core.handle_key(press(key)),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+            assert!(core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    fn sentence_boundary_events() -> [(KeyEvent, bool); 8] {
+        [
+            (press(Key::Return), false),
+            (press(Key::RawCode(28)), false),
+            (press(Key::Char('.')), true),
+            (press(Key::Char('!')), true),
+            (press(Key::Char('?')), true),
+            (press(Key::RawCode(52)), true),
+            (
+                KeyEvent {
+                    key: Key::RawCode(2),
+                    modifiers: Modifiers::SHIFT,
+                },
+                true,
+            ),
+            (
+                KeyEvent {
+                    key: Key::RawCode(53),
+                    modifiers: Modifiers::SHIFT,
+                },
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn native_sentence_boundaries_case_next_word_without_learning() {
+        for (event, needs_space) in sentence_boundary_events() {
+            let mut core = seeded_core();
+            core.load_word_lang("world", 1_000_000, LangId::En);
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(
+                core.handle_key(event.clone()),
+                [Action::HideGhost, Action::ForwardKey]
+            );
+            assert!(core.current_word().is_empty());
+            if needs_space {
+                core.handle_key(press(Key::Space));
+            }
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+            assert!(core.take_commit_learning().words.is_empty());
+            core.handle_key(press(Key::RawCode(17)));
+            assert_eq!(
+                core.predictions().first().map(|p| p.word.as_str()),
+                Some("World"),
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_sentence_boundaries_keep_casing_and_one_word_commit() {
+        for (event, needs_space) in sentence_boundary_events() {
+            let mut core = seeded_core();
+            core.load_word_lang("world", 1_000_000, LangId::En);
+            raw(&mut core, "hel");
+            let before = core.metrics().summary().total_commits;
+            let actions = core.handle_key(event.clone());
+            assert!(actions.contains(&Action::CommitText("hel".into())));
+            assert!(actions.contains(&Action::ForwardKey));
+            assert_eq!(core.take_commit_learning().words.len(), 1);
+            if needs_space {
+                core.handle_key(press(Key::Space));
+            }
+            assert_eq!(core.metrics().summary().total_commits, before + 1);
+            core.handle_key(press(Key::RawCode(17)));
+            assert_eq!(
+                core.predictions().first().map(|p| p.word.as_str()),
+                Some("World"),
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonsentence_native_boundaries_and_ordinary_controls_keep_lowercase() {
+        for native in [true, false] {
+            for (key, accepts) in [
+                (Key::Space, false),
+                (Key::RawCode(57), false),
+                (Key::Tab, true),
+                (Key::RawCode(15), true),
+                (Key::Char(','), false),
+                (Key::RawCode(51), false),
+            ] {
+                let mut core = seeded_core();
+                core.load_word_lang("world", 1_000_000, LangId::En);
+                raw(&mut core, "hel");
+                if native {
+                    core.handoff_preedit_for_native_completion();
+                }
+                let learned = core.engine.learned_state_for_test();
+                let before = core.metrics().summary().total_commits;
+                let accepted = core.metrics().summary().accepted_predictions;
+                let actions = core.handle_key(press(key.clone()));
+                if native {
+                    assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+                    assert_eq!(core.engine.learned_state_for_test(), learned);
+                    assert!(core.take_commit_learning().words.is_empty());
+                }
+                assert_eq!(
+                    core.metrics().summary().total_commits,
+                    before + u64::from(!native)
+                );
+                assert_eq!(
+                    core.metrics().summary().accepted_predictions,
+                    accepted + u64::from(!native && accepts)
+                );
+                core.handle_key(press(Key::Space));
+                assert_eq!(
+                    core.metrics().summary().total_commits,
+                    before + u64::from(!native)
+                );
+                core.handle_key(press(Key::RawCode(17)));
+                assert_eq!(
+                    core.predictions().first().map(|p| p.word.as_str()),
+                    Some("world"),
+                    "{key:?}, native={native}"
+                );
+            }
+        }
+    }
+
+    fn legacy_transliterating_core(dual_enabled: bool) -> InputMethodCore {
+        let mut config = InputConfig::default();
+        config.dual_buffer.enabled = dual_enabled;
+        let mut core = InputMethodCore::new(config);
+        core.load_word_lang("здравей", 1_000_000, LangId::Bg);
+        core.handle_key(press(Key::Char('z')));
+        assert!(core
+            .handle_key(press(Key::Char('d')))
+            .contains(&Action::ReplaceWord {
+                replace_len: 1,
+                text: "зд".into(),
+            }));
+        assert_eq!(core.current_word(), "зд");
+        assert!(core.transliteration_active);
+        assert!(core.dual_buffer.is_none());
+        core
+    }
+
+    #[test]
+    fn native_popup_legacy_raw_brackets_retire_when_dual_buffer_disabled() {
+        for code in [26, 27, 41, 43] {
+            for modifiers in [
+                Modifiers::empty(),
+                Modifiers::SHIFT,
+                Modifiers::CAPS_LOCK,
+                Modifiers::SHIFT | Modifiers::CAPS_LOCK,
+            ] {
+                let mut core = legacy_transliterating_core(false);
+                assert_eq!(
+                    core.handoff_preedit_for_native_completion(),
+                    [Action::HideGhost]
+                );
+                let learned = core.engine.learned_state_for_test();
+                let metrics = metrics(&core);
+                let actions = core.handle_key(KeyEvent {
+                    key: Key::RawCode(code),
+                    modifiers,
+                });
+                assert_eq!(core.engine.learned_state_for_test(), learned);
+                assert_eq!(self::metrics(&core), metrics);
+                assert!(core.take_commit_learning().words.is_empty());
+                assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+                assert!(core.current_word().is_empty());
+                assert!(!core.native_completion_owned());
+            }
+        }
+    }
+
+    #[test]
+    fn native_popup_legacy_raw_brackets_refine_when_dual_buffer_enabled() {
+        for (code, lower, upper) in [
+            (26, 'ш', 'Ш'),
+            (27, 'щ', 'Щ'),
+            (41, 'ч', 'Ч'),
+            (43, 'ю', 'Ю'),
+        ] {
+            for (modifiers, glyph) in [
+                (Modifiers::empty(), lower),
+                (Modifiers::SHIFT, upper),
+                (Modifiers::CAPS_LOCK, upper),
+                (Modifiers::SHIFT | Modifiers::CAPS_LOCK, lower),
+            ] {
+                let mut core = legacy_transliterating_core(true);
+                core.handoff_preedit_for_native_completion();
+                let learned = core.engine.learned_state_for_test();
+                let metrics = metrics(&core);
+                let actions = core.handle_key(KeyEvent {
+                    key: Key::RawCode(code),
+                    modifiers,
+                });
+                assert_eq!(
+                    actions,
+                    [Action::CommitText(glyph.into()), Action::HideGhost]
+                );
+                assert_eq!(core.current_word(), format!("зд{glyph}"));
+                assert!(core.native_completion_owned());
+                assert_eq!(core.engine.learned_state_for_test(), learned);
+                assert_eq!(self::metrics(&core), metrics);
+                assert!(core.take_commit_learning().words.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_legacy_raw_brackets_preserve_transliteration_in_both_configurations() {
+        for dual_enabled in [false, true] {
+            for (code, glyph) in [(26, 'ш'), (27, 'щ'), (41, 'ч'), (43, 'ю')] {
+                let mut core = legacy_transliterating_core(dual_enabled);
+                let learned = core.engine.learned_state_for_test();
+                let commits_before = core.metrics().summary().total_commits;
+                let accepts_before = core.metrics().summary().accepted_predictions;
+                let actions = core.handle_key(press(Key::RawCode(code)));
+                assert!(actions.contains(&Action::CommitText(glyph.into())));
+                assert!(!actions.contains(&Action::ForwardKey));
+                assert_eq!(core.current_word(), format!("зд{glyph}"));
+                assert!(!core.native_completion_owned());
+                assert_eq!(core.engine.learned_state_for_test(), learned);
+                // Ordinary predictions add latency samples, but refinement is
+                // still not a learned commit or accepted prediction.
+                assert_eq!(core.metrics().summary().total_commits, commits_before);
+                assert_eq!(
+                    core.metrics().summary().accepted_predictions,
+                    accepts_before
+                );
+                assert!(core.take_commit_learning().words.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_composing_boundaries_still_learn_delivered_word_once() {
+        for key in [
+            Key::Space,
+            Key::RawCode(57),
+            Key::Char('.'),
+            Key::RawCode(52),
+        ] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            let learned = core.engine.learned_state_for_test();
+            let before = core.metrics().summary().total_commits;
+            let actions = core.handle_key(press(key));
+            assert!(actions.contains(&Action::CommitText("hel".into())));
+            assert!(actions.contains(&Action::ForwardKey));
+            assert_eq!(core.metrics().summary().total_commits, before + 1);
+            assert_ne!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(core.take_commit_learning().words.len(), 1);
+            let learned = core.engine.learned_state_for_test();
+            core.handle_key(press(Key::Space));
+            assert_eq!(core.metrics().summary().total_commits, before + 1);
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert!(core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_popup_accept_keys_abandon_prefix_without_learning() {
+        for key in [Key::Tab, Key::Return, Key::RawCode(15), Key::RawCode(28)] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            let actions = core.handle_key(press(key.clone()));
+            assert_eq!(core.engine.learned_state_for_test(), learned, "{key:?}");
+            assert_eq!(self::metrics(&core), metrics, "{key:?}");
+            assert!(core.take_commit_learning().words.is_empty(), "{key:?}");
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert!(core.current_word().is_empty());
+            assert!(!core.native_completion_owned());
+            core.handle_key(press(Key::Space));
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+        }
+    }
+
+    #[test]
+    fn native_popup_vertical_navigation_preserves_delivered_word_and_learning() {
+        for key in [
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::RawCode(103),
+            Key::RawCode(108),
+            Key::RawCode(104),
+            Key::RawCode(109),
+        ] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(core.handle_key(press(key)), [Action::ForwardKey]);
+            assert!(core.native_completion_owned());
+            assert_eq!(core.current_word(), "hel");
+            assert!(core.predictions().is_empty() && !core.has_ghost());
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+            assert!(core.take_commit_learning().words.is_empty());
+            assert_eq!(
+                core.handle_key(press(Key::RawCode(38))),
+                [Action::CommitText("l".into()), Action::HideGhost]
+            );
+            assert_eq!(core.current_word(), "hell");
+            assert!(core.predictions().is_empty() && !core.has_ghost());
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+        }
+    }
+
+    #[test]
+    fn native_popup_escape_releases_presentation_without_recommitting_or_learning() {
+        for key in [Key::Escape, Key::RawCode(1)] {
+            let mut core = seeded_core();
+            raw(&mut core, "hel");
+            core.handoff_preedit_for_native_completion();
+            let layout = core.word_delivery_layout;
+            let learned = core.engine.learned_state_for_test();
+            let metrics = metrics(&core);
+            assert_eq!(core.handle_key(press(key)), [Action::ForwardKey]);
+            assert!(!core.native_completion_owned());
+            assert_eq!(core.current_word(), "hel");
+            assert_eq!(core.word_delivery_layout, layout);
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert_eq!(self::metrics(&core), metrics);
+            assert!(core.take_commit_learning().words.is_empty());
+            let actions = core.handle_key(press(Key::RawCode(38)));
+            assert_eq!(
+                actions,
+                [
+                    Action::CommitText("l".into()),
+                    Action::ShowGhost("o".into())
+                ]
+            );
+            assert!(!core.debug_state().0);
+            assert_eq!(core.current_word(), "hell");
+            assert_eq!(core.engine.learned_state_for_test(), learned);
+            assert!(core.take_commit_learning().words.is_empty());
+        }
+    }
+
+    #[test]
+    fn layout_handoff_keeps_explicitly_accepted_character_but_not_the_rest() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        let right = core.handle_key(press(Key::Right));
+        assert_eq!(
+            right,
+            [Action::ShowComposing {
+                typed: "hell".into(),
+                ghost: "o".into()
+            }]
+        );
+        let learned = core.engine.learned_state_for_test();
+        let metrics = metrics(&core);
+        assert_eq!(
+            core.flush_preedit_for_layout(),
+            [Action::CommitText("hell".into()), Action::HideGhost]
+        );
+        assert_eq!(core.engine.learned_state_for_test(), learned);
+        assert_eq!(self::metrics(&core), metrics);
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+    }
+
+    #[test]
+    fn layout_handoff_does_not_redeliver_semantic_input_already_in_client() {
+        let mut core = seeded_core();
+        for ch in "hel".chars() {
+            assert!(core
+                .handle_key(press(Key::Char(ch)))
+                .contains(&Action::ForwardKey));
+        }
+        assert_eq!(core.current_word(), "hel");
+        let learned = core.engine.learned_state_for_test();
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+        assert_eq!(core.engine.learned_state_for_test(), learned);
+        assert!(core.current_word().is_empty());
+    }
+
+    #[test]
+    fn layout_handoff_after_full_accept_does_not_recommit_or_relearn() {
+        let mut core = seeded_core();
+        raw(&mut core, "hel");
+        assert_eq!(
+            core.handle_key(press(Key::Tab)),
+            [Action::HideGhost, Action::CommitText("hello".into())]
+        );
+        let learned = core.engine.learned_state_for_test();
+        let metrics = metrics(&core);
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+        assert_eq!(core.flush_preedit_for_layout(), [Action::HideGhost]);
+        assert_eq!(core.engine.learned_state_for_test(), learned);
+        assert_eq!(self::metrics(&core), metrics);
+    }
+}
+
+#[cfg(test)]
+mod backspace_recovered_detector_tests {
+    use super::*;
+
+    fn raw(core: &mut InputMethodCore, code: u16) {
+        let actions = core.handle_key(KeyEvent {
+            key: Key::RawCode(code),
+            modifiers: Modifiers::empty(),
+        });
+        assert!(actions.iter().any(|action| matches!(
+            action, Action::ShowComposing { typed, .. } if typed == core.current_word()
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            Action::CommitText(_) | Action::ReplaceWord { .. } | Action::ForwardKey
+        )));
+        assert_eq!(core.metrics().summary().total_commits, 0);
+    }
+
+    fn fixture(prior: LangId) -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        if prior == LangId::En {
+            core.load_word_lang("list", 190_546, LangId::En);
+            core.load_word_lang("листа", 47_863, LangId::Bg);
+            core.load_word_lang("листовете", 95, LangId::Bg);
+        }
+        core.load_word_lang("liston", 457, LangId::En);
+        core.load_word_lang("листове", 4_466, LangId::Bg);
+        core.apply_hints(&crate::master_loop::Hints {
+            lang_prior: Some(prior),
+            context_words: vec![match prior {
+                LangId::En => "thank".into(),
+                _ => "благодаря".into(),
+            }],
+            ..Default::default()
+        });
+        core
+    }
+
+    #[test]
+    fn deleting_recovered_bg_suffix_restores_english_detector_and_ghost() {
+        let mut fresh = fixture(LangId::En);
+        for code in [38, 23, 31] {
+            raw(&mut fresh, code);
+        }
+        assert_eq!(fresh.current_word(), "lis");
+        assert_eq!(fresh.ghost_text(), "t");
+        assert_eq!(fresh.detected_language().lang, LangId::En);
+
+        let mut edited = fixture(LangId::En);
+        for code in [38, 23, 31, 20, 24, 17] {
+            raw(&mut edited, code);
+        }
+        assert_eq!(edited.current_word(), "листов");
+        assert_eq!(edited.detected_language().lang, LangId::Bg);
+        assert!(edited.detected_language().confidence >= 0.6);
+        for _ in 0..3 {
+            raw(&mut edited, 14);
+        }
+        assert_eq!(edited.current_word(), "lis");
+        assert_eq!(
+            (edited.detected_language().lang, edited.ghost_text()),
+            (LangId::En, fresh.ghost_text())
+        );
+        assert!(edited.predictions().iter().any(|p| p.word == "list"));
+    }
+
+    #[test]
+    fn deleting_recovered_en_suffix_restores_bulgarian_detector_and_ghost() {
+        let mut fresh = fixture(LangId::Bg);
+        for code in [38, 23, 31] {
+            raw(&mut fresh, code);
+        }
+        assert_eq!(fresh.current_word(), "лис");
+        assert_eq!(fresh.ghost_text(), "тове");
+        assert_eq!(fresh.detected_language().lang, LangId::Bg);
+
+        let mut edited = fixture(LangId::Bg);
+        for code in [38, 23, 31, 20, 24, 49] {
+            raw(&mut edited, code);
+        }
+        assert_eq!(edited.current_word(), "liston");
+        assert_eq!(edited.detected_language().lang, LangId::En);
+        assert!(edited.detected_language().confidence >= 0.6);
+        for _ in 0..3 {
+            raw(&mut edited, 14);
+        }
+        assert_eq!(edited.current_word(), "лис");
+        assert_eq!(
+            (edited.detected_language().lang, edited.ghost_text()),
+            (LangId::Bg, fresh.ghost_text())
+        );
+        assert!(edited.predictions().iter().any(|p| p.word == "листове"));
+    }
+}
+
+#[cfg(test)]
+mod direct_delivery_regression_tests {
+    use super::*;
+
+    fn key(key: Key) -> KeyEvent {
+        KeyEvent {
+            key,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn prefix() -> InputMethodCore {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("hello", 1000, LangId::En);
+        for code in [35, 18, 38] {
+            core.handle_key(key(Key::RawCode(code)));
+        }
+        assert_eq!(core.current_word(), "hel");
+        core.handoff_preedit_for_delivery();
+        core
+    }
+
+    #[test]
+    fn direct_delivery_boundaries_do_not_learn_speculative_tokens() {
+        for boundary in [
+            Key::Space,
+            Key::Return,
+            Key::Tab,
+            Key::RawCode(51),
+            Key::RawCode(2),
+            Key::RawCode(26),
+        ] {
+            let mut core = prefix();
+            let learned = core.learned_state_for_test();
+            let before = core.metrics().summary().total_commits;
+            let actions = core.handle_key(key(boundary.clone()));
+            assert_eq!(core.current_word(), "", "boundary {boundary:?}");
+            assert_eq!(actions, [Action::HideGhost, Action::ForwardKey]);
+            assert_eq!(core.learned_state_for_test(), learned);
+            assert_eq!(core.metrics().summary().total_commits, before);
+            assert!(core.take_commit_learning().words.is_empty());
+            assert_eq!(core.context_words(), (None, None));
+        }
+    }
+
+    #[test]
+    fn direct_delivery_shortcut_retires_token_and_layout() {
+        for modifiers in [Modifiers::CTRL, Modifiers::ALT, Modifiers::SUPER] {
+            let mut core = prefix();
+            let learned = core.learned_state_for_test();
+            core.handle_key(KeyEvent {
+                key: Key::RawCode(30),
+                modifiers,
+            });
+            assert_eq!(core.current_word(), "", "shortcut {modifiers:?}");
+            assert_eq!(core.learned_state_for_test(), learned);
+            core.handle_key(key(Key::RawCode(32)));
+            assert!(
+                core.debug_state().0,
+                "new token must decide its layout anew"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_delivery_backspace_keeps_only_nonempty_token() {
+        let mut core = prefix();
+        let learned = core.learned_state_for_test();
+        core.handle_key(key(Key::Backspace));
+        assert_eq!(core.current_word(), "he");
+        core.handle_key(key(Key::RawCode(38)));
+        assert_eq!(core.current_word(), "hel");
+        for _ in 0..3 {
+            core.handle_key(key(Key::Backspace));
+        }
+        core.handle_key(key(Key::RawCode(32)));
+        assert!(core.debug_state().0);
+        assert_eq!(core.learned_state_for_test(), learned);
+    }
+
+    #[test]
+    fn direct_delivery_handoff_uses_completed_word_boundary_choice() {
+        let build = || {
+            let mut core = InputMethodCore::new(InputConfig::default());
+            core.load_word_lang("sky", 10, LangId::En);
+            core.load_word_lang("скъп", 100000, LangId::Bg);
+            for code in [31, 37, 21] {
+                core.handle_key(key(Key::RawCode(code)));
+            }
+            core
+        };
+        let mut boundary = build();
+        let expected = boundary
+            .handle_key(key(Key::Space))
+            .into_iter()
+            .find_map(|a| match a {
+                Action::CommitText(text) => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        let mut delivered = build();
+        let actual = delivered
+            .handoff_preedit_for_delivery()
+            .into_iter()
+            .find_map(|a| match a {
+                Action::CommitText(text) => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            delivered.handle_key(key(Key::RawCode(26))),
+            [Action::HideGhost, Action::ForwardKey]
+        );
+    }
+
+    #[test]
+    fn direct_delivery_bg_bracket_key_remains_a_letter() {
+        let mut core = InputMethodCore::new(InputConfig::default());
+        core.load_word_lang("още", 10000, LangId::Bg);
+        core.handle_key(key(Key::RawCode(24)));
+        core.handoff_preedit_for_delivery();
+        let actions = core.handle_key(key(Key::RawCode(27)));
+        assert_eq!(core.current_word(), "ощ");
+        assert!(actions.contains(&Action::CommitText("щ".into())));
+        core.handle_key(key(Key::Space));
+        assert_eq!(core.metrics().summary().total_commits, 0);
     }
 }

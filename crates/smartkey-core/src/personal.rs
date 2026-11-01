@@ -8,12 +8,67 @@ use serde::{Deserialize, Serialize};
 use crate::correction_memory::CorrectionSnapshot;
 use crate::cvm::CvmSnapshot;
 use crate::lang_cvm::LangCvmSnapshot;
+use crate::lang_detect::{LangId, LanguageDetector};
 use crate::light_profile::LightProfile;
+
+/// Language explicitly attested for a complete personal word. Unsupported
+/// future strings retain the rest of the profile without creating evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfirmedWordLanguage {
+    Bg,
+    En,
+    #[serde(other)]
+    Unsupported,
+}
+
+impl ConfirmedWordLanguage {
+    pub(crate) fn lang(self) -> Option<LangId> {
+        match self {
+            Self::Bg => Some(LangId::Bg),
+            Self::En => Some(LangId::En),
+            Self::Unsupported => None,
+        }
+    }
+}
+
+/// Positive full-word confirmation, independent of sampled generic vocabulary.
+/// Frequency is deliberately absent: the engine supplies its fixed value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmedWord {
+    pub word: String,
+    pub language: ConfirmedWordLanguage,
+}
+
+impl ConfirmedWord {
+    pub(crate) fn new(word: &str, lang: LangId) -> Option<Self> {
+        let language = match lang {
+            LangId::Bg => ConfirmedWordLanguage::Bg,
+            LangId::En => ConfirmedWordLanguage::En,
+            LangId::Tech => return None,
+        };
+        if word.chars().count() < 3 || word.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return None;
+        }
+        let mut observed_letter = false;
+        for ch in word.chars().filter(|ch| ch.is_alphabetic()) {
+            if LanguageDetector::instant_classify(ch) != Some(lang) {
+                return None;
+            }
+            observed_letter = true;
+        }
+        observed_letter.then(|| Self {
+            word: word.to_lowercase(),
+            language,
+        })
+    }
+}
 
 /// Versioned personal profile containing all learned state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonalProfile {
-    /// Schema version. Current = 3.
+    /// Schema version. Current = 4.
     pub version: u32,
     /// CVM streaming counter snapshot (v2 compat fallback).
     pub cvm: CvmSnapshot,
@@ -32,6 +87,10 @@ pub struct PersonalProfile {
     /// Light profile snapshot (v4, optional for backward compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub light_profile: Option<LightProfile>,
+    /// Independently confirmed personal words (optional v4 extension).
+    /// Absence never implies confirmation from historical CVM/prior data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirmed_words: Vec<ConfirmedWord>,
 }
 
 /// Snapshot of adaptive ensemble weights for persistence.
@@ -72,6 +131,7 @@ impl PersonalProfile {
             lang_cvm: None,
             corrections: None,
             light_profile: None,
+            confirmed_words: Vec::new(),
         }
     }
 
@@ -91,6 +151,7 @@ impl PersonalProfile {
             lang_cvm: Some(lang_cvm),
             corrections: None,
             light_profile: None,
+            confirmed_words: Vec::new(),
         }
     }
 
@@ -109,9 +170,17 @@ impl PersonalProfile {
 /// - v2: `PersonalProfile` (new format with Markov + weights)
 /// - v1: bare `CvmSnapshot` (old format — wrapped in a default profile)
 pub fn load_personal_json(json_str: &str) -> Result<PersonalProfile, String> {
-    // Try v2 first.
-    if let Ok(profile) = serde_json::from_str::<PersonalProfile>(json_str) {
-        return Ok(profile);
+    // A malformed versioned envelope must not fall back to unrelated bare-CVM
+    // fields. Unsupported optional confirmation languages deserialize safely.
+    match serde_json::from_str::<PersonalProfile>(json_str) {
+        Ok(profile) => return Ok(profile),
+        Err(error) => {
+            if serde_json::from_str::<serde_json::Value>(json_str).is_ok_and(|value| {
+                value.get("cvm").is_some() || value.get("confirmed_words").is_some()
+            }) {
+                return Err(format!("invalid personal profile: {error}"));
+            }
+        }
     }
 
     // Fall back to v1 (bare CvmSnapshot).
@@ -127,6 +196,7 @@ pub fn load_personal_json(json_str: &str) -> Result<PersonalProfile, String> {
         lang_cvm: None,
         corrections: None,
         light_profile: None,
+        confirmed_words: Vec::new(),
     })
 }
 
@@ -180,6 +250,67 @@ mod tests {
             words: vec!["hello".into()],
             age_secs: [("hello".into(), 0.0)].into(),
         }
+    }
+
+    #[test]
+    fn review_confirmation_validates_same_script_whole_tokens_with_punctuation_and_digits() {
+        for (word, lang, folded) in [
+            ("Qx-name2", LangId::En, "qx-name2"),
+            ("Зор-иван2", LangId::Bg, "зор-иван2"),
+        ] {
+            let confirmed = ConfirmedWord::new(word, lang).unwrap();
+            assert_eq!(confirmed.word, folded);
+            assert_eq!(confirmed.language.lang(), Some(lang));
+        }
+        for (word, lang) in [
+            ("", LangId::En),
+            ("qx", LangId::En),
+            ("   ", LangId::En),
+            ("qx word", LangId::En),
+            ("qx\nword", LangId::En),
+            ("qx\u{0000}word", LangId::En),
+            ("qxслово", LangId::En),
+            ("qxé", LangId::En),
+            ("qx漢", LangId::En),
+            ("123", LangId::En),
+            ("___", LangId::En),
+            ("qxword", LangId::Bg),
+            ("зориван", LangId::En),
+            ("qxword", LangId::Tech),
+        ] {
+            assert!(
+                ConfirmedWord::new(word, lang).is_none(),
+                "invalid confirmation: {word:?} {lang:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_confirmation_malformed_envelope_cannot_fall_back_to_bare_cvm() {
+        let profile = PersonalProfile::new(
+            test_cvm_snapshot(),
+            PersonalMarkovSnapshot {
+                bigrams: Vec::new(),
+                trigrams: Vec::new(),
+            },
+            None,
+        );
+        let mut value = serde_json::to_value(&profile).unwrap();
+        // Valid bare-CVM fields must not rescue a malformed explicit envelope.
+        for (key, entry) in serde_json::to_value(test_cvm_snapshot())
+            .unwrap()
+            .as_object()
+            .unwrap()
+        {
+            value
+                .as_object_mut()
+                .unwrap()
+                .entry(key.clone())
+                .or_insert(entry.clone());
+        }
+        value["confirmed_words"] =
+            serde_json::json!([{ "word": "qxproof", "language": { "bad": "en" } }]);
+        assert!(load_personal_json(&serde_json::to_string(&value).unwrap()).is_err());
     }
 
     #[test]
@@ -251,5 +382,45 @@ mod tests {
             .markov_bigrams
             .iter()
             .any(|(c, w, n)| c == "hello" && w == "world" && *n == 5));
+    }
+
+    #[test]
+    fn personal_profile_float_roundtrip_preserves_f64_bits() {
+        let values =
+            std::iter::once(0.48475499919573045_f64).chain((1..=16).map(|n| f64::from(n) / 19.0));
+        for value in values {
+            let mut profile = PersonalProfile::new(
+                test_cvm_snapshot(),
+                PersonalMarkovSnapshot {
+                    bigrams: Vec::new(),
+                    trigrams: Vec::new(),
+                },
+                None,
+            );
+            profile.light_profile = Some(LightProfile {
+                lang_prior: [value, (1.0 - value) * 0.6, (1.0 - value) * 0.4],
+                ghost_accept_rate: value,
+                suppress_after_reject: 1,
+                confidence_floor: (0.35 - 0.25 * value).max(0.12),
+            });
+            let bits = |light: &LightProfile| {
+                (
+                    light.lang_prior.map(f64::to_bits),
+                    light.ghost_accept_rate.to_bits(),
+                    light.suppress_after_reject,
+                    light.confidence_floor.to_bits(),
+                )
+            };
+            let expected = bits(profile.light_profile.as_ref().unwrap());
+            for generation in 0..3 {
+                let json = serde_json::to_string_pretty(&profile).unwrap();
+                profile = load_personal_json(&json).unwrap();
+                assert_eq!(
+                    bits(profile.light_profile.as_ref().unwrap()),
+                    expected,
+                    "value={value:?}, generation={generation}"
+                );
+            }
+        }
     }
 }

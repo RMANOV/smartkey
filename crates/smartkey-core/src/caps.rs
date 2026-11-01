@@ -34,8 +34,18 @@ impl CapsEngine {
         if trimmed.is_empty() {
             return true; // Start of input
         }
+        // Closing quotes/brackets can follow a sentence terminator. Keep the
+        // original empty-input rule separate: a quote-only token is not a start.
+        let trimmed = trimmed.trim_end_matches(Self::is_closing_punctuation);
         let last_char = trimmed.chars().last().unwrap_or(' ');
         matches!(last_char, '.' | '!' | '?' | '\n')
+    }
+
+    pub(crate) fn is_closing_punctuation(ch: char) -> bool {
+        matches!(
+            ch,
+            '"' | '\'' | ')' | ']' | '}' | '‘' | '’' | '“' | '”' | '«' | '»' | '‹' | '›'
+        )
     }
 
     /// Detect caps regime from the typed prefix.
@@ -203,5 +213,48 @@ mod tests {
         assert!(engine.is_proper_noun("London"));
         assert!(engine.is_proper_noun("LONDON"));
         assert!(!engine.is_proper_noun("hello"));
+    }
+
+    #[test]
+    fn sentence_boundary_caps_closing_suffix_utf8_safe() {
+        let mut failed = Vec::new();
+        for token in [
+            "hello.\"",
+            "hello.')",
+            "hello.?]}",
+            "hello.”",
+            "привет.“",
+            "hello.«»‹›‘’“”",
+        ] {
+            if !CapsEngine::requires_capitalization(token) {
+                failed.push(token);
+            }
+        }
+        assert!(failed.is_empty(), "closing suffix: {failed:?}");
+    }
+
+    #[test]
+    fn sentence_boundary_caps_empty_and_closer_only_remain_distinct() {
+        for token in ["", " ", "\t\n"] {
+            assert!(CapsEngine::requires_capitalization(token));
+        }
+        for token in ["\"", "')]} ", "‘’“”«»‹›"] {
+            assert!(!CapsEngine::requires_capitalization(token), "{token:?}");
+        }
+    }
+
+    #[test]
+    fn sentence_boundary_caps_ordinary_and_adjacent_tokens_remain_false() {
+        for token in [
+            "hello)",
+            "example.com)",
+            "3.14)",
+            "hello.\"world",
+            "hello.1)",
+            "hello. next",
+            "hello. \"",
+        ] {
+            assert!(!CapsEngine::requires_capitalization(token), "{token:?}");
+        }
     }
 }

@@ -337,7 +337,9 @@ def prepare_candidate(
         schema = json.loads(schema_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise WriterError("E_OPERATION_SHAPE", "input JSON is malformed") from exc
-    if not isinstance(source, dict) or not isinstance(additions, list):
+    if not isinstance(source, dict):
+        raise WriterError("E_OPERATION_SHAPE", "source registry must be a JSON object")
+    if not isinstance(additions, list):
         raise WriterError("E_OPERATION_SHAPE", "append input must be a JSON array")
     if not isinstance(schema, dict):
         raise WriterError("E_SCHEMA_SHAPE", "schema must be a JSON object")

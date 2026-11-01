@@ -23,6 +23,7 @@ pub struct DetectedLanguage {
 
 /// Character trigram cross-entropy classifier with EMA smoothing
 /// and instant Unicode block classification (v0.4.1).
+#[derive(Clone)]
 pub struct LanguageDetector {
     /// Running EMA of cross-entropy per language [Bg, En, Tech].
     ema_scores: [f64; 3],
@@ -283,6 +284,31 @@ impl LanguageDetector {
         }
     }
 
+    /// Whether this character independently scores most strongly for Tech.
+    /// This deliberately excludes prior/momentum fallback and script inference.
+    pub(crate) fn has_positive_tech_signal(&self, ch: char) -> bool {
+        let [bg, en, tech] = self.score_char(ch);
+        tech > bg && tech > en
+    }
+
+    /// Re-evaluate surviving word characters from this editing baseline.
+    /// Only the local clone is fed: the current detector retains its routing
+    /// state, latest prior and committed momentum. Context is copied rather
+    /// than merged, so replay cannot duplicate or restore obsolete history.
+    pub(crate) fn replay_word_detection(
+        &self,
+        word: &str,
+        current_context: &Self,
+    ) -> DetectedLanguage {
+        let mut replay = self.clone();
+        replay.prior = current_context.prior;
+        replay.momentum = current_context.momentum.clone();
+        for ch in word.chars() {
+            replay.feed_char_instant(ch);
+        }
+        replay.detected()
+    }
+
     /// Score a character for each language model.
     ///
     /// Uses Unicode ranges as a fast proxy for trigram cross-entropy:
@@ -310,6 +336,54 @@ impl LanguageDetector {
             // Default: slight En bias
             _ => [0.2, 0.5, 0.3],
         }
+    }
+}
+
+#[cfg(test)]
+mod retraction_detection_tests {
+    use super::*;
+
+    #[test]
+    fn retraction_local_replay_uses_latest_context_without_mutating_history() {
+        for (prior, expected, confidence) in [
+            (Some(LangId::En), LangId::En, 0.65),
+            (None, LangId::Tech, 0.55),
+        ] {
+            let mut baseline = LanguageDetector::new();
+            baseline.set_prior(LangId::Bg);
+            baseline.record_commit(LangId::Bg);
+            let mut current = LanguageDetector::new();
+            current.prior = prior;
+            current.record_commit(LangId::Tech);
+            let replay = baseline.replay_word_detection("?", &current);
+            assert_eq!(replay.lang, expected);
+            assert_eq!(replay.confidence, confidence);
+            assert_eq!(baseline.prior, Some(LangId::Bg));
+            assert_eq!(baseline.momentum, VecDeque::from([LangId::Bg]));
+            assert_eq!(current.prior, prior);
+            assert_eq!(current.momentum, VecDeque::from([LangId::Tech]));
+            assert_eq!(current.detected().confidence, 0.0);
+        }
+    }
+
+    #[test]
+    fn retraction_replay_omits_deleted_script_without_changing_global_detector() {
+        let baseline = LanguageDetector::new();
+        let mut current = baseline.clone();
+        for ch in "123a".chars() {
+            current.feed_char_instant(ch);
+        }
+        let global_scores = current.ema_scores;
+        let global_chars = current.char_buffer.clone();
+        let replay = baseline.replay_word_detection("123", &current);
+        assert_eq!(replay.lang, LangId::Tech);
+        assert!((replay.confidence - 0.9).abs() < 1e-12);
+        assert_eq!(current.detected().lang, LangId::En);
+        assert_eq!(current.detected().confidence, 1.0);
+        assert_eq!(current.ema_scores, global_scores);
+        assert_eq!(current.char_buffer, global_chars);
+        assert_eq!(baseline.ema_scores, [0.0; 3]);
+        assert!(baseline.char_buffer.is_empty());
     }
 }
 
